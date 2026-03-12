@@ -7,7 +7,7 @@ let browser: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
     if (!browser) {
-        const launchOptions: LaunchOptions = {
+        browser = await chromium.launch({
             headless: true,
             args: [
                 '--no-sandbox',
@@ -15,14 +15,7 @@ async function getBrowser(): Promise<Browser> {
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
             ],
-        };
-
-        // Явно указываем обычный Chromium из кеша Playwright
-        if (process.env.PLAYWRIGHT_CHROMIUM_PATH) {
-            launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH;
-        }
-
-        browser = await chromium.launch(launchOptions);
+        });
     }
     return browser;
 }
