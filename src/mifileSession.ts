@@ -1,4 +1,4 @@
-import { chromium, Browser, Page } from 'playwright';
+import { chromium, Browser, Page, LaunchOptions } from 'playwright';
 
 const MIFILE_USER = process.env.MIFILE_USER!;
 const MIFILE_PASSWORD = process.env.MIFILE_PASSWORD!;
@@ -7,9 +7,22 @@ let browser: Browser | null = null;
 
 async function getBrowser(): Promise<Browser> {
     if (!browser) {
-        browser = await chromium.launch({
-            headless: true, // можно временно false для отладки
-        });
+        const launchOptions: LaunchOptions = {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+            ],
+        };
+
+        // Явно указываем обычный Chromium из кеша Playwright
+        if (process.env.PLAYWRIGHT_CHROMIUM_PATH) {
+            launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH;
+        }
+
+        browser = await chromium.launch(launchOptions);
     }
     return browser;
 }
