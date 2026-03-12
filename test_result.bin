@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueCertify</title>
+    <link href="/Content/css?v=iFD7h5vniSFvMLnKHgFCxkaRXckACE3-USCjE3zGxfE1" rel="stylesheet"/>
+
+    <script src="/bundles/modernizr?v=inCVuEFe6J4Q07A0AcRsbJic_UE5MwpRMNGcOtk94TE1"></script>
+
+    <script src="/bundles/jquery?v=AaxnkxbVboLGXwVaM1CxqwODaHRA-ica_sD_vRagvrA1"></script>
+
+    <script src="/bundles/bootstrap?v=-ktyuuYVm8reiCqek-REkH9kFQQZ53F1Ay-TXz9RIew1"></script>
+
+    <script src="/bundles/angular?v=EfDgTYF4hfEmC7DHMZFIWtEe50F_K9tbmWyGfjdeAZI1"></script>
+
+    <script type = 'text/javascript' >
+        var appInsights=window.appInsights||function(config)
+        {
+            function r(config){ t[config] = function(){ var i = arguments; t.queue.push(function(){ t[config].apply(t, i)})} }
+            var t = { config:config},u=document,e=window,o='script',s=u.createElement(o),i,f;for(s.src=config.url||'//az416426.vo.msecnd.net/scripts/a/ai.0.js',u.getElementsByTagName(o)[0].parentNode.appendChild(s),t.cookie=u.cookie,t.queue=[],i=['Event','Exception','Metric','PageView','Trace','Ajax'];i.length;)r('track'+i.pop());return r('setAuthenticatedUserContext'),r('clearAuthenticatedUserContext'),config.disableExceptionTracking||(i='onerror',r('_'+i),f=e[i],e[i]=function(config, r, u, e, o) { var s = f && f(config, r, u, e, o); return s !== !0 && t['_' + i](config, r, u, e, o),s}),t
+        }({
+            instrumentationKey:'a1e318fc-3de5-4c14-8922-0a311e65a9d0'
+        });
+        
+        window.appInsights=appInsights;
+        appInsights.trackPageView();
+    </script>
+</head>
+<body>
+    <div class="container-fluid body-content">
+        
+        
+
+<div class="jumbotron2">
+    <img src="/Home/GetLogo" class="tc-logo" alt="Company Logo" />
+    <span class="tc-title">TrueCertify</span>
+
+        <div class="tc-container">
+            <p class="tc-text">Please enter the information below to access the certified document.</p>
+            <hr class="tc-divider" />
+            <form action="/" method="post">                <div class="tc-form-row">
+                    <div class="tc-field">
+                        <p>File Locator</p>
+                        <input class="tc-input" id="DocumentLocator" name="DocumentLocator" type="text" value="MIP63-S2HGMQ-FF7DC1F3" />
+                    </div>
+                    <div class="tc-field">
+                        <p>Public Key</p>
+                        <input class="tc-input" id="PublicKey" name="PublicKey" type="text" value="3A7" />
+                    </div>
+                </div>
+                <div class="tc-clear"></div>
+                    <p class="tc-text tc-mt40">Type in the text from the image below.</p>
+                    <div class="tc-captcha">
+                        <div class="tc-inline">
+                            <input class="tc-captcha-input" id="CaptchaValue" name="CaptchaValue" type="text" value="eNFAy" />
+                        </div>
+                        <div class="tc-inline tc-image-container">
+                            <img src="/Home/GetCaptcha" class="tc-responsive-img" alt="CAPTCHA image" />
+                        </div>
+                        <br />
+                        <div class="tc-inline">
+                            <a href="/?loc=MIP63-S2HGMQ-FF7DC1F3&amp;key=3A7&amp;useRecaptcha=True" class="tc-accessibility-link">
+                                Switch to accessible captcha
+                            </a>
+                        </div>
+                        <div class="tc-centered">
+                            <span class="tc-error"></span>
+                        </div>
+                    </div>
+                <input type="submit" name="action" value="Submit" class="btn btn-primary btn-lg tc-submit" />
+                <br />
+                <br />
+                <span class="tc-error">There was an error processing the request. Please check the file locator, key and expiration date and try again.</span>
+                <span class="tc-error"></span>
+                <span class="tc-error"></span>
+<input id="CaptchaToken" name="CaptchaToken" type="hidden" value="" /><input id="CaptchaValue" name="CaptchaValue" type="hidden" value="eNFAy" /><input id="VersionNumber" name="VersionNumber" type="hidden" value="" /></form>        </div>
+    <div class="tc-version"></div>
+</div>
+        <div class="navbar navbar-inverse navbar-fixed-bottom">
+            <div class="container-fluid">
+                <div class="navbar-collapse collapse">
+                    <ul class="nav navbar-nav">
+                        <li><a href="/">Home</a></li>
+                        <li><a href="/Home/FAQ">FAQ</a></li>
+                        <li><a href="http://www.truecertify.com" target="_blank">About TrueCertify</a></li>
+                    </ul>
+                    <span style="float: right; margin-top: 18px; color: silver; font-size: 14px;">&copy; 2026 - ImageSoft Inc.</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="/bundles/jquery?v=AaxnkxbVboLGXwVaM1CxqwODaHRA-ica_sD_vRagvrA1"></script>
+
+    <script src="/bundles/bootstrap?v=-ktyuuYVm8reiCqek-REkH9kFQQZ53F1Ay-TXz9RIew1"></script>
+
+    
+</body>
+</html>
+
+
+
+  
