@@ -1,4 +1,3 @@
-// truecertifyBufferDownloader.ts
 import { chromium, Browser, Page } from 'playwright';
 import fetch from 'node-fetch';
 import { TwoCaptchaClient } from './2captcha-client';
@@ -86,25 +85,33 @@ export class TrueCertifyBufferDownloader {
                 await this.page.waitForTimeout(300);
 
                 const submitButton = await this.page.$('.tc-submit');
-                if (!submitButton) throw new Error('Submit button not found');
+                if (!submitButton) {
+                    throw new Error('Submit button not found');
+                }
 
-                const fileName = `truecertify_${locator}_${Date.now()}.pdf`;
                 console.log('Waiting for download event...');
 
                 try {
                     const [download] = await Promise.all([
-                        this.page.waitForEvent('download', { timeout: 15000 }),
-                        submitButton.click(),
+                        this.page.waitForEvent('download', { timeout: 20000 }),
+                        (async () => {
+                            await submitButton.click();
+                            // небольшая пауза после клика, чтобы сервер успел инициировать выдачу файла
+                            await this.page!.waitForTimeout(1000);
+                        })(),
                     ]);
+
+                    // на всякий случай ещё немного ждём перед чтением стрима
+                    await this.page!.waitForTimeout(500);
 
                     const stream = await download.createReadStream();
                     if (!stream) throw new Error('No download stream');
 
                     const chunks: Buffer[] = [];
                     await new Promise<void>((resolve, reject) => {
-                        stream.on('data', (c) => chunks.push(c));
+                        stream.on('data', c => chunks.push(c));
                         stream.on('end', () => resolve());
-                        stream.on('error', (err) => reject(err));
+                        stream.on('error', err => reject(err));
                     });
 
                     const buffer = Buffer.concat(chunks);
@@ -112,16 +119,17 @@ export class TrueCertifyBufferDownloader {
 
                     if (buffer.length <= 10_000) {
                         console.log('Downloaded buffer too small, retrying...');
-                        await this.page.reload({ waitUntil: 'networkidle' });
-                        await this.page.waitForTimeout(2000);
+                        await this.page!.reload({ waitUntil: 'networkidle' });
+                        await this.page!.waitForTimeout(2000);
                         continue;
                     }
 
+                    const fileName = `truecertify_${locator}_${Date.now()}.pdf`;
                     return { success: true, buffer, fileName };
                 } catch (e) {
                     console.log('Download failed in this attempt, reloading...', e);
-                    await this.page.reload({ waitUntil: 'networkidle' });
-                    await this.page.waitForTimeout(2000);
+                    await this.page!.reload({ waitUntil: 'networkidle' });
+                    await this.page!.waitForTimeout(2000);
                 }
             }
 

@@ -7,22 +7,23 @@ import {
     uploadFileBufferToFolder,
     createFileLink,
 } from './oneDriveClient';
+import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
 
 // === ТИПЫ ДЛЯ РЕЗУЛЬТАТОВ ===
 
 export interface DownloadedFile {
     documentType: string | null;
     documentName?: string | null;
-    localPath: string; // логический путь в структуре OneDrive
+    localPath: string;
 }
 
 export interface NotificationFile {
-    displayName: string;        // логическое имя: "Complaint for Possession Only"
-    fileName: string;           // имя PDF в OneDrive
-    buffer: Buffer;             // сам PDF для вложения
+    displayName: string;
+    fileName: string;
+    buffer: Buffer;
     driveId: string;
     itemId: string;
-    webUrl?: string;            // ссылка просмотр в OneDrive
+    webUrl?: string;
 }
 
 export interface DownloadResult {
@@ -30,7 +31,7 @@ export interface DownloadResult {
     notificationFiles: NotificationFile[];
 }
 
-// === УТИЛИТЫ И ИМЕЮЩИЕСЯ ФУНКЦИИ ===
+// === УТИЛИТЫ ===
 
 function sanitizeForPath(value: string | null | undefined): string {
     if (!value) return '';
@@ -68,7 +69,6 @@ function getDateFolderNameFromReceived(receivedAtIso?: string): string {
 }
 
 function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): string {
-    // Type C: нет courtName, обычно один документ, статус "Sent"
     const isTypeC =
         !parsed.courtName &&
         parsed.filedDocuments.length === 1 &&
@@ -90,7 +90,6 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
         return parts.join(' ') + '.pdf';
     }
 
-    // Старые правила для MiFILE (Type A/B)
     const courtNumber = extractCourtNumber(parsed.courtName);
     const courtSafe = sanitizeForPath(courtNumber);
     const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'unknown';
@@ -125,6 +124,22 @@ function extractKeyFromUrl(url: string): string {
     return match ? match[1] : '';
 }
 
+function looksLikePdf(buffer: Buffer): boolean {
+    if (buffer.length < 100) return false;
+    const header = buffer.subarray(0, 5).toString('ascii');
+    return header === '%PDF-';
+}
+
+function looksLikeHtml(buffer: Buffer): boolean {
+    const snippet = buffer.subarray(0, 200).toString('utf8').toLowerCase();
+    return snippet.includes('<html') || snippet.includes('<!doctype html');
+}
+
+const TWO_CAPTCHA_API_KEY = process.env.TWO_CAPTCHA_API_KEY || '';
+const trueCertifyDownloader = TWO_CAPTCHA_API_KEY
+    ? new TrueCertifyBufferDownloader(TWO_CAPTCHA_API_KEY)
+    : null;
+
 // ===== НОВА ФУНКЦІЯ ДЛЯ TRUECERTIFY =====
 
 export async function uploadTrueCertifyDocuments(
@@ -138,6 +153,11 @@ export async function uploadTrueCertifyDocuments(
     );
 
     if (trueCertifyDocs.length === 0) return { downloaded: [], notificationFiles: [] };
+
+    if (!trueCertifyDownloader) {
+        console.error('TrueCertify: TWO_CAPTCHA_API_KEY not set, cannot process TYPE C.');
+        return { downloaded: [], notificationFiles: [] };
+    }
 
     console.log(`🚀 Починаємо завантаження ${trueCertifyDocs.length} TrueCertify документів`);
 
@@ -163,13 +183,25 @@ export async function uploadTrueCertifyDocuments(
 
             console.log(`🔑 locator=${locator}, key=${key}`);
 
-            // Скачиваем PDF в память (httpDownloadFromMifileToBuffer уже знает про truecertify.com)
-            const buffer = await httpDownloadFromMifileToBuffer(doc.downloadUrl);
+            const result = await trueCertifyDownloader.downloadToBuffer(locator, key);
 
-            // Имя файла по тем же правилам, что и для MiFILE
+            if (!result.success || !result.buffer) {
+                throw new Error(
+                    `TrueCertify: не удалось скачать PDF (success=${result.success}, error=${result.error})`
+                );
+            }
+
+            const buffer = result.buffer;
+            console.log(`TrueCertify final buffer size: ${buffer.length}`);
+
+            if (!looksLikePdf(buffer) || looksLikeHtml(buffer)) {
+                throw new Error(
+                    `TrueCertify: скачан не PDF (size=${buffer.length}) — вероятно HTML/ошибка после капчи`
+                );
+            }
+
             const fileName = buildPdfFileName(parsed, doc);
 
-            // Грузим в OneDrive и получаем id файла
             const upload = await uploadFileBufferToFolder(
                 driveId,
                 dayFolderItemId,
@@ -177,8 +209,7 @@ export async function uploadTrueCertifyDocuments(
                 buffer,
             );
 
-            // Создаём ссылку просмотра
-            const webUrl = await createFileLink(upload.driveId, upload.itemId); // [web:140]
+            const webUrl = await createFileLink(upload.driveId, upload.itemId);
 
             const logicalPath = path.posix.join(dateFolderName, fileName);
 
@@ -216,7 +247,6 @@ export async function downloadFiledDocuments(
     if (!parsed.isMiFile) return { downloaded: [], notificationFiles: [] };
     if (!parsed.filedDocuments.length) return { downloaded: [], notificationFiles: [] };
 
-    // Відокремлюємо TrueCertify документи
     const trueCertifyDocs = parsed.filedDocuments.filter(doc =>
         doc.downloadUrl?.includes('truecertify.com')
     );
@@ -227,7 +257,7 @@ export async function downloadFiledDocuments(
     const downloaded: DownloadedFile[] = [];
     const notificationFiles: NotificationFile[] = [];
 
-    // Спочатку обробляємо TrueCertify, якщо є
+    // TrueCertify / TYPE C
     if (trueCertifyDocs.length > 0) {
         const trueCertifyParsed = { ...parsed, filedDocuments: trueCertifyDocs };
         const {
@@ -239,7 +269,7 @@ export async function downloadFiledDocuments(
         notificationFiles.push(...tcNotificationFiles);
     }
 
-    // Потім обробляємо MiFILE, якщо є
+    // MiFILE (A/B)
     if (miFileDocs.length > 0) {
         const mainDoc = pickMainDocument({ ...parsed, filedDocuments: miFileDocs });
         if (!mainDoc) return { downloaded, notificationFiles };
@@ -263,7 +293,7 @@ export async function downloadFiledDocuments(
                 buffer,
             );
 
-            const webUrl = await createFileLink(upload.driveId, upload.itemId); // [web:140]
+            const webUrl = await createFileLink(upload.driveId, upload.itemId);
 
             const logicalPath = path.posix.join(dateFolderName, fileName);
 
