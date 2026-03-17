@@ -259,30 +259,34 @@ function parseDocumentSentStyle(
     text: string,
     html: string,
 ): Omit<ParsedEmailInfo, 'isMiFile'> | null {
-    // якорь: Subject внутри форварда “MiFILE - Document Sent”
-    if (!/MiFILE\s*-\s*Document Sent/i.test(text)) return null;
+    // 1) Главный маркер Type C — ссылка на TrueCertify
+    const tfHrefMatch =
+        html.match(/https:\/\/eservices\.truecertify\.com\/[^\s"'<>]*/i) ??
+        text.match(/https:\/\/eservices\.truecertify\.com\/[^\s"'<>]*/i);
 
+    if (!tfHrefMatch) {
+        // нет TrueCertify‑ссылки → точно не Type C
+        return null;
+    }
+
+    const downloadUrl = tfHrefMatch[0];
+
+    // 2) Остальные поля — best effort
     const documentName = extractAfterLabel(text, 'Document Name:');
     const documentType = extractAfterLabel(text, 'Document Type:');
-    const servedDownload = extractAfterLabel(text, 'Served Document:');
 
-    // ссылка на TrueFiling e‑service (https://eservices.truecertify.com/...)
-    const tfHrefMatch = html.match(/https:\/\/eservices\.truecertify\.com\/[^\s"'<>]*/i);
-    const urlFromHtml = tfHrefMatch ? tfHrefMatch[0] : null;
-
-    const downloadUrl = urlFromHtml ?? clean(servedDownload);
-
-    // courtName для Type C:
-    // "The following document was electronically sent on behalf of the 54A DISTRICT COURT by MiFILE."
+    // courtName:
+    // "The following document was electronically sent on behalf of the 48TH DISTRICT COURT by MiFILE."
     let courtName: string | null = null;
     const courtMatch = text.match(
         /The following document was electronically sent on behalf of the\s+(.+?COURT)\s+by MiFILE/i
     );
     if (courtMatch) {
-        courtName = courtMatch[1]?.trim() || null; // "54A DISTRICT COURT"
+        courtName = courtMatch[1]?.trim() || null;
     }
 
-    // caseNumber/caseTitle из "MiFILE - Document Sent 25-08823-LT, CAPITOL VILLAGE V CHAN"
+    // caseNumber / caseTitle из:
+    // "MiFILE - Document Sent 25-08823-LT, CAPITOL VILLAGE V CHAN"
     let caseNumber: string | null = null;
     let caseTitle: string | null = null;
 
