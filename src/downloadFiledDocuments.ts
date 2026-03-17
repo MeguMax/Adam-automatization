@@ -284,7 +284,55 @@ export async function downloadFiledDocuments(
             console.log(`\n📄 Обробка MiFILE документа: ${doc.documentType || 'unknown'}`);
 
             const fileName = buildPdfFileName(parsed, doc);
-            const buffer = await httpDownloadFromMifileToBuffer(doc.downloadUrl);
+
+            let buffer: Buffer | null = null;
+            const maxRetries = 3;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    console.log(
+                        `📥 Завантажуємо MiFILE документ (спроба ${attempt}/${maxRetries})`,
+                    );
+
+                    const downloadedBuf = await httpDownloadFromMifileToBuffer(doc.downloadUrl);
+
+                    if (!looksLikePdf(downloadedBuf) || looksLikeHtml(downloadedBuf)) {
+                        console.warn(
+                            `⚠️ MiFILE: скачан не PDF (size=${downloadedBuf.length}) — ` +
+                            `ймовірно HTML/сторінка логіну`,
+                        );
+
+                        if (attempt < maxRetries) {
+                            console.log('🔄 Повторна спроба через 2 сек...');
+                            await new Promise(res => setTimeout(res, 2000));
+                            continue;
+                        } else {
+                            throw new Error(
+                                `MiFILE: не вдалося отримати PDF після ${maxRetries} спроб`,
+                            );
+                        }
+                    }
+
+                    buffer = downloadedBuf;
+                    break; // успех
+                } catch (err) {
+                    console.error(
+                        `❌ Помилка при завантаженні MiFILE (спроба ${attempt}):`,
+                        err,
+                    );
+                    if (attempt === maxRetries) {
+                        console.error(
+                            `❌ MiFILE: не вдалося завантажити документ після ${maxRetries} спроб, пропускаємо`,
+                        );
+                    } else {
+                        await new Promise(res => setTimeout(res, 2000));
+                    }
+                }
+            }
+
+            if (!buffer) {
+                continue; // не удалось получить валидный PDF – не грузим в OneDrive
+            }
 
             const upload = await uploadFileBufferToFolder(
                 driveId,
