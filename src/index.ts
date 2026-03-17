@@ -4,7 +4,7 @@ import { downloadFiledDocuments } from './downloadFiledDocuments';
 import { closeMifileBrowser } from './mifileSession';
 import fs from 'fs/promises';
 
-import { getGraphClient } from './graphClient';         // ← ВАЖНО: именно getGraphClient
+import { getGraphClient } from './graphClient';
 import { buildSuccessBody, buildErrorBody } from './buildSuccessBody';
 import { sendProcessingReport } from './notificationEmail';
 
@@ -46,7 +46,6 @@ async function processOnce(processedIds: Set<string>) {
 
     let changed = false;
 
-    // получаем singleton‑клиент Graph
     const graphClient = getGraphClient();
 
     for (const msg of emails) {
@@ -60,6 +59,20 @@ async function processOnce(processedIds: Set<string>) {
             console.log('Subject:', msg.subject);
             console.log('From:', msg.from?.emailAddress?.address);
             console.log('Received:', msg.receivedDateTime);
+
+            const fromAddr =
+                msg.from?.emailAddress?.address?.toLowerCase() ?? '';
+            const subject = (msg.subject ?? '') as string;
+
+            // Пишем в лог, но не обрабатываем свои же success‑репорты
+            if (
+                fromAddr === process.env.NOTIFY_TO_EMAIL!.toLowerCase() &&
+                subject.startsWith('MiFILE/TrueFiling processed:')
+            ) {
+                processedIds.add(id);
+                changed = true;
+                continue;
+            }
 
             const bodyContent = (msg as any).body?.content ?? '';
             parsed = parseEmailBody(bodyContent);
@@ -89,7 +102,7 @@ async function processOnce(processedIds: Set<string>) {
                     notificationFiles.map(f => ({ name: f.fileName, url: f.webUrl })),
                 );
 
-                const subject =
+                const subjectLine =
                     `MiFILE/TrueFiling processed: ` +
                     `${parsed.caseNumber ?? 'NO CASE'} – ${notificationFiles.length} doc(s)`;
 
@@ -102,7 +115,7 @@ async function processOnce(processedIds: Set<string>) {
                 try {
                     await sendProcessingReport({
                         client: graphClient,
-                        subject,
+                        subject: subjectLine,
                         bodyText,
                         files: notificationFiles,
                     });
@@ -118,7 +131,7 @@ async function processOnce(processedIds: Set<string>) {
             console.error(`Error while processing message ${id}:`, err);
 
             try {
-                const subject =
+                const subjectLine =
                     `ERROR processing MiFILE/TrueFiling email: ` +
                     `${parsed?.caseNumber ?? msg.subject ?? 'UNKNOWN'}`;
 
@@ -130,7 +143,7 @@ async function processOnce(processedIds: Set<string>) {
 
                 await sendProcessingReport({
                     client: graphClient,
-                    subject,
+                    subject: subjectLine,
                     bodyText,
                     files: [],
                 });
