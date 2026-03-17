@@ -75,12 +75,16 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
         (doc.status === 'Sent' || doc.documentType === 'SECOND_MAIL_COPY');
 
     if (isTypeC) {
+        const courtNumber = extractCourtNumber(parsed.courtName);
+        const courtSafe = sanitizeForPath(courtNumber);
+
         const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'NO_CASE';
         const caseTitleSafe = sanitizeForPath(parsed.caseTitle);
         const docNameSafe = sanitizeForPath(doc.documentName) || 'DOC';
         const docTypeSafe = sanitizeForPath(doc.documentType ?? 'OTHER');
 
         const parts = [
+            courtSafe,       // 👈 Court Number первым
             caseNumberSafe,
             caseTitleSafe,
             docNameSafe,
@@ -90,18 +94,21 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
         return parts.join(' ') + '.pdf';
     }
 
+    // A/B оставляем как есть
     const courtNumber = extractCourtNumber(parsed.courtName);
     const courtSafe = sanitizeForPath(courtNumber);
     const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'unknown';
     const caseTitleSafe = sanitizeForPath(parsed.caseTitle);
     const docTypeFirst = firstWord(doc.documentType ?? 'Document');
     const docTypeSafe = sanitizeForPath(docTypeFirst);
+
     const parts = [
         courtSafe,
         caseNumberSafe,
         caseTitleSafe,
         docTypeSafe,
     ].filter(Boolean) as string[];
+
     return parts.join(' ') + '.pdf';
 }
 
