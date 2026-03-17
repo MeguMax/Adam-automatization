@@ -70,7 +70,6 @@ function getDateFolderNameFromReceived(receivedAtIso?: string): string {
 
 function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): string {
     const isTypeC =
-        !parsed.courtName &&
         parsed.filedDocuments.length === 1 &&
         (doc.status === 'Sent' || doc.documentType === 'SECOND_MAIL_COPY');
 
@@ -80,15 +79,17 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
 
         const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'NO_CASE';
         const caseTitleSafe = sanitizeForPath(parsed.caseTitle);
-        const docNameSafe = sanitizeForPath(doc.documentName) || 'DOC';
+        const rawDocName = doc.documentName || '';
+        const docNameSafe = sanitizeForPath(rawDocName) || 'DOC';
         const docTypeSafe = sanitizeForPath(doc.documentType ?? 'OTHER');
 
         const parts = [
-            courtSafe,       // 👈 Court Number первым
-            caseNumberSafe,
-            caseTitleSafe,
-            docNameSafe,
-            docTypeSafe,
+            courtSafe,       // CourtNumber
+            caseNumberSafe,  // CaseNumber
+            caseTitleSafe,   // CaseTitle
+            // DocumentName — только если он не дублирует Title
+            docNameSafe !== caseTitleSafe ? docNameSafe : '',
+            docTypeSafe,     // DocumentType
         ].filter(Boolean) as string[];
 
         return parts.join(' ') + '.pdf';
