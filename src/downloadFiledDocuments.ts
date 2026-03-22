@@ -68,6 +68,21 @@ function getDateFolderNameFromReceived(receivedAtIso?: string): string {
     return `${yyyy}${mm}${dd}`;
 }
 
+function makeUniqueFileName(baseName: string, counters: Map<string, number>): string {
+    const dotIndex = baseName.lastIndexOf('.');
+    const nameNoExt = dotIndex > 0 ? baseName.slice(0, dotIndex) : baseName;
+    const ext = dotIndex > 0 ? baseName.slice(dotIndex) : '.pdf';
+
+    const current = counters.get(nameNoExt) ?? 0;
+    const next = current + 1;
+    counters.set(nameNoExt, next);
+
+    if (next === 1) {
+        return `${nameNoExt}${ext}`;
+    }
+    return `${nameNoExt}_${next}${ext}`;
+}
+
 function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): string {
     const isTypeC =
         parsed.filedDocuments.length === 1 &&
@@ -172,6 +187,8 @@ export async function uploadTrueCertifyDocuments(
     const downloaded: DownloadedFile[] = [];
     const notificationFiles: NotificationFile[] = [];
 
+    const fileNameCounters = new Map<string, number>();
+
     const { driveId, itemId: rootItemId } = await ensureRootFolder();
     const dateFolderName = getDateFolderNameFromReceived(receivedAtIso);
     const dayFolderItemId = await ensureChildFolder(driveId, rootItemId, dateFolderName);
@@ -208,7 +225,8 @@ export async function uploadTrueCertifyDocuments(
                 );
             }
 
-            const fileName = buildPdfFileName(parsed, doc);
+            const baseName = buildPdfFileName(parsed, doc);
+            const fileName = makeUniqueFileName(baseName, fileNameCounters);
 
             const upload = await uploadFileBufferToFolder(
                 driveId,
@@ -286,15 +304,18 @@ export async function downloadFiledDocuments(
         const dateFolderName = getDateFolderNameFromReceived(receivedAtIso);
         const dayFolderItemId = await ensureChildFolder(driveId, rootItemId, dateFolderName);
 
+        const fileNameCounters = new Map<string, number>();
+
         for (const doc of miFileDocs) {
             if (!doc.downloadUrl) continue;
 
             console.log(`\n📄 Обробка MiFILE документа: ${doc.documentType || 'unknown'}`);
 
-            const fileName = buildPdfFileName(parsed, doc);
+            const baseName = buildPdfFileName(parsed, doc);
+            const fileName = makeUniqueFileName(baseName, fileNameCounters);
 
             let buffer: Buffer | null = null;
-            const maxRetries = 3;
+            const maxRetries = 5;
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
