@@ -6,6 +6,7 @@ import {
     ensureChildFolder,
     uploadFileBufferToFolder,
     createFileLink,
+    itemExistsInFolder,
 } from './oneDriveClient';
 import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
 
@@ -68,19 +69,26 @@ function getDateFolderNameFromReceived(receivedAtIso?: string): string {
     return `${yyyy}${mm}${dd}`;
 }
 
-function makeUniqueFileName(baseName: string, counters: Map<string, number>): string {
+function makeUniqueFileName(baseName: string, seen: Set<string>): string {
     const dotIndex = baseName.lastIndexOf('.');
     const nameNoExt = dotIndex > 0 ? baseName.slice(0, dotIndex) : baseName;
     const ext = dotIndex > 0 ? baseName.slice(dotIndex) : '.pdf';
 
-    const current = counters.get(nameNoExt) ?? 0;
-    const next = current + 1;
-    counters.set(nameNoExt, next);
-
-    if (next === 1) {
-        return `${nameNoExt}${ext}`;
+    let candidate = `${nameNoExt}${ext}`;
+    if (!seen.has(candidate)) {
+        seen.add(candidate);
+        return candidate;
     }
-    return `${nameNoExt}_${next}${ext}`;
+
+    // 5‑символьный алфанумерический суффикс
+    for (;;) {
+        const suffix = Math.random().toString(36).slice(2, 7).toUpperCase(); // например: A7F3Q
+        candidate = `${nameNoExt}-${suffix}${ext}`;
+        if (!seen.has(candidate)) {
+            seen.add(candidate);
+            return candidate;
+        }
+    }
 }
 
 function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): string {
@@ -187,7 +195,7 @@ export async function uploadTrueCertifyDocuments(
     const downloaded: DownloadedFile[] = [];
     const notificationFiles: NotificationFile[] = [];
 
-    const fileNameCounters = new Map<string, number>();
+    const fileNamesSeen = new Set<string>();
 
     const { driveId, itemId: rootItemId } = await ensureRootFolder();
     const dateFolderName = getDateFolderNameFromReceived(receivedAtIso);
@@ -225,8 +233,24 @@ export async function uploadTrueCertifyDocuments(
                 );
             }
 
-            const baseName = buildPdfFileName(parsed, doc);
-            const fileName = makeUniqueFileName(baseName, fileNameCounters);
+            let baseName = buildPdfFileName(parsed, doc);
+            let fileName = makeUniqueFileName(baseName, fileNamesSeen);
+
+// доп. проверка в OneDrive: если файл с таким именем уже есть в папке — добавляем ещё 5-символьный суффикс
+            if (await itemExistsInFolder(driveId, dayFolderItemId, fileName)) {
+                const dotIndex = fileName.lastIndexOf('.');
+                const nameNoExt = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+                const ext = dotIndex > 0 ? fileName.slice(dotIndex) : '.pdf';
+
+                for (;;) {
+                    const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
+                    const candidate = `${nameNoExt}-${suffix}${ext}`;
+                    if (!(await itemExistsInFolder(driveId, dayFolderItemId, candidate))) {
+                        fileName = candidate;
+                        break;
+                    }
+                }
+            }
 
             const upload = await uploadFileBufferToFolder(
                 driveId,
@@ -304,17 +328,34 @@ export async function downloadFiledDocuments(
         const dateFolderName = getDateFolderNameFromReceived(receivedAtIso);
         const dayFolderItemId = await ensureChildFolder(driveId, rootItemId, dateFolderName);
 
-        const fileNameCounters = new Map<string, number>();
+        const fileNamesSeen = new Set<string>();
 
         for (const doc of miFileDocs) {
             if (!doc.downloadUrl) continue;
 
             console.log(`\n📄 Обробка MiFILE документа: ${doc.documentType || 'unknown'}`);
 
-            const baseName = buildPdfFileName(parsed, doc);
-            const fileName = makeUniqueFileName(baseName, fileNameCounters);
+            let baseName = buildPdfFileName(parsed, doc);
+            let fileName = makeUniqueFileName(baseName, fileNamesSeen);
+
+// доп. проверка в OneDrive
+            if (await itemExistsInFolder(driveId, dayFolderItemId, fileName)) {
+                const dotIndex = fileName.lastIndexOf('.');
+                const nameNoExt = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+                const ext = dotIndex > 0 ? fileName.slice(dotIndex) : '.pdf';
+
+                for (;;) {
+                    const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
+                    const candidate = `${nameNoExt}-${suffix}${ext}`;
+                    if (!(await itemExistsInFolder(driveId, dayFolderItemId, candidate))) {
+                        fileName = candidate;
+                        break;
+                    }
+                }
+            }
 
             let buffer: Buffer | null = null;
+
             const maxRetries = 5;
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {

@@ -99,6 +99,24 @@ export async function uploadFileBufferToFolder(
     };
 }
 
+export async function itemExistsInFolder(
+    driveId: string,
+    folderItemId: string,
+    fileName: string,
+): Promise<boolean> {
+    // ищем по имени среди children этой папки
+    const children = await oneDriveClient
+        .api(`/drives/${driveId}/items/${folderItemId}/children`)
+        .query({
+            $select: 'id,name',
+            $filter: `name eq '${fileName.replace(/'/g, "''")}'`,
+        })
+        .get();
+
+    const items = (children.value ?? []) as { id: string; name: string }[];
+    return items.length > 0;
+}
+
 export async function createFileLink(
     driveId: string,
     itemId: string,
