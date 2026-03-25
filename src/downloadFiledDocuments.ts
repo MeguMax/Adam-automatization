@@ -74,16 +74,11 @@ function makeUniqueFileName(baseName: string, seen: Set<string>): string {
     const nameNoExt = dotIndex > 0 ? baseName.slice(0, dotIndex) : baseName;
     const ext = dotIndex > 0 ? baseName.slice(dotIndex) : '.pdf';
 
-    let candidate = `${nameNoExt}${ext}`;
-    if (!seen.has(candidate)) {
-        seen.add(candidate);
-        return candidate;
-    }
-
-    // 5‑символьный алфанумерический суффикс
+    // всегда добавляем 5-символьный суффикс
     for (;;) {
-        const suffix = Math.random().toString(36).slice(2, 7).toUpperCase(); // например: A7F3Q
-        candidate = `${nameNoExt}-${suffix}${ext}`;
+        const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
+        const candidate = `${nameNoExt}-${suffix}${ext}`;
+
         if (!seen.has(candidate)) {
             seen.add(candidate);
             return candidate;
