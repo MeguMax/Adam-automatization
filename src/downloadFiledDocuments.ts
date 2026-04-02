@@ -118,8 +118,8 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
     const courtSafe = sanitizeForPath(courtNumber);
     const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'unknown';
     const caseTitleSafe = sanitizeForPath(parsed.caseTitle);
-    const rawDocType = doc.documentType ?? 'Document';
-    const docTypeSafe = sanitizeForPath(rawDocType);
+    const docTypeFirst = firstWord(doc.documentType ?? 'Document');
+    const docTypeSafe = sanitizeForPath(docTypeFirst);
 
     const parts = [
         courtSafe,
