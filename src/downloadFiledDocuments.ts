@@ -161,6 +161,22 @@ function looksLikeHtml(buffer: Buffer): boolean {
     return snippet.includes('<html') || snippet.includes('<!doctype html');
 }
 
+function normalizeMifileUrl(rawUrl: string): string {
+    if (!rawUrl) return rawUrl;
+
+    // раскодировать &amp; -> &
+    const decoded = rawUrl.replace(/&amp;/g, '&');
+
+    // оставить только часть до /filestampedcopy
+    const marker = '/filestampedcopy';
+    const idx = decoded.indexOf(marker);
+    if (idx === -1) {
+        return decoded;
+    }
+
+    return decoded.slice(0, idx + marker.length);
+}
+
 const TWO_CAPTCHA_API_KEY = process.env.TWO_CAPTCHA_API_KEY || '';
 const trueCertifyDownloader = TWO_CAPTCHA_API_KEY
     ? new TrueCertifyBufferDownloader(TWO_CAPTCHA_API_KEY)
@@ -351,7 +367,7 @@ export async function downloadFiledDocuments(
 
             let buffer: Buffer | null = null;
 
-            const maxRetries = 5;
+            const maxRetries = 12;
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
                 try {
@@ -359,7 +375,10 @@ export async function downloadFiledDocuments(
                         `📥 Завантажуємо MiFILE документ (спроба ${attempt}/${maxRetries})`,
                     );
 
-                    const downloadedBuf = await httpDownloadFromMifileToBuffer(doc.downloadUrl);
+                    const url = normalizeMifileUrl(doc.downloadUrl);
+                    console.log('MiFILE raw URL:', doc.downloadUrl);
+                    console.log('MiFILE normalized URL:', url);
+                    const downloadedBuf = await httpDownloadFromMifileToBuffer(url);
 
                     if (!looksLikePdf(downloadedBuf) || looksLikeHtml(downloadedBuf)) {
                         console.warn(
