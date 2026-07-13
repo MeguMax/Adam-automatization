@@ -4,7 +4,7 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
 ## Before Deploying
 
-- Keep the existing Render `Professional` plan. SQLite requires the persistent disk and must run in one service instance.
+- Use the Render Professional tier. In `render.yaml`, its valid Blueprint value is `pro`. SQLite requires the persistent disk and must run in one service instance.
 - Keep exactly one active worker. Disable the old Render worker before enabling the new one.
 - The public admin uses HTTP Basic Auth. Choose a long `ADMIN_PASSWORD` without a colon (`:`).
 
@@ -25,7 +25,7 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
    git push origin HEAD
    ```
 
-3. In Render, select **New** -> **Blueprint**, connect this repository, and confirm the `render.yaml` configuration. It creates one `Professional` Docker Web Service with a 5 GB persistent disk.
+3. In Render, select **New** -> **Blueprint**, connect this repository, and confirm the `render.yaml` configuration. It creates one `pro` Docker Web Service with a 5 GB persistent disk.
 
 4. Enter every requested secret. Copy their values from the local `.env`; never commit `.env`.
 
