@@ -3,12 +3,21 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run build && node --test dist/pdfValidation.test.js dist/database.test.js",
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "start": "npm run build && node dist/index.js",
+    "start:once": "npm run build && node dist/index.js --once",
+    "production": "node dist/productionServer.js",
+    "plaintiffs:export": "npm run build && node dist/plaintiffMappingsCli.js export",
+    "plaintiffs:import": "npm run build && node dist/plaintiffMappingsCli.js import",
+    "dev": "ts-node src/index.ts",
+    "dev:once": "ts-node src/index.ts --once",
+    "admin": "npm run build && node dist/adminServer.js"
   },
   "keywords": [],
+  "engines": {
+    "node": ">=22.5 <23"
+  },
   "author": "",
   "license": "ISC",
   "description": "",
@@ -19,17 +28,17 @@
     "@typescript-eslint/eslint-plugin": "^8.56.0",
     "@typescript-eslint/parser": "^8.56.0",
     "eslint": "^10.0.1",
-    "playwright": "1.58.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
     "@2captcha/captcha-solver": "^1.3.2",
-    "@azure/identity": "^4.13.0",
+    "@azure/identity": "^4.13.1",
     "@microsoft/microsoft-graph-client": "^3.0.7",
     "dotenv": "^17.3.1",
     "isomorphic-fetch": "^3.0.0",
     "node-fetch": "^2.7.0",
+    "playwright": "1.58.2",
     "sharp": "^0.34.5",
     "tesseract.js": "^7.0.0"
   }

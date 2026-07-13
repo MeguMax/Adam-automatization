@@ -1,14 +1,18 @@
-FROM mcr.microsoft.com/playwright:v1.58.2
+FROM node:22-bookworm-slim
 
-ENV PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW=false
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
+RUN npx playwright install --with-deps chromium
 
 COPY . .
+RUN npm run build && npm prune --omit=dev
 
-RUN npm run build
+ENV NODE_ENV=production
 
-CMD ["node", "dist/index.js"]
+EXPOSE 10000
+
+CMD ["npm", "run", "production"]

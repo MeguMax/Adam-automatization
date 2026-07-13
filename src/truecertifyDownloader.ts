@@ -1,12 +1,14 @@
 import { chromium, Browser, Page } from 'playwright';
 import fetch from 'node-fetch';
 import { TwoCaptchaClient } from './2captcha-client';
+import { validatePdfBuffer } from './pdfValidation';
 
 export interface TrueCertifyBufferResult {
     success: boolean;
     buffer?: Buffer;
     fileName?: string;
     error?: string;
+    attempts: number;
 }
 
 export class TrueCertifyBufferDownloader {
@@ -40,6 +42,7 @@ export class TrueCertifyBufferDownloader {
     }
 
     async downloadToBuffer(locator: string, publicKey: string): Promise<TrueCertifyBufferResult> {
+        let attempts = 0;
         try {
             await this.launch();
             if (!this.page) throw new Error('Browser/page not initialized');
@@ -51,10 +54,14 @@ export class TrueCertifyBufferDownloader {
 
             await this.page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
 
-            const MAX_ATTEMPTS = 7;
+            const configuredAttempts = Number(process.env.DOCUMENT_DOWNLOAD_ATTEMPTS || 12);
+            const maxAttempts = Number.isFinite(configuredAttempts)
+                ? Math.min(Math.max(Math.floor(configuredAttempts), 1), 50)
+                : 12;
 
-            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-                console.log(`TrueCertify attempt ${attempt}/${MAX_ATTEMPTS}`);
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                attempts = attempt;
+                console.log(`TrueCertify attempt ${attempt}/${maxAttempts}`);
 
                 const captchaImg = await this.page.$('.tc-image-container img');
                 if (!captchaImg) throw new Error('Captcha image not found');
@@ -117,15 +124,16 @@ export class TrueCertifyBufferDownloader {
                     const buffer = Buffer.concat(chunks);
                     console.log(`TrueCertify PDF buffer size: ${buffer.length}`);
 
-                    if (buffer.length <= 10_000) {
-                        console.log('Downloaded buffer too small, retrying...');
+                    const validation = validatePdfBuffer(buffer);
+                    if (!validation.valid) {
+                        console.log(`Downloaded content is not a valid PDF: ${validation.reason}. Retrying...`);
                         await this.page!.reload({ waitUntil: 'networkidle' });
                         await this.page!.waitForTimeout(2000);
                         continue;
                     }
 
                     const fileName = `truecertify_${locator}_${Date.now()}.pdf`;
-                    return { success: true, buffer, fileName };
+                    return { success: true, buffer, fileName, attempts };
                 } catch (e) {
                     console.log('Download failed in this attempt, reloading...', e);
                     await this.page!.reload({ waitUntil: 'networkidle' });
@@ -139,6 +147,7 @@ export class TrueCertifyBufferDownloader {
             return {
                 success: false,
                 error: error instanceof Error ? error.message : 'Unknown error',
+                attempts,
             };
         }
     }

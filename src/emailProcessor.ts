@@ -60,19 +60,29 @@ const graphClient = Client.initWithMiddleware({
 
 export async function fetchRecentCourtEmails(top: number) {
     const maxRetries = 3;
+    const pageSize = Math.min(Math.max(top, 1), 50);
 
     const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const res = await graphClient
+            const firstPage = await graphClient
                 .api(`/users/${encodeURIComponent(userEmail)}/mailFolders/Inbox/messages`)
-                .top(top)
+                .top(pageSize)
                 .orderby('receivedDateTime DESC')
                 .select('id,subject,from,body,receivedDateTime')
                 .get();
 
-            return (res.value ?? []) as any[];
+            const messages = [...(firstPage.value ?? [])] as any[];
+            let nextLink = firstPage['@odata.nextLink'] as string | undefined;
+
+            while (nextLink && messages.length < top) {
+                const page = await graphClient.api(nextLink).get();
+                messages.push(...((page.value ?? []) as any[]));
+                nextLink = page['@odata.nextLink'] as string | undefined;
+            }
+
+            return messages.slice(0, top);
         } catch (err: any) {
             const status = err?.statusCode;
             if (status === 502 || status === 503 || status === 504) {
@@ -87,6 +97,30 @@ export async function fetchRecentCourtEmails(top: number) {
     }
 
     return [];
+}
+
+export async function fetchCourtEmailById(messageId: string): Promise<any> {
+    const maxRetries = 3;
+    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await graphClient
+                .api(`/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}`)
+                .select('id,subject,from,body,receivedDateTime')
+                .get();
+        } catch (err: any) {
+            const status = err?.statusCode;
+            if ([429, 500, 502, 503, 504].includes(status) && attempt < maxRetries) {
+                console.warn(`Graph message fetch error ${status}, retry ${attempt}/${maxRetries}...`);
+                await delay(2000 * attempt);
+                continue;
+            }
+            throw err;
+        }
+    }
+
+    throw new Error(`Unable to fetch message ${messageId}`);
 }
 
 // ===== PARSER (универсальный) =====

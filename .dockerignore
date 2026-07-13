@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.git/
+.env
+.env.*
+data/
+logs/
+temp/
+tmp/
+coverage/
+*.log
+*.sqlite
+*.sqlite-*
+test_result.bin

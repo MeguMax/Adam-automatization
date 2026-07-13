@@ -29,14 +29,18 @@ export const oneDriveClient = Client.initWithMiddleware({
 let rootDriveId: string | null = null;
 let rootItemId: string | null = null;
 
+function shareIdFromUrl(url: string): string {
+    const encoded = Buffer.from(url).toString('base64');
+    return `u!${encoded.replace(/=+$/g, '')}`;
+}
+
 // получить driveId + itemId папки по share URL
 export async function ensureRootFolder(): Promise<{ driveId: string; itemId: string }> {
     if (rootDriveId && rootItemId) {
         return { driveId: rootDriveId, itemId: rootItemId };
     }
 
-    const encoded = Buffer.from(shareUrl).toString('base64');
-    const shareId = `u!${encoded.replace(/=+$/g, '')}`;
+    const shareId = shareIdFromUrl(shareUrl);
 
     const item = await oneDriveClient
         .api(`/shares/${shareId}/driveItem`)
@@ -51,6 +55,51 @@ export async function ensureRootFolder(): Promise<{ driveId: string; itemId: str
     }
 
     return { driveId: rootDriveId, itemId: rootItemId };
+}
+
+export interface OneDriveSharedItem {
+    driveId: string;
+    itemId: string;
+    fileName: string;
+    webUrl: string | null;
+}
+
+export async function resolveSharedDriveItem(shareUrl: string): Promise<OneDriveSharedItem> {
+    const item = await oneDriveClient
+        .api(`/shares/${shareIdFromUrl(shareUrl)}/driveItem`)
+        .select('id,name,webUrl,parentReference')
+        .get();
+    const driveId = item.parentReference?.driveId ?? item.driveId;
+    const itemId = item.id as string | undefined;
+    const fileName = item.name as string | undefined;
+
+    if (!driveId || !itemId || !fileName) {
+        throw new Error('Failed to resolve the OneDrive file from its sharing link');
+    }
+
+    return {
+        driveId,
+        itemId,
+        fileName,
+        webUrl: (item.webUrl as string | undefined) ?? null,
+    };
+}
+
+export async function renameDriveItem(
+    driveId: string,
+    itemId: string,
+    fileName: string,
+): Promise<OneDriveSharedItem> {
+    const item = await oneDriveClient
+        .api(`/drives/${driveId}/items/${itemId}`)
+        .patch({ name: fileName });
+
+    return {
+        driveId,
+        itemId: item.id as string,
+        fileName: item.name as string,
+        webUrl: (item.webUrl as string | undefined) ?? null,
+    };
 }
 
 // создать/найти подпапку по имени (например "25-08830-LT - ...")

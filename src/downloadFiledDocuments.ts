@@ -9,6 +9,7 @@ import {
     itemExistsInFolder,
 } from './oneDriveClient';
 import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
+import { validatePdfBuffer } from './pdfValidation';
 
 // === ТИПЫ ДЛЯ РЕЗУЛЬТАТОВ ===
 
@@ -16,6 +17,8 @@ export interface DownloadedFile {
     documentType: string | null;
     documentName?: string | null;
     localPath: string;
+    downloadUrl?: string | null;
+    downloadAttempts?: number;
 }
 
 export interface NotificationFile {
@@ -30,6 +33,26 @@ export interface NotificationFile {
 export interface DownloadResult {
     downloaded: DownloadedFile[];
     notificationFiles: NotificationFile[];
+    failures: DocumentFailure[];
+}
+
+export interface DocumentFailure {
+    documentType: string | null;
+    documentName?: string | null;
+    downloadUrl?: string | null;
+    reason: string;
+    downloadAttempts?: number;
+}
+
+export interface DownloadFiledDocumentsOptions {
+    plaintiffShortName?: string | null;
+    resolvePlaintiffNaming?: () => Promise<PlaintiffFileNaming> | PlaintiffFileNaming;
+}
+
+export interface PlaintiffFileNaming {
+    fullName: string | null;
+    shortName: string | null;
+    mappingStatus: string;
 }
 
 // === УТИЛИТЫ ===
@@ -51,6 +74,19 @@ function firstWord(s: string | null | undefined): string | null {
     if (!trimmed) return null;
     const word = trimmed.split(/\s+/)[0];
     return word || null;
+}
+
+function caseTitleForFile(parsed: ParsedEmailInfo, options?: DownloadFiledDocumentsOptions): string | null {
+    const shortName = options?.plaintiffShortName?.trim();
+    if (!shortName) return parsed.caseTitle;
+
+    const title = parsed.caseTitle?.trim();
+    if (!title) return shortName;
+
+    const match = title.match(/^(.+?)\s+v(?:\.|s\.?)?\s+(.+)$/i);
+    if (!match) return shortName;
+
+    return `${shortName} V ${match[2].trim()}`;
 }
 
 function getDateFolderNameFromReceived(receivedAtIso?: string): string {
@@ -86,7 +122,11 @@ function makeUniqueFileName(baseName: string, seen: Set<string>): string {
     }
 }
 
-function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): string {
+function buildPdfFileName(
+    parsed: ParsedEmailInfo,
+    doc: FiledDocumentInfo,
+    options?: DownloadFiledDocumentsOptions,
+): string {
     const isTypeC =
         parsed.filedDocuments.length === 1 &&
         (doc.status === 'Sent' || doc.documentType === 'SECOND_MAIL_COPY');
@@ -96,7 +136,7 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
         const courtSafe = sanitizeForPath(courtNumber);
 
         const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'NO_CASE';
-        const caseTitleSafe = sanitizeForPath(parsed.caseTitle);
+        const caseTitleSafe = sanitizeForPath(caseTitleForFile(parsed, options));
         const rawDocName = doc.documentName || '';
         const docNameSafe = sanitizeForPath(rawDocName) || 'DOC';
         const docTypeSafe = sanitizeForPath(doc.documentType ?? 'OTHER');
@@ -117,7 +157,7 @@ function buildPdfFileName(parsed: ParsedEmailInfo, doc: FiledDocumentInfo): stri
     const courtNumber = extractCourtNumber(parsed.courtName);
     const courtSafe = sanitizeForPath(courtNumber);
     const caseNumberSafe = sanitizeForPath(parsed.caseNumber) || 'unknown';
-    const caseTitleSafe = sanitizeForPath(parsed.caseTitle);
+    const caseTitleSafe = sanitizeForPath(caseTitleForFile(parsed, options));
     const docTypeFirst = firstWord(doc.documentType ?? 'Document');
     const docTypeSafe = sanitizeForPath(docTypeFirst);
 
@@ -150,15 +190,42 @@ function extractKeyFromUrl(url: string): string {
     return match ? match[1] : '';
 }
 
-function looksLikePdf(buffer: Buffer): boolean {
-    if (buffer.length < 100) return false;
-    const header = buffer.subarray(0, 5).toString('ascii');
-    return header === '%PDF-';
+function failureReason(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    return String(error);
 }
 
-function looksLikeHtml(buffer: Buffer): boolean {
-    const snippet = buffer.subarray(0, 200).toString('utf8').toLowerCase();
-    return snippet.includes('<html') || snippet.includes('<!doctype html');
+function documentDownloadAttemptLimit(): number {
+    const configured = Number(process.env.DOCUMENT_DOWNLOAD_ATTEMPTS || 12);
+    if (!Number.isFinite(configured)) return 12;
+    return Math.min(Math.max(Math.floor(configured), 1), 50);
+}
+
+function retryDelayMs(attempt: number): number {
+    return Math.min(1_000 * 2 ** Math.min(Math.max(attempt - 1, 0), 2), 5_000);
+}
+
+async function resolvePlaintiffNaming(
+    options: DownloadFiledDocumentsOptions,
+): Promise<PlaintiffFileNaming> {
+    const fallback: PlaintiffFileNaming = {
+        fullName: null,
+        shortName: options.plaintiffShortName?.trim() || null,
+        mappingStatus: options.plaintiffShortName ? 'mapped_from_worker' : 'not_checked',
+    };
+    if (!options.resolvePlaintiffNaming) return fallback;
+
+    try {
+        const resolved = await options.resolvePlaintiffNaming();
+        return {
+            fullName: resolved.fullName ?? null,
+            shortName: resolved.shortName?.trim() || null,
+            mappingStatus: resolved.mappingStatus || 'unknown',
+        };
+    } catch (error) {
+        console.error('Plaintiff naming lookup failed; using the full Plaintiff name:', error);
+        return fallback;
+    }
 }
 
 function normalizeMifileUrl(rawUrl: string): string {
@@ -186,25 +253,37 @@ const trueCertifyDownloader = TWO_CAPTCHA_API_KEY
 
 export async function uploadTrueCertifyDocuments(
     parsed: ParsedEmailInfo,
-    receivedAtIso?: string
+    receivedAtIso?: string,
+    options: DownloadFiledDocumentsOptions = {},
 ): Promise<DownloadResult> {
-    if (!parsed.isMiFile) return { downloaded: [], notificationFiles: [] };
+    if (!parsed.isMiFile) return { downloaded: [], notificationFiles: [], failures: [] };
 
     const trueCertifyDocs = parsed.filedDocuments.filter(doc =>
         doc.downloadUrl?.includes('truecertify.com')
     );
 
-    if (trueCertifyDocs.length === 0) return { downloaded: [], notificationFiles: [] };
+    if (trueCertifyDocs.length === 0) return { downloaded: [], notificationFiles: [], failures: [] };
 
     if (!trueCertifyDownloader) {
         console.error('TrueCertify: TWO_CAPTCHA_API_KEY not set, cannot process TYPE C.');
-        return { downloaded: [], notificationFiles: [] };
+        return {
+            downloaded: [],
+            notificationFiles: [],
+            failures: trueCertifyDocs.map(doc => ({
+                documentType: doc.documentType ?? null,
+                documentName: doc.documentName,
+                downloadUrl: doc.downloadUrl,
+                reason: 'TrueCertify: TWO_CAPTCHA_API_KEY not set',
+                downloadAttempts: 0,
+            })),
+        };
     }
 
     console.log(`🚀 Починаємо завантаження ${trueCertifyDocs.length} TrueCertify документів`);
 
     const downloaded: DownloadedFile[] = [];
     const notificationFiles: NotificationFile[] = [];
+    const failures: DocumentFailure[] = [];
 
     const fileNamesSeen = new Set<string>();
 
@@ -213,10 +292,20 @@ export async function uploadTrueCertifyDocuments(
     const dayFolderItemId = await ensureChildFolder(driveId, rootItemId, dateFolderName);
 
     for (const doc of trueCertifyDocs) {
-        if (!doc.downloadUrl) continue;
+        if (!doc.downloadUrl) {
+            failures.push({
+                documentType: doc.documentType ?? null,
+                documentName: doc.documentName,
+                downloadUrl: null,
+                reason: 'Missing TrueCertify download URL',
+                downloadAttempts: 0,
+            });
+            continue;
+        }
 
         console.log(`\n📄 Обробка TrueCertify документа: ${doc.documentType || 'unknown'}`);
 
+        let downloadAttempts = 0;
         try {
             const locator = extractLocatorFromUrl(doc.downloadUrl);
             const key = extractKeyFromUrl(doc.downloadUrl);
@@ -228,6 +317,7 @@ export async function uploadTrueCertifyDocuments(
             console.log(`🔑 locator=${locator}, key=${key}`);
 
             const result = await trueCertifyDownloader.downloadToBuffer(locator, key);
+            downloadAttempts = result.attempts;
 
             if (!result.success || !result.buffer) {
                 throw new Error(
@@ -238,14 +328,26 @@ export async function uploadTrueCertifyDocuments(
             const buffer = result.buffer;
             console.log(`TrueCertify final buffer size: ${buffer.length}`);
 
-            if (!looksLikePdf(buffer) || looksLikeHtml(buffer)) {
+            const validation = validatePdfBuffer(buffer);
+            if (!validation.valid) {
                 throw new Error(
-                    `TrueCertify: скачан не PDF (size=${buffer.length}) — вероятно HTML/ошибка после капчи`
+                    `TrueCertify: downloaded content is not a valid PDF (${validation.reason})`
                 );
             }
 
-            let baseName = buildPdfFileName(parsed, doc);
+            const plaintiffNaming = await resolvePlaintiffNaming(options);
+            console.log('Plaintiff naming lookup:', {
+                documentType: doc.documentType ?? null,
+                fullName: plaintiffNaming.fullName,
+                shortName: plaintiffNaming.shortName,
+                mappingStatus: plaintiffNaming.mappingStatus,
+            });
+            let baseName = buildPdfFileName(parsed, doc, {
+                ...options,
+                plaintiffShortName: plaintiffNaming.shortName,
+            });
             let fileName = makeUniqueFileName(baseName, fileNamesSeen);
+            console.log('OneDrive file name selected:', fileName);
 
 // доп. проверка в OneDrive: если файл с таким именем уже есть в папке — добавляем ещё 5-символьный суффикс
             if (await itemExistsInFolder(driveId, dayFolderItemId, fileName)) {
@@ -278,6 +380,8 @@ export async function uploadTrueCertifyDocuments(
                 documentType: doc.documentType ?? null,
                 documentName: doc.documentName,
                 localPath: logicalPath,
+                downloadUrl: doc.downloadUrl,
+                downloadAttempts,
             });
 
             notificationFiles.push({
@@ -292,10 +396,17 @@ export async function uploadTrueCertifyDocuments(
             console.log(`✅ TrueCertify документ загружен в OneDrive: ${logicalPath}`);
         } catch (error) {
             console.error(`❌ Критична помилка TrueCertify:`, error);
+            failures.push({
+                documentType: doc.documentType ?? null,
+                documentName: doc.documentName,
+                downloadUrl: doc.downloadUrl,
+                reason: failureReason(error),
+                downloadAttempts,
+            });
         }
     }
 
-    return { downloaded, notificationFiles };
+    return { downloaded, notificationFiles, failures };
 }
 
 // ===== ОСНОВНА ФУНКЦІЯ =====
@@ -303,10 +414,24 @@ export async function uploadTrueCertifyDocuments(
 export async function downloadFiledDocuments(
     parsed: ParsedEmailInfo,
     _baseDir: string,
-    receivedAtIso?: string
+    receivedAtIso?: string,
+    options: DownloadFiledDocumentsOptions = {},
 ): Promise<DownloadResult> {
-    if (!parsed.isMiFile) return { downloaded: [], notificationFiles: [] };
-    if (!parsed.filedDocuments.length) return { downloaded: [], notificationFiles: [] };
+    if (!parsed.isMiFile) return { downloaded: [], notificationFiles: [], failures: [] };
+    if (!parsed.filedDocuments.length) {
+        return {
+            downloaded: [],
+            notificationFiles: [],
+            failures: [
+                {
+                    documentType: null,
+                    documentName: null,
+                    downloadUrl: null,
+                    reason: 'No filed documents found in parsed email',
+                },
+            ],
+        };
+    }
 
     const trueCertifyDocs = parsed.filedDocuments.filter(doc =>
         doc.downloadUrl?.includes('truecertify.com')
@@ -317,6 +442,7 @@ export async function downloadFiledDocuments(
 
     const downloaded: DownloadedFile[] = [];
     const notificationFiles: NotificationFile[] = [];
+    const failures: DocumentFailure[] = [];
 
     // TrueCertify / TYPE C
     if (trueCertifyDocs.length > 0) {
@@ -324,16 +450,18 @@ export async function downloadFiledDocuments(
         const {
             downloaded: tcDownloaded,
             notificationFiles: tcNotificationFiles,
-        } = await uploadTrueCertifyDocuments(trueCertifyParsed, receivedAtIso);
+            failures: tcFailures,
+        } = await uploadTrueCertifyDocuments(trueCertifyParsed, receivedAtIso, options);
 
         downloaded.push(...tcDownloaded);
         notificationFiles.push(...tcNotificationFiles);
+        failures.push(...tcFailures);
     }
 
     // MiFILE (A/B)
     if (miFileDocs.length > 0) {
         const mainDoc = pickMainDocument({ ...parsed, filedDocuments: miFileDocs });
-        if (!mainDoc) return { downloaded, notificationFiles };
+        if (!mainDoc) return { downloaded, notificationFiles, failures };
 
         const { driveId, itemId: rootItemId } = await ensureRootFolder();
         const dateFolderName = getDateFolderNameFromReceived(receivedAtIso);
@@ -342,34 +470,28 @@ export async function downloadFiledDocuments(
         const fileNamesSeen = new Set<string>();
 
         for (const doc of miFileDocs) {
-            if (!doc.downloadUrl) continue;
+            if (!doc.downloadUrl) {
+                failures.push({
+                    documentType: doc.documentType ?? null,
+                    documentName: doc.documentName,
+                    downloadUrl: null,
+                    reason: 'Missing MiFILE download URL',
+                    downloadAttempts: 0,
+                });
+                continue;
+            }
 
             console.log(`\n📄 Обробка MiFILE документа: ${doc.documentType || 'unknown'}`);
 
-            let baseName = buildPdfFileName(parsed, doc);
-            let fileName = makeUniqueFileName(baseName, fileNamesSeen);
-
-// доп. проверка в OneDrive
-            if (await itemExistsInFolder(driveId, dayFolderItemId, fileName)) {
-                const dotIndex = fileName.lastIndexOf('.');
-                const nameNoExt = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
-                const ext = dotIndex > 0 ? fileName.slice(dotIndex) : '.pdf';
-
-                for (;;) {
-                    const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
-                    const candidate = `${nameNoExt}-${suffix}${ext}`;
-                    if (!(await itemExistsInFolder(driveId, dayFolderItemId, candidate))) {
-                        fileName = candidate;
-                        break;
-                    }
-                }
-            }
-
             let buffer: Buffer | null = null;
 
-            const maxRetries = 12;
+            const maxRetries = documentDownloadAttemptLimit();
+            let downloadAttempts = 0;
+
+            try {
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                downloadAttempts = attempt;
                 try {
                     console.log(
                         `📥 Завантажуємо MiFILE документ (спроба ${attempt}/${maxRetries})`,
@@ -380,15 +502,14 @@ export async function downloadFiledDocuments(
                     console.log('MiFILE normalized URL:', url);
                     const downloadedBuf = await httpDownloadFromMifileToBuffer(url);
 
-                    if (!looksLikePdf(downloadedBuf) || looksLikeHtml(downloadedBuf)) {
+                    const validation = validatePdfBuffer(downloadedBuf);
+                    if (!validation.valid) {
                         console.warn(
-                            `⚠️ MiFILE: скачан не PDF (size=${downloadedBuf.length}) — ` +
-                            `ймовірно HTML/сторінка логіну`,
+                            `MiFILE: downloaded content is not a valid PDF (${validation.reason})`,
                         );
 
                         if (attempt < maxRetries) {
-                            console.log('🔄 Повторна спроба через 2 сек...');
-                            await new Promise(res => setTimeout(res, 2000));
+                            await new Promise(res => setTimeout(res, retryDelayMs(attempt)));
                             continue;
                         } else {
                             throw new Error(
@@ -409,13 +530,49 @@ export async function downloadFiledDocuments(
                             `❌ MiFILE: не вдалося завантажити документ після ${maxRetries} спроб, пропускаємо`,
                         );
                     } else {
-                        await new Promise(res => setTimeout(res, 2000));
+                        await new Promise(res => setTimeout(res, retryDelayMs(attempt)));
                     }
                 }
             }
 
             if (!buffer) {
+                failures.push({
+                    documentType: doc.documentType ?? null,
+                    documentName: doc.documentName,
+                    downloadUrl: doc.downloadUrl,
+                    reason: `MiFILE: failed to download a valid PDF after ${maxRetries} attempts`,
+                    downloadAttempts,
+                });
                 continue; // не удалось получить валидный PDF – не грузим в OneDrive
+            }
+
+            const plaintiffNaming = await resolvePlaintiffNaming(options);
+            console.log('Plaintiff naming lookup:', {
+                documentType: doc.documentType ?? null,
+                fullName: plaintiffNaming.fullName,
+                shortName: plaintiffNaming.shortName,
+                mappingStatus: plaintiffNaming.mappingStatus,
+            });
+            const baseName = buildPdfFileName(parsed, doc, {
+                ...options,
+                plaintiffShortName: plaintiffNaming.shortName,
+            });
+            let fileName = makeUniqueFileName(baseName, fileNamesSeen);
+            console.log('OneDrive file name selected:', fileName);
+
+            if (await itemExistsInFolder(driveId, dayFolderItemId, fileName)) {
+                const dotIndex = fileName.lastIndexOf('.');
+                const nameNoExt = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+                const ext = dotIndex > 0 ? fileName.slice(dotIndex) : '.pdf';
+
+                for (;;) {
+                    const suffix = Math.random().toString(36).slice(2, 7).toUpperCase();
+                    const candidate = `${nameNoExt}-${suffix}${ext}`;
+                    if (!(await itemExistsInFolder(driveId, dayFolderItemId, candidate))) {
+                        fileName = candidate;
+                        break;
+                    }
+                }
             }
 
             const upload = await uploadFileBufferToFolder(
@@ -433,6 +590,8 @@ export async function downloadFiledDocuments(
                 documentType: doc.documentType ?? null,
                 documentName: doc.documentName,
                 localPath: logicalPath,
+                downloadUrl: doc.downloadUrl,
+                downloadAttempts,
             });
 
             notificationFiles.push({
@@ -445,8 +604,18 @@ export async function downloadFiledDocuments(
             });
 
             console.log(`✅ MiFILE документ загружен в OneDrive: ${logicalPath}`);
+            } catch (error) {
+                console.error('Critical MiFILE document processing error:', error);
+                failures.push({
+                    documentType: doc.documentType ?? null,
+                    documentName: doc.documentName,
+                    downloadUrl: doc.downloadUrl,
+                    reason: failureReason(error),
+                    downloadAttempts,
+                });
+            }
         }
     }
 
-    return { downloaded, notificationFiles };
+    return { downloaded, notificationFiles, failures };
 }

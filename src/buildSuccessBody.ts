@@ -6,8 +6,10 @@ export function buildSuccessBody(args: {
     msg: any;                  // раньше Message
     parsed: ParsedEmailInfo;
     files: NotificationFile[];
+    plaintiffFullName?: string | null;
+    plaintiffShortName?: string | null;
 }) {
-    const { msg, parsed, files } = args;
+    const { msg, parsed, files, plaintiffFullName, plaintiffShortName } = args;
 
     const header =
         `Original email:\n` +
@@ -17,7 +19,9 @@ export function buildSuccessBody(args: {
         `Case:\n` +
         `Court: ${parsed.courtName ?? 'N/A'}\n` +
         `Case: ${parsed.caseNumber ?? 'N/A'}\n` +
-        `Title: ${parsed.caseTitle ?? 'N/A'}\n\n` +
+        `Title: ${parsed.caseTitle ?? 'N/A'}\n` +
+        `Plaintiff (full): ${plaintiffFullName ?? ''}\n` +
+        `Plaintiff (short): ${plaintiffShortName ?? ''}\n\n` +
         `Documents:\n`;
 
     const docs = files

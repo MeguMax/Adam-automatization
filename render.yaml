@@ -1,0 +1,54 @@
+services:
+  - type: web
+    runtime: docker
+    name: legal-workflow-admin
+    plan: professional
+    healthCheckPath: /healthz
+    maxShutdownDelaySeconds: 120
+    disk:
+      name: workflow-data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: WORKFLOW_DB_PATH
+        value: /var/data/workflow.sqlite
+      - key: WORKFLOW_MODE
+        value: review_before_submission
+      - key: WORKER_ENABLED
+        value: "false"
+      - key: WORKER_POLL_INTERVAL_MS
+        value: "10000"
+      - key: WORKER_EMAIL_LIMIT
+        value: "50"
+      - key: ADMIN_AUTO_SYNC_MS
+        value: "30000"
+      - key: ADMIN_SYNC_EMAIL_LIMIT
+        value: "500"
+      - key: DOCUMENT_DOWNLOAD_ATTEMPTS
+        value: "12"
+      - key: TENANT_ID
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: CLIENT_SECRET
+        sync: false
+      - key: USER_EMAIL
+        sync: false
+      - key: NOTIFY_TO_EMAIL
+        sync: false
+      - key: SENDER_USER_ID
+        sync: false
+      - key: ONEDRIVE_ROOT_SHARE_URL
+        sync: false
+      - key: MIFILE_USER
+        sync: false
+      - key: MIFILE_PASSWORD
+        sync: false
+      - key: TWO_CAPTCHA_API_KEY
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
