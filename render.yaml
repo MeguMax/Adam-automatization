@@ -47,6 +47,10 @@ services:
         sync: false
       - key: TWO_CAPTCHA_API_KEY
         sync: false
+      - key: TRUECERTIFY_HEADLESS
+        value: "true"
+      - key: TRUECERTIFY_DEBUG_DIR
+        value: /var/data/captcha_debug
       - key: ADMIN_USERNAME
         sync: false
       - key: ADMIN_PASSWORD

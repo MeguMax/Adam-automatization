@@ -29,6 +29,8 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
 4. Enter every requested secret. Copy their values from the local `.env`; never commit `.env`.
 
+   Required secrets: `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `USER_EMAIL`, `NOTIFY_TO_EMAIL`, `SENDER_USER_ID`, `ONEDRIVE_ROOT_SHARE_URL`, `MIFILE_USER`, `MIFILE_PASSWORD`, `TWO_CAPTCHA_API_KEY`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD`. `TRUECERTIFY_HEADLESS=true` and `TRUECERTIFY_DEBUG_DIR=/var/data/captcha_debug` are configured by the Blueprint.
+
 5. Leave `WORKER_ENABLED=false` for the first deploy. Open `https://<service>.onrender.com/`, authenticate with `ADMIN_USERNAME` and `ADMIN_PASSWORD`, and verify `https://<service>.onrender.com/healthz` returns `{"ok":true}`.
 
 6. While the worker is disabled, the admin synchronizes up to 500 recent inbox messages. This reconstructs recent email records and reports without downloading historical court files again.

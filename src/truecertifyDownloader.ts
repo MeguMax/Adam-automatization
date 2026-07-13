@@ -16,15 +16,22 @@ export class TrueCertifyBufferDownloader {
     private page: Page | null = null;
     private captchaClient: TwoCaptchaClient;
 
-    constructor(twoCaptchaApiKey: string, debugDir: string = './temp/captcha_debug') {
+    constructor(
+        twoCaptchaApiKey: string,
+        debugDir: string = process.env.TRUECERTIFY_DEBUG_DIR || './temp/captcha_debug'
+    ) {
         this.captchaClient = new TwoCaptchaClient(twoCaptchaApiKey, debugDir);
     }
 
     private async launch(): Promise<void> {
         if (this.browser) return;
 
+        const configuredHeadless = (process.env.TRUECERTIFY_HEADLESS ?? 'true')
+            .trim()
+            .toLowerCase();
+
         this.browser = await chromium.launch({
-            headless: true,
+            headless: !['0', 'false', 'no', 'off'].includes(configuredHeadless),
             args: ['--disable-blink-features=AutomationControlled', '--disable-web-security'],
         });
 
