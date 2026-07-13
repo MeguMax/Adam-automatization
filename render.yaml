@@ -16,7 +16,7 @@ services:
       - key: WORKFLOW_MODE
         value: review_before_submission
       - key: WORKER_ENABLED
-        value: "false"
+        value: "true"
       - key: WORKER_POLL_INTERVAL_MS
         value: "10000"
       - key: WORKER_EMAIL_LIMIT
