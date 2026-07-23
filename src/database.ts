@@ -98,6 +98,7 @@ export interface DashboardSummary {
     documentsToday: number;
     emailsToday: number;
     missingPlaintiffMappings: number;
+    databaseBytes: number;
 }
 
 export interface PlaintiffMappingView {
@@ -196,8 +197,35 @@ export interface QueueItem {
 export type QueueScope = 'active' | 'all';
 
 export interface QueueListOptions {
-    limit?: number;
+    page?: number;
+    pageSize?: number;
     scope?: QueueScope;
+    status?: EmailProcessingStatus | '';
+    search?: string;
+    dateFrom?: string | null;
+    dateTo?: string | null;
+}
+
+export interface QueuePage {
+    items: QueueItem[];
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    totalPages: number;
+}
+
+export interface EmailDeleteResult {
+    emailRecords: number;
+    caseDrafts: number;
+    documentRecords: number;
+    filingJobs: number;
+    auditLogs: number;
+    oneDriveFilesDeleted: 0;
+}
+
+export interface EmailPurgeResult extends EmailDeleteResult {
+    cutoff: string;
+    tombstones: number;
 }
 
 export interface DocumentRecordView {
@@ -218,6 +246,12 @@ export interface DocumentRecordView {
     automaticRetryCount: number;
     lastRetryAt: string | null;
     nextRetryAt: string | null;
+    failureLog: Array<{
+        attempt: number;
+        at: string;
+        stage: string;
+        message: string;
+    }>;
     createdAt: string;
     updatedAt: string;
 }
@@ -343,6 +377,22 @@ function normalizeError(error: unknown): string | null {
     if (!error) return null;
     if (error instanceof Error) return error.stack || error.message;
     return String(error);
+}
+
+function failureLogFromMetadata(value: unknown): DocumentRecordView['failureLog'] {
+    if (!value || typeof value !== 'object') return [];
+    const attemptLog = (value as { attemptLog?: unknown }).attemptLog;
+    if (!Array.isArray(attemptLog)) return [];
+
+    return attemptLog
+        .filter(item => item && typeof item === 'object')
+        .map((item: any) => ({
+            attempt: Number(item.attempt ?? 0),
+            at: String(item.at ?? ''),
+            stage: String(item.stage ?? 'download'),
+            message: String(item.message ?? 'Unknown failure'),
+        }))
+        .filter(item => item.message);
 }
 
 function bodySummary(bodyHtml: string): string {
@@ -756,6 +806,34 @@ const migrations: Migration[] = [
             `);
         },
     },
+    {
+        version: 8,
+        name: 'add_deleted_email_tombstones_and_queue_indexes',
+        up: db => {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS deleted_email_tombstones (
+                    external_message_id TEXT PRIMARY KEY,
+                    deleted_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_email_records_status_received
+                    ON email_records(processing_status, received_at DESC);
+            `);
+        },
+    },
+    {
+        version: 9,
+        name: 'add_history_and_retention_indexes',
+        up: db => {
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_email_records_received_at
+                    ON email_records(received_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_deleted_email_tombstones_deleted_at
+                    ON deleted_email_tombstones(deleted_at);
+            `);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -814,11 +892,19 @@ export class WorkflowDatabase {
     }
 
     shouldSkipEmail(externalMessageId: string): boolean {
+        if (this.isEmailDeleted(externalMessageId)) return true;
+
         const row = this.db
             .prepare('SELECT processing_status FROM email_records WHERE external_message_id = ?')
             .get(externalMessageId) as { processing_status: EmailProcessingStatus } | undefined;
 
         return row ? TERMINAL_EMAIL_STATUSES.has(row.processing_status) : false;
+    }
+
+    isEmailDeleted(externalMessageId: string): boolean {
+        return !!this.db
+            .prepare('SELECT 1 FROM deleted_email_tombstones WHERE external_message_id = ?')
+            .get(externalMessageId);
     }
 
     registerEmail(msg: any): EmailRecord {
@@ -1188,13 +1274,42 @@ export class WorkflowDatabase {
         metadata?: unknown;
     }): void {
         const existing = this.db
-            .prepare('SELECT automatic_retry_count FROM document_records WHERE id = ?')
-            .get(input.documentId) as { automatic_retry_count: number } | undefined;
+            .prepare(`
+                SELECT automatic_retry_count, metadata_json
+                FROM document_records
+                WHERE id = ?
+            `)
+            .get(input.documentId) as
+            | { automatic_retry_count: number; metadata_json: string | null }
+            | undefined;
         if (!existing) throw new Error('Document record not found');
 
         const retryCount = Number(existing.automatic_retry_count ?? 0);
         const nextRetryAt = nextDocumentRetryAt(retryCount);
         const timestamp = nowIso();
+        const existingMetadata = this.safeJson(existing.metadata_json);
+        const incomingMetadata = input.metadata && typeof input.metadata === 'object'
+            ? input.metadata as Record<string, unknown>
+            : {};
+        const incomingFailureLog = failureLogFromMetadata(incomingMetadata);
+        const mergedFailureLog = [
+            ...failureLogFromMetadata(existingMetadata),
+            ...(incomingFailureLog.length
+                ? incomingFailureLog
+                : [{
+                    attempt: input.downloadAttempts,
+                    at: timestamp,
+                    stage: 'retry',
+                    message: input.reason,
+                }]),
+        ].slice(-100);
+        const mergedMetadata = {
+            ...(existingMetadata && typeof existingMetadata === 'object'
+                ? existingMetadata as Record<string, unknown>
+                : {}),
+            ...incomingMetadata,
+            attemptLog: mergedFailureLog,
+        };
         this.db
             .prepare(`
                 UPDATE document_records
@@ -1208,7 +1323,7 @@ export class WorkflowDatabase {
             `)
             .run(
                 input.reason,
-                toJson(input.metadata),
+                toJson(mergedMetadata),
                 input.downloadAttempts,
                 nextRetryAt,
                 timestamp,
@@ -1965,11 +2080,13 @@ export class WorkflowDatabase {
                 "processing_status != 'legacy_processed'",
             ),
             missingPlaintiffMappings: this.countMissingPlaintiffMappings(),
+            databaseBytes: this.getDatabaseSizeBytes(),
         };
     }
 
-    listQueue(options: QueueListOptions = {}): QueueItem[] {
-        const limit = options.limit ?? 100;
+    listQueue(options: QueueListOptions = {}): QueuePage {
+        const pageSize = Math.min(Math.max(Math.floor(options.pageSize ?? 50), 10), 200);
+        const requestedPage = Math.max(Math.floor(options.page ?? 1), 1);
         const scope = options.scope ?? 'active';
         const visibilityWhere = scope === 'all'
             ? `(e.processing_status != 'legacy_processed' OR e.subject IS NOT NULL)`
@@ -1978,6 +2095,49 @@ export class WorkflowDatabase {
                 AND e.processing_status != 'ignored'
                 AND NOT (e.processing_status = 'new' AND c.id IS NULL)
             )`;
+        const whereParts = [visibilityWhere];
+        const parameters: Array<string | number> = [];
+
+        if (options.status) {
+            whereParts.push('e.processing_status = ?');
+            parameters.push(options.status);
+        }
+
+        const search = options.search?.trim();
+        if (search) {
+            const pattern = `%${search}%`;
+            whereParts.push(`(
+                e.subject LIKE ? COLLATE NOCASE
+                OR e.sender LIKE ? COLLATE NOCASE
+                OR e.processing_error LIKE ? COLLATE NOCASE
+                OR c.normalized_data_json LIKE ? COLLATE NOCASE
+            )`);
+            parameters.push(pattern, pattern, pattern, pattern);
+        }
+
+        if (options.dateFrom) {
+            whereParts.push('COALESCE(e.received_at, e.created_at) >= ?');
+            parameters.push(options.dateFrom);
+        }
+
+        if (options.dateTo) {
+            whereParts.push('COALESCE(e.received_at, e.created_at) < ?');
+            parameters.push(options.dateTo);
+        }
+
+        const whereSql = whereParts.join('\n AND ');
+        const countRow = this.db
+            .prepare(`
+                SELECT COUNT(DISTINCT e.id) AS total
+                FROM email_records e
+                LEFT JOIN case_drafts c ON c.email_id = e.id
+                WHERE ${whereSql}
+            `)
+            .get(...parameters) as { total: number };
+        const totalItems = Number(countRow.total ?? 0);
+        const totalPages = Math.max(Math.ceil(totalItems / pageSize), 1);
+        const page = Math.min(requestedPage, totalPages);
+        const offset = (page - 1) * pageSize;
 
         const rows = this.db
             .prepare(`
@@ -2007,21 +2167,22 @@ export class WorkflowDatabase {
                 FROM email_records e
                 LEFT JOIN case_drafts c ON c.email_id = e.id
                 LEFT JOIN document_records d ON d.email_id = e.id
-                WHERE ${visibilityWhere}
+                WHERE ${whereSql}
                 GROUP BY e.id, c.id
                 ORDER BY
+                    ${scope === 'active' ? `
                     CASE
                         WHEN e.processing_status IN ('failed', 'partial_failure') THEN 0
                         WHEN c.id IS NOT NULL THEN 1
                         WHEN e.processing_status = 'new' THEN 2
                         ELSE 3
-                    END,
+                    END,` : ''}
                     COALESCE(e.received_at, e.created_at) DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
             `)
-            .all(limit) as any[];
+            .all(...parameters, pageSize, offset) as any[];
 
-        return rows.map(row => {
+        const items = rows.map(row => {
             const normalized = this.safeJson(row.normalized_data_json);
             const plaintiffName = extractPlaintiffName(normalized);
             const plaintiffMapping = this.getPlaintiffMappingStatus(plaintiffName);
@@ -2055,6 +2216,126 @@ export class WorkflowDatabase {
                 updatedAt: row.updated_at,
             };
         });
+
+        return {
+            items,
+            page,
+            pageSize,
+            totalItems,
+            totalPages,
+        };
+    }
+
+    countDeletableEmailsBefore(cutoff: string): number {
+        const row = this.db
+            .prepare(`
+                SELECT COUNT(*) AS count
+                FROM email_records e
+                WHERE COALESCE(e.received_at, e.created_at) < ?
+                  AND e.processing_status IN (
+                    'processed',
+                    'failed',
+                    'partial_failure',
+                    'ignored',
+                    'legacy_processed'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM document_records d
+                    WHERE d.email_id = e.id
+                      AND d.status IN ('retry_queued', 'retrying')
+                  )
+            `)
+            .get(cutoff) as { count: number };
+        return Number(row.count ?? 0);
+    }
+
+    deleteEmailRecord(emailId: string): EmailDeleteResult {
+        const email = this.db
+            .prepare(`
+                SELECT external_message_id, processing_status
+                FROM email_records
+                WHERE id = ?
+            `)
+            .get(emailId) as
+            | { external_message_id: string; processing_status: EmailProcessingStatus }
+            | undefined;
+        if (!email) throw new Error('Email record not found');
+        if (email.processing_status === 'processing') {
+            throw new Error('A processing email cannot be deleted');
+        }
+
+        const activeRetry = this.db
+            .prepare(`
+                SELECT 1
+                FROM document_records
+                WHERE email_id = ?
+                  AND status IN ('retry_queued', 'retrying')
+                LIMIT 1
+            `)
+            .get(emailId);
+        if (activeRetry) {
+            throw new Error('An email with an active document retry cannot be deleted');
+        }
+
+        return this.runInTransaction(() =>
+            this.deleteEmailRecordInternal(emailId, email.external_message_id),
+        );
+    }
+
+    purgeEmailRecordsBefore(cutoff: string): EmailPurgeResult {
+        const candidates = this.db
+            .prepare(`
+                SELECT e.id, e.external_message_id
+                FROM email_records e
+                WHERE COALESCE(e.received_at, e.created_at) < ?
+                  AND e.processing_status IN (
+                    'processed',
+                    'failed',
+                    'partial_failure',
+                    'ignored',
+                    'legacy_processed'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM document_records d
+                    WHERE d.email_id = e.id
+                      AND d.status IN ('retry_queued', 'retrying')
+                  )
+                ORDER BY COALESCE(e.received_at, e.created_at)
+            `)
+            .all(cutoff) as Array<{ id: string; external_message_id: string }>;
+
+        const totals: EmailPurgeResult = {
+            cutoff,
+            emailRecords: 0,
+            caseDrafts: 0,
+            documentRecords: 0,
+            filingJobs: 0,
+            auditLogs: 0,
+            tombstones: 0,
+            oneDriveFilesDeleted: 0,
+        };
+
+        this.runInTransaction(() => {
+            for (const candidate of candidates) {
+                const deleted = this.deleteEmailRecordInternal(
+                    candidate.id,
+                    candidate.external_message_id,
+                );
+                totals.emailRecords += deleted.emailRecords;
+                totals.caseDrafts += deleted.caseDrafts;
+                totals.documentRecords += deleted.documentRecords;
+                totals.filingJobs += deleted.filingJobs;
+                totals.auditLogs += deleted.auditLogs;
+                totals.tombstones += deleted.emailRecords;
+            }
+        });
+
+        if (totals.emailRecords > 0) {
+            this.compactDatabase();
+        }
+        return totals;
     }
 
     getEmailDetail(emailId: string): EmailDetail | null {
@@ -2118,6 +2399,7 @@ export class WorkflowDatabase {
                     upload_source,
                     status,
                     error_message,
+                    metadata_json,
                     download_attempts,
                     automatic_retry_count,
                     last_retry_at,
@@ -2213,6 +2495,7 @@ export class WorkflowDatabase {
                 automaticRetryCount: Number(row.automatic_retry_count ?? 0),
                 lastRetryAt: row.last_retry_at,
                 nextRetryAt: row.next_retry_at,
+                failureLog: failureLogFromMetadata(this.safeJson(row.metadata_json)),
                 createdAt: row.created_at,
                 updatedAt: row.updated_at,
             })),
@@ -2536,6 +2819,87 @@ export class WorkflowDatabase {
             .all() as { key: string; count: number }[];
 
         return Object.fromEntries(rows.map(row => [row.key, Number(row.count)]));
+    }
+
+    private getDatabaseSizeBytes(): number {
+        return [
+            this.databasePath,
+            `${this.databasePath}-wal`,
+            `${this.databasePath}-shm`,
+        ].reduce((total, filePath) => {
+            try {
+                return total + fs.statSync(filePath).size;
+            } catch {
+                return total;
+            }
+        }, 0);
+    }
+
+    private deleteEmailRecordInternal(
+        emailId: string,
+        externalMessageId: string,
+    ): EmailDeleteResult {
+        const timestamp = nowIso();
+        this.db
+            .prepare(`
+                INSERT INTO deleted_email_tombstones (external_message_id, deleted_at)
+                VALUES (?, ?)
+                ON CONFLICT(external_message_id) DO UPDATE SET deleted_at = excluded.deleted_at
+            `)
+            .run(externalMessageId, timestamp);
+
+        const auditLogs = this.db
+            .prepare(`
+                DELETE FROM audit_logs
+                WHERE entity_id = ?
+                   OR entity_id IN (SELECT id FROM case_drafts WHERE email_id = ?)
+                   OR entity_id IN (SELECT id FROM document_records WHERE email_id = ?)
+                   OR entity_id IN (
+                        SELECT f.id
+                        FROM filing_jobs f
+                        JOIN case_drafts c ON c.id = f.case_draft_id
+                        WHERE c.email_id = ?
+                   )
+            `)
+            .run(emailId, emailId, emailId, emailId);
+
+        this.db
+            .prepare('UPDATE case_drafts SET primary_document_id = NULL WHERE email_id = ?')
+            .run(emailId);
+        const filingJobs = this.db
+            .prepare(`
+                DELETE FROM filing_jobs
+                WHERE case_draft_id IN (SELECT id FROM case_drafts WHERE email_id = ?)
+            `)
+            .run(emailId);
+        const documentRecords = this.db
+            .prepare('DELETE FROM document_records WHERE email_id = ?')
+            .run(emailId);
+        const caseDrafts = this.db
+            .prepare('DELETE FROM case_drafts WHERE email_id = ?')
+            .run(emailId);
+        const emailRecords = this.db
+            .prepare('DELETE FROM email_records WHERE id = ?')
+            .run(emailId);
+
+        return {
+            emailRecords: Number(emailRecords.changes ?? 0),
+            caseDrafts: Number(caseDrafts.changes ?? 0),
+            documentRecords: Number(documentRecords.changes ?? 0),
+            filingJobs: Number(filingJobs.changes ?? 0),
+            auditLogs: Number(auditLogs.changes ?? 0),
+            oneDriveFilesDeleted: 0,
+        };
+    }
+
+    private compactDatabase(): void {
+        try {
+            this.db.exec('PRAGMA optimize');
+            this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+            this.db.exec('VACUUM');
+        } catch (error) {
+            console.warn('Database records were deleted, but SQLite compaction failed:', error);
+        }
     }
 
     private countSinceToday(tableName: string, extraWhere?: string): number {

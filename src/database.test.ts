@@ -143,3 +143,200 @@ test('saving a blank short Plaintiff name keeps the full name without an active 
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 });
+
+test('queue history supports server-side pagination, search, status, and date filters', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-queue-history-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        for (let index = 1; index <= 12; index += 1) {
+            const email = db.registerEmail({
+                id: `history-message-${index}`,
+                subject: index === 6 ? 'Needle filing' : `History filing ${index}`,
+                receivedDateTime: `2026-07-${String(index).padStart(2, '0')}T12:00:00.000Z`,
+                from: { emailAddress: { address: 'court@example.com' } },
+                body: { content: '<p>History</p>' },
+            });
+            if (index === 6) {
+                db.markEmailFailed(email.id, 'Test failure');
+            } else {
+                db.markEmailProcessed(email.id);
+            }
+        }
+
+        const firstPage = db.listQueue({ scope: 'all', page: 1, pageSize: 10 });
+        assert.equal(firstPage.totalItems, 12);
+        assert.equal(firstPage.totalPages, 2);
+        assert.equal(firstPage.items.length, 10);
+        assert.equal(firstPage.items[0].subject, 'History filing 12');
+
+        const secondPage = db.listQueue({ scope: 'all', page: 2, pageSize: 10 });
+        assert.equal(secondPage.items.length, 2);
+
+        const searched = db.listQueue({ scope: 'all', search: 'needle' });
+        assert.equal(searched.totalItems, 1);
+        assert.equal(searched.items[0].processingStatus, 'failed');
+
+        const failed = db.listQueue({ scope: 'all', status: 'failed' });
+        assert.equal(failed.totalItems, 1);
+
+        const dated = db.listQueue({
+            scope: 'all',
+            dateFrom: '2026-07-05T00:00:00.000Z',
+            dateTo: '2026-07-08T00:00:00.000Z',
+        });
+        assert.equal(dated.totalItems, 3);
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('deleting an email removes database records and keeps a tombstone without touching OneDrive', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-delete-email-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'delete-message-id',
+            subject: 'Delete me',
+            receivedDateTime: '2026-01-10T12:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Delete test</p>' },
+        });
+        const parsed: ParsedEmailInfo = {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: '26-00001-LT',
+            caseTitle: 'PLAINTIFF V DEFENDANT',
+            plaintiff: 'PLAINTIFF',
+            defendant: 'DEFENDANT',
+            bundleNumber: null,
+            filerName: null,
+            filedAt: null,
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        };
+        const caseDraftId = db.createCaseDraft(email.id, parsed);
+        db.addDocument({
+            emailId: email.id,
+            caseDraftId,
+            currentFilename: 'document.pdf',
+            oneDriveUrl: 'https://onedrive.example/document',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+        db.markEmailProcessed(email.id);
+
+        const result = db.deleteEmailRecord(email.id);
+        assert.equal(result.emailRecords, 1);
+        assert.equal(result.caseDrafts, 1);
+        assert.equal(result.documentRecords, 1);
+        assert.equal(result.oneDriveFilesDeleted, 0);
+        assert.equal(db.getEmailDetail(email.id), null);
+        assert.equal(db.isEmailDeleted('delete-message-id'), true);
+        assert.equal(db.listQueue({ scope: 'all' }).totalItems, 0);
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('period cleanup removes only terminal records and protects active retries', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-period-cleanup-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    const register = (id: string) => db.registerEmail({
+        id,
+        subject: id,
+        receivedDateTime: '2026-01-10T12:00:00.000Z',
+        from: { emailAddress: { address: 'court@example.com' } },
+        body: { content: '<p>Cleanup test</p>' },
+    });
+
+    try {
+        const processed = register('old-processed');
+        db.markEmailProcessed(processed.id);
+
+        const ignored = register('old-ignored');
+        db.markEmailIgnored(ignored.id, 'Not relevant');
+
+        const failedWithRetry = register('old-failed-retrying');
+        db.markEmailFailed(failedWithRetry.id, 'Download failed');
+        db.addDocument({
+            emailId: failedWithRetry.id,
+            sourceUrl: 'https://mifile.example/document',
+            uploadSource: 'test',
+            status: 'retrying',
+        });
+
+        const stillNew = register('old-still-new');
+        const cutoff = '2026-06-01T00:00:00.000Z';
+
+        assert.equal(db.countDeletableEmailsBefore(cutoff), 2);
+        const result = db.purgeEmailRecordsBefore(cutoff);
+        assert.equal(result.emailRecords, 2);
+        assert.equal(result.oneDriveFilesDeleted, 0);
+        assert.equal(db.getEmailDetail(processed.id), null);
+        assert.equal(db.getEmailDetail(ignored.id), null);
+        assert.notEqual(db.getEmailDetail(failedWithRetry.id), null);
+        assert.notEqual(db.getEmailDetail(stillNew.id), null);
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('document failure logs are preserved across automatic retry cycles', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-failure-log-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'failure-log-message',
+            subject: 'Failure log test',
+            receivedDateTime: '2026-07-23T12:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Failure log</p>' },
+        });
+        const documentId = db.addDocument({
+            emailId: email.id,
+            sourceUrl: 'https://mifile.example/document',
+            uploadSource: 'mifile',
+            status: 'failed',
+            errorMessage: 'HTTP 503',
+            metadata: {
+                attemptLog: [{
+                    attempt: 1,
+                    at: '2026-07-23T12:01:00.000Z',
+                    stage: 'download',
+                    message: 'HTTP 503',
+                }],
+            },
+        });
+
+        db.completeDocumentRetryFailure({
+            documentId,
+            reason: 'Downloaded content failed PDF validation',
+            downloadAttempts: 1,
+            metadata: {
+                attemptLog: [{
+                    attempt: 1,
+                    at: '2026-07-23T12:16:00.000Z',
+                    stage: 'validation',
+                    message: 'Downloaded content failed PDF validation',
+                }],
+            },
+        });
+
+        const detail = db.getEmailDetail(email.id);
+        assert.equal(detail?.documents[0].failureLog.length, 2);
+        assert.deepEqual(
+            detail?.documents[0].failureLog.map(entry => entry.stage),
+            ['download', 'validation'],
+        );
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});

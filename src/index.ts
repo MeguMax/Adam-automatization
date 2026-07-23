@@ -20,11 +20,11 @@ import { loadLegacyProcessed } from './legacyState';
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
 const MAX_EMAILS_PER_POLL = Number(process.env.WORKER_EMAIL_LIMIT || 50);
 const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
-    Math.max(Number(process.env.DOCUMENT_RETRY_BATCH_SIZE || 10), 1),
-    50,
+    Math.max(Number(process.env.DOCUMENT_RETRY_BATCH_SIZE || 2), 1),
+    10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-07-12-plaintiff-db-naming-v3';
+const WORKER_BUILD_ID = '2026-07-23-history-retry-visibility-v4';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -323,12 +323,12 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
 }
 
 async function processOnce(db: WorkflowDatabase): Promise<void> {
-    await processDueDocumentRetries(db);
     console.log('Checking inbox for new court emails...');
 
     const emails = await fetchRecentCourtEmails(MAX_EMAILS_PER_POLL);
     if (!emails.length) {
         console.log('No emails returned.');
+        await processDueDocumentRetries(db);
         return;
     }
 
@@ -474,6 +474,8 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             }
         }
     }
+
+    await processDueDocumentRetries(db);
 }
 
 export async function runWorker(options: WorkerRunOptions = {}): Promise<void> {

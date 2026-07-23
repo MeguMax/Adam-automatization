@@ -33,7 +33,7 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
 5. Leave `WORKER_ENABLED=false` for the first deploy. Open `https://<service>.onrender.com/`, authenticate with `ADMIN_USERNAME` and `ADMIN_PASSWORD`, and verify `https://<service>.onrender.com/healthz` returns `{"ok":true}`.
 
-6. While the worker is disabled, the admin synchronizes up to 500 recent inbox messages. This reconstructs recent email records and reports without downloading historical court files again.
+6. While the worker is disabled, the admin synchronizes 100 recent inbox messages per background pass. Use **Sync 1000** once when a larger metadata backfill is needed; this does not download historical court files again.
 
 ## Transfer Plaintiff Mappings
 
@@ -64,7 +64,7 @@ The new Render database is persistent from its first deploy onward. Transfer the
 
    ```text
    Production worker enabled.
-   Worker runtime: { buildId: '2026-07-12-plaintiff-db-naming-v3', ... }
+   Worker runtime: { buildId: '2026-07-23-history-retry-visibility-v4', ... }
    Plaintiff naming database lookup: ...
    OneDrive file name selected: ...
    ```
@@ -73,4 +73,6 @@ The new Render database is persistent from its first deploy onward. Transfer the
 
 - Render provides `PORT`; the admin binds to it automatically on `0.0.0.0`.
 - `/healthz` is public only for Render health checks. The dashboard and all `/api/*` endpoints require admin credentials.
+- `DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS=3` keeps a bad file from monopolizing the worker. Failed documents are retried later up to `DOCUMENT_AUTO_RETRY_LIMIT`, two due retry jobs per poll.
+- Queue history is paginated from SQLite and is not capped at the newest 100 or 200 records. Period cleanup deletes database records and tombstones their mailbox IDs; it never deletes OneDrive files.
 - Do not copy a live SQLite file over the running Render database. This deployment starts with a clean operational database, restores Plaintiff mappings from the seed, and rebuilds recent inbox state from Microsoft 365. A full historical SQLite migration should be handled separately if old audit history is required.

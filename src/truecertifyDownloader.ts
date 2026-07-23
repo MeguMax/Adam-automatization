@@ -9,6 +9,12 @@ export interface TrueCertifyBufferResult {
     fileName?: string;
     error?: string;
     attempts: number;
+    attemptLog: Array<{
+        attempt: number;
+        at: string;
+        stage: 'download' | 'validation';
+        message: string;
+    }>;
 }
 
 export class TrueCertifyBufferDownloader {
@@ -50,6 +56,7 @@ export class TrueCertifyBufferDownloader {
 
     async downloadToBuffer(locator: string, publicKey: string): Promise<TrueCertifyBufferResult> {
         let attempts = 0;
+        const attemptLog: TrueCertifyBufferResult['attemptLog'] = [];
         try {
             await this.launch();
             if (!this.page) throw new Error('Browser/page not initialized');
@@ -61,10 +68,10 @@ export class TrueCertifyBufferDownloader {
 
             await this.page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
 
-            const configuredAttempts = Number(process.env.DOCUMENT_DOWNLOAD_ATTEMPTS || 12);
+            const configuredAttempts = Number(process.env.DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS || 3);
             const maxAttempts = Number.isFinite(configuredAttempts)
-                ? Math.min(Math.max(Math.floor(configuredAttempts), 1), 50)
-                : 12;
+                ? Math.min(Math.max(Math.floor(configuredAttempts), 1), 5)
+                : 3;
 
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
                 attempts = attempt;
@@ -85,6 +92,12 @@ export class TrueCertifyBufferDownloader {
 
                 const captchaText = await this.captchaClient.solveImage(imageBuffer);
                 if (!captchaText || captchaText.length < 3) {
+                    attemptLog.push({
+                        attempt,
+                        at: new Date().toISOString(),
+                        stage: 'download',
+                        message: 'Captcha solver returned an empty or too-short value',
+                    });
                     console.log('Captcha empty/too short, reloading page...');
                     await this.page.reload({ waitUntil: 'networkidle' });
                     await this.page.waitForTimeout(2000);
@@ -133,6 +146,12 @@ export class TrueCertifyBufferDownloader {
 
                     const validation = validatePdfBuffer(buffer);
                     if (!validation.valid) {
+                        attemptLog.push({
+                            attempt,
+                            at: new Date().toISOString(),
+                            stage: 'validation',
+                            message: `Downloaded content failed PDF validation: ${validation.reason}`,
+                        });
                         console.log(`Downloaded content is not a valid PDF: ${validation.reason}. Retrying...`);
                         await this.page!.reload({ waitUntil: 'networkidle' });
                         await this.page!.waitForTimeout(2000);
@@ -140,8 +159,14 @@ export class TrueCertifyBufferDownloader {
                     }
 
                     const fileName = `truecertify_${locator}_${Date.now()}.pdf`;
-                    return { success: true, buffer, fileName, attempts };
+                    return { success: true, buffer, fileName, attempts, attemptLog };
                 } catch (e) {
+                    attemptLog.push({
+                        attempt,
+                        at: new Date().toISOString(),
+                        stage: 'download',
+                        message: e instanceof Error ? e.message : String(e),
+                    });
                     console.log('Download failed in this attempt, reloading...', e);
                     await this.page!.reload({ waitUntil: 'networkidle' });
                     await this.page!.waitForTimeout(2000);
@@ -155,6 +180,7 @@ export class TrueCertifyBufferDownloader {
                 success: false,
                 error: error instanceof Error ? error.message : 'Unknown error',
                 attempts,
+                attemptLog,
             };
         }
     }

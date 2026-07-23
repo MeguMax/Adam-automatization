@@ -1,7 +1,12 @@
 import http from 'http';
 import { URL } from 'url';
 import { timingSafeEqual } from 'crypto';
-import { getWorkflowDatabase, ProcessingReportInput, ReviewAction } from './database';
+import {
+    EmailProcessingStatus,
+    getWorkflowDatabase,
+    ProcessingReportInput,
+    ReviewAction,
+} from './database';
 import { fetchRecentCourtEmails, parseEmailBody } from './emailProcessor';
 import { loadLegacyProcessed } from './legacyState';
 import { renameDriveItem, resolveSharedDriveItem } from './oneDriveClient';
@@ -100,6 +105,18 @@ function readRequestBody(req: http.IncomingMessage): Promise<string> {
         req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
         req.on('error', reject);
     });
+}
+
+function parseDateBoundary(value: string | null | undefined, endExclusive = false): string | null {
+    if (!value) return null;
+    const normalized = value.trim();
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(normalized);
+    const date = isDateOnly
+        ? new Date(`${normalized}T00:00:00.000Z`)
+        : new Date(normalized);
+    if (Number.isNaN(date.getTime())) return null;
+    if (endExclusive && isDateOnly) date.setUTCDate(date.getUTCDate() + 1);
+    return date.toISOString();
 }
 
 function bodyToText(msg: any): string {
@@ -247,6 +264,7 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
         const checkedPlaintiffMappingIds = new Set<string>();
 
         for (const msg of emails) {
+            if (db.isEmailDeleted(msg.id as string)) continue;
             const emailRecord = db.registerEmail(msg);
             syncedEmails += 1;
 
@@ -366,7 +384,7 @@ const html = String.raw`<!doctype html>
     }
     main {
       display: grid;
-      grid-template-columns: minmax(430px, 1.15fr) minmax(360px, 0.85fr);
+      grid-template-columns: minmax(500px, 1.3fr) minmax(360px, 0.7fr);
       gap: 16px;
       padding: 16px;
     }
@@ -419,6 +437,7 @@ const html = String.raw`<!doctype html>
       display: flex;
       gap: 8px;
       align-items: center;
+      flex-wrap: wrap;
     }
     .nav-tabs {
       display: flex;
@@ -516,6 +535,14 @@ const html = String.raw`<!doctype html>
     }
     button.primary:hover {
       background: var(--accent-strong);
+    }
+    button.danger {
+      border-color: #f2b8b5;
+      color: var(--bad);
+      background: #fff;
+    }
+    button.danger:hover {
+      background: #fdecec;
     }
     button:disabled {
       opacity: 0.55;
@@ -652,6 +679,41 @@ const html = String.raw`<!doctype html>
       gap: 8px;
       margin-top: 8px;
     }
+    .queue-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+      background: #fafbfc;
+    }
+    .pagination {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .pagination button {
+      min-width: 32px;
+      padding: 0 7px;
+    }
+    .pagination button.active {
+      border-color: var(--accent);
+      background: #e8f2fa;
+      color: var(--accent-strong);
+      font-weight: 650;
+    }
+    .failure-log summary {
+      margin-top: 6px;
+      color: var(--bad);
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .date-input {
+      width: 142px;
+    }
     .empty {
       padding: 24px;
       color: var(--muted);
@@ -677,6 +739,13 @@ const html = String.raw`<!doctype html>
       }
       .split-panels, .form-grid {
         grid-template-columns: 1fr;
+      }
+      .queue-footer {
+        align-items: stretch;
+        flex-direction: column;
+      }
+      .pagination {
+        justify-content: flex-start;
       }
     }
     @media (max-width: 620px) {
@@ -716,6 +785,7 @@ const html = String.raw`<!doctype html>
         <option value="100" selected>Sync 100</option>
         <option value="250">Sync 250</option>
         <option value="500">Sync 500</option>
+        <option value="1000">Sync 1000</option>
       </select>
       <button id="syncBtn" type="button">Sync Inbox</button>
       <button id="refreshBtn" class="primary" type="button">Refresh</button>
@@ -731,13 +801,12 @@ const html = String.raw`<!doctype html>
             <input id="searchInput" type="search" placeholder="Search subject, case, plaintiff">
             <select id="scopeFilter">
               <option value="active">Active</option>
-              <option value="all">All recent</option>
+              <option value="all">All history</option>
             </select>
-            <select id="limitFilter">
-              <option value="50">50 rows</option>
-              <option value="100" selected>100 rows</option>
-              <option value="250">250 rows</option>
-              <option value="500">500 rows</option>
+            <select id="pageSizeFilter">
+              <option value="25">25 / page</option>
+              <option value="50" selected>50 / page</option>
+              <option value="100">100 / page</option>
             </select>
             <select id="statusFilter">
               <option value="">All statuses</option>
@@ -748,15 +817,30 @@ const html = String.raw`<!doctype html>
               <option value="new">New</option>
               <option value="processing">Processing</option>
             </select>
+            <input id="dateFromFilter" class="date-input" type="date" title="Received from">
+            <input id="dateToFilter" class="date-input" type="date" title="Received through">
           </div>
         </div>
         <div id="queue"></div>
+        <div class="queue-footer">
+          <div class="controls">
+            <input id="deleteBeforeDate" class="date-input" type="date" title="Delete terminal records before date">
+            <button id="purgeBtn" class="danger" type="button">Delete older records</button>
+          </div>
+          <div class="controls">
+            <span id="pageInfo" class="muted"></span>
+            <div id="pagination" class="pagination" aria-label="Queue pages"></div>
+          </div>
+        </div>
       </div>
     </section>
     <section id="detailPane" class="panel detail">
       <div class="toolbar">
         <h2>Record Detail</h2>
-        <button id="retryBtn" type="button" disabled title="Retry the whole email when parsing or all document processing failed">Retry email</button>
+        <div class="controls">
+          <button id="retryBtn" type="button" disabled title="Retry the whole email when parsing or all document processing failed">Retry email</button>
+          <button id="deleteEmailBtn" class="danger" type="button" disabled title="Delete this database record only">Delete record</button>
+        </div>
       </div>
       <div class="detail-body" id="detail">
         <div class="empty">Select a queue row.</div>
@@ -799,6 +883,8 @@ const html = String.raw`<!doctype html>
       plaintiffMappings: { mappings: [], missing: [] },
       editingMappingId: null,
       view: 'queue',
+      pagination: { page: 1, pageSize: 50, totalItems: 0, totalPages: 1 },
+      loadPromise: null,
     };
 
     const statusClass = value => String(value || 'unknown').replace(/[^a-z0-9_ -]/gi, '_');
@@ -814,8 +900,17 @@ const html = String.raw`<!doctype html>
 
     async function api(path, options) {
       const res = await fetch(path, options);
-      if (!res.ok) throw new Error(await res.text());
-      return res.json();
+      const text = await res.text();
+      let payload = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        payload = text;
+      }
+      if (!res.ok) {
+        throw new Error(payload && payload.error ? payload.error : String(payload || res.statusText));
+      }
+      return payload;
     }
 
     function setView(view) {
@@ -837,6 +932,21 @@ const html = String.raw`<!doctype html>
       return '<div class="metric"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(value) + '</strong></div>';
     }
 
+    function formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+    }
+
+    function localDateBoundaryIso(value, endExclusive) {
+      if (!value) return '';
+      const date = new Date(value + 'T00:00:00');
+      if (endExclusive) date.setDate(date.getDate() + 1);
+      return date.toISOString();
+    }
+
     function renderSummary() {
       const s = state.summary;
       if (!s) return;
@@ -851,6 +961,7 @@ const html = String.raw`<!doctype html>
         metric('No file link', docs.not_downloadable || 0),
         metric('Needs attention', (email.failed || 0) + (email.partial_failure || 0) + (drafts.needs_review || 0)),
         metric('Missing plaintiff mappings', s.missingPlaintiffMappings),
+        metric('Database storage', formatBytes(s.databaseBytes)),
       ].join('');
     }
 
@@ -883,37 +994,25 @@ const html = String.raw`<!doctype html>
     }
 
     function filteredQueue() {
-      const q = document.getElementById('searchInput').value.trim().toLowerCase();
-      const status = document.getElementById('statusFilter').value;
-      return state.queue.filter(item => {
-        if (status && item.processingStatus !== status) return false;
-        if (!q) return true;
-        return [
-          item.subject,
-          item.sender,
-          item.caseNumber,
-          item.plaintiffName,
-          item.plaintiffShortName,
-          item.processingError,
-        ].some(value => String(value || '').toLowerCase().includes(q));
-      });
+      return state.queue;
     }
 
     function renderQueue() {
       const items = filteredQueue();
       const root = document.getElementById('queue');
+      renderPagination();
       if (!items.length) {
         root.innerHTML = '<div class="empty">No queue records match the current filters.</div>';
         return;
       }
 
       root.innerHTML = '<table><thead><tr>' +
-        '<th style="width: 128px;">Received</th>' +
+        '<th style="width: 108px;">Received</th>' +
         '<th>Subject</th>' +
-        '<th style="width: 130px;">Case</th>' +
-        '<th style="width: 140px;">Plaintiff</th>' +
-        '<th style="width: 108px;">Documents</th>' +
-        '<th style="width: 150px;">Status</th>' +
+        '<th style="width: 104px;">Case</th>' +
+        '<th style="width: 132px;">Plaintiff</th>' +
+        '<th style="width: 92px;">Documents</th>' +
+        '<th style="width: 128px;">Status</th>' +
         '</tr></thead><tbody>' +
         items.map(item => '<tr data-id="' + escapeHtml(item.emailId) + '" class="' + (item.emailId === state.selectedId ? 'selected' : '') + '">' +
           '<td>' + escapeHtml(fmtDate(item.receivedAt)) + '</td>' +
@@ -928,6 +1027,56 @@ const html = String.raw`<!doctype html>
       root.querySelectorAll('tr[data-id]').forEach(row => {
         row.addEventListener('click', () => selectRecord(row.dataset.id));
       });
+    }
+
+    function renderPagination() {
+      const pagination = state.pagination;
+      const pageInfo = document.getElementById('pageInfo');
+      const root = document.getElementById('pagination');
+      const first = pagination.totalItems
+        ? ((pagination.page - 1) * pagination.pageSize) + 1
+        : 0;
+      const last = Math.min(pagination.page * pagination.pageSize, pagination.totalItems);
+      pageInfo.textContent = first + '-' + last + ' of ' + pagination.totalItems;
+
+      const pageNumbers = new Set([1, pagination.totalPages]);
+      for (let page = pagination.page - 2; page <= pagination.page + 2; page++) {
+        if (page >= 1 && page <= pagination.totalPages) pageNumbers.add(page);
+      }
+      const sorted = Array.from(pageNumbers).sort((a, b) => a - b);
+      const parts = [
+        '<button type="button" data-page="' + (pagination.page - 1) + '" ' +
+          (pagination.page <= 1 ? 'disabled' : '') + ' title="Previous page" aria-label="Previous page">&#8249;</button>',
+      ];
+      let previous = 0;
+      sorted.forEach(page => {
+        if (previous && page - previous > 1) parts.push('<span class="muted">...</span>');
+        parts.push(
+          '<button type="button" data-page="' + page + '" class="' +
+          (page === pagination.page ? 'active' : '') + '">' + page + '</button>',
+        );
+        previous = page;
+      });
+      parts.push(
+        '<button type="button" data-page="' + (pagination.page + 1) + '" ' +
+        (pagination.page >= pagination.totalPages ? 'disabled' : '') +
+        ' title="Next page" aria-label="Next page">&#8250;</button>',
+      );
+      root.innerHTML = parts.join('');
+      root.querySelectorAll('button[data-page]').forEach(button => {
+        button.addEventListener('click', () => {
+          const nextPage = Number(button.dataset.page);
+          if (nextPage >= 1 && nextPage <= pagination.totalPages) {
+            state.pagination.page = nextPage;
+            loadData().catch(showQueueError);
+          }
+        });
+      });
+    }
+
+    function showQueueError(error) {
+      document.getElementById('queue').innerHTML =
+        '<div class="empty error-text">' + escapeHtml(error.message) + '</div>';
     }
 
     function renderPlaintiffCell(item) {
@@ -1176,8 +1325,15 @@ const html = String.raw`<!doctype html>
     function renderDetail() {
       const root = document.getElementById('detail');
       const retryBtn = document.getElementById('retryBtn');
+      const deleteBtn = document.getElementById('deleteEmailBtn');
       const detail = state.detail;
       retryBtn.disabled = !detail || !['failed', 'partial_failure'].includes(detail.email.processingStatus);
+      const hasActiveRetry = detail && detail.documents.some(doc =>
+        ['retry_queued', 'retrying'].includes(doc.status)
+      );
+      deleteBtn.disabled = !detail ||
+        detail.email.processingStatus === 'processing' ||
+        hasActiveRetry;
 
       if (!detail) {
         root.innerHTML = '<div class="empty">Select a queue row.</div>';
@@ -1212,6 +1368,7 @@ const html = String.raw`<!doctype html>
           renderDocumentLinks(doc) +
           renderDocumentRetryInfo(doc, detail.retryPolicy) +
           (doc.errorMessage ? '<div class="error-text">' + escapeHtml(doc.errorMessage) + '</div>' : '') +
+          renderDocumentFailureLog(doc) +
         '</div>').join('') : '<div class="empty">No documents recorded.</div>') +
         '<h3>Audit</h3>' +
         (detail.auditLogs.length ? detail.auditLogs.map(log => '<div class="audit">' +
@@ -1303,6 +1460,21 @@ const html = String.raw`<!doctype html>
       return '<div class="muted">' + parts.join(' &middot; ') + '</div>';
     }
 
+    function renderDocumentFailureLog(doc) {
+      const entries = Array.isArray(doc.failureLog) ? doc.failureLog : [];
+      if (!entries.length) return '';
+      const lines = entries.map(entry =>
+        'Attempt ' + escapeHtml(entry.attempt || 0) +
+        ' · ' + escapeHtml(fmtDate(entry.at)) +
+        ' · ' + escapeHtml(entry.stage || 'download') +
+        '\n' + escapeHtml(entry.message || 'Unknown failure')
+      ).join('\n\n');
+      return '<details class="failure-log" open>' +
+        '<summary>Failure log (' + escapeHtml(entries.length) + ')</summary>' +
+        '<pre>' + lines + '</pre>' +
+      '</details>';
+    }
+
     function renderDocumentLinks(doc) {
       const links = [];
       if (doc.oneDriveUrl) {
@@ -1340,8 +1512,66 @@ const html = String.raw`<!doctype html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'Queued from admin UI' }),
       });
-      await loadData();
+      await loadData(true);
       await selectRecord(state.selectedId);
+    }
+
+    async function deleteSelectedEmail() {
+      if (!state.selectedId || !state.detail) return;
+      const subject = state.detail.email.subject || '(no subject)';
+      const confirmed = window.confirm(
+        'Delete "' + subject + '" and its related records from this database?\n\n' +
+        'Files in OneDrive will not be deleted.',
+      );
+      if (!confirmed) return;
+
+      await api('/api/emails/' + encodeURIComponent(state.selectedId), {
+        method: 'DELETE',
+      });
+      state.selectedId = null;
+      state.detail = null;
+      renderDetail();
+      await loadData(true);
+    }
+
+    async function purgeOlderEmails() {
+      const dateInput = document.getElementById('deleteBeforeDate');
+      const beforeDate = dateInput.value;
+      if (!beforeDate) {
+        window.alert('Choose a cutoff date first.');
+        return;
+      }
+
+      const preview = await api('/api/emails/purge-preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ beforeDate }),
+      });
+      if (!preview.emailRecords) {
+        window.alert('No completed, failed, or ignored records are eligible before this date.');
+        return;
+      }
+
+      const confirmed = window.confirm(
+        'Delete ' + preview.emailRecords + ' database record(s) before ' + beforeDate + '?\n\n' +
+        'Processing and active retry records are protected. OneDrive files will not be deleted.',
+      );
+      if (!confirmed) return;
+
+      const result = await api('/api/emails/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ beforeDate, confirm: true }),
+      });
+      state.selectedId = null;
+      state.detail = null;
+      state.pagination.page = 1;
+      renderDetail();
+      await loadData(true);
+      window.alert(
+        'Deleted ' + result.emailRecords + ' email record(s), ' +
+        result.documentRecords + ' document record(s), and 0 OneDrive files.',
+      );
     }
 
     async function retryDocument(documentId) {
@@ -1351,7 +1581,7 @@ const html = String.raw`<!doctype html>
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'Queued from document retry button' }),
       });
-      await loadData();
+      await loadData(true);
       if (state.selectedId) await selectRecord(state.selectedId);
     }
 
@@ -1368,7 +1598,7 @@ const html = String.raw`<!doctype html>
           notes: notesInput ? notesInput.value : '',
         }),
       });
-      await loadData();
+      await loadData(true);
     }
 
     async function syncInbox() {
@@ -1378,64 +1608,119 @@ const html = String.raw`<!doctype html>
       btn.textContent = 'Syncing...';
       try {
         await api('/api/sync-inbox?limit=' + encodeURIComponent(limit), { method: 'POST' });
-        await loadData();
+        await loadData(true);
       } finally {
         btn.disabled = false;
         btn.textContent = 'Sync Inbox';
       }
     }
 
-    async function loadData() {
-      const scope = document.getElementById('scopeFilter').value;
-      const limit = document.getElementById('limitFilter').value;
-      const [summary, queue, live] = await Promise.all([
-        api('/api/summary'),
-        api('/api/queue?scope=' + encodeURIComponent(scope) + '&limit=' + encodeURIComponent(limit)),
-        api('/api/live-status'),
-      ]);
-      state.summary = summary;
-      state.queue = queue;
-      state.live = live;
-      renderSummary();
-      renderQueue();
-      renderLiveStatus();
-
-      if (state.selectedId) {
+    async function loadData(force) {
+      if (state.loadPromise) {
         try {
-          state.detail = await api('/api/emails/' + encodeURIComponent(state.selectedId));
-          renderDetail();
+          await state.loadPromise;
         } catch {
-          state.selectedId = null;
-          state.detail = null;
-          renderDetail();
+          // The caller that started the request reports the error.
         }
+        if (!force) return;
+      }
+
+      const task = (async () => {
+        const params = new URLSearchParams({
+          scope: document.getElementById('scopeFilter').value,
+          page: String(state.pagination.page),
+          pageSize: document.getElementById('pageSizeFilter').value,
+        });
+        const search = document.getElementById('searchInput').value.trim();
+        const status = document.getElementById('statusFilter').value;
+        const dateFrom = document.getElementById('dateFromFilter').value;
+        const dateTo = document.getElementById('dateToFilter').value;
+        if (search) params.set('q', search);
+        if (status) params.set('status', status);
+        if (dateFrom) params.set('dateFrom', localDateBoundaryIso(dateFrom, false));
+        if (dateTo) params.set('dateTo', localDateBoundaryIso(dateTo, true));
+
+        const [summary, queuePage, live] = await Promise.all([
+          api('/api/summary'),
+          api('/api/queue?' + params.toString()),
+          api('/api/live-status'),
+        ]);
+        state.summary = summary;
+        state.queue = queuePage.items || [];
+        state.pagination = {
+          page: Number(queuePage.page || 1),
+          pageSize: Number(queuePage.pageSize || 50),
+          totalItems: Number(queuePage.totalItems || 0),
+          totalPages: Number(queuePage.totalPages || 1),
+        };
+        state.live = live;
+        renderSummary();
+        renderQueue();
+        renderLiveStatus();
+
+        if (state.selectedId) {
+          try {
+            state.detail = await api('/api/emails/' + encodeURIComponent(state.selectedId));
+            renderDetail();
+          } catch {
+            state.selectedId = null;
+            state.detail = null;
+            renderDetail();
+          }
+        }
+      })();
+
+      state.loadPromise = task;
+      try {
+        await task;
+      } finally {
+        if (state.loadPromise === task) state.loadPromise = null;
       }
     }
 
-    document.getElementById('refreshBtn').addEventListener('click', loadData);
+    function resetPageAndLoad() {
+      state.pagination.page = 1;
+      loadData(true).catch(showQueueError);
+    }
+
+    let searchTimer = null;
+    document.getElementById('refreshBtn').addEventListener('click', () => loadData(true));
     document.getElementById('syncBtn').addEventListener('click', syncInbox);
     document.getElementById('retryBtn').addEventListener('click', retrySelected);
+    document.getElementById('deleteEmailBtn').addEventListener('click', () => {
+      deleteSelectedEmail().catch(showQueueError);
+    });
+    document.getElementById('purgeBtn').addEventListener('click', () => {
+      purgeOlderEmails().catch(showQueueError);
+    });
     document.getElementById('queueTab').addEventListener('click', () => setView('queue'));
     document.getElementById('mappingsTab').addEventListener('click', () => setView('mappings'));
-    document.getElementById('searchInput').addEventListener('input', renderQueue);
-    document.getElementById('scopeFilter').addEventListener('change', loadData);
-    document.getElementById('limitFilter').addEventListener('change', loadData);
-    document.getElementById('statusFilter').addEventListener('change', renderQueue);
+    document.getElementById('searchInput').addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(resetPageAndLoad, 300);
+    });
+    document.getElementById('scopeFilter').addEventListener('change', resetPageAndLoad);
+    document.getElementById('pageSizeFilter').addEventListener('change', resetPageAndLoad);
+    document.getElementById('statusFilter').addEventListener('change', resetPageAndLoad);
+    document.getElementById('dateFromFilter').addEventListener('change', resetPageAndLoad);
+    document.getElementById('dateToFilter').addEventListener('change', resetPageAndLoad);
     document.getElementById('mappingSearch').addEventListener('input', renderPlaintiffMappings);
     document.getElementById('addMappingBtn').addEventListener('click', () => {
       addMapping().catch(showMappingError);
     });
     document.getElementById('clearMappingBtn').addEventListener('click', clearMappingForm);
 
-    loadData().catch(error => {
-      document.getElementById('queue').innerHTML = '<div class="empty error-text">' + escapeHtml(error.message) + '</div>';
+    loadData().catch(showQueueError);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) loadData(true).catch(showQueueError);
     });
     setInterval(() => {
+      if (document.hidden) return;
       loadData().catch(error => {
         state.live = { running: false, lastError: error.message, lastFinishedAt: null, lastStartedAt: null, lastSyncedEmails: 0, lastMiFileDrafts: 0 };
         renderLiveStatus();
       });
-    }, 5000);
+    }, 3000);
   </script>
 </body>
 </html>`;
@@ -1504,9 +1789,61 @@ export function createAdminServer(
             }
 
             if (req.method === 'GET' && url.pathname === '/api/queue') {
-                const limit = Number(url.searchParams.get('limit') || 100);
+                const page = Number(url.searchParams.get('page') || 1);
+                const pageSize = Number(url.searchParams.get('pageSize') || 50);
                 const scope = url.searchParams.get('scope') === 'all' ? 'all' : 'active';
-                sendJson(res, 200, db.listQueue({ limit, scope }));
+                const requestedStatus = url.searchParams.get('status') || '';
+                const allowedStatuses = new Set<EmailProcessingStatus>([
+                    'new',
+                    'processing',
+                    'ignored',
+                    'processed',
+                    'failed',
+                    'partial_failure',
+                    'legacy_processed',
+                ]);
+                const status = allowedStatuses.has(requestedStatus as EmailProcessingStatus)
+                    ? requestedStatus as EmailProcessingStatus
+                    : '';
+                sendJson(res, 200, db.listQueue({
+                    page,
+                    pageSize,
+                    scope,
+                    status,
+                    search: url.searchParams.get('q') || '',
+                    dateFrom: parseDateBoundary(url.searchParams.get('dateFrom')),
+                    dateTo: parseDateBoundary(url.searchParams.get('dateTo'), true),
+                }));
+                return;
+            }
+
+            if (req.method === 'POST' && url.pathname === '/api/emails/purge-preview') {
+                const body = await readRequestBody(req);
+                const parsed = body ? JSON.parse(body) : {};
+                const cutoff = parseDateBoundary(parsed.beforeDate);
+                if (!cutoff) {
+                    sendJson(res, 400, { error: 'A valid beforeDate is required' });
+                    return;
+                }
+                sendJson(res, 200, {
+                    cutoff,
+                    emailRecords: db.countDeletableEmailsBefore(cutoff),
+                    oneDriveFilesDeleted: 0,
+                });
+                return;
+            }
+
+            if (req.method === 'POST' && url.pathname === '/api/emails/purge') {
+                const body = await readRequestBody(req);
+                const parsed = body ? JSON.parse(body) : {};
+                const cutoff = parseDateBoundary(parsed.beforeDate);
+                if (!cutoff || parsed.confirm !== true) {
+                    sendJson(res, 400, {
+                        error: 'A valid beforeDate and confirm=true are required',
+                    });
+                    return;
+                }
+                sendJson(res, 200, db.purgeEmailRecordsBefore(cutoff));
                 return;
             }
 
@@ -1574,6 +1911,15 @@ export function createAdminServer(
             }
 
             const detailMatch = url.pathname.match(/^\/api\/emails\/([^/]+)$/);
+            if (req.method === 'DELETE' && detailMatch) {
+                sendJson(
+                    res,
+                    200,
+                    db.deleteEmailRecord(decodeURIComponent(detailMatch[1])),
+                );
+                return;
+            }
+
             if (req.method === 'GET' && detailMatch) {
                 const detail = db.getEmailDetail(decodeURIComponent(detailMatch[1]));
                 if (!detail) {

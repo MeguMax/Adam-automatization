@@ -51,18 +51,38 @@ export async function httpDownloadFromMifileToBuffer(url: string): Promise<Buffe
     // MiFILE
     console.log('📥 Завантажуємо MiFILE документ');
     const cookieHeader = await getMifileCookieHeader();
+    const configuredTimeout = Number(process.env.MIFILE_DOWNLOAD_TIMEOUT_MS || 90000);
+    const timeoutMs = Number.isFinite(configuredTimeout)
+        ? Math.min(Math.max(Math.floor(configuredTimeout), 10000), 300000)
+        : 90000;
 
     const doFetch = async () => {
-        const res = await fetch(url, {
-            method: 'GET',
-            headers: {
-                Cookie: cookieHeader,
-            },
-        });
-        return res;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    Cookie: cookieHeader,
+                },
+                signal: controller.signal,
+            });
+            const buffer = response.ok
+                ? Buffer.from(await response.arrayBuffer())
+                : null;
+            return { response, buffer };
+        } catch (error) {
+            if ((error as { name?: string }).name === 'AbortError') {
+                throw new Error(`MiFILE download timed out after ${timeoutMs} ms`);
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
     };
 
-    let res = await doFetch();
+    let download = await doFetch();
+    let res = download.response;
 
     if (!res.ok) {
         console.warn(`⚠️ MiFILE HTTP ${res.status} for URL: ${url}`);
@@ -71,7 +91,8 @@ export async function httpDownloadFromMifileToBuffer(url: string): Promise<Buffe
         if (res.status === 400 || res.status === 500 || res.status === 502 || res.status === 503) {
             console.warn('🔁 Повторная спроба завантаження з MiFILE через 3 секунди...');
             await new Promise(resolve => setTimeout(resolve, 3000));
-            res = await doFetch();
+            download = await doFetch();
+            res = download.response;
         }
 
         if (!res.ok) {
@@ -79,6 +100,8 @@ export async function httpDownloadFromMifileToBuffer(url: string): Promise<Buffe
         }
     }
 
-    const arrayBuffer = await res.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+    if (!download.buffer) {
+        throw new Error('MiFILE returned an empty download body');
+    }
+    return download.buffer;
 }

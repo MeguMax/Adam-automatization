@@ -42,6 +42,14 @@ export interface DocumentFailure {
     downloadUrl?: string | null;
     reason: string;
     downloadAttempts?: number;
+    attemptLog?: DocumentAttemptLog[];
+}
+
+export interface DocumentAttemptLog {
+    attempt: number;
+    at: string;
+    stage: 'configuration' | 'preparation' | 'download' | 'validation' | 'upload';
+    message: string;
 }
 
 export interface DownloadFiledDocumentsOptions {
@@ -196,9 +204,9 @@ function failureReason(error: unknown): string {
 }
 
 function documentDownloadAttemptLimit(): number {
-    const configured = Number(process.env.DOCUMENT_DOWNLOAD_ATTEMPTS || 12);
-    if (!Number.isFinite(configured)) return 12;
-    return Math.min(Math.max(Math.floor(configured), 1), 50);
+    const configured = Number(process.env.DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS || 3);
+    if (!Number.isFinite(configured)) return 3;
+    return Math.min(Math.max(Math.floor(configured), 1), 5);
 }
 
 function retryDelayMs(attempt: number): number {
@@ -275,6 +283,12 @@ export async function uploadTrueCertifyDocuments(
                 downloadUrl: doc.downloadUrl,
                 reason: 'TrueCertify: TWO_CAPTCHA_API_KEY not set',
                 downloadAttempts: 0,
+                attemptLog: [{
+                    attempt: 0,
+                    at: new Date().toISOString(),
+                    stage: 'configuration',
+                    message: 'TWO_CAPTCHA_API_KEY is not set',
+                }],
             })),
         };
     }
@@ -299,6 +313,12 @@ export async function uploadTrueCertifyDocuments(
                 downloadUrl: null,
                 reason: 'Missing TrueCertify download URL',
                 downloadAttempts: 0,
+                attemptLog: [{
+                    attempt: 0,
+                    at: new Date().toISOString(),
+                    stage: 'preparation',
+                    message: 'Missing TrueCertify download URL',
+                }],
             });
             continue;
         }
@@ -306,6 +326,8 @@ export async function uploadTrueCertifyDocuments(
         console.log(`\n📄 Обробка TrueCertify документа: ${doc.documentType || 'unknown'}`);
 
         let downloadAttempts = 0;
+        let processingStage: DocumentAttemptLog['stage'] = 'preparation';
+        let attemptLog: DocumentAttemptLog[] = [];
         try {
             const locator = extractLocatorFromUrl(doc.downloadUrl);
             const key = extractKeyFromUrl(doc.downloadUrl);
@@ -316,8 +338,10 @@ export async function uploadTrueCertifyDocuments(
 
             console.log(`🔑 locator=${locator}, key=${key}`);
 
+            processingStage = 'download';
             const result = await trueCertifyDownloader.downloadToBuffer(locator, key);
             downloadAttempts = result.attempts;
+            attemptLog = result.attemptLog;
 
             if (!result.success || !result.buffer) {
                 throw new Error(
@@ -330,11 +354,13 @@ export async function uploadTrueCertifyDocuments(
 
             const validation = validatePdfBuffer(buffer);
             if (!validation.valid) {
+                processingStage = 'validation';
                 throw new Error(
                     `TrueCertify: downloaded content is not a valid PDF (${validation.reason})`
                 );
             }
 
+            processingStage = 'upload';
             const plaintiffNaming = await resolvePlaintiffNaming(options);
             console.log('Plaintiff naming lookup:', {
                 documentType: doc.documentType ?? null,
@@ -396,12 +422,22 @@ export async function uploadTrueCertifyDocuments(
             console.log(`✅ TrueCertify документ загружен в OneDrive: ${logicalPath}`);
         } catch (error) {
             console.error(`❌ Критична помилка TrueCertify:`, error);
+            const reason = failureReason(error);
+            if (attemptLog[attemptLog.length - 1]?.message !== reason) {
+                attemptLog.push({
+                    attempt: downloadAttempts,
+                    at: new Date().toISOString(),
+                    stage: processingStage,
+                    message: reason,
+                });
+            }
             failures.push({
                 documentType: doc.documentType ?? null,
                 documentName: doc.documentName,
                 downloadUrl: doc.downloadUrl,
-                reason: failureReason(error),
+                reason,
                 downloadAttempts,
+                attemptLog,
             });
         }
     }
@@ -477,6 +513,12 @@ export async function downloadFiledDocuments(
                     downloadUrl: null,
                     reason: 'Missing MiFILE download URL',
                     downloadAttempts: 0,
+                    attemptLog: [{
+                        attempt: 0,
+                        at: new Date().toISOString(),
+                        stage: 'preparation',
+                        message: 'Missing MiFILE download URL',
+                    }],
                 });
                 continue;
             }
@@ -487,6 +529,8 @@ export async function downloadFiledDocuments(
 
             const maxRetries = documentDownloadAttemptLimit();
             let downloadAttempts = 0;
+            const attemptLog: DocumentAttemptLog[] = [];
+            let lastFailureReason = 'Unknown download failure';
 
             try {
 
@@ -504,23 +548,23 @@ export async function downloadFiledDocuments(
 
                     const validation = validatePdfBuffer(downloadedBuf);
                     if (!validation.valid) {
-                        console.warn(
-                            `MiFILE: downloaded content is not a valid PDF (${validation.reason})`,
+                        throw new Error(
+                            `Downloaded content failed PDF validation: ${validation.reason}`,
                         );
-
-                        if (attempt < maxRetries) {
-                            await new Promise(res => setTimeout(res, retryDelayMs(attempt)));
-                            continue;
-                        } else {
-                            throw new Error(
-                                `MiFILE: не вдалося отримати PDF після ${maxRetries} спроб`,
-                            );
-                        }
                     }
 
                     buffer = downloadedBuf;
                     break; // успех
                 } catch (err) {
+                    lastFailureReason = failureReason(err);
+                    attemptLog.push({
+                        attempt,
+                        at: new Date().toISOString(),
+                        stage: lastFailureReason.includes('PDF validation')
+                            ? 'validation'
+                            : 'download',
+                        message: lastFailureReason,
+                    });
                     console.error(
                         `❌ Помилка при завантаженні MiFILE (спроба ${attempt}):`,
                         err,
@@ -540,8 +584,9 @@ export async function downloadFiledDocuments(
                     documentType: doc.documentType ?? null,
                     documentName: doc.documentName,
                     downloadUrl: doc.downloadUrl,
-                    reason: `MiFILE: failed to download a valid PDF after ${maxRetries} attempts`,
+                    reason: `MiFILE: failed after ${maxRetries} immediate attempt(s). Last error: ${lastFailureReason}`,
                     downloadAttempts,
+                    attemptLog,
                 });
                 continue; // не удалось получить валидный PDF – не грузим в OneDrive
             }
@@ -606,12 +651,20 @@ export async function downloadFiledDocuments(
             console.log(`✅ MiFILE документ загружен в OneDrive: ${logicalPath}`);
             } catch (error) {
                 console.error('Critical MiFILE document processing error:', error);
+                const reason = failureReason(error);
+                attemptLog.push({
+                    attempt: downloadAttempts,
+                    at: new Date().toISOString(),
+                    stage: buffer ? 'upload' : 'download',
+                    message: reason,
+                });
                 failures.push({
                     documentType: doc.documentType ?? null,
                     documentName: doc.documentName,
                     downloadUrl: doc.downloadUrl,
-                    reason: failureReason(error),
+                    reason,
                     downloadAttempts,
+                    attemptLog,
                 });
             }
         }

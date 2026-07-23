@@ -22,11 +22,21 @@ services:
       - key: WORKER_EMAIL_LIMIT
         value: "50"
       - key: ADMIN_AUTO_SYNC_MS
-        value: "30000"
+        value: "60000"
       - key: ADMIN_SYNC_EMAIL_LIMIT
-        value: "500"
-      - key: DOCUMENT_DOWNLOAD_ATTEMPTS
-        value: "12"
+        value: "100"
+      - key: DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS
+        value: "3"
+      - key: DOCUMENT_AUTO_RETRY_LIMIT
+        value: "6"
+      - key: DOCUMENT_RETRY_BATCH_SIZE
+        value: "2"
+      - key: DOCUMENT_RETRY_INITIAL_DELAY_MS
+        value: "900000"
+      - key: DOCUMENT_RETRY_MAX_DELAY_MS
+        value: "43200000"
+      - key: MIFILE_DOWNLOAD_TIMEOUT_MS
+        value: "90000"
       - key: TENANT_ID
         sync: false
       - key: CLIENT_ID
