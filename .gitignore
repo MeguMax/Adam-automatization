@@ -20,6 +20,8 @@ logs/
 *.log
 temp/
 tmp/
+data/*.sqlite
+data/*.sqlite-*
 .DS_Store
 
 # cache

@@ -340,3 +340,213 @@ test('document failure logs are preserved across automatic retry cycles', () => 
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
 });
+
+test('manual email retries are discoverable even when the source message is outside the recent inbox window', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-email-retry-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'old-message-for-retry',
+            subject: 'Old filing notification',
+            receivedDateTime: '2025-01-10T12:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Old filing</p>' },
+        });
+        db.markEmailProcessed(email.id);
+        db.queueEmailRetry(email.id, 'Manual admin retry');
+
+        assert.deepEqual(db.listQueuedEmailRetries(), [{
+            emailId: email.id,
+            externalMessageId: 'old-message-for-retry',
+        }]);
+
+        db.markEmailProcessing(email.id);
+        assert.throws(
+            () => db.queueEmailRetry(email.id),
+            /processing email cannot be queued again/,
+        );
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('global activity history supports related-email search, record filters, and pagination', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-activity-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'activity-message-id',
+            subject: 'Activity Needle Filing',
+            receivedDateTime: '2026-07-24T10:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Activity</p>' },
+        });
+        db.addDocument({
+            emailId: email.id,
+            sourceUrl: 'https://mifile.example/activity-document',
+            uploadSource: 'test',
+            status: 'failed',
+            errorMessage: 'Activity failure',
+        });
+        db.markEmailFailed(email.id, 'Activity failure');
+
+        const searched = db.listActivity({ search: 'needle' });
+        assert.ok(searched.totalItems >= 2);
+        assert.ok(searched.items.every(item => item.emailId === email.id));
+
+        const documents = db.listActivity({ entityType: 'document_record' });
+        assert.equal(documents.totalItems, 1);
+        assert.equal(documents.items[0].subject, 'Activity Needle Filing');
+
+        const firstPage = db.listActivity({ page: 1, pageSize: 10 });
+        assert.equal(firstPage.page, 1);
+        assert.ok(firstPage.totalItems >= 3);
+        assert.ok(firstPage.items.some(item => item.action === 'email_processing_failed'));
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('draft workspace supports listing, editable fields, validation, and reparse preservation', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-draft-workspace-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'draft-workspace-message',
+            subject: 'Draft workspace filing',
+            receivedDateTime: '2026-07-24T12:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Draft workspace</p>' },
+        });
+        const parsed: ParsedEmailInfo = {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: '26-01000-LT',
+            caseTitle: 'ORIGINAL PLAINTIFF V ORIGINAL DEFENDANT',
+            plaintiff: null,
+            defendant: null,
+            bundleNumber: '1000',
+            filerName: 'Adam Devlin',
+            submitterName: 'Adam Devlin',
+            filedAt: '7/24/2026',
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        };
+        const draftId = db.createCaseDraft(email.id, parsed);
+        const documentId = db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            currentFilename: 'filing.pdf',
+            oneDriveUrl: 'https://onedrive.example/draft-workspace',
+            mimeType: 'application/pdf',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+
+        const page = db.listDrafts({ search: '26-01000', pageSize: 10 });
+        assert.equal(page.totalItems, 1);
+        assert.equal(page.items[0].draftId, draftId);
+        assert.equal(page.items[0].viewableDocumentCount, 1);
+        assert.equal(page.items[0].plaintiff, 'ORIGINAL PLAINTIFF');
+
+        const initial = db.getDraftDetail(draftId);
+        assert.equal(initial?.caseDraft?.editableData.defendant, 'ORIGINAL DEFENDANT');
+        assert.equal(initial?.caseDraft?.fieldSources.defendant, 'derived');
+        assert.equal(
+            initial?.caseDraft?.filingData.caseType,
+            'LT - Landlord-Tenant Summary Proceedings',
+        );
+        assert.equal(initial?.caseDraft?.filingData.action, 'Initiate a new case');
+        assert.equal(initial?.caseDraft?.filingData.defendants.length, 1);
+
+        const updated = db.updateCaseDraft(
+            draftId,
+            {
+                courtName: 'Updated District Court',
+                plaintiff: 'MANUAL PLAINTIFF',
+                defendant: 'MANUAL DEFENDANT',
+            },
+            'Ready for legal review',
+            {
+                ...initial?.caseDraft?.filingData,
+                relatedCivilAction: 'none',
+                plaintiff: {
+                    ...initial?.caseDraft?.filingData.plaintiff,
+                    partyType: 'entity',
+                    entityName: 'MANUAL PLAINTIFF',
+                },
+                defendants: [
+                    {
+                        ...initial?.caseDraft?.filingData.defendants[0],
+                        partyType: 'person',
+                        displayName: null,
+                        firstName: 'MANUAL',
+                        lastName: 'DEFENDANT',
+                        address1: '100 Main Street',
+                        city: 'Wayne',
+                        state: 'MI',
+                        postalCode: '48184',
+                    },
+                    {
+                        id: 'defendant-2',
+                        partyType: 'person',
+                        firstName: 'SECOND',
+                        lastName: 'DEFENDANT',
+                        address1: '100 Main Street',
+                        city: 'Wayne',
+                        state: 'MI',
+                        postalCode: '48184',
+                    },
+                ],
+            },
+            [{
+                id: documentId,
+                filingName: 'Story Summons',
+                filingType: 'Summons, Landlord-Tenant/Land Contract',
+                filingSequence: 1,
+                requiredForFiling: true,
+            }],
+        );
+        assert.equal(updated.caseDraft?.editableData.courtName, 'Updated District Court');
+        assert.equal(updated.caseDraft?.fieldSources.courtName, 'manual');
+        assert.equal(updated.caseDraft?.reviewerNotes, 'Ready for legal review');
+        assert.equal(updated.caseDraft?.status, 'needs_review');
+        assert.equal(updated.caseDraft?.validationStatus, 'passed');
+        assert.equal(updated.caseDraft?.filingData.defendants.length, 2);
+        assert.equal(updated.caseDraft?.editableData.defendant, 'MANUAL DEFENDANT, SECOND DEFENDANT');
+        assert.equal(updated.documents[0].filingName, 'Story Summons');
+        assert.equal(
+            updated.documents[0].filingType,
+            'Summons, Landlord-Tenant/Land Contract',
+        );
+        assert.equal(updated.documents[0].filingTypeSource, 'manual');
+        assert.equal(updated.documents[0].requiredForFiling, true);
+
+        db.createCaseDraft(email.id, {
+            ...parsed,
+            courtName: 'Court name from reparsed email',
+            bundleNumber: '2000',
+        });
+        const reparsed = db.getDraftDetail(draftId);
+        assert.equal(reparsed?.caseDraft?.editableData.courtName, 'Updated District Court');
+        assert.equal(reparsed?.caseDraft?.editableData.bundleNumber, '2000');
+        assert.equal(reparsed?.caseDraft?.fieldSources.courtName, 'manual');
+        assert.equal(reparsed?.caseDraft?.filingData.defendants.length, 2);
+        assert.equal(reparsed?.caseDraft?.filingData.relatedCivilAction, 'none');
+
+        assert.deepEqual(db.getDocumentAccess(documentId), {
+            id: documentId,
+            oneDriveUrl: 'https://onedrive.example/draft-workspace',
+            currentFilename: 'filing.pdf',
+            mimeType: 'application/pdf',
+        });
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});

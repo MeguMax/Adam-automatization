@@ -1,4 +1,4 @@
-import { Client } from '@microsoft/microsoft-graph-client';
+import { Client, ResponseType } from '@microsoft/microsoft-graph-client';
 import { ClientSecretCredential } from '@azure/identity';
 import 'isomorphic-fetch';
 
@@ -103,6 +103,17 @@ export async function renameDriveItem(
 }
 
 // создать/найти подпапку по имени (например "25-08830-LT - ...")
+export async function downloadDriveItemBuffer(
+    driveId: string,
+    itemId: string,
+): Promise<Buffer> {
+    const content = await oneDriveClient
+        .api(`/drives/${driveId}/items/${itemId}/content`)
+        .responseType(ResponseType.ARRAYBUFFER)
+        .get();
+    return Buffer.from(content);
+}
+
 export async function ensureChildFolder(
     driveId: string,
     parentItemId: string,

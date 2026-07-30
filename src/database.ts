@@ -214,6 +214,116 @@ export interface QueuePage {
     totalPages: number;
 }
 
+export interface DraftListOptions {
+    page?: number;
+    pageSize?: number;
+    status?: CaseDraftStatus | '';
+    validationStatus?: ValidationStatus | '';
+    search?: string;
+    dateFrom?: string | null;
+    dateTo?: string | null;
+}
+
+export interface DraftListItem {
+    draftId: string;
+    emailId: string;
+    subject: string | null;
+    sender: string | null;
+    receivedAt: string | null;
+    caseNumber: string | null;
+    caseTitle: string | null;
+    plaintiff: string | null;
+    defendant: string | null;
+    status: CaseDraftStatus;
+    validationStatus: ValidationStatus;
+    filingStatus: FilingStatus;
+    documentCount: number;
+    viewableDocumentCount: number;
+    failedDocumentCount: number;
+    updatedAt: string;
+}
+
+export interface DraftPage {
+    items: DraftListItem[];
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    totalPages: number;
+}
+
+export interface DraftValidationIssue {
+    field: string;
+    severity: 'error' | 'warning';
+    message: string;
+}
+
+export type DraftFieldSource = 'email' | 'manual' | 'derived' | 'empty';
+
+export type DraftPartyType = 'person' | 'entity';
+export type RelatedCivilAction = 'none' | 'previously_filed' | 'unknown';
+
+export interface DraftParty {
+    id: string;
+    partyType: DraftPartyType;
+    displayName: string | null;
+    entityName: string | null;
+    firstName: string | null;
+    middleName: string | null;
+    lastName: string | null;
+    suffix: string | null;
+    address1: string | null;
+    address2: string | null;
+    city: string | null;
+    state: string | null;
+    postalCode: string | null;
+    phone: string | null;
+    email: string | null;
+}
+
+export interface DraftAttorney {
+    name: string | null;
+    barNumber: string | null;
+    address1: string | null;
+    address2: string | null;
+    city: string | null;
+    state: string | null;
+    postalCode: string | null;
+    phone: string | null;
+    email: string | null;
+}
+
+export interface DraftFilingData {
+    courtDistrict: string | null;
+    action: string | null;
+    caseType: string | null;
+    relatedCivilAction: RelatedCivilAction;
+    relatedCaseCourt: string | null;
+    relatedCaseDocketNumber: string | null;
+    relatedCaseJudge: string | null;
+    relatedCasePending: boolean | null;
+    claimAmount: string | null;
+    mailingRequested: boolean;
+    includeAllOtherOccupants: boolean;
+    plaintiff: DraftParty;
+    defendants: DraftParty[];
+    attorney: DraftAttorney;
+}
+
+export interface DraftDocumentFilingUpdate {
+    id: string;
+    filingName?: unknown;
+    filingType?: unknown;
+    filingSequence?: unknown;
+    requiredForFiling?: unknown;
+}
+
+export interface DraftDocumentAccess {
+    id: string;
+    oneDriveUrl: string;
+    currentFilename: string | null;
+    mimeType: string | null;
+}
+
 export interface EmailDeleteResult {
     emailRecords: number;
     caseDrafts: number;
@@ -239,6 +349,11 @@ export interface DocumentRecordView {
     mimeType: string | null;
     fileSize: number | null;
     documentType: string | null;
+    filingName: string | null;
+    filingType: string | null;
+    filingTypeSource: 'suggested' | 'manual' | null;
+    filingSequence: number | null;
+    requiredForFiling: boolean;
     uploadSource: string;
     status: string;
     errorMessage: string | null;
@@ -267,6 +382,36 @@ export interface AuditLogView {
     createdAt: string;
 }
 
+export interface ActivityLogItem extends AuditLogView {
+    emailId: string | null;
+    subject: string | null;
+    sender: string | null;
+    oldValueJson: string | null;
+    newValueJson: string | null;
+}
+
+export interface ActivityListOptions {
+    page?: number;
+    pageSize?: number;
+    entityType?: string;
+    search?: string;
+    dateFrom?: string | null;
+    dateTo?: string | null;
+}
+
+export interface ActivityPage {
+    items: ActivityLogItem[];
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    totalPages: number;
+}
+
+export interface QueuedEmailRetry {
+    emailId: string;
+    externalMessageId: string;
+}
+
 export interface EmailDetail {
     email: {
         id: string;
@@ -293,6 +438,10 @@ export interface EmailDetail {
         normalizedDataJson: string | null;
         reviewerNotes: string | null;
         reviewedAt: string | null;
+        editableData: Record<string, string | null>;
+        filingData: DraftFilingData;
+        fieldSources: Record<string, DraftFieldSource>;
+        validationIssues: DraftValidationIssue[];
         createdAt: string;
         updatedAt: string;
     } | null;
@@ -428,6 +577,406 @@ function plaintiffFromCaseTitle(caseTitle: string | null | undefined): string | 
 
 function extractPlaintiffName(data: any): string | null {
     return normalizeName(data?.plaintiff) || plaintiffFromCaseTitle(data?.caseTitle);
+}
+
+const EDITABLE_DRAFT_FIELDS = [
+    'courtName',
+    'caseNumber',
+    'caseTitle',
+    'plaintiff',
+    'defendant',
+    'bundleNumber',
+    'filerName',
+    'submitterName',
+    'temporaryCaseNumber',
+    'newCaseNumber',
+    'filedAt',
+] as const;
+
+type EditableDraftField = typeof EDITABLE_DRAFT_FIELDS[number];
+
+function editableDraftValue(value: unknown): string | null {
+    if (value === undefined || value === null) return null;
+    const normalized = String(value).replace(/\s+/g, ' ').trim();
+    return normalized || null;
+}
+
+function boundedDraftValue(value: unknown, field: string, limit = 1000): string | null {
+    const normalized = editableDraftValue(value);
+    if (normalized && normalized.length > limit) {
+        throw new Error(`${field} must be ${limit} characters or fewer`);
+    }
+    return normalized;
+}
+
+function partiesFromCaseTitle(caseTitle: unknown): {
+    plaintiff: string | null;
+    defendant: string | null;
+} {
+    const normalized = editableDraftValue(caseTitle);
+    if (!normalized) return { plaintiff: null, defendant: null };
+    const match = normalized.match(/^(.+?)\s+v(?:\.|s\.?)?\s+(.+)$/i);
+    return {
+        plaintiff: editableDraftValue(match?.[1]),
+        defendant: editableDraftValue(match?.[2]),
+    };
+}
+
+function inferCourtDistrict(courtName: unknown): string | null {
+    const normalized = editableDraftValue(courtName);
+    if (!normalized) return null;
+    const match = normalized.match(/\b(\d{1,3}[A-Z]?)(?:st|nd|rd|th)?\s+District\b/i);
+    return match?.[1] ?? null;
+}
+
+function inferCaseType(data: Record<string, unknown>): string | null {
+    const explicit = editableDraftValue(data.caseType);
+    if (explicit) return explicit;
+    const caseNumber = editableDraftValue(
+        data.newCaseNumber ?? data.caseNumber ?? data.temporaryCaseNumber,
+    );
+    if (caseNumber && /(?:^|[-\s])LT(?:$|[-\s])/i.test(caseNumber)) {
+        return 'LT - Landlord-Tenant Summary Proceedings';
+    }
+    return null;
+}
+
+function draftPartyName(party: DraftParty): string | null {
+    if (party.partyType === 'entity') {
+        return party.entityName || party.displayName;
+    }
+    const personName = [party.firstName, party.middleName, party.lastName, party.suffix]
+        .filter(Boolean)
+        .join(' ');
+    return editableDraftValue(personName) || party.displayName;
+}
+
+function emptyDraftParty(id: string, partyType: DraftPartyType): DraftParty {
+    return {
+        id,
+        partyType,
+        displayName: null,
+        entityName: null,
+        firstName: null,
+        middleName: null,
+        lastName: null,
+        suffix: null,
+        address1: null,
+        address2: null,
+        city: null,
+        state: null,
+        postalCode: null,
+        phone: null,
+        email: null,
+    };
+}
+
+function sanitizeDraftParty(
+    input: unknown,
+    fallbackId: string,
+    fallbackType: DraftPartyType,
+): DraftParty {
+    const source = input && typeof input === 'object' && !Array.isArray(input)
+        ? input as Record<string, unknown>
+        : {};
+    const partyType: DraftPartyType = source.partyType === 'person' || source.partyType === 'entity'
+        ? source.partyType
+        : fallbackType;
+    return {
+        id: boundedDraftValue(source.id, 'party.id', 100) || fallbackId,
+        partyType,
+        displayName: boundedDraftValue(source.displayName, 'party.displayName', 300),
+        entityName: boundedDraftValue(source.entityName, 'party.entityName', 300),
+        firstName: boundedDraftValue(source.firstName, 'party.firstName', 150),
+        middleName: boundedDraftValue(source.middleName, 'party.middleName', 150),
+        lastName: boundedDraftValue(source.lastName, 'party.lastName', 150),
+        suffix: boundedDraftValue(source.suffix, 'party.suffix', 50),
+        address1: boundedDraftValue(source.address1, 'party.address1', 300),
+        address2: boundedDraftValue(source.address2, 'party.address2', 150),
+        city: boundedDraftValue(source.city, 'party.city', 150),
+        state: boundedDraftValue(source.state, 'party.state', 50),
+        postalCode: boundedDraftValue(source.postalCode, 'party.postalCode', 30),
+        phone: boundedDraftValue(source.phone, 'party.phone', 50),
+        email: boundedDraftValue(source.email, 'party.email', 254),
+    };
+}
+
+function sanitizeDraftAttorney(input: unknown, fallbackName: unknown): DraftAttorney {
+    const source = input && typeof input === 'object' && !Array.isArray(input)
+        ? input as Record<string, unknown>
+        : {};
+    return {
+        name: boundedDraftValue(source.name ?? fallbackName, 'attorney.name', 300),
+        barNumber: boundedDraftValue(source.barNumber, 'attorney.barNumber', 80),
+        address1: boundedDraftValue(source.address1, 'attorney.address1', 300),
+        address2: boundedDraftValue(source.address2, 'attorney.address2', 150),
+        city: boundedDraftValue(source.city, 'attorney.city', 150),
+        state: boundedDraftValue(source.state, 'attorney.state', 50),
+        postalCode: boundedDraftValue(source.postalCode, 'attorney.postalCode', 30),
+        phone: boundedDraftValue(source.phone, 'attorney.phone', 50),
+        email: boundedDraftValue(source.email, 'attorney.email', 254),
+    };
+}
+
+function draftFilingData(data: unknown): DraftFilingData {
+    const root = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : {};
+    const source = root.filingData && typeof root.filingData === 'object' &&
+        !Array.isArray(root.filingData)
+        ? root.filingData as Record<string, unknown>
+        : {};
+    const titleParties = partiesFromCaseTitle(root.caseTitle);
+    const plaintiffName = editableDraftValue(root.plaintiff) || titleParties.plaintiff;
+    const defendantName = editableDraftValue(root.defendant) || titleParties.defendant;
+    const plaintiffInput = source.plaintiff && typeof source.plaintiff === 'object'
+        ? source.plaintiff
+        : {
+            partyType: 'entity',
+            entityName: plaintiffName,
+            displayName: plaintiffName,
+        };
+    const rawDefendants = Array.isArray(source.defendants)
+        ? source.defendants
+        : defendantName
+            ? [{
+                partyType: 'person',
+                displayName: defendantName,
+            }]
+            : [];
+    const relatedCivilAction: RelatedCivilAction =
+        source.relatedCivilAction === 'none' ||
+        source.relatedCivilAction === 'previously_filed'
+            ? source.relatedCivilAction
+            : 'unknown';
+    const relatedCasePending = typeof source.relatedCasePending === 'boolean'
+        ? source.relatedCasePending
+        : null;
+    const claimAmount = boundedDraftValue(source.claimAmount, 'claimAmount', 50);
+    if (claimAmount && !/^\d+(?:\.\d{1,2})?$/.test(claimAmount.replace(/[$,\s]/g, ''))) {
+        throw new Error('Claim amount must be a valid non-negative amount');
+    }
+
+    return {
+        courtDistrict: boundedDraftValue(
+            source.courtDistrict ?? inferCourtDistrict(root.courtName),
+            'courtDistrict',
+            20,
+        ),
+        action: boundedDraftValue(
+            source.action ?? 'Initiate a new case',
+            'action',
+            150,
+        ),
+        caseType: boundedDraftValue(
+            source.caseType ?? inferCaseType(root),
+            'caseType',
+            250,
+        ),
+        relatedCivilAction,
+        relatedCaseCourt: boundedDraftValue(source.relatedCaseCourt, 'relatedCaseCourt', 300),
+        relatedCaseDocketNumber: boundedDraftValue(
+            source.relatedCaseDocketNumber,
+            'relatedCaseDocketNumber',
+            150,
+        ),
+        relatedCaseJudge: boundedDraftValue(source.relatedCaseJudge, 'relatedCaseJudge', 200),
+        relatedCasePending,
+        claimAmount: claimAmount ? claimAmount.replace(/[$,\s]/g, '') : null,
+        mailingRequested: typeof source.mailingRequested === 'boolean'
+            ? source.mailingRequested
+            : true,
+        includeAllOtherOccupants: source.includeAllOtherOccupants === true,
+        plaintiff: sanitizeDraftParty(plaintiffInput, 'plaintiff-1', 'entity'),
+        defendants: rawDefendants
+            .slice(0, 50)
+            .map((party, index) =>
+                sanitizeDraftParty(party, `defendant-${index + 1}`, 'person')),
+        attorney: sanitizeDraftAttorney(source.attorney, root.filerName ?? root.submitterName),
+    };
+}
+
+function draftEditableData(data: unknown): Record<EditableDraftField, string | null> {
+    const source = data && typeof data === 'object'
+        ? data as Record<string, unknown>
+        : {};
+    const titleParties = partiesFromCaseTitle(source.caseTitle);
+    const result = {} as Record<EditableDraftField, string | null>;
+    for (const field of EDITABLE_DRAFT_FIELDS) {
+        const direct = editableDraftValue(source[field]);
+        result[field] = direct ??
+            (field === 'plaintiff' ? titleParties.plaintiff : null) ??
+            (field === 'defendant' ? titleParties.defendant : null);
+    }
+    return result;
+}
+
+function draftFieldSources(
+    extracted: unknown,
+    normalized: unknown,
+): Record<EditableDraftField, DraftFieldSource> {
+    const original = draftEditableData(extracted);
+    const current = draftEditableData(normalized);
+    const normalizedObject = normalized && typeof normalized === 'object'
+        ? normalized as Record<string, unknown>
+        : {};
+    const sources = {} as Record<EditableDraftField, DraftFieldSource>;
+
+    for (const field of EDITABLE_DRAFT_FIELDS) {
+        if (!current[field]) {
+            sources[field] = 'empty';
+        } else if (
+            (field === 'plaintiff' || field === 'defendant') &&
+            !editableDraftValue(normalizedObject[field])
+        ) {
+            sources[field] = 'derived';
+        } else if (current[field] !== original[field]) {
+            sources[field] = 'manual';
+        } else {
+            sources[field] = 'email';
+        }
+    }
+    return sources;
+}
+
+function validateDraftData(data: unknown): DraftValidationIssue[] {
+    const values = draftEditableData(data);
+    const filing = draftFilingData(data);
+    const issues: DraftValidationIssue[] = [];
+    if (!values.courtName) {
+        issues.push({
+            field: 'courtName',
+            severity: 'warning',
+            message: 'Court name was not extracted.',
+        });
+    }
+    if (!values.caseNumber && !values.newCaseNumber && !values.temporaryCaseNumber) {
+        issues.push({
+            field: 'caseNumber',
+            severity: 'error',
+            message: 'A case number or temporary case number is required.',
+        });
+    }
+    if (!values.caseTitle) {
+        issues.push({
+            field: 'caseTitle',
+            severity: 'warning',
+            message: 'Case title was not extracted.',
+        });
+    }
+    if (!values.plaintiff) {
+        issues.push({
+            field: 'plaintiff',
+            severity: 'warning',
+            message: 'Plaintiff was not extracted and could not be derived from the case title.',
+        });
+    }
+    if (!values.defendant) {
+        issues.push({
+            field: 'defendant',
+            severity: 'warning',
+            message: 'Defendant was not extracted and could not be derived from the case title.',
+        });
+    }
+    if (!filing.caseType) {
+        issues.push({
+            field: 'filingData.caseType',
+            severity: 'warning',
+            message: 'Select the MiFILE case type.',
+        });
+    }
+    if (filing.relatedCivilAction === 'unknown') {
+        issues.push({
+            field: 'filingData.relatedCivilAction',
+            severity: 'warning',
+            message: 'Confirm whether a related civil action exists.',
+        });
+    }
+    if (!draftPartyName(filing.plaintiff)) {
+        issues.push({
+            field: 'filingData.plaintiff',
+            severity: 'warning',
+            message: 'Complete the Plaintiff party information.',
+        });
+    }
+    if (!filing.defendants.length) {
+        issues.push({
+            field: 'filingData.defendants',
+            severity: 'warning',
+            message: 'Add at least one Defendant.',
+        });
+    }
+    filing.defendants.forEach((party, index) => {
+        if (!draftPartyName(party)) {
+            issues.push({
+                field: `filingData.defendants.${index}`,
+                severity: 'warning',
+                message: `Complete the name for Defendant ${index + 1}.`,
+            });
+        }
+    });
+    return issues;
+}
+
+export const MIFILE_FILING_TYPES = [
+    'Advice of Rights and Information (Landlord-Tenant)',
+    'Local Rental and Housing Information',
+    'Complaint for Possession and Supplemental Money Judgment (Fee Varies)',
+    'Complaint for Possession Only',
+    'Other',
+    'Request for Court Mailing and Record (Landlord-Tenant)',
+    'Summons, Landlord-Tenant/Land Contract',
+] as const;
+
+function suggestMiFileFilingType(
+    documentType: string | null | undefined,
+    filename: string | null | undefined,
+): string | null {
+    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    if (!value.trim()) return null;
+    if (value.includes('advice')) return MIFILE_FILING_TYPES[0];
+    if (value.includes('local')) return MIFILE_FILING_TYPES[1];
+    if (value.includes('complaint')) {
+        if (value.includes('possession only')) return MIFILE_FILING_TYPES[3];
+        return MIFILE_FILING_TYPES[2];
+    }
+    if (value.includes('demand')) return MIFILE_FILING_TYPES[4];
+    if (value.includes('request')) return MIFILE_FILING_TYPES[5];
+    if (value.includes('summons')) return MIFILE_FILING_TYPES[6];
+    if (value.includes('connected filing')) return MIFILE_FILING_TYPES[4];
+    return null;
+}
+
+function validateDraftDocuments(documents: DocumentRecordView[]): DraftValidationIssue[] {
+    const issues: DraftValidationIssue[] = [];
+    for (const document of documents) {
+        if (!document.requiredForFiling || document.status === 'not_downloadable') continue;
+        if (['failed', 'invalid'].includes(document.status)) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${document.currentFilename || document.documentType || 'Document'} is not ready.`,
+            });
+            continue;
+        }
+        if (['pending', 'retry_queued', 'retrying'].includes(document.status)) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${document.currentFilename || document.documentType || 'Document'} is still processing.`,
+            });
+        }
+        if (!document.filingType) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `Select a MiFILE Filing Type for ${
+                    document.currentFilename || document.documentType || 'the document'
+                }.`,
+            });
+        }
+    }
+    return issues;
 }
 
 function filenameToken(value: string): string {
@@ -834,6 +1383,50 @@ const migrations: Migration[] = [
             `);
         },
     },
+    {
+        version: 10,
+        name: 'add_mifile_document_metadata',
+        up: db => {
+            const columns = db
+                .prepare('PRAGMA table_info(document_records)')
+                .all() as Array<{ name: string }>;
+            const names = new Set(columns.map(column => column.name));
+
+            if (!names.has('filing_name')) {
+                db.exec('ALTER TABLE document_records ADD COLUMN filing_name TEXT');
+            }
+            if (!names.has('filing_type')) {
+                db.exec('ALTER TABLE document_records ADD COLUMN filing_type TEXT');
+            }
+            if (!names.has('filing_type_source')) {
+                db.exec('ALTER TABLE document_records ADD COLUMN filing_type_source TEXT');
+            }
+            if (!names.has('filing_sequence')) {
+                db.exec('ALTER TABLE document_records ADD COLUMN filing_sequence INTEGER');
+            }
+            if (!names.has('required_for_filing')) {
+                db.exec(
+                    'ALTER TABLE document_records ADD COLUMN required_for_filing INTEGER NOT NULL DEFAULT 0',
+                );
+            }
+
+            db.exec(`
+                UPDATE document_records
+                SET required_for_filing = 0
+                WHERE upload_source IN (
+                    'parsed_email',
+                    'processing_report',
+                    'mifile_download',
+                    'document_retry',
+                    'retry'
+                )
+                   OR status = 'not_downloadable';
+
+                CREATE INDEX IF NOT EXISTS idx_documents_filing_sequence
+                    ON document_records(case_draft_id, filing_sequence, created_at);
+            `);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -1061,6 +1654,31 @@ export class WorkflowDatabase {
     }
 
     queueEmailRetry(emailId: string, reason?: string): void {
+        const existing = this.db
+            .prepare(`
+                SELECT id, processing_status
+                FROM email_records
+                WHERE id = ?
+            `)
+            .get(emailId) as { id: string; processing_status: EmailProcessingStatus } | undefined;
+        if (!existing) throw new Error('Email record not found');
+        if (existing.processing_status === 'processing') {
+            throw new Error('A processing email cannot be queued again');
+        }
+
+        const activeRetry = this.db
+            .prepare(`
+                SELECT 1
+                FROM document_records
+                WHERE email_id = ?
+                  AND status IN ('retry_queued', 'retrying')
+                LIMIT 1
+            `)
+            .get(emailId);
+        if (activeRetry) {
+            throw new Error('This email already has an active document retry');
+        }
+
         const timestamp = nowIso();
         this.db
             .prepare(`
@@ -1072,6 +1690,31 @@ export class WorkflowDatabase {
             `)
             .run(timestamp, emailId);
         this.insertAuditLog('email_record', emailId, 'email_retry_queued', { reason });
+    }
+
+    listQueuedEmailRetries(limit = 25): QueuedEmailRetry[] {
+        const safeLimit = Math.min(Math.max(Math.floor(limit), 1), 200);
+        const rows = this.db
+            .prepare(`
+                SELECT e.id, e.external_message_id
+                FROM email_records e
+                WHERE e.processing_status = 'new'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM audit_logs a
+                    WHERE a.entity_type = 'email_record'
+                      AND a.entity_id = e.id
+                      AND a.action = 'email_retry_queued'
+                  )
+                ORDER BY e.updated_at, e.id
+                LIMIT ?
+            `)
+            .all(safeLimit) as Array<{ id: string; external_message_id: string }>;
+
+        return rows.map(row => ({
+            emailId: row.id,
+            externalMessageId: row.external_message_id,
+        }));
     }
 
     getDocumentRetryPolicy(): { maxAutomaticRetries: number } {
@@ -2226,6 +2869,242 @@ export class WorkflowDatabase {
         };
     }
 
+    listDrafts(options: DraftListOptions = {}): DraftPage {
+        const pageSize = Math.min(Math.max(Math.floor(options.pageSize ?? 25), 10), 100);
+        const requestedPage = Math.max(Math.floor(options.page ?? 1), 1);
+        const whereParts = ['1 = 1'];
+        const parameters: Array<string | number> = [];
+
+        if (options.status) {
+            whereParts.push('c.status = ?');
+            parameters.push(options.status);
+        }
+        if (options.validationStatus) {
+            whereParts.push('c.validation_status = ?');
+            parameters.push(options.validationStatus);
+        }
+
+        const search = options.search?.trim();
+        if (search) {
+            const pattern = `%${search}%`;
+            whereParts.push(`(
+                e.subject LIKE ? COLLATE NOCASE
+                OR e.sender LIKE ? COLLATE NOCASE
+                OR c.normalized_data_json LIKE ? COLLATE NOCASE
+            )`);
+            parameters.push(pattern, pattern, pattern);
+        }
+        if (options.dateFrom) {
+            whereParts.push('COALESCE(e.received_at, e.created_at) >= ?');
+            parameters.push(options.dateFrom);
+        }
+        if (options.dateTo) {
+            whereParts.push('COALESCE(e.received_at, e.created_at) < ?');
+            parameters.push(options.dateTo);
+        }
+
+        const whereSql = whereParts.join('\n AND ');
+        const countRow = this.db
+            .prepare(`
+                SELECT COUNT(*) AS total
+                FROM case_drafts c
+                JOIN email_records e ON e.id = c.email_id
+                WHERE ${whereSql}
+            `)
+            .get(...parameters) as { total: number };
+        const totalItems = Number(countRow.total ?? 0);
+        const totalPages = Math.max(Math.ceil(totalItems / pageSize), 1);
+        const page = Math.min(requestedPage, totalPages);
+        const offset = (page - 1) * pageSize;
+
+        const rows = this.db
+            .prepare(`
+                SELECT
+                    c.id AS draft_id,
+                    c.email_id,
+                    c.status,
+                    c.validation_status,
+                    c.filing_status,
+                    c.normalized_data_json,
+                    c.updated_at,
+                    e.subject,
+                    e.sender,
+                    e.received_at,
+                    COUNT(d.id) AS document_count,
+                    SUM(CASE WHEN d.one_drive_url IS NOT NULL THEN 1 ELSE 0 END)
+                        AS viewable_document_count,
+                    SUM(CASE WHEN d.status IN ('failed', 'invalid') THEN 1 ELSE 0 END)
+                        AS failed_document_count
+                FROM case_drafts c
+                JOIN email_records e ON e.id = c.email_id
+                LEFT JOIN document_records d
+                  ON d.case_draft_id = c.id
+                 AND d.is_active = 1
+                WHERE ${whereSql}
+                GROUP BY c.id, e.id
+                ORDER BY
+                    CASE
+                        WHEN c.status IN ('validation_failed', 'needs_review', 'filing_failed') THEN 0
+                        WHEN c.status = 'parsed' THEN 1
+                        WHEN c.status = 'ready_to_file' THEN 2
+                        ELSE 3
+                    END,
+                    COALESCE(e.received_at, e.created_at) DESC
+                LIMIT ? OFFSET ?
+            `)
+            .all(...parameters, pageSize, offset) as any[];
+
+        return {
+            items: rows.map(row => {
+                const normalized = this.safeJson(row.normalized_data_json);
+                const values = draftEditableData(normalized);
+                return {
+                    draftId: row.draft_id,
+                    emailId: row.email_id,
+                    subject: row.subject,
+                    sender: row.sender,
+                    receivedAt: row.received_at,
+                    caseNumber:
+                        values.caseNumber ||
+                        values.newCaseNumber ||
+                        values.temporaryCaseNumber,
+                    caseTitle: values.caseTitle,
+                    plaintiff: values.plaintiff,
+                    defendant: values.defendant,
+                    status: row.status,
+                    validationStatus: row.validation_status,
+                    filingStatus: row.filing_status,
+                    documentCount: Number(row.document_count ?? 0),
+                    viewableDocumentCount: Number(row.viewable_document_count ?? 0),
+                    failedDocumentCount: Number(row.failed_document_count ?? 0),
+                    updatedAt: row.updated_at,
+                };
+            }),
+            page,
+            pageSize,
+            totalItems,
+            totalPages,
+        };
+    }
+
+    listActivity(options: ActivityListOptions = {}): ActivityPage {
+        const pageSize = Math.min(Math.max(Math.floor(options.pageSize ?? 50), 10), 200);
+        const requestedPage = Math.max(Math.floor(options.page ?? 1), 1);
+        const whereParts = ['1 = 1'];
+        const parameters: Array<string | number> = [];
+
+        const entityType = options.entityType?.trim();
+        if (entityType) {
+            whereParts.push('a.entity_type = ?');
+            parameters.push(entityType);
+        }
+
+        const search = options.search?.trim();
+        if (search) {
+            const pattern = `%${search}%`;
+            whereParts.push(`(
+                a.action LIKE ? COLLATE NOCASE
+                OR a.entity_type LIKE ? COLLATE NOCASE
+                OR a.metadata_json LIKE ? COLLATE NOCASE
+                OR related_email.subject LIKE ? COLLATE NOCASE
+                OR related_email.sender LIKE ? COLLATE NOCASE
+            )`);
+            parameters.push(pattern, pattern, pattern, pattern, pattern);
+        }
+
+        if (options.dateFrom) {
+            whereParts.push('a.created_at >= ?');
+            parameters.push(options.dateFrom);
+        }
+        if (options.dateTo) {
+            whereParts.push('a.created_at < ?');
+            parameters.push(options.dateTo);
+        }
+
+        const joins = `
+            LEFT JOIN email_records direct_email
+              ON a.entity_type = 'email_record'
+             AND direct_email.id = a.entity_id
+            LEFT JOIN case_drafts related_draft
+              ON a.entity_type = 'case_draft'
+             AND related_draft.id = a.entity_id
+            LEFT JOIN document_records related_document
+              ON a.entity_type = 'document_record'
+             AND related_document.id = a.entity_id
+            LEFT JOIN filing_jobs related_job
+              ON a.entity_type = 'filing_job'
+             AND related_job.id = a.entity_id
+            LEFT JOIN case_drafts filing_draft
+              ON filing_draft.id = related_job.case_draft_id
+            LEFT JOIN email_records related_email
+              ON related_email.id = COALESCE(
+                direct_email.id,
+                related_draft.email_id,
+                related_document.email_id,
+                filing_draft.email_id
+              )
+        `;
+        const whereSql = whereParts.join('\n AND ');
+        const countRow = this.db
+            .prepare(`
+                SELECT COUNT(*) AS total
+                FROM audit_logs a
+                ${joins}
+                WHERE ${whereSql}
+            `)
+            .get(...parameters) as { total: number };
+        const totalItems = Number(countRow.total ?? 0);
+        const totalPages = Math.max(Math.ceil(totalItems / pageSize), 1);
+        const page = Math.min(requestedPage, totalPages);
+        const offset = (page - 1) * pageSize;
+
+        const rows = this.db
+            .prepare(`
+                SELECT
+                    a.id,
+                    a.entity_type,
+                    a.entity_id,
+                    a.action,
+                    a.actor_type,
+                    a.actor_id,
+                    a.old_value_json,
+                    a.new_value_json,
+                    a.metadata_json,
+                    a.created_at,
+                    related_email.id AS email_id,
+                    related_email.subject,
+                    related_email.sender
+                FROM audit_logs a
+                ${joins}
+                WHERE ${whereSql}
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT ? OFFSET ?
+            `)
+            .all(...parameters, pageSize, offset) as any[];
+
+        return {
+            items: rows.map(row => ({
+                id: row.id,
+                entityType: row.entity_type,
+                entityId: row.entity_id,
+                action: row.action,
+                actorType: row.actor_type,
+                actorId: row.actor_id,
+                oldValueJson: row.old_value_json,
+                newValueJson: row.new_value_json,
+                metadataJson: row.metadata_json,
+                createdAt: row.created_at,
+                emailId: row.email_id,
+                subject: row.subject,
+                sender: row.sender,
+            })),
+            page,
+            pageSize,
+            totalItems,
+            totalPages,
+        };
+    }
+
     countDeletableEmailsBefore(cutoff: string): number {
         const row = this.db
             .prepare(`
@@ -2396,6 +3275,11 @@ export class WorkflowDatabase {
                     mime_type,
                     file_size,
                     document_type,
+                    filing_name,
+                    filing_type,
+                    filing_type_source,
+                    filing_sequence,
+                    required_for_filing,
                     upload_source,
                     status,
                     error_message,
@@ -2442,6 +3326,57 @@ export class WorkflowDatabase {
                 : null,
         );
         const plaintiffFilenameMapping = this.getEmailPlaintiffFilenameMappingState(emailId);
+        const extractedDraftData = caseDraft
+            ? this.safeJson(caseDraft.extracted_data_json)
+            : null;
+        const normalizedDraftData = caseDraft
+            ? this.safeJson(caseDraft.normalized_data_json)
+            : null;
+        const documentViews: DocumentRecordView[] = documents.map(row => {
+            const suggestedFilingType = suggestMiFileFilingType(
+                row.document_type,
+                row.current_filename || row.original_filename,
+            );
+            return {
+                id: row.id,
+                originalFilename: row.original_filename,
+                currentFilename: row.current_filename,
+                fileUrl: row.file_url,
+                sourceUrl: row.source_url,
+                oneDriveUrl: row.one_drive_url,
+                storagePath: row.storage_path,
+                mimeType: row.mime_type,
+                fileSize: row.file_size === null ? null : Number(row.file_size),
+                documentType: row.document_type,
+                filingName: row.filing_name || row.current_filename || row.original_filename,
+                filingType: row.filing_type || suggestedFilingType,
+                filingTypeSource: row.filing_type
+                    ? (row.filing_type_source === 'manual' ? 'manual' : 'suggested')
+                    : suggestedFilingType
+                        ? 'suggested'
+                        : null,
+                filingSequence: row.filing_sequence === null
+                    ? null
+                    : Number(row.filing_sequence),
+                requiredForFiling: Number(row.required_for_filing ?? 0) === 1,
+                uploadSource: row.upload_source,
+                status: row.status,
+                errorMessage: row.error_message,
+                downloadAttempts: Number(row.download_attempts ?? 0),
+                automaticRetryCount: Number(row.automatic_retry_count ?? 0),
+                lastRetryAt: row.last_retry_at,
+                nextRetryAt: row.next_retry_at,
+                failureLog: failureLogFromMetadata(this.safeJson(row.metadata_json)),
+                createdAt: row.created_at,
+                updatedAt: row.updated_at,
+            };
+        });
+        const validationIssues = caseDraft
+            ? [
+                ...validateDraftData(normalizedDraftData),
+                ...validateDraftDocuments(documentViews),
+            ]
+            : [];
 
         return {
             email: {
@@ -2470,6 +3405,10 @@ export class WorkflowDatabase {
                     normalizedDataJson: caseDraft.normalized_data_json,
                     reviewerNotes: caseDraft.reviewer_notes,
                     reviewedAt: caseDraft.reviewed_at,
+                    editableData: draftEditableData(normalizedDraftData),
+                    filingData: draftFilingData(normalizedDraftData),
+                    fieldSources: draftFieldSources(extractedDraftData, normalizedDraftData),
+                    validationIssues,
                     createdAt: caseDraft.created_at,
                     updatedAt: caseDraft.updated_at,
                 }
@@ -2477,28 +3416,7 @@ export class WorkflowDatabase {
             plaintiffMapping,
             plaintiffFilenameMapping,
             retryPolicy: this.getDocumentRetryPolicy(),
-            documents: documents.map(row => ({
-                id: row.id,
-                originalFilename: row.original_filename,
-                currentFilename: row.current_filename,
-                fileUrl: row.file_url,
-                sourceUrl: row.source_url,
-                oneDriveUrl: row.one_drive_url,
-                storagePath: row.storage_path,
-                mimeType: row.mime_type,
-                fileSize: row.file_size === null ? null : Number(row.file_size),
-                documentType: row.document_type,
-                uploadSource: row.upload_source,
-                status: row.status,
-                errorMessage: row.error_message,
-                downloadAttempts: Number(row.download_attempts ?? 0),
-                automaticRetryCount: Number(row.automatic_retry_count ?? 0),
-                lastRetryAt: row.last_retry_at,
-                nextRetryAt: row.next_retry_at,
-                failureLog: failureLogFromMetadata(this.safeJson(row.metadata_json)),
-                createdAt: row.created_at,
-                updatedAt: row.updated_at,
-            })),
+            documents: documentViews,
             auditLogs: auditLogs.map(row => ({
                 id: row.id,
                 entityType: row.entity_type,
@@ -2512,24 +3430,339 @@ export class WorkflowDatabase {
         };
     }
 
+    getDraftDetail(caseDraftId: string): EmailDetail | null {
+        const row = this.db
+            .prepare('SELECT email_id FROM case_drafts WHERE id = ?')
+            .get(caseDraftId) as { email_id: string } | undefined;
+        return row ? this.getEmailDetail(row.email_id) : null;
+    }
+
+    updateCaseDraft(
+        caseDraftId: string,
+        fields: Record<string, unknown>,
+        reviewerNotes?: string,
+        filingDataInput?: unknown,
+        documentMappings: DraftDocumentFilingUpdate[] = [],
+    ): EmailDetail {
+        const existing = this.db
+            .prepare(`
+                SELECT
+                    email_id,
+                    status,
+                    validation_status,
+                    filing_status,
+                    normalized_data_json,
+                    reviewer_notes
+                FROM case_drafts
+                WHERE id = ?
+            `)
+            .get(caseDraftId) as
+            | {
+                email_id: string;
+                status: CaseDraftStatus;
+                validation_status: ValidationStatus;
+                filing_status: FilingStatus;
+                normalized_data_json: string | null;
+                reviewer_notes: string | null;
+            }
+            | undefined;
+        if (!existing) throw new Error('Case draft not found');
+        if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
+            throw new Error('Draft fields must be an object');
+        }
+        if (!Array.isArray(documentMappings)) {
+            throw new Error('Draft document mappings must be an array');
+        }
+        if (documentMappings.length > 200) {
+            throw new Error('A draft cannot update more than 200 documents at once');
+        }
+
+        const allowed = new Set<string>(EDITABLE_DRAFT_FIELDS);
+        const requestedFields = Object.keys(fields);
+        const invalidField = requestedFields.find(field => !allowed.has(field));
+        if (invalidField) throw new Error(`Draft field is not editable: ${invalidField}`);
+
+        const current = this.safeJson(existing.normalized_data_json);
+        const next = current && typeof current === 'object' && !Array.isArray(current)
+            ? { ...current }
+            : {};
+        const oldFields: Record<string, string | null> = {};
+        const newFields: Record<string, string | null> = {};
+
+        for (const field of requestedFields as EditableDraftField[]) {
+            const value = editableDraftValue(fields[field]);
+            if (value && value.length > 1000) {
+                throw new Error(`${field} must be 1000 characters or fewer`);
+            }
+            const previous = editableDraftValue(next[field]);
+            if (previous === value) continue;
+            oldFields[field] = previous;
+            newFields[field] = value;
+            next[field] = value;
+        }
+
+        const previousFilingData = draftFilingData(next);
+        const nextFilingData = filingDataInput === undefined
+            ? previousFilingData
+            : draftFilingData({
+                ...next,
+                filingData: filingDataInput,
+            });
+        const filingDataChanged =
+            JSON.stringify(previousFilingData) !== JSON.stringify(nextFilingData);
+        next.filingData = nextFilingData;
+
+        if (filingDataInput !== undefined) {
+            const plaintiffName = draftPartyName(nextFilingData.plaintiff);
+            const defendantNames = nextFilingData.defendants
+                .map(draftPartyName)
+                .filter((value): value is string => Boolean(value));
+            const compatibilityFields: Partial<Record<EditableDraftField, string | null>> = {
+                plaintiff: plaintiffName,
+                defendant: defendantNames.length ? defendantNames.join(', ') : null,
+                filerName: nextFilingData.attorney.name,
+            };
+            for (const [field, value] of Object.entries(compatibilityFields) as Array<
+                [EditableDraftField, string | null]
+            >) {
+                const previous = editableDraftValue(next[field]);
+                if (previous === value) continue;
+                oldFields[field] = previous;
+                newFields[field] = value;
+                next[field] = value;
+            }
+        }
+
+        const notes = reviewerNotes === undefined
+            ? existing.reviewer_notes
+            : reviewerNotes.trim().slice(0, 10_000) || null;
+        const issues = validateDraftData(next);
+        const validationStatus: ValidationStatus = issues.some(issue => issue.severity === 'error')
+            ? 'failed'
+            : issues.length > 0
+                ? 'warnings'
+                : 'passed';
+        const protectedStatuses = new Set<CaseDraftStatus>([
+            'filing_in_progress',
+            'filed_successfully',
+            'archived',
+        ]);
+        const changed =
+            Object.keys(newFields).length > 0 ||
+            filingDataChanged ||
+            documentMappings.length > 0;
+        const status = changed && !protectedStatuses.has(existing.status)
+            ? 'needs_review'
+            : existing.status;
+        const timestamp = nowIso();
+
+        const updatedDocumentIds: string[] = [];
+        this.runInTransaction(() => {
+            this.db
+                .prepare(`
+                    UPDATE case_drafts
+                    SET normalized_data_json = ?,
+                        reviewer_notes = ?,
+                        status = ?,
+                        validation_status = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                `)
+                .run(
+                    toJson(next),
+                    notes,
+                    status,
+                    validationStatus,
+                    timestamp,
+                    caseDraftId,
+                );
+
+            for (const [index, mapping] of documentMappings.entries()) {
+                const documentId = boundedDraftValue(mapping?.id, 'document.id', 100);
+                if (!documentId) throw new Error('Every document mapping requires an id');
+                const existingDocument = this.db
+                    .prepare(`
+                        SELECT id
+                        FROM document_records
+                        WHERE id = ?
+                          AND case_draft_id = ?
+                          AND is_active = 1
+                    `)
+                    .get(documentId, caseDraftId);
+                if (!existingDocument) {
+                    throw new Error(`Document does not belong to this draft: ${documentId}`);
+                }
+
+                const filingName = boundedDraftValue(
+                    mapping.filingName,
+                    'document.filingName',
+                    300,
+                );
+                const filingType = boundedDraftValue(
+                    mapping.filingType,
+                    'document.filingType',
+                    300,
+                );
+                const rawSequence = Number(mapping.filingSequence ?? index + 1);
+                const filingSequence = Number.isFinite(rawSequence)
+                    ? Math.min(Math.max(Math.floor(rawSequence), 0), 10_000)
+                    : index + 1;
+                const requiredForFiling = mapping.requiredForFiling !== false;
+
+                this.db
+                    .prepare(`
+                        UPDATE document_records
+                        SET filing_name = ?,
+                            filing_type = ?,
+                            filing_type_source = ?,
+                            filing_sequence = ?,
+                            required_for_filing = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                    `)
+                    .run(
+                        filingName,
+                        filingType,
+                        filingType ? 'manual' : null,
+                        filingSequence,
+                        requiredForFiling ? 1 : 0,
+                        timestamp,
+                        documentId,
+                    );
+                updatedDocumentIds.push(documentId);
+            }
+        });
+
+        const detailAfterUpdate = this.getEmailDetail(existing.email_id);
+        if (!detailAfterUpdate?.caseDraft) {
+            throw new Error('Draft email record not found after update');
+        }
+        const completeIssues = detailAfterUpdate.caseDraft.validationIssues;
+        const completeValidationStatus: ValidationStatus = completeIssues.some(
+            issue => issue.severity === 'error',
+        )
+            ? 'failed'
+            : completeIssues.length
+                ? 'warnings'
+                : 'passed';
+        if (completeValidationStatus !== validationStatus) {
+            this.db
+                .prepare(`
+                    UPDATE case_drafts
+                    SET validation_status = ?, updated_at = ?
+                    WHERE id = ?
+                `)
+                .run(completeValidationStatus, timestamp, caseDraftId);
+        }
+
+        this.insertAuditLog(
+            'case_draft',
+            caseDraftId,
+            changed ? 'draft_fields_updated' : 'draft_note_updated',
+            {
+                changedFields: Object.keys(newFields),
+                filingDataChanged,
+                updatedDocumentIds,
+                validationIssues: completeIssues,
+            },
+            {
+                fields: oldFields,
+                reviewerNotes: existing.reviewer_notes,
+                status: existing.status,
+                validationStatus: existing.validation_status,
+            },
+            {
+                fields: newFields,
+                filingData: filingDataChanged ? nextFilingData : undefined,
+                updatedDocumentIds,
+                reviewerNotes: notes,
+                status,
+                validationStatus: completeValidationStatus,
+            },
+        );
+
+        const detail = this.getEmailDetail(existing.email_id);
+        if (!detail) throw new Error('Draft email record not found');
+        return detail;
+    }
+
+    getDocumentAccess(documentId: string): DraftDocumentAccess | null {
+        const row = this.db
+            .prepare(`
+                SELECT id, one_drive_url, current_filename, mime_type
+                FROM document_records
+                WHERE id = ?
+                  AND is_active = 1
+                  AND one_drive_url IS NOT NULL
+            `)
+            .get(documentId) as any | undefined;
+        return row
+            ? {
+                id: row.id,
+                oneDriveUrl: row.one_drive_url,
+                currentFilename: row.current_filename,
+                mimeType: row.mime_type,
+            }
+            : null;
+    }
+
     createCaseDraft(emailId: string, parsed: ParsedEmailInfo): string {
         const parsedJson = toJson(parsed);
         this.ensurePlaintiffCandidateFromParsed(parsed);
 
         const existing = this.db
             .prepare(`
-                SELECT id, normalized_data_json
+                SELECT id, extracted_data_json, normalized_data_json
                 FROM case_drafts
                 WHERE email_id = ?
                 ORDER BY created_at DESC
                 LIMIT 1
             `)
-            .get(emailId) as { id: string; normalized_data_json: string | null } | undefined;
+            .get(emailId) as
+            | {
+                id: string;
+                extracted_data_json: string | null;
+                normalized_data_json: string | null;
+            }
+            | undefined;
 
         if (existing) {
             this.ensureExpectedDocuments(emailId, existing.id, parsed);
 
-            if (existing.normalized_data_json === parsedJson) {
+            const previousExtracted = this.safeJson(existing.extracted_data_json);
+            const previousNormalized = this.safeJson(existing.normalized_data_json);
+            const nextNormalized = {
+                ...parsed,
+                filingData: draftFilingData(parsed),
+            } as Record<string, unknown>;
+            const oldExtractedObject = previousExtracted && typeof previousExtracted === 'object'
+                ? previousExtracted as Record<string, unknown>
+                : {};
+            const oldNormalizedObject = previousNormalized && typeof previousNormalized === 'object'
+                ? previousNormalized as Record<string, unknown>
+                : {};
+
+            for (const field of EDITABLE_DRAFT_FIELDS) {
+                if (
+                    editableDraftValue(oldNormalizedObject[field]) !==
+                    editableDraftValue(oldExtractedObject[field])
+                ) {
+                    nextNormalized[field] = oldNormalizedObject[field] ?? null;
+                }
+            }
+            if (
+                oldNormalizedObject.filingData &&
+                typeof oldNormalizedObject.filingData === 'object' &&
+                !Array.isArray(oldNormalizedObject.filingData)
+            ) {
+                nextNormalized.filingData = oldNormalizedObject.filingData;
+            }
+            const nextNormalizedJson = toJson(nextNormalized);
+
+            if (
+                existing.extracted_data_json === parsedJson &&
+                existing.normalized_data_json === nextNormalizedJson
+            ) {
                 return existing.id;
             }
 
@@ -2543,14 +3776,23 @@ export class WorkflowDatabase {
                         updated_at = ?
                     WHERE id = ?
                 `)
-                .run(parsedJson, parsedJson, timestamp, existing.id);
-            this.insertAuditLog('case_draft', existing.id, 'draft_reparsed');
+                .run(parsedJson, nextNormalizedJson, timestamp, existing.id);
+            this.insertAuditLog('case_draft', existing.id, 'draft_reparsed', {
+                preservedManualFields: EDITABLE_DRAFT_FIELDS.filter(field =>
+                    editableDraftValue(oldNormalizedObject[field]) !==
+                    editableDraftValue(oldExtractedObject[field]),
+                ),
+            });
             return existing.id;
         }
 
         const id = randomUUID();
         const timestamp = nowIso();
         const workflowMode = process.env.WORKFLOW_MODE || 'review_before_submission';
+        const normalizedJson = toJson({
+            ...parsed,
+            filingData: draftFilingData(parsed),
+        });
 
         this.db
             .prepare(`
@@ -2568,7 +3810,7 @@ export class WorkflowDatabase {
                 )
                 VALUES (?, ?, ?, 'parsed', 'unknown', 'not_started', ?, ?, ?, ?)
             `)
-            .run(id, emailId, workflowMode, parsedJson, parsedJson, timestamp, timestamp);
+            .run(id, emailId, workflowMode, parsedJson, normalizedJson, timestamp, timestamp);
 
         this.ensureExpectedDocuments(emailId, id, parsed);
 
@@ -2608,7 +3850,12 @@ export class WorkflowDatabase {
     reviewCaseDraft(caseDraftId: string, action: ReviewAction, notes?: string | null): void {
         const existing = this.db
             .prepare(`
-                SELECT status, validation_status, filing_status, reviewer_notes
+                SELECT
+                    status,
+                    validation_status,
+                    filing_status,
+                    normalized_data_json,
+                    reviewer_notes
                 FROM case_drafts
                 WHERE id = ?
             `)
@@ -2617,6 +3864,7 @@ export class WorkflowDatabase {
                 status: CaseDraftStatus;
                 validation_status: ValidationStatus;
                 filing_status: FilingStatus;
+                normalized_data_json: string | null;
                 reviewer_notes: string | null;
             }
             | undefined;
@@ -2641,8 +3889,15 @@ export class WorkflowDatabase {
             next.filingStatus = 'not_started';
             next.auditAction = 'moved_to_review';
         } else if (action === 'approve') {
+            const detail = this.getDraftDetail(caseDraftId);
+            const issues = detail?.caseDraft?.validationIssues ??
+                validateDraftData(this.safeJson(existing.normalized_data_json));
+            const blockingIssue = issues.find(issue => issue.severity === 'error');
+            if (blockingIssue) {
+                throw new Error(`Cannot approve draft: ${blockingIssue.message}`);
+            }
             next.status = 'ready_to_file';
-            next.validationStatus = 'passed';
+            next.validationStatus = issues.length ? 'warnings' : 'passed';
             next.filingStatus = 'not_started';
             next.reviewedAt = timestamp;
             next.auditAction = 'approval_granted';

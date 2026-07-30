@@ -19,12 +19,16 @@ import { loadLegacyProcessed } from './legacyState';
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
 const MAX_EMAILS_PER_POLL = Number(process.env.WORKER_EMAIL_LIMIT || 50);
+const MAX_MANUAL_EMAIL_RETRIES_PER_POLL = Math.min(
+    Math.max(Number(process.env.EMAIL_RETRY_BATCH_SIZE || 10), 1),
+    50,
+);
 const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     Math.max(Number(process.env.DOCUMENT_RETRY_BATCH_SIZE || 2), 1),
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-07-30-resilient-graph-inbox-v6';
+const WORKER_BUILD_ID = '2026-07-30-draft-workspace-v7';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -325,7 +329,28 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
 async function processOnce(db: WorkflowDatabase): Promise<void> {
     console.log('Checking inbox for new court emails...');
 
-    const emails = await fetchRecentCourtEmailHeaders(MAX_EMAILS_PER_POLL);
+    const recentEmails = await fetchRecentCourtEmailHeaders(MAX_EMAILS_PER_POLL);
+    const emailsById = new Map<string, any>(
+        recentEmails.map((email: any) => [String(email.id), email]),
+    );
+    const queuedRetries = db.listQueuedEmailRetries(MAX_MANUAL_EMAIL_RETRIES_PER_POLL);
+
+    for (const retry of queuedRetries) {
+        if (emailsById.has(retry.externalMessageId)) continue;
+        try {
+            const email = await fetchCourtEmailById(retry.externalMessageId);
+            emailsById.set(retry.externalMessageId, email);
+        } catch (error) {
+            db.markEmailFailed(
+                retry.emailId,
+                `Unable to fetch the source email for manual retry: ${
+                    error instanceof Error ? error.message : String(error)
+                }`,
+            );
+        }
+    }
+
+    const emails = Array.from(emailsById.values());
     if (!emails.length) {
         console.log('No emails returned.');
         await processDueDocumentRetries(db);
