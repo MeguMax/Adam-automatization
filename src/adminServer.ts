@@ -16,6 +16,7 @@ import { loadLegacyProcessed } from './legacyState';
 import { renameDriveItem, resolveSharedDriveItem } from './oneDriveClient';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
+const ADMIN_BUILD_ID = '2026-07-30-resilient-graph-inbox-v6';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -1779,7 +1780,7 @@ export function createAdminServer(
             const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
             if (req.method === 'GET' && url.pathname === '/healthz') {
-                sendJson(res, 200, { ok: true });
+                sendJson(res, 200, { ok: true, buildId: ADMIN_BUILD_ID });
                 return;
             }
 
