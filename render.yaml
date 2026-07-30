@@ -21,6 +21,12 @@ services:
         value: "10000"
       - key: WORKER_EMAIL_LIMIT
         value: "50"
+      - key: GRAPH_INBOX_PAGE_SIZE
+        value: "10"
+      - key: GRAPH_REQUEST_MAX_ATTEMPTS
+        value: "5"
+      - key: GRAPH_BODY_FETCH_CONCURRENCY
+        value: "4"
       - key: ADMIN_AUTO_SYNC_MS
         value: "60000"
       - key: ADMIN_SYNC_EMAIL_LIMIT

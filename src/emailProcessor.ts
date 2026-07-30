@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Client } from '@microsoft/microsoft-graph-client';
 import { ClientSecretCredential } from '@azure/identity';
 import 'isomorphic-fetch';
+import { graphErrorReason, withGraphRetry } from './graphRetry';
 
 export interface FiledDocumentInfo {
     documentName?: string | null;      // для single-док писем
@@ -58,69 +59,132 @@ const graphClient = Client.initWithMiddleware({
 
 // ===== FETCH EMAILS =====
 
-export async function fetchRecentCourtEmails(top: number) {
-    const maxRetries = 3;
-    const pageSize = Math.min(Math.max(top, 1), 50);
+function boundedEnvironmentInteger(
+    value: string | undefined,
+    fallback: number,
+    min: number,
+    max: number,
+): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(Math.max(Math.floor(parsed), min), max);
+}
 
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const GRAPH_INBOX_PAGE_SIZE = boundedEnvironmentInteger(
+    process.env.GRAPH_INBOX_PAGE_SIZE,
+    10,
+    5,
+    50,
+);
+const GRAPH_REQUEST_MAX_ATTEMPTS = boundedEnvironmentInteger(
+    process.env.GRAPH_REQUEST_MAX_ATTEMPTS,
+    5,
+    1,
+    10,
+);
+const GRAPH_BODY_FETCH_CONCURRENCY = boundedEnvironmentInteger(
+    process.env.GRAPH_BODY_FETCH_CONCURRENCY,
+    4,
+    1,
+    10,
+);
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+function graphRetryOptions(label: string) {
+    return {
+        label,
+        maxAttempts: GRAPH_REQUEST_MAX_ATTEMPTS,
+        onRetry: (details: {
+            attempt: number;
+            maxAttempts: number;
+            delayMs: number;
+            reason: string;
+        }) => {
+            console.warn(
+                `${label} failed; retrying after ${details.delayMs}ms ` +
+                `(attempt ${details.attempt + 1}/${details.maxAttempts}): ${details.reason}`,
+            );
+        },
+    };
+}
+
+export async function fetchRecentCourtEmailHeaders(top: number): Promise<any[]> {
+    const limit = Math.min(Math.max(Math.floor(top), 1), 1_000);
+    const pageSize = Math.min(limit, GRAPH_INBOX_PAGE_SIZE);
+    const firstPath =
+        `/users/${encodeURIComponent(userEmail)}/mailFolders/Inbox/messages`;
+
+    const firstPage = await withGraphRetry(
+        () => graphClient
+            .api(firstPath)
+            .header('Accept-Encoding', 'identity')
+            .top(pageSize)
+            .orderby('receivedDateTime DESC')
+            .select('id,subject,from,receivedDateTime')
+            .get(),
+        graphRetryOptions('Graph Inbox metadata page 1'),
+    );
+
+    const messages = [...(firstPage.value ?? [])] as any[];
+    let nextLink = firstPage['@odata.nextLink'] as string | undefined;
+    let pageNumber = 2;
+
+    while (nextLink && messages.length < limit) {
         try {
-            const firstPage = await graphClient
-                .api(`/users/${encodeURIComponent(userEmail)}/mailFolders/Inbox/messages`)
-                .top(pageSize)
-                .orderby('receivedDateTime DESC')
-                .select('id,subject,from,body,receivedDateTime')
-                .get();
-
-            const messages = [...(firstPage.value ?? [])] as any[];
-            let nextLink = firstPage['@odata.nextLink'] as string | undefined;
-
-            while (nextLink && messages.length < top) {
-                const page = await graphClient.api(nextLink).get();
-                messages.push(...((page.value ?? []) as any[]));
-                nextLink = page['@odata.nextLink'] as string | undefined;
-            }
-
-            return messages.slice(0, top);
-        } catch (err: any) {
-            const status = err?.statusCode;
-            if (status === 502 || status === 503 || status === 504) {
-                if (attempt < maxRetries) {
-                    console.warn(`Graph transient error ${status}, retry ${attempt}/${maxRetries}...`);
-                    await delay(2000 * attempt);
-                    continue;
-                }
-            }
-            throw err;
+            const page = await withGraphRetry(
+                () => graphClient
+                    .api(nextLink!)
+                    .header('Accept-Encoding', 'identity')
+                    .get(),
+                graphRetryOptions(`Graph Inbox metadata page ${pageNumber}`),
+            );
+            messages.push(...((page.value ?? []) as any[]));
+            nextLink = page['@odata.nextLink'] as string | undefined;
+            pageNumber += 1;
+        } catch (error) {
+            console.error(
+                `Graph Inbox page ${pageNumber} exhausted retries; ` +
+                `continuing with ${messages.length} message(s): ${graphErrorReason(error)}`,
+            );
+            break;
         }
     }
 
-    return [];
+    return messages.slice(0, limit);
+}
+
+export async function fetchRecentCourtEmails(top: number): Promise<any[]> {
+    const headers = await fetchRecentCourtEmailHeaders(top);
+    const messages: any[] = [];
+
+    for (let offset = 0; offset < headers.length; offset += GRAPH_BODY_FETCH_CONCURRENCY) {
+        const batch = headers.slice(offset, offset + GRAPH_BODY_FETCH_CONCURRENCY);
+        const results = await Promise.allSettled(
+            batch.map(header => fetchCourtEmailById(String(header.id))),
+        );
+        results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                messages.push(result.value);
+            } else {
+                console.error(
+                    `Skipping Inbox message ${batch[index]?.id || 'unknown'} for this pass ` +
+                    `after body-fetch retries: ${graphErrorReason(result.reason)}`,
+                );
+            }
+        });
+    }
+
+    return messages;
 }
 
 export async function fetchCourtEmailById(messageId: string): Promise<any> {
-    const maxRetries = 3;
-    const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            return await graphClient
+    return withGraphRetry(
+        () => graphClient
                 .api(`/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}`)
+                .header('Accept-Encoding', 'identity')
                 .select('id,subject,from,body,receivedDateTime')
-                .get();
-        } catch (err: any) {
-            const status = err?.statusCode;
-            if ([429, 500, 502, 503, 504].includes(status) && attempt < maxRetries) {
-                console.warn(`Graph message fetch error ${status}, retry ${attempt}/${maxRetries}...`);
-                await delay(2000 * attempt);
-                continue;
-            }
-            throw err;
-        }
-    }
-
-    throw new Error(`Unable to fetch message ${messageId}`);
+                .get(),
+        graphRetryOptions(`Graph message ${messageId}`),
+    );
 }
 
 // ===== PARSER (универсальный) =====

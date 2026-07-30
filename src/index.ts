@@ -1,6 +1,6 @@
 import {
     fetchCourtEmailById,
-    fetchRecentCourtEmails,
+    fetchRecentCourtEmailHeaders,
     parseEmailBody,
     ParsedEmailInfo,
 } from './emailProcessor';
@@ -24,7 +24,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-07-23-history-retry-visibility-v4';
+const WORKER_BUILD_ID = '2026-07-30-resilient-graph-inbox-v6';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -325,7 +325,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
 async function processOnce(db: WorkflowDatabase): Promise<void> {
     console.log('Checking inbox for new court emails...');
 
-    const emails = await fetchRecentCourtEmails(MAX_EMAILS_PER_POLL);
+    const emails = await fetchRecentCourtEmailHeaders(MAX_EMAILS_PER_POLL);
     if (!emails.length) {
         console.log('No emails returned.');
         await processDueDocumentRetries(db);
@@ -340,9 +340,24 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
 
     const graphClient = getGraphClient();
 
-    for (const msg of emails) {
-        const externalMessageId = msg.id as string;
+    for (const candidate of emails) {
+        const externalMessageId = String(candidate.id);
         if (db.shouldSkipEmail(externalMessageId)) continue;
+
+        let msg = candidate;
+        if (!(msg as any).body?.content) {
+            db.registerEmail(candidate);
+            try {
+                msg = await fetchCourtEmailById(externalMessageId);
+            } catch (error) {
+                console.error(
+                    `Unable to fetch message body ${externalMessageId}; ` +
+                    'the email remains new and will be retried on the next poll:',
+                    error,
+                );
+                continue;
+            }
+        }
 
         const emailRecord = db.registerEmail(msg);
         db.markEmailProcessing(emailRecord.id);

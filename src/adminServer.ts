@@ -7,7 +7,11 @@ import {
     ProcessingReportInput,
     ReviewAction,
 } from './database';
-import { fetchRecentCourtEmails, parseEmailBody } from './emailProcessor';
+import {
+    fetchCourtEmailById,
+    fetchRecentCourtEmailHeaders,
+    parseEmailBody,
+} from './emailProcessor';
 import { loadLegacyProcessed } from './legacyState';
 import { renameDriveItem, resolveSharedDriveItem } from './oneDriveClient';
 
@@ -252,8 +256,8 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
 
     const db = getWorkflowDatabase();
     try {
-        const emails = await fetchRecentCourtEmails(limit);
-        emails.sort(
+        const emailHeaders = await fetchRecentCourtEmailHeaders(limit);
+        emailHeaders.sort(
             (a: any, b: any) =>
                 new Date(a.receivedDateTime).getTime() -
                 new Date(b.receivedDateTime).getTime(),
@@ -263,10 +267,25 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
         let miFileDrafts = 0;
         const checkedPlaintiffMappingIds = new Set<string>();
 
-        for (const msg of emails) {
-            if (db.isEmailDeleted(msg.id as string)) continue;
-            const emailRecord = db.registerEmail(msg);
+        for (const header of emailHeaders) {
+            const externalMessageId = String(header.id);
+            if (db.isEmailDeleted(externalMessageId)) continue;
+            const emailRecord = db.registerEmail(header);
             syncedEmails += 1;
+            if (emailRecord.processingStatus !== 'new') continue;
+
+            let msg: any;
+            try {
+                msg = await fetchCourtEmailById(externalMessageId);
+                db.registerEmail(msg);
+            } catch (error) {
+                console.error(
+                    `Admin sync could not fetch Inbox message ${externalMessageId}; ` +
+                    'leaving it in new status for the next pass:',
+                    error,
+                );
+                continue;
+            }
 
             if (isSelfProcessingReport(msg)) {
                 const report = parseProcessingReport(msg);
@@ -291,14 +310,12 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
                         });
                     }
                 }
-                if (emailRecord.processingStatus !== 'ignored') {
-                    db.markEmailIgnored(
-                        emailRecord.id,
-                        applyResult?.applied
-                            ? 'Self processing report applied to original email'
-                            : 'Self processing report',
-                    );
-                }
+                db.markEmailIgnored(
+                    emailRecord.id,
+                    applyResult?.applied
+                        ? 'Self processing report applied to original email'
+                        : 'Self processing report',
+                );
                 continue;
             }
 
@@ -307,9 +324,7 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
                 db.createCaseDraft(emailRecord.id, parsed);
                 miFileDrafts += 1;
             } else {
-                if (emailRecord.processingStatus !== 'ignored') {
-                    db.markEmailIgnored(emailRecord.id, 'Not a MiFILE/TrueFiling email');
-                }
+                db.markEmailIgnored(emailRecord.id, 'Not a MiFILE/TrueFiling email');
             }
         }
 
