@@ -1469,6 +1469,31 @@ const migrations: Migration[] = [
             `).run(timestamp, timestamp);
         },
     },
+    {
+        version: 13,
+        name: 'ignore_non_court_backlog_recovery_failures',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE email_records
+                SET processing_status = 'ignored',
+                    processing_error = 'Non-court email excluded from worker backlog',
+                    processed_at = COALESCE(processed_at, ?),
+                    updated_at = ?
+                WHERE processing_status = 'failed'
+                  AND processing_error LIKE 'Unable to fetch the source email for queued processing:%'
+                  AND LOWER(COALESCE(sender, '')) NOT LIKE '%@truefiling.com'
+                  AND LOWER(COALESCE(subject, '')) NOT LIKE '%mifile%'
+                  AND LOWER(COALESCE(subject, '')) NOT LIKE '%truefiling%'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM case_drafts c WHERE c.email_id = email_records.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM document_records d WHERE d.email_id = email_records.id
+                  )
+            `).run(timestamp, timestamp);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -1785,6 +1810,21 @@ export class WorkflowDatabase {
                     e.received_at
                 FROM email_records e
                 WHERE e.processing_status = 'new'
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM case_drafts c WHERE c.email_id = e.id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM audit_logs a
+                        WHERE a.entity_type = 'email_record'
+                          AND a.entity_id = e.id
+                          AND a.action = 'email_retry_queued'
+                    )
+                    OR LOWER(COALESCE(e.sender, '')) LIKE '%@truefiling.com'
+                    OR LOWER(COALESCE(e.subject, '')) LIKE '%mifile%'
+                    OR LOWER(COALESCE(e.subject, '')) LIKE '%truefiling%'
+                  )
                 ORDER BY
                     CASE WHEN EXISTS (
                         SELECT 1

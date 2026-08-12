@@ -43,7 +43,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-08-12-graph-search-hardening-v11';
+const WORKER_BUILD_ID = '2026-08-12-court-email-backlog-v12';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;

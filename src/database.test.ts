@@ -356,13 +356,15 @@ test('manual email retries are discoverable even when the source message is outs
         db.markEmailProcessed(email.id);
         db.queueEmailRetry(email.id, 'Manual admin retry');
 
-        assert.deepEqual(db.listQueuedEmailRetries(), [{
+        const expectedRetry = [{
             emailId: email.id,
             externalMessageId: 'old-message-for-retry',
             subject: 'Old filing notification',
             sender: 'court@example.com',
             receivedAt: '2025-01-10T12:00:00.000Z',
-        }]);
+        }];
+        assert.deepEqual(db.listQueuedEmailRetries(), expectedRetry);
+        assert.deepEqual(db.listPendingEmails(), expectedRetry);
 
         db.markEmailProcessing(email.id);
         assert.throws(
@@ -405,6 +407,12 @@ test('admin-synced new emails remain discoverable outside the recent Outlook win
                 downloadUrl: 'https://mifile.example/document/old',
             }],
             fileTypeByAttachmentId: {},
+        });
+        db.registerEmail({
+            id: 'old-non-court-message',
+            subject: 'Are you beach-bound? Follow these tips.',
+            receivedDateTime: '2026-07-31T14:47:25.000Z',
+            from: { emailAddress: { address: 'redcross@example.com' } },
         });
 
         assert.deepEqual(db.listQueuedEmailRetries(), []);
