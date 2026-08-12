@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client } from '@microsoft/microsoft-graph-client';
+import { Client, ResponseType } from '@microsoft/microsoft-graph-client';
 import { ClientSecretCredential } from '@azure/identity';
 import 'isomorphic-fetch';
 import { graphErrorReason, withGraphRetry } from './graphRetry';
@@ -34,6 +34,20 @@ export interface ParsedEmailInfo {
 
     // техническое
     fileTypeByAttachmentId: Record<string, string>;
+}
+
+export interface CourtEmailAttachment {
+    id: string;
+    name: string;
+    contentType: string | null;
+    size: number;
+    isInline: boolean;
+}
+
+export interface CourtEmailLookup {
+    subject: string | null;
+    sender: string | null;
+    receivedAt: string | null;
 }
 
 const tenantId = process.env.TENANT_ID!;
@@ -188,6 +202,130 @@ export async function fetchCourtEmailById(messageId: string): Promise<any> {
 }
 
 // ===== PARSER (универсальный) =====
+
+export async function findCourtEmailByMetadata(lookup: CourtEmailLookup): Promise<any | null> {
+    const receivedAt = lookup.receivedAt ? new Date(lookup.receivedAt) : null;
+    if (!receivedAt || Number.isNaN(receivedAt.getTime()) || !lookup.subject?.trim()) {
+        return null;
+    }
+
+    const path = `/users/${encodeURIComponent(userEmail)}/messages`;
+    const searchSubject = lookup.subject.replace(/["\\]/g, ' ').trim();
+    let messages: any[] = [];
+    try {
+        const searchResult = await withGraphRetry(
+            () => graphClient
+                .api(path)
+                .header('Accept-Encoding', 'identity')
+                .header('ConsistencyLevel', 'eventual')
+                .search(`"subject:${searchSubject}"`)
+                .top(100)
+                .select('id,subject,from,receivedDateTime')
+                .get(),
+            graphRetryOptions(`Graph subject recovery search for ${lookup.subject}`),
+        );
+        messages = (searchResult.value ?? []) as any[];
+    } catch (error) {
+        console.warn('Graph subject recovery search failed; falling back to a date window:', error);
+    }
+
+    if (!messages.length) {
+        const windowMs = 2 * 60 * 60 * 1000;
+        const from = new Date(receivedAt.getTime() - windowMs).toISOString();
+        const to = new Date(receivedAt.getTime() + windowMs).toISOString();
+        const dateResult = await withGraphRetry(
+            () => graphClient
+                .api(path)
+                .header('Accept-Encoding', 'identity')
+                .filter(`receivedDateTime ge ${from} and receivedDateTime le ${to}`)
+                .top(100)
+                .select('id,subject,from,receivedDateTime')
+                .get(),
+            graphRetryOptions(`Graph date recovery search for ${lookup.subject}`),
+        );
+        messages = (dateResult.value ?? []) as any[];
+    }
+
+    const normalizedSubject = lookup.subject.trim().toLowerCase();
+    const normalizedSender = lookup.sender?.trim().toLowerCase() ?? '';
+    const candidates = messages
+        .filter(message => String(message.subject ?? '').trim().toLowerCase() === normalizedSubject)
+        .map(message => {
+            const sender = String(message.from?.emailAddress?.address ?? '').trim().toLowerCase();
+            const senderMatches = !normalizedSender || sender === normalizedSender;
+            const distance = Math.abs(
+                new Date(message.receivedDateTime ?? 0).getTime() - receivedAt.getTime(),
+            );
+            return { message, senderMatches, distance };
+        })
+        .sort((left, right) =>
+            Number(right.senderMatches) - Number(left.senderMatches) ||
+            left.distance - right.distance,
+        );
+
+    const best = candidates[0]?.message;
+    if (!best) return null;
+
+    console.log('Recovered Outlook message by metadata:', {
+        subject: lookup.subject,
+        receivedAt: lookup.receivedAt,
+        messageId: best.id,
+    });
+    return fetchCourtEmailById(String(best.id));
+}
+
+export async function fetchCourtEmailPdfAttachments(
+    messageId: string,
+): Promise<CourtEmailAttachment[]> {
+    const result = await withGraphRetry(
+        () => graphClient
+            .api(`/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}/attachments`)
+            .header('Accept-Encoding', 'identity')
+            .top(100)
+            .select('id,name,contentType,size,isInline')
+            .get(),
+        graphRetryOptions(`Graph PDF attachment list for ${messageId}`),
+    );
+
+    return ((result.value ?? []) as any[])
+        .filter(attachment => {
+            if (attachment.isInline) return false;
+            const contentType = String(attachment.contentType ?? '').toLowerCase();
+            const name = String(attachment.name ?? '').toLowerCase();
+            return contentType === 'application/pdf' || name.endsWith('.pdf');
+        })
+        .map(attachment => ({
+            id: String(attachment.id),
+            name: String(attachment.name || 'attachment.pdf'),
+            contentType: attachment.contentType ? String(attachment.contentType) : null,
+            size: Number(attachment.size ?? 0),
+            isInline: Boolean(attachment.isInline),
+        }));
+}
+
+export async function downloadCourtEmailAttachment(
+    messageId: string,
+    attachmentId: string,
+): Promise<Buffer> {
+    const value = await withGraphRetry(
+        () => graphClient
+            .api(
+                `/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}` +
+                `/attachments/${encodeURIComponent(attachmentId)}/$value`,
+            )
+            .header('Accept-Encoding', 'identity')
+            .responseType(ResponseType.ARRAYBUFFER)
+            .get(),
+        graphRetryOptions(`Graph PDF attachment ${attachmentId}`),
+    );
+
+    if (Buffer.isBuffer(value)) return value;
+    if (value instanceof ArrayBuffer) return Buffer.from(value);
+    if (ArrayBuffer.isView(value)) {
+        return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    throw new Error('Microsoft Graph returned an unsupported attachment payload');
+}
 
 export function parseEmailBody(bodyHtml: string): ParsedEmailInfo {
     const text = htmlToText(bodyHtml);
@@ -353,21 +491,46 @@ function parseMultiDocumentStyle(
 
 // ===== PARSER: Type C “Document Sent …” (TrueFiling e‑service) =====
 
+export function isUsableTrueCertifyUrl(value: string | null | undefined): boolean {
+    if (!value) return false;
+    try {
+        const url = new URL(value.replace(/&amp;/gi, '&'));
+        if (url.hostname.toLowerCase() !== 'eservices.truecertify.com') return false;
+        const parameters = new Map<string, string>();
+        url.searchParams.forEach((parameterValue, key) => {
+            parameters.set(key.toLowerCase(), parameterValue.trim());
+        });
+        return !!parameters.get('loc') && !!parameters.get('key');
+    } catch {
+        return false;
+    }
+}
+
+function trueCertifyDownloadUrl(html: string, text: string): string | null {
+    const candidates = `${html}\n${text}`.match(
+        /https:\/\/eservices\.truecertify\.com\/[^\s"'<>]*/gi,
+    ) ?? [];
+    for (const candidate of candidates) {
+        const normalized = candidate.replace(/&amp;/gi, '&').replace(/[),.;]+$/, '');
+        if (isUsableTrueCertifyUrl(normalized)) return normalized;
+    }
+    return null;
+}
+
 function parseDocumentSentStyle(
     text: string,
     html: string,
 ): Omit<ParsedEmailInfo, 'isMiFile'> | null {
     // 1) Главный маркер Type C — ссылка на TrueCertify
-    const tfHrefMatch =
-        html.match(/https:\/\/eservices\.truecertify\.com\/[^\s"'<>]*/i) ??
-        text.match(/https:\/\/eservices\.truecertify\.com\/[^\s"'<>]*/i);
+    const downloadUrl = trueCertifyDownloadUrl(html, text);
+    const isDocumentSentNotice =
+        /MiFILE\s*-\s*Document Sent/i.test(text) ||
+        /document was electronically sent on behalf of the\s+.+?COURT\s+by MiFILE/i.test(text);
 
-    if (!tfHrefMatch) {
+    if (!downloadUrl && !isDocumentSentNotice) {
         // нет TrueCertify‑ссылки → точно не Type C
         return null;
     }
-
-    const downloadUrl = tfHrefMatch[0];
 
     // 2) Остальные поля — best effort
     const documentName = extractAfterLabel(text, 'Document Name:');

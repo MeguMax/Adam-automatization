@@ -359,6 +359,9 @@ test('manual email retries are discoverable even when the source message is outs
         assert.deepEqual(db.listQueuedEmailRetries(), [{
             emailId: email.id,
             externalMessageId: 'old-message-for-retry',
+            subject: 'Old filing notification',
+            sender: 'court@example.com',
+            receivedAt: '2025-01-10T12:00:00.000Z',
         }]);
 
         db.markEmailProcessing(email.id);
@@ -366,6 +369,53 @@ test('manual email retries are discoverable even when the source message is outs
             () => db.queueEmailRetry(email.id),
             /processing email cannot be queued again/,
         );
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('failed emails expose pending documents to the retry worker with stored draft data', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-pending-retry-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'pending-retry-message',
+            subject: 'MiFILE - Document Filed 26-02763-LT',
+            receivedDateTime: '2026-07-14T18:29:57.000Z',
+            from: { emailAddress: { address: 'info@truefiling.com' } },
+            body: { content: '<p>Filing</p>' },
+        });
+        const parsed: ParsedEmailInfo = {
+            isMiFile: true,
+            courtName: 'District Court',
+            caseNumber: '26-02763-LT',
+            caseTitle: 'DELTA SQUARE APARTMENTS V JOHNSON',
+            plaintiff: 'DELTA SQUARE APARTMENTS',
+            defendant: 'JOHNSON',
+            bundleNumber: null,
+            filerName: null,
+            filedAt: '2026-07-14',
+            filedDocuments: [{
+                documentName: 'Complaint',
+                documentType: 'Complaint',
+                status: 'Filed',
+                comments: null,
+                downloadUrl: 'https://mifile.example/document/pending',
+            }],
+            fileTypeByAttachmentId: {},
+        };
+        const caseDraftId = db.createCaseDraft(email.id, parsed);
+        db.markEmailFailed(email.id, 'One document is still pending', 'failed');
+
+        const retries = db.claimDueDocumentRetries(5);
+        assert.equal(retries.length, 1);
+        assert.equal(retries[0].caseDraftId, caseDraftId);
+        assert.equal(retries[0].sourceUrl, 'https://mifile.example/document/pending');
+        assert.equal(retries[0].receivedAt, '2026-07-14T18:29:57.000Z');
+        assert.equal(retries[0].parsedEmail?.caseNumber, '26-02763-LT');
+        assert.equal(retries[0].retrySource, 'automatic');
     } finally {
         db.close();
         fs.rmSync(tempDir, { recursive: true, force: true });

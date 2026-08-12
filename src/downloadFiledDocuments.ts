@@ -10,6 +10,7 @@ import {
 } from './oneDriveClient';
 import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
 import { validatePdfBuffer } from './pdfValidation';
+import { isEmailAttachmentSource } from './emailAttachmentSource';
 
 // === ТИПЫ ДЛЯ РЕЗУЛЬТАТОВ ===
 
@@ -55,6 +56,7 @@ export interface DocumentAttemptLog {
 export interface DownloadFiledDocumentsOptions {
     plaintiffShortName?: string | null;
     resolvePlaintiffNaming?: () => Promise<PlaintiffFileNaming> | PlaintiffFileNaming;
+    resolveDocumentBuffer?: (document: FiledDocumentInfo) => Promise<Buffer>;
 }
 
 export interface PlaintiffFileNaming {
@@ -541,10 +543,19 @@ export async function downloadFiledDocuments(
                         `📥 Завантажуємо MiFILE документ (спроба ${attempt}/${maxRetries})`,
                     );
 
-                    const url = normalizeMifileUrl(doc.downloadUrl);
-                    console.log('MiFILE raw URL:', doc.downloadUrl);
-                    console.log('MiFILE normalized URL:', url);
-                    const downloadedBuf = await httpDownloadFromMifileToBuffer(url);
+                    let downloadedBuf: Buffer;
+                    if (isEmailAttachmentSource(doc.downloadUrl)) {
+                        if (!options.resolveDocumentBuffer) {
+                            throw new Error('The source email attachment is not available to this retry');
+                        }
+                        console.log('Downloading PDF attachment from the source email:', doc.documentName);
+                        downloadedBuf = await options.resolveDocumentBuffer(doc);
+                    } else {
+                        const url = normalizeMifileUrl(doc.downloadUrl);
+                        console.log('MiFILE raw URL:', doc.downloadUrl);
+                        console.log('MiFILE normalized URL:', url);
+                        downloadedBuf = await httpDownloadFromMifileToBuffer(url);
+                    }
 
                     const validation = validatePdfBuffer(downloadedBuf);
                     if (!validation.valid) {

@@ -1,6 +1,6 @@
 // mifileDownloader.ts
 import fetch from 'node-fetch';
-import { getMifileCookieHeader } from './mifileSession';
+import { getMifileCookieHeader, invalidateMifileSession } from './mifileSession';
 import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
 
 const twoCaptchaApiKey = process.env.TWO_CAPTCHA_API_KEY;
@@ -50,7 +50,7 @@ export async function httpDownloadFromMifileToBuffer(url: string): Promise<Buffe
 
     // MiFILE
     console.log('📥 Завантажуємо MiFILE документ');
-    const cookieHeader = await getMifileCookieHeader();
+    let cookieHeader = await getMifileCookieHeader();
     const configuredTimeout = Number(process.env.MIFILE_DOWNLOAD_TIMEOUT_MS || 90000);
     const timeoutMs = Number.isFinite(configuredTimeout)
         ? Math.min(Math.max(Math.floor(configuredTimeout), 10000), 300000)
@@ -83,6 +83,23 @@ export async function httpDownloadFromMifileToBuffer(url: string): Promise<Buffe
 
     let download = await doFetch();
     let res = download.response;
+
+    const isLoginPageResponse = () => {
+        const contentType = res.headers.get('content-type')?.toLowerCase() ?? '';
+        return res.url.toLowerCase().includes('/login?returnurl=') ||
+            (contentType.includes('text/html') && !!download.buffer);
+    };
+
+    if (isLoginPageResponse()) {
+        console.warn('MiFILE returned the login page instead of a PDF; refreshing authentication.');
+        invalidateMifileSession();
+        cookieHeader = await getMifileCookieHeader(true);
+        download = await doFetch();
+        res = download.response;
+        if (isLoginPageResponse()) {
+            throw new Error('MiFILE redirected the download to its login page after session refresh');
+        }
+    }
 
     if (!res.ok) {
         console.warn(`⚠️ MiFILE HTTP ${res.status} for URL: ${url}`);

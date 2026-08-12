@@ -4,9 +4,35 @@ const MIFILE_USER = process.env.MIFILE_USER!;
 const MIFILE_PASSWORD = process.env.MIFILE_PASSWORD!;
 
 let browser: Browser | null = null;
+let cachedCookieHeader: { value: string; createdAt: number } | null = null;
+let cookieRefreshPromise: Promise<string> | null = null;
+
+function boundedEnvironmentInteger(
+    value: string | undefined,
+    fallback: number,
+    min: number,
+    max: number,
+): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(Math.max(Math.floor(parsed), min), max);
+}
+
+const MIFILE_LOGIN_TIMEOUT_MS = boundedEnvironmentInteger(
+    process.env.MIFILE_LOGIN_TIMEOUT_MS,
+    30_000,
+    5_000,
+    120_000,
+);
+const MIFILE_COOKIE_CACHE_MS = boundedEnvironmentInteger(
+    process.env.MIFILE_COOKIE_CACHE_MS,
+    10 * 60 * 1000,
+    30_000,
+    60 * 60 * 1000,
+);
 
 async function getBrowser(): Promise<Browser> {
-    if (!browser) {
+    if (!browser || !browser.isConnected()) {
         browser = await chromium.launch({
             headless: true,
             args: [
@@ -18,6 +44,20 @@ async function getBrowser(): Promise<Browser> {
         });
     }
     return browser;
+}
+
+async function waitForAuthenticatedCookies(page: Page): Promise<void> {
+    const deadline = Date.now() + MIFILE_LOGIN_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        const cookies = await page.context().cookies('https://mifile.courts.michigan.gov');
+        if (cookies.some(cookie => cookie.name.startsWith('.AspNetCore.Identity.Application'))) {
+            return;
+        }
+        await page.waitForTimeout(400);
+    }
+    throw new Error(
+        `MiFILE login did not create an authenticated session within ${MIFILE_LOGIN_TIMEOUT_MS} ms`,
+    );
 }
 
 async function closeLoginModalIfAny(page: Page): Promise<void> {
@@ -64,26 +104,53 @@ async function loginToMifile(page: Page): Promise<void> {
     await loginButton.click({ force: true });
 
     // даём немного времени на установку cookies
-    await page.waitForTimeout(3000);
+    await waitForAuthenticatedCookies(page);
 }
 
 /**
  * Возвращает заголовок Cookie для домена MiFILE после логина.
  */
-export async function getMifileCookieHeader(): Promise<string> {
+async function createMifileCookieHeader(): Promise<string> {
     const br = await getBrowser();
     const page = await br.newPage();
+    try {
+        await loginToMifile(page);
+        const cookies = await page.context().cookies('https://mifile.courts.michigan.gov');
+        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        if (!cookieHeader) throw new Error('MiFILE login returned an empty cookie set');
+        cachedCookieHeader = { value: cookieHeader, createdAt: Date.now() };
+        return cookieHeader;
+    } finally {
+        await page.close().catch(() => {});
+    }
+}
 
-    await loginToMifile(page);
+export function invalidateMifileSession(): void {
+    cachedCookieHeader = null;
+}
 
-    const cookies = await page.context().cookies('https://mifile.courts.michigan.gov');
-    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+export async function getMifileCookieHeader(forceRefresh = false): Promise<string> {
+    if (
+        !forceRefresh &&
+        cachedCookieHeader &&
+        Date.now() - cachedCookieHeader.createdAt < MIFILE_COOKIE_CACHE_MS
+    ) {
+        return cachedCookieHeader.value;
+    }
+    if (cookieRefreshPromise) return cookieRefreshPromise;
 
-    await page.close();
-    return cookieHeader;
+    const refresh = createMifileCookieHeader();
+    cookieRefreshPromise = refresh;
+    try {
+        return await refresh;
+    } finally {
+        if (cookieRefreshPromise === refresh) cookieRefreshPromise = null;
+    }
 }
 
 export async function closeMifileBrowser(): Promise<void> {
+    cachedCookieHeader = null;
+    cookieRefreshPromise = null;
     if (browser) {
         await browser.close();
         browser = null;

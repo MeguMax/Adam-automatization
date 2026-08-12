@@ -15,6 +15,7 @@ import {
     fetchRecentCourtEmailHeaders,
     parseEmailBody,
 } from './emailProcessor';
+import { addEmailAttachmentSources } from './emailAttachmentSource';
 import { loadLegacyProcessed } from './legacyState';
 import {
     downloadDriveItemBuffer,
@@ -23,7 +24,7 @@ import {
 } from './oneDriveClient';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-07-30-draft-workspace-v7';
+const ADMIN_BUILD_ID = '2026-08-12-resilient-downloads-v8';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -349,7 +350,9 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
                 continue;
             }
 
-            const parsed = parseEmailBody((msg as any).body?.content ?? '');
+            const parsed = addEmailAttachmentSources(
+                parseEmailBody((msg as any).body?.content ?? ''),
+            );
             if (parsed.isMiFile) {
                 db.createCaseDraft(emailRecord.id, parsed);
                 miFileDrafts += 1;
@@ -2536,6 +2539,270 @@ const html = String.raw`<!doctype html>
         grid-column: 1 / -1;
       }
     }
+
+    /* Admin UI v3: compact operations workspace */
+    :root {
+      --bg: #f2f3f5;
+      --panel: #ffffff;
+      --subtle: #f7f8f9;
+      --line: #d9dde2;
+      --line-strong: #bfc6ce;
+      --text: #20252b;
+      --muted: #626b75;
+      --accent: #176b91;
+      --accent-strong: #0f506d;
+      --accent-soft: #e8f2f6;
+      --bad: #a7332b;
+      --bad-soft: #fbeceb;
+      --warn: #8a5a00;
+      --warn-soft: #fff4d6;
+      --ok: #23734b;
+      --ok-soft: #e8f4ed;
+      --shadow: none;
+    }
+    body {
+      background: var(--bg);
+      font-size: 13px;
+    }
+    header.app-header {
+      min-height: 58px;
+      padding: 8px 18px;
+      box-shadow: none;
+    }
+    .brand-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 4px;
+      background: #252b31;
+    }
+    .nav-tabs {
+      gap: 0;
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+    .nav-tabs button {
+      height: 40px;
+      padding: 0 12px;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+    }
+    .nav-tabs button.active {
+      color: var(--accent-strong);
+      background: transparent;
+      border-bottom-color: var(--accent);
+      box-shadow: none;
+    }
+    main {
+      gap: 12px;
+      padding: 14px 16px 24px;
+    }
+    .panel {
+      border-radius: 4px;
+      box-shadow: none;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0;
+      margin-bottom: 10px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--panel);
+    }
+    .metric {
+      min-height: 60px;
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      overflow: hidden;
+      border: 0;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      border-radius: 0;
+      box-shadow: none;
+      background: transparent;
+    }
+    .metric:nth-child(4n) { border-right: 0; }
+    .metric:nth-last-child(-n + 4) { border-bottom: 0; }
+    .metric > .metric-icon {
+      width: 30px;
+      height: 30px;
+      min-height: 30px;
+      display: inline-flex !important;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+      border-radius: 4px;
+      color: var(--accent);
+      background: transparent;
+    }
+    .metric > .metric-icon svg {
+      width: 17px;
+      height: 17px;
+    }
+    .metric.tone-danger .metric-icon,
+    .metric.tone-warning .metric-icon,
+    .metric.tone-success .metric-icon {
+      background: transparent;
+    }
+    .metric-copy {
+      align-self: center;
+      min-width: 0;
+      padding: 0;
+    }
+    .metric .metric-copy > span {
+      margin: 0 0 2px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.2;
+      white-space: normal;
+    }
+    .metric strong {
+      font-size: 19px;
+      line-height: 1.05;
+    }
+    .toolbar {
+      min-height: 50px;
+      padding: 9px 12px;
+    }
+    .filter-bar {
+      padding: 10px 12px;
+      background: #fafbfc;
+    }
+    table thead th {
+      background: #f5f6f7;
+      color: #515a64;
+    }
+    tbody tr:hover { background: #f7fafb; }
+    tbody tr.selected { background: #eaf3f7; }
+    tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+    .queue-issue {
+      display: block;
+      max-width: 190px;
+      margin-top: 4px;
+      overflow: hidden;
+      color: var(--bad);
+      font-size: 10px;
+      line-height: 1.25;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .source-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 30px;
+      padding: 0 9px;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--subtle);
+      font-size: 11px;
+    }
+    .source-label svg {
+      width: 14px;
+      height: 14px;
+    }
+    #mappingSummary {
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+    }
+    #mappingSummary .metric {
+      border-bottom: 0;
+    }
+    #mappingSummary .metric:nth-child(4n) {
+      border-right: 1px solid var(--line);
+    }
+    #mappingSummary .metric:last-child {
+      border-right: 0;
+    }
+    @media (min-width: 1601px) {
+      .filter-bar {
+        grid-template-columns: minmax(280px, 1fr) 120px 170px 110px minmax(320px, 0.8fr);
+      }
+      .filter-bar .date-field {
+        width: auto;
+        grid-column: auto;
+      }
+    }
+    @media (max-width: 1100px) {
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric:nth-child(4n) { border-right: 1px solid var(--line); }
+      .metric:nth-child(2n) { border-right: 0; }
+      .metric:nth-last-child(-n + 4) { border-bottom: 1px solid var(--line); }
+      .metric:nth-last-child(-n + 2) { border-bottom: 0; }
+    }
+    @media (max-width: 620px) {
+      header.app-header { padding: 8px 10px; }
+      main { padding: 10px; }
+      .metric {
+        min-height: 56px;
+        grid-template-columns: 26px minmax(0, 1fr);
+        padding: 8px;
+      }
+      .metric > .metric-icon {
+        width: 26px;
+        height: 26px;
+        min-height: 26px;
+      }
+      .metric strong { font-size: 17px; }
+      #mappingSummary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #mappingSummary .metric { border-bottom: 1px solid var(--line); }
+      #mappingSummary .metric:nth-child(2n) { border-right: 0; }
+      #mappingSummary .metric:last-child { border-bottom: 0; }
+      #queue { overflow: visible; }
+      #queue table,
+      #queue tbody {
+        display: block;
+        width: 100%;
+        min-width: 0;
+      }
+      #queue thead { display: none; }
+      #queue tr[data-id] {
+        position: relative;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 10px 14px;
+        padding: 12px 12px 12px 42px;
+        border-bottom: 1px solid var(--line);
+      }
+      #queue tr[data-id].selected {
+        box-shadow: inset 3px 0 0 var(--accent);
+      }
+      #queue tr[data-id] td {
+        display: block !important;
+        width: auto;
+        min-width: 0;
+        padding: 0;
+        border: 0;
+        box-shadow: none;
+      }
+      #queue tr[data-id] td.select-column {
+        position: absolute;
+        top: 14px;
+        left: 13px;
+        width: 16px;
+      }
+      #queue tr[data-id] td:nth-child(3),
+      #queue tr[data-id] td:nth-child(5) {
+        grid-column: 1 / -1;
+      }
+      #queue tr[data-id] td:nth-child(3) { order: -1; }
+      #queue tr[data-id] td[data-label]::before {
+        display: block;
+        margin-bottom: 3px;
+        color: var(--muted);
+        content: attr(data-label);
+        font-size: 9px;
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+      #queue tr[data-id] td:nth-child(3)::before { display: none; }
+      #queue .queue-issue { max-width: none; }
+    }
   </style>
 </head>
 <body>
@@ -3085,13 +3352,13 @@ const html = String.raw`<!doctype html>
       const docs = s.documentStatuses || {};
       document.getElementById('summary').innerHTML = [
         metric('Needs attention', (email.failed || 0) + (email.partial_failure || 0) + (drafts.needs_review || 0), 'triangle-alert', 'warning'),
-        metric('Failed documents', docs.failed || 0, 'file-x-2', 'danger'),
-        metric('Pending documents', docs.pending || 0, 'clock-3'),
-        metric('Downloaded documents', docs.uploaded || 0, 'circle-check-big', 'success'),
+        metric('Failed files', docs.failed || 0, 'file-x-2', 'danger'),
+        metric('Waiting to download', (docs.pending || 0) + (docs.retry_queued || 0) + (docs.retrying || 0), 'clock-3'),
+        metric('Downloaded', docs.uploaded || 0, 'circle-check-big', 'success'),
         metric('Active drafts', (drafts.parsed || 0) + (drafts.needs_review || 0) + (drafts.ready_to_file || 0), 'files'),
-        metric('No file link', docs.not_downloadable || 0, 'unlink'),
-        metric('Missing mappings', s.missingPlaintiffMappings, 'user-round-search', 'warning'),
-        metric('Database storage', formatBytes(s.databaseBytes), 'database'),
+        metric('No source file', docs.not_downloadable || 0, 'unlink'),
+        metric('Plaintiff names needed', s.missingPlaintiffMappings, 'user-round-search', 'warning'),
+        metric('Database', formatBytes(s.databaseBytes), 'database'),
       ].join('');
       renderIcons();
     }
@@ -3128,6 +3395,15 @@ const html = String.raw`<!doctype html>
       return state.queue;
     }
 
+    function renderQueueIssue(value) {
+      if (!value) return '';
+      const full = String(value).trim();
+      const firstLine = full.split(/\r?\n/)[0];
+      const preview = firstLine.length > 90 ? firstLine.slice(0, 87) + '...' : firstLine;
+      return '<span class="queue-issue" title="' + escapeHtml(full) + '">' +
+        escapeHtml(preview) + '</span>';
+    }
+
     function renderQueue() {
       const items = filteredQueue();
       const root = document.getElementById('queue');
@@ -3145,7 +3421,7 @@ const html = String.raw`<!doctype html>
         '<th style="width: 104px;">Case</th>' +
         '<th style="width: 132px;">Plaintiff</th>' +
         '<th style="width: 92px;">Documents</th>' +
-        '<th style="width: 128px;">Status</th>' +
+        '<th style="width: 172px;">Status</th>' +
         '</tr></thead><tbody>' +
         items.map(item => '<tr data-id="' + escapeHtml(item.emailId) + '" class="' +
           (item.emailId === state.selectedId ? 'selected ' : '') +
@@ -3160,7 +3436,7 @@ const html = String.raw`<!doctype html>
           '<td data-label="Status"><div class="status-line">' + statusPill(item.processingStatus) + '</div><span class="cell-secondary">' +
             escapeHtml(item.draftStatus ? statusLabel(item.draftStatus) : '') +
             (item.validationStatus ? ' · ' + escapeHtml(statusLabel(item.validationStatus)) : '') +
-          '</span></td>' +
+          '</span>' + renderQueueIssue(item.processingError) + '</td>' +
         '</tr>').join('') +
         '</tbody></table>';
 
@@ -4464,7 +4740,7 @@ const html = String.raw`<!doctype html>
     }
 
     function renderDocumentRetryAction(doc) {
-      if (doc.status !== 'failed' || !doc.sourceUrl) return '';
+      if (!['pending', 'failed'].includes(doc.status) || !doc.sourceUrl) return '';
       return '<button type="button" class="icon-button" data-retry-document="' + escapeHtml(doc.id) + '" title="Retry document download" aria-label="Retry document download">' + icon('rotate-cw') + '</button>';
     }
 
@@ -4478,6 +4754,8 @@ const html = String.raw`<!doctype html>
         parts.push('Retry in progress');
       } else if (doc.status === 'retry_queued') {
         parts.push('Manual retry queued');
+      } else if (doc.status === 'pending') {
+        parts.push('Waiting for the download worker');
       } else if (doc.nextRetryAt) {
         parts.push('Next automatic retry: ' + escapeHtml(fmtDate(doc.nextRetryAt)));
       } else if (doc.status === 'failed' && maxRetries && Number(doc.automaticRetryCount || 0) >= maxRetries) {
@@ -4506,8 +4784,15 @@ const html = String.raw`<!doctype html>
       if (doc.oneDriveUrl) {
         links.push('<a class="doc-link" href="' + escapeHtml(doc.oneDriveUrl) + '" target="_blank" rel="noreferrer">' + icon('cloud') + 'OneDrive</a>');
       }
-      if (doc.sourceUrl) {
-        links.push('<a class="doc-link" href="' + escapeHtml(doc.sourceUrl) + '" target="_blank" rel="noreferrer">' + icon('download') + 'MiFILE</a>');
+      if (doc.sourceUrl && /^https?:\/\//i.test(doc.sourceUrl)) {
+        const sourceLabel = doc.sourceUrl.includes('truecertify.com')
+          ? 'TrueCertify'
+          : doc.sourceUrl.includes('mifile.courts.michigan.gov')
+            ? 'MiFILE'
+            : 'Source file';
+        links.push('<a class="doc-link" href="' + escapeHtml(doc.sourceUrl) + '" target="_blank" rel="noreferrer">' + icon('download') + escapeHtml(sourceLabel) + '</a>');
+      } else if (doc.sourceUrl && doc.sourceUrl.startsWith('email-attachment://')) {
+        links.push('<span class="source-label">' + icon('paperclip') + 'Email attachment</span>');
       }
       if (!links.length && doc.fileUrl) {
         links.push('<a class="doc-link" href="' + escapeHtml(doc.fileUrl) + '" target="_blank" rel="noreferrer">' + icon('external-link') + 'Legacy file</a>');

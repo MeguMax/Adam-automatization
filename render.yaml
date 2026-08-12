@@ -45,6 +45,10 @@ services:
         value: "43200000"
       - key: MIFILE_DOWNLOAD_TIMEOUT_MS
         value: "90000"
+      - key: MIFILE_LOGIN_TIMEOUT_MS
+        value: "30000"
+      - key: MIFILE_COOKIE_CACHE_MS
+        value: "600000"
       - key: TENANT_ID
         sync: false
       - key: CLIENT_ID

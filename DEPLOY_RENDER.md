@@ -64,7 +64,7 @@ The new Render database is persistent from its first deploy onward. Transfer the
 
    ```text
    Production worker enabled.
-   Worker runtime: { buildId: '2026-07-23-history-retry-visibility-v4', ... }
+   Worker runtime: { buildId: '2026-08-12-resilient-downloads-v8', ... }
    Plaintiff naming database lookup: ...
    OneDrive file name selected: ...
    ```
@@ -74,5 +74,7 @@ The new Render database is persistent from its first deploy onward. Transfer the
 - Render provides `PORT`; the admin binds to it automatically on `0.0.0.0`.
 - `/healthz` is public only for Render health checks. The dashboard and all `/api/*` endpoints require admin credentials.
 - `DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS=3` keeps a bad file from monopolizing the worker. Failed documents are retried later up to `DOCUMENT_AUTO_RETRY_LIMIT`, two due retry jobs per poll.
+- Document retries use the URL and parsed case data already stored in SQLite. They do not require the original Outlook message unless the source is a PDF email attachment. If Outlook changed the message ID after moving the email, the worker recovers it by subject, sender, and received time.
+- MiFILE authentication is verified by its identity cookie and cached for ten minutes. A response redirected to the login page invalidates and refreshes that session before the download is marked failed.
 - Queue history is paginated from SQLite and is not capped at the newest 100 or 200 records. Period cleanup deletes database records and tombstones their mailbox IDs; it never deletes OneDrive files.
 - Do not copy a live SQLite file over the running Render database. This deployment starts with a clean operational database, restores Plaintiff mappings from the seed, and rebuilds recent inbox state from Microsoft 365. A full historical SQLite migration should be handled separately if old audit history is required.

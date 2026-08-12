@@ -410,6 +410,9 @@ export interface ActivityPage {
 export interface QueuedEmailRetry {
     emailId: string;
     externalMessageId: string;
+    subject: string | null;
+    sender: string | null;
+    receivedAt: string | null;
 }
 
 export interface EmailDetail {
@@ -459,6 +462,10 @@ export interface DueDocumentRetry {
     emailId: string;
     externalMessageId: string;
     caseDraftId: string | null;
+    subject: string | null;
+    sender: string | null;
+    receivedAt: string | null;
+    parsedEmail: ParsedEmailInfo | null;
     sourceUrl: string;
     documentType: string | null;
     documentName: string | null;
@@ -1427,6 +1434,24 @@ const migrations: Migration[] = [
             `);
         },
     },
+    {
+        version: 11,
+        name: 'requeue_documents_after_source_independent_retry_fix',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE document_records
+                SET status = 'retry_queued',
+                    automatic_retry_count = 0,
+                    next_retry_at = ?,
+                    updated_at = ?
+                WHERE status = 'failed'
+                  AND one_drive_url IS NULL
+                  AND source_url IS NOT NULL
+                  AND source_url != ''
+            `).run(timestamp, timestamp);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -1696,7 +1721,12 @@ export class WorkflowDatabase {
         const safeLimit = Math.min(Math.max(Math.floor(limit), 1), 200);
         const rows = this.db
             .prepare(`
-                SELECT e.id, e.external_message_id
+                SELECT
+                    e.id,
+                    e.external_message_id,
+                    e.subject,
+                    e.sender,
+                    e.received_at
                 FROM email_records e
                 WHERE e.processing_status = 'new'
                   AND EXISTS (
@@ -1709,12 +1739,42 @@ export class WorkflowDatabase {
                 ORDER BY e.updated_at, e.id
                 LIMIT ?
             `)
-            .all(safeLimit) as Array<{ id: string; external_message_id: string }>;
+            .all(safeLimit) as Array<{
+                id: string;
+                external_message_id: string;
+                subject: string | null;
+                sender: string | null;
+                received_at: string | null;
+            }>;
 
         return rows.map(row => ({
             emailId: row.id,
             externalMessageId: row.external_message_id,
+            subject: row.subject,
+            sender: row.sender,
+            receivedAt: row.received_at,
         }));
+    }
+
+    updateEmailExternalMessageId(emailId: string, externalMessageId: string): void {
+        const conflict = this.db
+            .prepare('SELECT id FROM email_records WHERE external_message_id = ?')
+            .get(externalMessageId) as { id: string } | undefined;
+        if (conflict && conflict.id !== emailId) {
+            throw new Error('The recovered Outlook message is already linked to another email record');
+        }
+
+        const timestamp = nowIso();
+        this.db
+            .prepare(`
+                UPDATE email_records
+                SET external_message_id = ?, updated_at = ?
+                WHERE id = ?
+            `)
+            .run(externalMessageId, timestamp, emailId);
+        this.insertAuditLog('email_record', emailId, 'email_source_message_recovered', {
+            externalMessageId,
+        });
     }
 
     getDocumentRetryPolicy(): { maxAutomaticRetries: number } {
@@ -1728,8 +1788,8 @@ export class WorkflowDatabase {
 
         if (!existing) throw new Error('Document record not found');
         if (!existing.source_url) throw new Error('This document has no source URL to retry');
-        if (!['failed', 'retry_queued'].includes(existing.status)) {
-            throw new Error('Only failed documents can be queued for retry');
+        if (!['pending', 'failed', 'retry_queued'].includes(existing.status)) {
+            throw new Error('Only pending or failed documents can be queued for retry');
         }
 
         const timestamp = nowIso();
@@ -1778,17 +1838,26 @@ export class WorkflowDatabase {
                     d.id AS document_id,
                     d.email_id,
                     e.external_message_id,
+                    e.subject,
+                    e.sender,
+                    e.received_at,
                     d.case_draft_id,
                     d.source_url,
                     d.document_type,
                     d.original_filename,
-                    d.status
+                    d.status,
+                    COALESCE(c.normalized_data_json, c.extracted_data_json) AS parsed_email_json
                 FROM document_records d
                 JOIN email_records e ON e.id = d.email_id
+                LEFT JOIN case_drafts c ON c.id = d.case_draft_id
                 WHERE d.source_url IS NOT NULL
                   AND d.source_url != ''
                   AND (
                     d.status = 'retry_queued'
+                    OR (
+                        d.status = 'pending'
+                        AND e.processing_status IN ('failed', 'partial_failure')
+                    )
                     OR (
                         d.status = 'failed'
                         AND d.next_retry_at IS NOT NULL
@@ -1809,6 +1878,7 @@ export class WorkflowDatabase {
             for (const candidate of candidates) {
                 const retrySource: DueDocumentRetry['retrySource'] =
                     candidate.status === 'retry_queued' ? 'manual' : 'automatic';
+                const parsedCandidate = this.safeJson(candidate.parsed_email_json);
                 this.db
                     .prepare(`
                         UPDATE document_records
@@ -1828,6 +1898,15 @@ export class WorkflowDatabase {
                     emailId: candidate.email_id,
                     externalMessageId: candidate.external_message_id,
                     caseDraftId: candidate.case_draft_id,
+                    subject: candidate.subject,
+                    sender: candidate.sender,
+                    receivedAt: candidate.received_at,
+                    parsedEmail:
+                        parsedCandidate &&
+                        typeof parsedCandidate === 'object' &&
+                        Array.isArray(parsedCandidate.filedDocuments)
+                            ? parsedCandidate as ParsedEmailInfo
+                            : null,
                     sourceUrl: candidate.source_url,
                     documentType: candidate.document_type,
                     documentName: candidate.original_filename,

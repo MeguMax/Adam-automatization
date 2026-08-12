@@ -1,6 +1,11 @@
 import {
+    CourtEmailAttachment,
+    downloadCourtEmailAttachment,
     fetchCourtEmailById,
+    fetchCourtEmailPdfAttachments,
     fetchRecentCourtEmailHeaders,
+    findCourtEmailByMetadata,
+    isUsableTrueCertifyUrl,
     parseEmailBody,
     ParsedEmailInfo,
 } from './emailProcessor';
@@ -14,8 +19,14 @@ import { closeMifileBrowser } from './mifileSession';
 import { getGraphClient } from './graphClient';
 import { buildSuccessBody, buildErrorBody } from './buildSuccessBody';
 import { sendProcessingReport } from './notificationEmail';
-import { getWorkflowDatabase, WorkflowDatabase } from './database';
+import { DueDocumentRetry, getWorkflowDatabase, WorkflowDatabase } from './database';
 import { loadLegacyProcessed } from './legacyState';
+import {
+    addEmailAttachmentSources,
+    createEmailAttachmentSource,
+    emailAttachmentSourceName,
+    isEmailAttachmentSource,
+} from './emailAttachmentSource';
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
 const MAX_EMAILS_PER_POLL = Number(process.env.WORKER_EMAIL_LIMIT || 50);
@@ -28,7 +39,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-07-30-draft-workspace-v7';
+const WORKER_BUILD_ID = '2026-08-12-resilient-downloads-v8';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -151,9 +162,11 @@ function recordDownloadResults(params: {
             mimeType: 'application/pdf',
             fileSize: null,
             documentType: failure.documentType ?? null,
-            uploadSource: failure.downloadUrl?.includes('truecertify.com')
-                ? 'truecertify'
-                : 'mifile',
+            uploadSource: isEmailAttachmentSource(failure.downloadUrl)
+                ? 'email_attachment'
+                : failure.downloadUrl?.includes('truecertify.com')
+                    ? 'truecertify'
+                    : 'mifile',
             status: notDownloadable ? 'not_downloadable' : 'failed',
             errorMessage: notDownloadable ? 'No downloadable file in source email' : failure.reason,
             downloadAttempts: failure.downloadAttempts ?? 0,
@@ -192,6 +205,124 @@ function normalizedDocumentUrl(value: string | null | undefined): string {
     return (value ?? '').replace(/&amp;/g, '&').trim();
 }
 
+function normalizedAttachmentName(value: string | null | undefined): string {
+    return (value ?? '')
+        .toLowerCase()
+        .replace(/\.pdf$/i, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+function selectPdfAttachment(
+    documentName: string | null | undefined,
+    attachments: CourtEmailAttachment[],
+): CourtEmailAttachment {
+    if (!attachments.length) {
+        throw new Error('The source email does not contain a PDF attachment');
+    }
+
+    const target = normalizedAttachmentName(documentName);
+    const exact = target
+        ? attachments.find(attachment => normalizedAttachmentName(attachment.name) === target)
+        : undefined;
+    if (exact) return exact;
+
+    const partial = target
+        ? attachments.find(attachment => {
+            const candidate = normalizedAttachmentName(attachment.name);
+            return candidate.includes(target) || target.includes(candidate);
+        })
+        : undefined;
+    if (partial) return partial;
+    if (attachments.length === 1) return attachments[0];
+
+    throw new Error(
+        `Unable to match the document to a PDF attachment. Available files: ${
+            attachments.map(attachment => attachment.name).join(', ')
+        }`,
+    );
+}
+
+function createEmailAttachmentResolver(
+    messageProvider: () => Promise<any>,
+): (document: ParsedEmailInfo['filedDocuments'][number]) => Promise<Buffer> {
+    let messagePromise: Promise<any> | null = null;
+    let attachmentsPromise: Promise<CourtEmailAttachment[]> | null = null;
+
+    return async document => {
+        messagePromise ??= messageProvider();
+        const message = await messagePromise;
+        attachmentsPromise ??= fetchCourtEmailPdfAttachments(String(message.id));
+        const attachments = await attachmentsPromise;
+        const sourceName = emailAttachmentSourceName(document.downloadUrl);
+        const attachment = selectPdfAttachment(
+            sourceName || document.documentName || document.documentType,
+            attachments,
+        );
+        console.log('Email attachment selected:', {
+            source: document.downloadUrl,
+            attachmentName: attachment.name,
+            attachmentSize: attachment.size,
+        });
+        return downloadCourtEmailAttachment(String(message.id), attachment.id);
+    };
+}
+
+async function recoverOutlookMessage(
+    db: WorkflowDatabase,
+    email: {
+        emailId: string;
+        externalMessageId: string;
+        subject: string | null;
+        sender: string | null;
+        receivedAt: string | null;
+    },
+): Promise<any> {
+    try {
+        return await fetchCourtEmailById(email.externalMessageId);
+    } catch (directError) {
+        console.warn(
+            `Stored Outlook message ID is no longer available for ${email.subject || email.emailId}; ` +
+            'searching the mailbox by subject, sender, and received time.',
+        );
+        const recovered = await findCourtEmailByMetadata(email);
+        if (!recovered) throw directError;
+        if (String(recovered.id) !== email.externalMessageId) {
+            db.updateEmailExternalMessageId(email.emailId, String(recovered.id));
+        }
+        return recovered;
+    }
+}
+
+function retryParsedEmail(retry: DueDocumentRetry): ParsedEmailInfo {
+    if (retry.parsedEmail) return retry.parsedEmail;
+    return {
+        isMiFile: true,
+        courtName: null,
+        caseNumber: null,
+        caseTitle: null,
+        plaintiff: null,
+        defendant: null,
+        bundleNumber: null,
+        filerName: null,
+        submitterName: null,
+        temporaryCaseNumber: null,
+        newCaseNumber: null,
+        filedAt: null,
+        filedDocuments: [],
+        fileTypeByAttachmentId: {},
+    };
+}
+
+function retrySourceMessage(retry: DueDocumentRetry): any {
+    return {
+        id: retry.externalMessageId,
+        subject: retry.subject,
+        from: { emailAddress: { address: retry.sender } },
+        receivedDateTime: retry.receivedAt,
+    };
+}
+
 async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
     const recovered = db.recoverStaleDocumentRetries();
     if (recovered > 0) {
@@ -211,47 +342,55 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
 
     for (const [emailId, retries] of byEmail) {
         const caseDraftId = retries[0].caseDraftId;
-        const completed = new Set<string>();
         const recoveredFiles: NotificationFile[] = [];
-        let sourceMessage: any;
-        let parsed: ParsedEmailInfo | undefined;
+        const reportParsed = retryParsedEmail(retries[0]);
+        let sourceMessage = retrySourceMessage(retries[0]);
+        let recoveredMessagePromise: Promise<any> | null = null;
+        const attachmentResolver = createEmailAttachmentResolver(async () => {
+            recoveredMessagePromise ??= recoverOutlookMessage(db, retries[0]);
+            sourceMessage = await recoveredMessagePromise;
+            return sourceMessage;
+        });
 
         db.markEmailRetrying(emailId);
 
-        try {
-            sourceMessage = await fetchCourtEmailById(retries[0].externalMessageId);
-            parsed = parseEmailBody(sourceMessage.body?.content ?? '');
-            if (!parsed.isMiFile) {
-                throw new Error('The original email can no longer be parsed as a MiFILE/TrueFiling message');
-            }
-
-            const plaintiffNaming = lookupPlaintiffNaming(db, parsed);
-            for (const retry of retries) {
-                const retryDocument = parsed.filedDocuments.find(document =>
+        for (const retry of retries) {
+            try {
+                const parsed = retryParsedEmail(retry);
+                const storedDocument = parsed.filedDocuments.find(document =>
                     normalizedDocumentUrl(document.downloadUrl) === normalizedDocumentUrl(retry.sourceUrl),
                 );
-                if (!retryDocument) {
-                    db.completeDocumentRetryFailure({
-                        documentId: retry.documentId,
-                        reason: 'The source document link was not found in the original email',
-                        downloadAttempts: 0,
-                        metadata: { retrySource: retry.retrySource, sourceUrl: retry.sourceUrl },
-                    });
-                    completed.add(retry.documentId);
-                    continue;
-                }
-
+                const usesInvalidTrueCertifyLink =
+                    retry.sourceUrl.includes('truecertify.com') &&
+                    !isUsableTrueCertifyUrl(retry.sourceUrl);
+                const sourceUrl = usesInvalidTrueCertifyLink
+                    ? createEmailAttachmentSource(
+                        retry.documentName || retry.documentType || 'attachment.pdf',
+                    )
+                    : retry.sourceUrl;
+                const retryDocument = {
+                    documentName: retry.documentName ?? storedDocument?.documentName ?? null,
+                    documentType: retry.documentType ?? storedDocument?.documentType ?? null,
+                    status: storedDocument?.status ?? 'Filed',
+                    comments: storedDocument?.comments ?? null,
+                    downloadUrl: sourceUrl,
+                };
                 const oneDocumentParsed: ParsedEmailInfo = {
                     ...parsed,
+                    isMiFile: true,
                     filedDocuments: [retryDocument],
                 };
+                const plaintiffNaming = lookupPlaintiffNaming(db, oneDocumentParsed);
                 const result = await downloadFiledDocuments(
                     oneDocumentParsed,
                     'downloads',
-                    sourceMessage.receivedDateTime as string | undefined,
+                    retry.receivedAt ?? undefined,
                     {
                         plaintiffShortName: plaintiffNaming.shortName,
-                        resolvePlaintiffNaming: () => lookupPlaintiffNaming(db, parsed!),
+                        resolvePlaintiffNaming: () => lookupPlaintiffNaming(db, oneDocumentParsed),
+                        resolveDocumentBuffer: isEmailAttachmentSource(sourceUrl)
+                            ? attachmentResolver
+                            : undefined,
                     },
                 );
                 const downloadedFile = result.downloaded[0];
@@ -262,14 +401,16 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                         documentId: retry.documentId,
                         originalFilename: notificationFile.displayName || downloadedFile.documentName || null,
                         currentFilename: notificationFile.fileName,
-                        sourceUrl: downloadedFile.downloadUrl ?? retry.sourceUrl,
+                        sourceUrl: downloadedFile.downloadUrl ?? sourceUrl,
                         oneDriveUrl: notificationFile.webUrl ?? null,
                         storagePath: downloadedFile.localPath,
                         fileSize: notificationFile.buffer.length,
                         documentType: downloadedFile.documentType ?? retry.documentType,
-                        uploadSource: retry.sourceUrl.includes('truecertify.com')
-                            ? 'truecertify'
-                            : 'mifile',
+                        uploadSource: isEmailAttachmentSource(sourceUrl)
+                            ? 'email_attachment'
+                            : sourceUrl.includes('truecertify.com')
+                                ? 'truecertify'
+                                : 'mifile',
                         downloadAttempts: downloadedFile.downloadAttempts ?? 0,
                         metadata: {
                             driveId: notificationFile.driveId,
@@ -284,15 +425,11 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                         documentId: retry.documentId,
                         reason: failure?.reason ?? 'Retry finished without a downloaded PDF',
                         downloadAttempts: failure?.downloadAttempts ?? 0,
-                        metadata: failure ?? { retrySource: retry.retrySource },
+                        metadata: failure ?? { retrySource: retry.retrySource, sourceUrl },
                     });
                 }
-                completed.add(retry.documentId);
-            }
-        } catch (error) {
-            console.error(`Document retry processing failed for email ${emailId}:`, error);
-            for (const retry of retries) {
-                if (completed.has(retry.documentId)) continue;
+            } catch (error) {
+                console.error(`Document retry ${retry.documentId} failed:`, error);
                 db.completeDocumentRetryFailure({
                     documentId: retry.documentId,
                     reason: error instanceof Error ? error.message : String(error),
@@ -300,19 +437,19 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                     metadata: { retrySource: retry.retrySource, sourceUrl: retry.sourceUrl },
                 });
             }
-        } finally {
-            db.refreshEmailAfterDocumentRetries(emailId, caseDraftId);
         }
 
-        if (sourceMessage && parsed && recoveredFiles.length) {
+        db.refreshEmailAfterDocumentRetries(emailId, caseDraftId);
+
+        if (recoveredFiles.length) {
             try {
-                const reportPlaintiffNaming = lookupPlaintiffNaming(db, parsed);
+                const reportPlaintiffNaming = lookupPlaintiffNaming(db, reportParsed);
                 await sendProcessingReport({
                     client: getGraphClient(),
-                    subject: `MiFILE/TrueFiling retry completed: ${parsed.caseNumber ?? 'NO CASE'} - ${recoveredFiles.length} doc(s)`,
+                    subject: `MiFILE/TrueFiling retry completed: ${reportParsed.caseNumber ?? 'NO CASE'} - ${recoveredFiles.length} doc(s)`,
                     bodyText: buildSuccessBody({
                         msg: sourceMessage,
-                        parsed,
+                        parsed: reportParsed,
                         files: recoveredFiles,
                         plaintiffFullName: reportPlaintiffNaming.fullName,
                         plaintiffShortName: reportPlaintiffNaming.shortName,
@@ -338,8 +475,8 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
     for (const retry of queuedRetries) {
         if (emailsById.has(retry.externalMessageId)) continue;
         try {
-            const email = await fetchCourtEmailById(retry.externalMessageId);
-            emailsById.set(retry.externalMessageId, email);
+            const email = await recoverOutlookMessage(db, retry);
+            emailsById.set(String(email.id), email);
         } catch (error) {
             db.markEmailFailed(
                 retry.emailId,
@@ -402,7 +539,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             }
 
             const bodyContent = (msg as any).body?.content ?? '';
-            parsed = parseEmailBody(bodyContent);
+            parsed = addEmailAttachmentSources(parseEmailBody(bodyContent));
             console.log('Parsed info:', parsed);
 
             if (!parsed.isMiFile) {
@@ -420,6 +557,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 {
                     plaintiffShortName: plaintiffNaming.shortName,
                     resolvePlaintiffNaming: () => lookupPlaintiffNaming(db, parsed!),
+                    resolveDocumentBuffer: createEmailAttachmentResolver(async () => msg),
                 },
             );
 
