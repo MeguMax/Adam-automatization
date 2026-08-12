@@ -1829,6 +1829,27 @@ export class WorkflowDatabase {
         return Number(result.changes ?? 0);
     }
 
+    recoverInterruptedDocumentRetries(): number {
+        const timestamp = nowIso();
+        const result = this.db
+            .prepare(`
+                UPDATE document_records
+                SET status = 'failed',
+                    error_message = 'Worker restarted before the document finished; retry rescheduled',
+                    next_retry_at = ?,
+                    updated_at = ?
+                WHERE status = 'retrying'
+            `)
+            .run(timestamp, timestamp);
+        const recovered = Number(result.changes ?? 0);
+        if (recovered > 0) {
+            this.insertAuditLog('worker', 'document_retry_worker', 'interrupted_retries_recovered', {
+                recovered,
+            });
+        }
+        return recovered;
+    }
+
     claimDueDocumentRetries(limit = 10): DueDocumentRetry[] {
         const normalizedLimit = Math.min(Math.max(Math.floor(limit), 1), 50);
         const timestamp = nowIso();

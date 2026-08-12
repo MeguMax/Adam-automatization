@@ -673,6 +673,13 @@ export async function runWorker(options: WorkerRunOptions = {}): Promise<void> {
         console.log(`Imported ${imported} legacy processed email id(s) into SQLite.`);
     }
 
+    const interruptedRetries = db.recoverInterruptedDocumentRetries();
+    if (interruptedRetries > 0) {
+        console.warn(
+            `Rescheduled ${interruptedRetries} document retry job(s) interrupted by the previous worker shutdown.`,
+        );
+    }
+
     console.log(`Court-email worker started${runOnce ? ' (single pass)' : ''}`);
 
     try {

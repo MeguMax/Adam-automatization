@@ -422,6 +422,36 @@ test('failed emails expose pending documents to the retry worker with stored dra
     }
 });
 
+test('worker startup immediately recovers document retries interrupted by a restart', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-interrupted-retry-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'interrupted-retry-message',
+            subject: 'Interrupted retry',
+            receivedDateTime: '2026-08-12T10:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+        });
+        const documentId = db.addDocument({
+            emailId: email.id,
+            sourceUrl: 'https://mifile.example/interrupted',
+            uploadSource: 'mifile',
+            status: 'retry_queued',
+        });
+        assert.equal(db.claimDueDocumentRetries(1)[0].documentId, documentId);
+
+        assert.equal(db.recoverInterruptedDocumentRetries(), 1);
+        const recovered = db.claimDueDocumentRetries(1);
+        assert.equal(recovered.length, 1);
+        assert.equal(recovered[0].documentId, documentId);
+        assert.equal(recovered[0].retrySource, 'automatic');
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
 test('global activity history supports related-email search, record filters, and pagination', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-activity-'));
     const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
