@@ -1805,6 +1805,25 @@ const migrations: Migration[] = [
             `);
         },
     },
+    {
+        version: 16,
+        name: 'review_unextracted_primary_complaint_drafts',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE case_drafts
+                SET status = 'needs_review',
+                    validation_status = 'warnings',
+                    updated_at = ?
+                WHERE primary_document_id IS NOT NULL
+                  AND status IN ('new', 'parsed', 'ready_to_file')
+                  AND (
+                      normalized_data_json IS NULL
+                      OR normalized_data_json NOT LIKE '%"complaintExtraction"%'
+                  )
+            `).run(timestamp);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
