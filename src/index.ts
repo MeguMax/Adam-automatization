@@ -39,7 +39,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-08-12-resilient-downloads-v8';
+const WORKER_BUILD_ID = '2026-08-12-mifile-history-fallback-v9';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -100,13 +100,14 @@ function summarizeFailures(failures: DocumentFailure[]): string {
 }
 
 function isNonDownloadableDocument(failure: DocumentFailure): boolean {
-    return !failure.downloadUrl &&
+    return failure.notDownloadable === true ||
+        (!failure.downloadUrl &&
         (
             failure.reason === 'Missing MiFILE download URL' ||
             failure.reason === 'Missing TrueCertify download URL' ||
             failure.reason === 'No downloadable file in source email' ||
             failure.reason === 'Expected document has no downloadable source URL'
-        );
+        ));
 }
 
 function recordDownloadResults(params: {
@@ -168,7 +169,7 @@ function recordDownloadResults(params: {
                     ? 'truecertify'
                     : 'mifile',
             status: notDownloadable ? 'not_downloadable' : 'failed',
-            errorMessage: notDownloadable ? 'No downloadable file in source email' : failure.reason,
+            errorMessage: failure.reason,
             downloadAttempts: failure.downloadAttempts ?? 0,
             metadata: failure,
         });
@@ -421,12 +422,17 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                     recoveredFiles.push(notificationFile);
                 } else {
                     const failure = result.failures[0];
-                    db.completeDocumentRetryFailure({
+                    const failureInput = {
                         documentId: retry.documentId,
                         reason: failure?.reason ?? 'Retry finished without a downloaded PDF',
                         downloadAttempts: failure?.downloadAttempts ?? 0,
                         metadata: failure ?? { retrySource: retry.retrySource, sourceUrl },
-                    });
+                    };
+                    if (failure && isNonDownloadableDocument(failure)) {
+                        db.completeDocumentRetryNotDownloadable(failureInput);
+                    } else {
+                        db.completeDocumentRetryFailure(failureInput);
+                    }
                 }
             } catch (error) {
                 console.error(`Document retry ${retry.documentId} failed:`, error);
@@ -603,6 +609,19 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             }
 
             if (!notificationFiles.length) {
+                if (failures.length && failures.every(isNonDownloadableDocument)) {
+                    db.setCaseDraftStatus(
+                        caseDraftId,
+                        'needs_review',
+                        'warnings',
+                        'not_started',
+                    );
+                    db.markEmailProcessed(emailRecord.id);
+                    console.warn(
+                        'Email processed without file uploads because MiFILE exposes no downloadable PDF.',
+                    );
+                    continue;
+                }
                 throw new Error('No documents were downloaded or uploaded');
             }
 

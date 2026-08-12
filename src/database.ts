@@ -1452,6 +1452,23 @@ const migrations: Migration[] = [
             `).run(timestamp, timestamp);
         },
     },
+    {
+        version: 12,
+        name: 'requeue_mifile_documents_for_history_download_fallback',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE document_records
+                SET status = 'retry_queued',
+                    automatic_retry_count = 0,
+                    next_retry_at = ?,
+                    updated_at = ?
+                WHERE status = 'failed'
+                  AND one_drive_url IS NULL
+                  AND source_url LIKE '%mifile.courts.michigan.gov%'
+            `).run(timestamp, timestamp);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2010,6 +2027,66 @@ export class WorkflowDatabase {
         });
     }
 
+    completeDocumentRetryNotDownloadable(input: {
+        documentId: string;
+        reason: string;
+        downloadAttempts: number;
+        metadata?: unknown;
+    }): void {
+        const existing = this.db
+            .prepare('SELECT metadata_json FROM document_records WHERE id = ?')
+            .get(input.documentId) as { metadata_json: string | null } | undefined;
+        if (!existing) throw new Error('Document record not found');
+
+        const timestamp = nowIso();
+        const existingMetadata = this.safeJson(existing.metadata_json);
+        const incomingMetadata = input.metadata && typeof input.metadata === 'object'
+            ? input.metadata as Record<string, unknown>
+            : {};
+        const incomingFailureLog = failureLogFromMetadata(incomingMetadata);
+        const mergedFailureLog = [
+            ...failureLogFromMetadata(existingMetadata),
+            ...(incomingFailureLog.length
+                ? incomingFailureLog
+                : [{
+                    attempt: input.downloadAttempts,
+                    at: timestamp,
+                    stage: 'download',
+                    message: input.reason,
+                }]),
+        ].slice(-100);
+        const mergedMetadata = {
+            ...(existingMetadata && typeof existingMetadata === 'object'
+                ? existingMetadata as Record<string, unknown>
+                : {}),
+            ...incomingMetadata,
+            attemptLog: mergedFailureLog,
+        };
+
+        this.db
+            .prepare(`
+                UPDATE document_records
+                SET status = 'not_downloadable',
+                    error_message = ?,
+                    metadata_json = ?,
+                    download_attempts = download_attempts + ?,
+                    next_retry_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+            `)
+            .run(
+                input.reason,
+                toJson(mergedMetadata),
+                input.downloadAttempts,
+                timestamp,
+                input.documentId,
+            );
+        this.insertAuditLog('document_record', input.documentId, 'document_not_downloadable', {
+            reason: input.reason,
+            downloadAttempts: input.downloadAttempts,
+        });
+    }
+
     completeDocumentRetryFailure(input: {
         documentId: string;
         reason: string;
@@ -2085,6 +2162,7 @@ export class WorkflowDatabase {
             .prepare(`
                 SELECT
                     SUM(CASE WHEN status = 'uploaded' OR one_drive_url IS NOT NULL THEN 1 ELSE 0 END) AS uploaded_count,
+                    SUM(CASE WHEN status = 'not_downloadable' THEN 1 ELSE 0 END) AS not_downloadable_count,
                     SUM(CASE
                         WHEN source_url IS NOT NULL
                          AND status IN ('pending', 'failed', 'retry_queued', 'retrying')
@@ -2093,8 +2171,13 @@ export class WorkflowDatabase {
                 FROM document_records
                 WHERE email_id = ?
             `)
-            .get(emailId) as { uploaded_count: number | null; outstanding_count: number | null };
+            .get(emailId) as {
+                uploaded_count: number | null;
+                not_downloadable_count: number | null;
+                outstanding_count: number | null;
+            };
         const uploaded = Number(totals.uploaded_count ?? 0);
+        const notDownloadable = Number(totals.not_downloadable_count ?? 0);
         const outstanding = Number(totals.outstanding_count ?? 0);
 
         if (outstanding > 0) {
@@ -2115,6 +2198,14 @@ export class WorkflowDatabase {
             this.markEmailProcessed(emailId);
             if (caseDraftId) {
                 this.setCaseDraftStatus(caseDraftId, 'ready_to_file', 'passed', 'not_started');
+            }
+            return;
+        }
+
+        if (notDownloadable > 0) {
+            this.markEmailProcessed(emailId);
+            if (caseDraftId) {
+                this.setCaseDraftStatus(caseDraftId, 'needs_review', 'warnings', 'not_started');
             }
         }
     }

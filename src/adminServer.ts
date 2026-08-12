@@ -24,7 +24,7 @@ import {
 } from './oneDriveClient';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-08-12-resilient-downloads-v8';
+const ADMIN_BUILD_ID = '2026-08-12-mifile-history-fallback-v9';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3174,7 +3174,7 @@ const html = String.raw`<!doctype html>
       needs_review: 'Needs review',
       needs_short_name: 'Needs short name',
       needs_application: 'Needs application',
-      not_downloadable: 'No file link',
+      not_downloadable: 'Not downloadable',
       retry_queued: 'Retry queued',
       filing_in_progress: 'Filing in progress',
       filed_successfully: 'Filed successfully',
@@ -3356,7 +3356,7 @@ const html = String.raw`<!doctype html>
         metric('Waiting to download', (docs.pending || 0) + (docs.retry_queued || 0) + (docs.retrying || 0), 'clock-3'),
         metric('Downloaded', docs.uploaded || 0, 'circle-check-big', 'success'),
         metric('Active drafts', (drafts.parsed || 0) + (drafts.needs_review || 0) + (drafts.ready_to_file || 0), 'files'),
-        metric('No source file', docs.not_downloadable || 0, 'unlink'),
+        metric('Not downloadable', docs.not_downloadable || 0, 'file-warning'),
         metric('Plaintiff names needed', s.missingPlaintiffMappings, 'user-round-search', 'warning'),
         metric('Database', formatBytes(s.databaseBytes), 'database'),
       ].join('');
@@ -4567,14 +4567,20 @@ const html = String.raw`<!doctype html>
       const retrying = Number(item.retryingDocumentCount || 0);
       const failed = Number(item.failedDocumentCount || 0);
       const notDownloadable = Number(item.notDownloadableDocumentCount || 0);
-      if (!expected) return '<span class="cell-secondary">No files</span>';
+      if (!expected) {
+        return '<span class="cell-secondary">' +
+          (notDownloadable
+            ? escapeHtml(notDownloadable) + ' not downloadable'
+            : 'No files') +
+        '</span>';
+      }
       const percent = Math.min(Math.max(Math.round((uploaded / expected) * 100), 0), 100);
       const parts = [];
       if (pending) parts.push(escapeHtml(pending) + ' pending');
       if (retryQueued) parts.push(escapeHtml(retryQueued) + ' queued');
       if (retrying) parts.push(escapeHtml(retrying) + ' retrying');
       if (failed) parts.push('<span class="error-text">' + escapeHtml(failed) + ' failed</span>');
-      if (notDownloadable) parts.push(escapeHtml(notDownloadable) + ' no link');
+      if (notDownloadable) parts.push(escapeHtml(notDownloadable) + ' not downloadable');
       const progressTone = failed ? ' has-failure' : (pending || retryQueued || retrying ? ' in-progress' : '');
       return '<div class="document-progress">' +
         '<div class="document-progress-head"><strong>' + escapeHtml(uploaded) + ' / ' + escapeHtml(expected) + '</strong><span class="muted">' + percent + '%</span></div>' +
@@ -4734,7 +4740,7 @@ const html = String.raw`<!doctype html>
           (retryQueued ? '<span>' + escapeHtml(retryQueued) + ' queued</span>' : '') +
           (retrying ? '<span>' + escapeHtml(retrying) + ' retrying</span>' : '') +
           (failed ? '<span class="error-text">' + escapeHtml(failed) + ' failed</span>' : '') +
-          (notDownloadable ? '<span>' + escapeHtml(notDownloadable) + ' without link</span>' : '') +
+          (notDownloadable ? '<span>' + escapeHtml(notDownloadable) + ' not downloadable</span>' : '') +
         '</div>' +
       '</div>';
     }

@@ -452,6 +452,73 @@ test('worker startup immediately recovers document retries interrupted by a rest
     }
 });
 
+test('electronic MiFILE forms stop retrying and no longer leave the email failed', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-electronic-form-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'electronic-form-message',
+            subject: 'MiFILE - Document Filed 2026-224248-CH',
+            receivedDateTime: '2026-07-14T15:53:40.000Z',
+            from: { emailAddress: { address: 'info@truefiling.com' } },
+        });
+        const parsed: ParsedEmailInfo = {
+            isMiFile: true,
+            courtName: 'MI Oakland County 6th Circuit Court',
+            caseNumber: '2026-224248-CH',
+            caseTitle: 'MADISON V HP FORECLOSURE SOLUTION',
+            plaintiff: 'MADISON',
+            defendant: 'HP FORECLOSURE SOLUTION',
+            bundleNumber: '12805264',
+            filerName: 'Adam Devlin',
+            filedAt: '2026-07-14',
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        };
+        const caseDraftId = db.createCaseDraft(email.id, parsed);
+        const documentId = db.addDocument({
+            emailId: email.id,
+            caseDraftId,
+            sourceUrl: 'https://mifile.courts.michigan.gov/filing/electronic-form',
+            documentType: 'ISI_ADD_COUNSEL_FORM_DT',
+            uploadSource: 'mifile',
+            status: 'failed',
+        });
+        db.markEmailFailed(email.id, 'HTTP 400', 'failed');
+        db.queueDocumentRetry(documentId);
+        assert.equal(db.claimDueDocumentRetries(1)[0].documentId, documentId);
+        db.markEmailRetrying(email.id);
+
+        db.completeDocumentRetryNotDownloadable({
+            documentId,
+            reason: 'MiFILE returned structured form data instead of a PDF',
+            downloadAttempts: 1,
+            metadata: {
+                notDownloadable: true,
+                attemptLog: [{
+                    attempt: 1,
+                    at: '2026-08-12T12:00:00.000Z',
+                    stage: 'download',
+                    message: 'MiFILE returned structured form data instead of a PDF',
+                }],
+            },
+        });
+        db.refreshEmailAfterDocumentRetries(email.id, caseDraftId);
+
+        const detail = db.getEmailDetail(email.id);
+        assert.equal(detail?.email.processingStatus, 'processed');
+        assert.equal(detail?.caseDraft?.status, 'needs_review');
+        assert.equal(detail?.caseDraft?.validationStatus, 'warnings');
+        assert.equal(detail?.documents[0].status, 'not_downloadable');
+        assert.equal(detail?.documents[0].nextRetryAt, null);
+        assert.match(detail?.documents[0].errorMessage ?? '', /structured form data/);
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
 test('global activity history supports related-email search, record filters, and pagination', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-activity-'));
     const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));

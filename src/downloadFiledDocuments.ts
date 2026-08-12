@@ -1,6 +1,9 @@
 import path from 'path';
 import { ParsedEmailInfo, FiledDocumentInfo } from './emailProcessor';
-import { httpDownloadFromMifileToBuffer } from './mifileDownloader';
+import {
+    httpDownloadFromMifileToBuffer,
+    isMifileDocumentNotDownloadableError,
+} from './mifileDownloader';
 import {
     ensureRootFolder,
     ensureChildFolder,
@@ -42,6 +45,7 @@ export interface DocumentFailure {
     documentName?: string | null;
     downloadUrl?: string | null;
     reason: string;
+    notDownloadable?: boolean;
     downloadAttempts?: number;
     attemptLog?: DocumentAttemptLog[];
 }
@@ -533,6 +537,7 @@ export async function downloadFiledDocuments(
             let downloadAttempts = 0;
             const attemptLog: DocumentAttemptLog[] = [];
             let lastFailureReason = 'Unknown download failure';
+            let notDownloadable = false;
 
             try {
 
@@ -568,6 +573,7 @@ export async function downloadFiledDocuments(
                     break; // успех
                 } catch (err) {
                     lastFailureReason = failureReason(err);
+                    notDownloadable = isMifileDocumentNotDownloadableError(err);
                     attemptLog.push({
                         attempt,
                         at: new Date().toISOString(),
@@ -580,6 +586,10 @@ export async function downloadFiledDocuments(
                         `❌ Помилка при завантаженні MiFILE (спроба ${attempt}):`,
                         err,
                     );
+                    if (notDownloadable) {
+                        console.warn('MiFILE filing has no downloadable PDF; automatic retries stopped.');
+                        break;
+                    }
                     if (attempt === maxRetries) {
                         console.error(
                             `❌ MiFILE: не вдалося завантажити документ після ${maxRetries} спроб, пропускаємо`,
@@ -595,7 +605,10 @@ export async function downloadFiledDocuments(
                     documentType: doc.documentType ?? null,
                     documentName: doc.documentName,
                     downloadUrl: doc.downloadUrl,
-                    reason: `MiFILE: failed after ${maxRetries} immediate attempt(s). Last error: ${lastFailureReason}`,
+                    reason: notDownloadable
+                        ? lastFailureReason
+                        : `MiFILE: failed after ${maxRetries} immediate attempt(s). Last error: ${lastFailureReason}`,
+                    notDownloadable,
                     downloadAttempts,
                     attemptLog,
                 });
