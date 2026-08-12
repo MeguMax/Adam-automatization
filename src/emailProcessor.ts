@@ -203,6 +203,13 @@ export async function fetchCourtEmailById(messageId: string): Promise<any> {
 
 // ===== PARSER (универсальный) =====
 
+export function sanitizeGraphSearchSubject(subject: string): string {
+    return subject
+        .replace(/["\\&?#%+]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 export async function findCourtEmailByMetadata(lookup: CourtEmailLookup): Promise<any | null> {
     const receivedAt = lookup.receivedAt ? new Date(lookup.receivedAt) : null;
     if (!receivedAt || Number.isNaN(receivedAt.getTime()) || !lookup.subject?.trim()) {
@@ -210,7 +217,7 @@ export async function findCourtEmailByMetadata(lookup: CourtEmailLookup): Promis
     }
 
     const path = `/users/${encodeURIComponent(userEmail)}/messages`;
-    const searchSubject = lookup.subject.replace(/["\\]/g, ' ').trim();
+    const searchSubject = sanitizeGraphSearchSubject(lookup.subject);
     let messages: any[] = [];
     try {
         const searchResult = await withGraphRetry(

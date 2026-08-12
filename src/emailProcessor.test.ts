@@ -51,3 +51,11 @@ test('email attachment source identifiers round-trip filenames safely', () => {
     assert.equal(isEmailAttachmentSource(source), true);
     assert.equal(emailAttachmentSourceName(source), 'Court Order #1.pdf');
 });
+
+test('Graph subject searches remove URL and query syntax characters', async () => {
+    const { sanitizeGraphSearchSubject } = await import('./emailProcessor');
+    assert.equal(
+        sanitizeGraphSearchSubject('YOUR R&D TEST #1?'),
+        'YOUR R D TEST 1',
+    );
+});

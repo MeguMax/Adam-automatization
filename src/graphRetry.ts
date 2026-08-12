@@ -39,6 +39,7 @@ export function isRetryableGraphError(error: unknown): boolean {
     if ([408, 409, 425, 429, 500, 502, 503, 504].includes(statusCode)) {
         return true;
     }
+    if (statusCode >= 400 && statusCode < 500) return false;
 
     const code = String(value.code ?? '').toUpperCase();
     if ([

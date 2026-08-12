@@ -39,11 +39,14 @@ test('does not retry permanent Graph request errors', async () => {
         withGraphRetry(
             async () => {
                 calls += 1;
-                throw Object.assign(new Error('Invalid request'), { statusCode: 400 });
+                throw Object.assign(
+                    new Error('There is an unterminated string literal in the search query'),
+                    { statusCode: 400 },
+                );
             },
             { maxAttempts: 5, baseDelayMs: 0, maxDelayMs: 0 },
         ),
-        /Invalid request/,
+        /unterminated string literal/,
     );
     assert.equal(calls, 1);
 });
