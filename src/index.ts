@@ -27,6 +27,7 @@ import {
     emailAttachmentSourceName,
     isEmailAttachmentSource,
 } from './emailAttachmentSource';
+import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
 const MAX_EMAILS_PER_POLL = Number(process.env.WORKER_EMAIL_LIMIT || 50);
@@ -43,7 +44,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-08-12-court-email-backlog-v12';
+const WORKER_BUILD_ID = '2026-08-12-primary-complaint-drafts-v15';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -114,14 +115,14 @@ function isNonDownloadableDocument(failure: DocumentFailure): boolean {
         ));
 }
 
-function recordDownloadResults(params: {
+async function recordDownloadResults(params: {
     db: WorkflowDatabase;
     emailId: string;
     caseDraftId: string;
     downloaded: DownloadedFile[];
     notificationFiles: NotificationFile[];
     failures: DocumentFailure[];
-}): void {
+}): Promise<void> {
     const { db, emailId, caseDraftId, downloaded, notificationFiles, failures } = params;
 
     db.clearPendingDocuments(caseDraftId);
@@ -130,7 +131,7 @@ function recordDownloadResults(params: {
         const file = notificationFiles[i];
         const downloadedFile = downloaded[i];
 
-        db.addDocument({
+        const documentId = db.addDocument({
             emailId,
             caseDraftId,
             originalFilename: file.displayName || downloadedFile?.documentName || null,
@@ -150,6 +151,28 @@ function recordDownloadResults(params: {
                 itemId: file.itemId,
             },
         });
+        if (isComplaintDocument(
+            downloadedFile?.documentType,
+            file.fileName || file.displayName,
+        )) {
+            try {
+                const extraction = await extractComplaintPdf(
+                    file.buffer,
+                    downloadedFile?.documentType,
+                );
+                db.applyComplaintExtraction(caseDraftId, documentId, extraction);
+                console.log('Complaint fields extracted:', {
+                    documentId,
+                    appliedFields: Object.keys(extraction.data),
+                    warnings: extraction.warnings.map(warning => warning.code),
+                });
+            } catch (error) {
+                console.warn(
+                    `Complaint extraction skipped for ${file.fileName}:`,
+                    error instanceof Error ? error.message : String(error),
+                );
+            }
+        }
     }
 
     for (const failure of failures) {
@@ -423,6 +446,30 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                             retrySource: retry.retrySource,
                         },
                     });
+                    if (
+                        caseDraftId &&
+                        isComplaintDocument(
+                            downloadedFile.documentType ?? retry.documentType,
+                            notificationFile.fileName || notificationFile.displayName,
+                        )
+                    ) {
+                        try {
+                            const extraction = await extractComplaintPdf(
+                                notificationFile.buffer,
+                                downloadedFile.documentType ?? retry.documentType,
+                            );
+                            db.applyComplaintExtraction(
+                                caseDraftId,
+                                retry.documentId,
+                                extraction,
+                            );
+                        } catch (error) {
+                            console.warn(
+                                `Complaint extraction skipped after retry ${retry.documentId}:`,
+                                error instanceof Error ? error.message : String(error),
+                            );
+                        }
+                    }
                     recoveredFiles.push(notificationFile);
                 } else {
                     const failure = result.failures[0];
@@ -450,6 +497,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
         }
 
         db.refreshEmailAfterDocumentRetries(emailId, caseDraftId);
+        if (caseDraftId) db.refreshCaseDraftValidation(caseDraftId);
 
         if (recoveredFiles.length) {
             try {
@@ -571,7 +619,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 },
             );
 
-            recordDownloadResults({
+            await recordDownloadResults({
                 db,
                 emailId: emailRecord.id,
                 caseDraftId,
@@ -658,7 +706,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 console.error('Error sending success report email:', e);
             }
 
-            db.setCaseDraftStatus(caseDraftId, 'ready_to_file', 'passed', 'not_started');
+            db.refreshCaseDraftValidation(caseDraftId);
             db.markEmailProcessed(emailRecord.id);
         } catch (err) {
             console.error(`Error while processing message ${externalMessageId}:`, err);

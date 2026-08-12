@@ -3,6 +3,10 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { ParsedEmailInfo } from './emailProcessor';
+import {
+    ComplaintExtractionResult,
+    isComplaintDocument,
+} from './complaintExtractor';
 
 export type EmailProcessingStatus =
     | 'new'
@@ -257,7 +261,15 @@ export interface DraftValidationIssue {
     message: string;
 }
 
-export type DraftFieldSource = 'email' | 'manual' | 'derived' | 'empty';
+export type DraftFieldSource = 'email' | 'complaint' | 'manual' | 'derived' | 'empty';
+export type DraftFilingFieldSource =
+    | 'complaint'
+    | 'manual'
+    | 'email'
+    | 'default'
+    | 'empty';
+
+export type DraftDocumentRole = 'primary_source' | 'supporting' | 'fee' | 'unknown';
 
 export type DraftPartyType = 'person' | 'entity';
 export type RelatedCivilAction = 'none' | 'previously_filed' | 'unknown';
@@ -353,7 +365,10 @@ export interface DocumentRecordView {
     filingType: string | null;
     filingTypeSource: 'suggested' | 'manual' | null;
     filingSequence: number | null;
+    suggestedFilingSequence: number | null;
     requiredForFiling: boolean;
+    isPrimary: boolean;
+    documentRole: DraftDocumentRole;
     uploadSource: string;
     status: string;
     errorMessage: string | null;
@@ -441,9 +456,16 @@ export interface EmailDetail {
         normalizedDataJson: string | null;
         reviewerNotes: string | null;
         reviewedAt: string | null;
+        primaryDocumentId: string | null;
         editableData: Record<string, string | null>;
         filingData: DraftFilingData;
         fieldSources: Record<string, DraftFieldSource>;
+        filingFieldSources: Record<string, DraftFilingFieldSource>;
+        complaintExtraction: (ComplaintExtractionResult & {
+            documentId: string;
+            extractedAt: string;
+            appliedFields: string[];
+        }) | null;
         validationIssues: DraftValidationIssue[];
         createdAt: string;
         updatedAt: string;
@@ -803,6 +825,113 @@ function draftFilingData(data: unknown): DraftFilingData {
     };
 }
 
+const DRAFT_FILING_DATA_KEYS = [
+    'courtDistrict',
+    'action',
+    'caseType',
+    'relatedCivilAction',
+    'relatedCaseCourt',
+    'relatedCaseDocketNumber',
+    'relatedCaseJudge',
+    'relatedCasePending',
+    'claimAmount',
+    'mailingRequested',
+    'includeAllOtherOccupants',
+    'plaintiff',
+    'defendants',
+    'attorney',
+] as const;
+
+type DraftFilingDataKey = typeof DRAFT_FILING_DATA_KEYS[number];
+
+type StoredComplaintExtraction = ComplaintExtractionResult & {
+    documentId: string;
+    extractedAt: string;
+    appliedFields: string[];
+};
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function complaintExtractionFromDraft(data: unknown): StoredComplaintExtraction | null {
+    const root = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : {};
+    const extraction = root.complaintExtraction;
+    if (!extraction || typeof extraction !== 'object' || Array.isArray(extraction)) return null;
+    const source = extraction as Record<string, unknown>;
+    if (
+        typeof source.documentId !== 'string' ||
+        typeof source.extractedAt !== 'string' ||
+        source.extractorVersion !== 1 ||
+        !source.data ||
+        typeof source.data !== 'object'
+    ) {
+        return null;
+    }
+    return source as unknown as StoredComplaintExtraction;
+}
+
+function storedManualFilingFields(data: unknown): Set<DraftFilingDataKey> {
+    const root = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : {};
+    const values = Array.isArray(root.manualFilingFields) ? root.manualFilingFields : [];
+    const allowed = new Set<string>(DRAFT_FILING_DATA_KEYS);
+    return new Set(values.filter((value): value is DraftFilingDataKey =>
+        typeof value === 'string' && allowed.has(value)));
+}
+
+function inferredManualFilingFields(
+    extractedData: unknown,
+    normalizedData: unknown,
+): Set<DraftFilingDataKey> {
+    const stored = storedManualFilingFields(normalizedData);
+    if (stored.size || complaintExtractionFromDraft(normalizedData)) return stored;
+
+    const extracted = draftFilingData(extractedData);
+    const normalized = draftFilingData(normalizedData);
+    for (const key of DRAFT_FILING_DATA_KEYS) {
+        if (!jsonValuesEqual(extracted[key], normalized[key])) stored.add(key);
+    }
+    return stored;
+}
+
+function draftFilingFieldSources(
+    extractedData: unknown,
+    normalizedData: unknown,
+): Record<DraftFilingDataKey, DraftFilingFieldSource> {
+    const filing = draftFilingData(normalizedData);
+    const manualFields = inferredManualFilingFields(extractedData, normalizedData);
+    const complaintFields = new Set(
+        complaintExtractionFromDraft(normalizedData)?.appliedFields ?? [],
+    );
+    const result = {} as Record<DraftFilingDataKey, DraftFilingFieldSource>;
+    const defaultFields = new Set<DraftFilingDataKey>([
+        'action',
+        'caseType',
+        'mailingRequested',
+        'includeAllOtherOccupants',
+    ]);
+
+    for (const key of DRAFT_FILING_DATA_KEYS) {
+        const value = filing[key];
+        const empty = value === null || value === undefined || value === '' ||
+            (Array.isArray(value) && value.length === 0);
+        result[key] = manualFields.has(key)
+            ? 'manual'
+            : complaintFields.has(key)
+                ? 'complaint'
+                : empty
+                    ? 'empty'
+                    : defaultFields.has(key)
+                        ? 'default'
+                        : 'email';
+    }
+    return result;
+}
+
 function draftEditableData(data: unknown): Record<EditableDraftField, string | null> {
     const source = data && typeof data === 'object'
         ? data as Record<string, unknown>
@@ -824,6 +953,22 @@ function draftFieldSources(
 ): Record<EditableDraftField, DraftFieldSource> {
     const original = draftEditableData(extracted);
     const current = draftEditableData(normalized);
+    const complaint = complaintExtractionFromDraft(normalized);
+    const complaintValues: Partial<Record<EditableDraftField, string>> = {};
+    if (complaint?.data.caseNumber) {
+        complaintValues.caseNumber = complaint.data.caseNumber;
+    }
+    if (complaint?.data.plaintiff?.displayName) {
+        complaintValues.plaintiff = complaint.data.plaintiff.displayName;
+    }
+    if (complaint?.data.defendants?.length) {
+        complaintValues.defendant = complaint.data.defendants
+            .map(party => party.displayName)
+            .join(', ');
+    }
+    if (complaint?.data.attorney?.displayName) {
+        complaintValues.filerName = complaint.data.attorney.displayName;
+    }
     const normalizedObject = normalized && typeof normalized === 'object'
         ? normalized as Record<string, unknown>
         : {};
@@ -832,6 +977,8 @@ function draftFieldSources(
     for (const field of EDITABLE_DRAFT_FIELDS) {
         if (!current[field]) {
             sources[field] = 'empty';
+        } else if (current[field] === complaintValues[field]) {
+            sources[field] = 'complaint';
         } else if (
             (field === 'plaintiff' || field === 'defendant') &&
             !editableDraftValue(normalizedObject[field])
@@ -952,6 +1099,103 @@ function suggestMiFileFilingType(
     if (value.includes('summons')) return MIFILE_FILING_TYPES[6];
     if (value.includes('connected filing')) return MIFILE_FILING_TYPES[4];
     return null;
+}
+
+function suggestedDocumentSequence(
+    documentType: string | null | undefined,
+    filename: string | null | undefined,
+): number | null {
+    const filingType = suggestMiFileFilingType(documentType, filename);
+    if (!filingType) return null;
+    if (filingType === MIFILE_FILING_TYPES[0]) return 1;
+    if (filingType === MIFILE_FILING_TYPES[1]) return 2;
+    if (filingType === MIFILE_FILING_TYPES[2] || filingType === MIFILE_FILING_TYPES[3]) return 3;
+    if (filingType === MIFILE_FILING_TYPES[4]) return 4;
+    if (filingType === MIFILE_FILING_TYPES[5]) return 5;
+    if (filingType === MIFILE_FILING_TYPES[6]) return 6;
+    return null;
+}
+
+function draftDocumentRole(
+    documentType: string | null | undefined,
+    filename: string | null | undefined,
+): DraftDocumentRole {
+    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    if (isComplaintDocument(documentType, filename)) return 'primary_source';
+    if (/\b(?:mailing|filing) fee\b/.test(value)) return 'fee';
+    return suggestMiFileFilingType(documentType, filename) ? 'supporting' : 'unknown';
+}
+
+function validatePrimaryComplaint(
+    primaryDocumentId: string | null,
+    documents: DocumentRecordView[],
+    extraction: StoredComplaintExtraction | null,
+    filing: DraftFilingData,
+): DraftValidationIssue[] {
+    const complaintDocuments = documents.filter(document =>
+        isComplaintDocument(
+            document.documentType,
+            document.currentFilename || document.originalFilename,
+        ));
+    const primary = primaryDocumentId
+        ? documents.find(document => document.id === primaryDocumentId) ?? null
+        : null;
+    const issues: DraftValidationIssue[] = [];
+
+    if (!primary) {
+        issues.push({
+            field: 'primaryDocumentId',
+            severity: 'warning',
+            message: complaintDocuments.length
+                ? 'Select the Complaint as the primary data source.'
+                : 'No Complaint document is available for this Draft.',
+        });
+        return issues;
+    }
+
+    if (!isComplaintDocument(
+        primary.documentType,
+        primary.currentFilename || primary.originalFilename,
+    )) {
+        issues.push({
+            field: 'primaryDocumentId',
+            severity: 'warning',
+            message: 'The selected primary source is not recognized as a Complaint.',
+        });
+    }
+    if (!primary.oneDriveUrl || !['uploaded', 'downloaded', 'replaced'].includes(primary.status)) {
+        issues.push({
+            field: 'primaryDocumentId',
+            severity: 'warning',
+            message: 'The primary Complaint is not yet available for field extraction.',
+        });
+    } else if (!extraction || extraction.documentId !== primary.id) {
+        issues.push({
+            field: 'complaintExtraction',
+            severity: 'warning',
+            message: 'Extract the filing fields from the primary Complaint and review them.',
+        });
+    }
+
+    if (extraction?.documentId === primary.id) {
+        for (const warning of extraction.warnings) {
+            if (
+                warning.code === 'related_action_review' ||
+                (warning.code === 'claim_amount_review' && Boolean(filing.claimAmount)) ||
+                (warning.code === 'multiple_defendants_review' && filing.defendants.length > 1) ||
+                warning.code === 'missing_plaintiff' ||
+                warning.code === 'missing_defendant'
+            ) {
+                continue;
+            }
+            issues.push({
+                field: `complaintExtraction.${warning.code}`,
+                severity: 'warning',
+                message: warning.message,
+            });
+        }
+    }
+    return issues;
 }
 
 function validateDraftDocuments(documents: DocumentRecordView[]): DraftValidationIssue[] {
@@ -1492,6 +1736,73 @@ const migrations: Migration[] = [
                       SELECT 1 FROM document_records d WHERE d.email_id = email_records.id
                   )
             `).run(timestamp, timestamp);
+        },
+    },
+    {
+        version: 14,
+        name: 'assign_existing_complaints_as_primary_draft_sources',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE case_drafts
+                SET primary_document_id = (
+                        SELECT d.id
+                        FROM document_records d
+                        WHERE d.case_draft_id = case_drafts.id
+                          AND d.is_active = 1
+                          AND LOWER(
+                              COALESCE(d.document_type, '') || ' ' ||
+                              COALESCE(d.current_filename, '') || ' ' ||
+                              COALESCE(d.original_filename, '')
+                          ) LIKE '%complaint%'
+                          AND LOWER(
+                              COALESCE(d.document_type, '') || ' ' ||
+                              COALESCE(d.current_filename, '') || ' ' ||
+                              COALESCE(d.original_filename, '')
+                          ) NOT LIKE '%supplemental complaint attachment%'
+                        ORDER BY
+                            CASE
+                                WHEN d.one_drive_url IS NOT NULL OR d.status = 'uploaded' THEN 0
+                                ELSE 1
+                            END,
+                            d.created_at DESC
+                        LIMIT 1
+                    ),
+                    updated_at = ?
+                WHERE primary_document_id IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM document_records d
+                      WHERE d.case_draft_id = case_drafts.id
+                        AND d.is_active = 1
+                        AND LOWER(
+                            COALESCE(d.document_type, '') || ' ' ||
+                            COALESCE(d.current_filename, '') || ' ' ||
+                            COALESCE(d.original_filename, '')
+                        ) LIKE '%complaint%'
+                        AND LOWER(
+                            COALESCE(d.document_type, '') || ' ' ||
+                            COALESCE(d.current_filename, '') || ' ' ||
+                            COALESCE(d.original_filename, '')
+                        ) NOT LIKE '%supplemental complaint attachment%'
+                  )
+            `).run(timestamp);
+        },
+    },
+    {
+        version: 15,
+        name: 'require_primary_complaints_for_filing',
+        up: db => {
+            db.exec(`
+                UPDATE document_records
+                SET required_for_filing = 1
+                WHERE is_active = 1
+                  AND id IN (
+                      SELECT primary_document_id
+                      FROM case_drafts
+                      WHERE primary_document_id IS NOT NULL
+                  )
+            `);
         },
     },
 ];
@@ -2106,6 +2417,28 @@ export class WorkflowDatabase {
             downloadAttempts: input.downloadAttempts,
             oneDriveUrl: input.oneDriveUrl,
         });
+        const uploaded = this.db
+            .prepare(`
+                SELECT case_draft_id, document_type, current_filename, original_filename
+                FROM document_records
+                WHERE id = ?
+            `)
+            .get(input.documentId) as
+            | {
+                case_draft_id: string | null;
+                document_type: string | null;
+                current_filename: string | null;
+                original_filename: string | null;
+            }
+            | undefined;
+        if (uploaded?.case_draft_id) {
+            this.assignPrimaryComplaint(
+                uploaded.case_draft_id,
+                input.documentId,
+                uploaded.document_type,
+                uploaded.current_filename || uploaded.original_filename,
+            );
+        }
     }
 
     completeDocumentRetryNotDownloadable(input: {
@@ -2292,6 +2625,20 @@ export class WorkflowDatabase {
     }
 
     clearPendingDocuments(caseDraftId: string): void {
+        this.db
+            .prepare(`
+                UPDATE case_drafts
+                SET primary_document_id = NULL
+                WHERE id = ?
+                  AND primary_document_id IN (
+                      SELECT id
+                      FROM document_records
+                      WHERE case_draft_id = ?
+                        AND status IN ('pending', 'not_downloadable')
+                        AND upload_source = 'parsed_email'
+                  )
+            `)
+            .run(caseDraftId, caseDraftId);
         this.db
             .prepare(`
                 DELETE FROM document_records
@@ -3517,6 +3864,7 @@ export class WorkflowDatabase {
             .prepare(`
                 SELECT
                     id,
+                    primary_document_id,
                     workflow_mode,
                     status,
                     validation_status,
@@ -3564,7 +3912,7 @@ export class WorkflowDatabase {
                     updated_at
                 FROM document_records
                 WHERE email_id = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at ASC
             `)
             .all(emailId) as any[];
 
@@ -3604,8 +3952,15 @@ export class WorkflowDatabase {
         const normalizedDraftData = caseDraft
             ? this.safeJson(caseDraft.normalized_data_json)
             : null;
+        const complaintExtraction = caseDraft
+            ? complaintExtractionFromDraft(normalizedDraftData)
+            : null;
         const documentViews: DocumentRecordView[] = documents.map(row => {
             const suggestedFilingType = suggestMiFileFilingType(
+                row.document_type,
+                row.current_filename || row.original_filename,
+            );
+            const suggestedSequence = suggestedDocumentSequence(
                 row.document_type,
                 row.current_filename || row.original_filename,
             );
@@ -3628,9 +3983,15 @@ export class WorkflowDatabase {
                         ? 'suggested'
                         : null,
                 filingSequence: row.filing_sequence === null
-                    ? null
+                    ? suggestedSequence
                     : Number(row.filing_sequence),
+                suggestedFilingSequence: suggestedSequence,
                 requiredForFiling: Number(row.required_for_filing ?? 0) === 1,
+                isPrimary: caseDraft?.primary_document_id === row.id,
+                documentRole: draftDocumentRole(
+                    row.document_type,
+                    row.current_filename || row.original_filename,
+                ),
                 uploadSource: row.upload_source,
                 status: row.status,
                 errorMessage: row.error_message,
@@ -3643,9 +4004,22 @@ export class WorkflowDatabase {
                 updatedAt: row.updated_at,
             };
         });
+        documentViews.sort((left, right) => {
+            if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
+            const leftSequence = left.filingSequence ?? Number.MAX_SAFE_INTEGER;
+            const rightSequence = right.filingSequence ?? Number.MAX_SAFE_INTEGER;
+            if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+            return left.createdAt.localeCompare(right.createdAt);
+        });
         const validationIssues = caseDraft
             ? [
                 ...validateDraftData(normalizedDraftData),
+                ...validatePrimaryComplaint(
+                    caseDraft.primary_document_id,
+                    documentViews,
+                    complaintExtraction,
+                    draftFilingData(normalizedDraftData),
+                ),
                 ...validateDraftDocuments(documentViews),
             ]
             : [];
@@ -3677,9 +4051,15 @@ export class WorkflowDatabase {
                     normalizedDataJson: caseDraft.normalized_data_json,
                     reviewerNotes: caseDraft.reviewer_notes,
                     reviewedAt: caseDraft.reviewed_at,
+                    primaryDocumentId: caseDraft.primary_document_id,
                     editableData: draftEditableData(normalizedDraftData),
                     filingData: draftFilingData(normalizedDraftData),
                     fieldSources: draftFieldSources(extractedDraftData, normalizedDraftData),
+                    filingFieldSources: draftFilingFieldSources(
+                        extractedDraftData,
+                        normalizedDraftData,
+                    ),
+                    complaintExtraction,
                     validationIssues,
                     createdAt: caseDraft.created_at,
                     updatedAt: caseDraft.updated_at,
@@ -3715,6 +4095,7 @@ export class WorkflowDatabase {
         reviewerNotes?: string,
         filingDataInput?: unknown,
         documentMappings: DraftDocumentFilingUpdate[] = [],
+        primaryDocumentIdInput?: unknown,
     ): EmailDetail {
         const existing = this.db
             .prepare(`
@@ -3723,6 +4104,7 @@ export class WorkflowDatabase {
                     status,
                     validation_status,
                     filing_status,
+                    primary_document_id,
                     normalized_data_json,
                     reviewer_notes
                 FROM case_drafts
@@ -3734,6 +4116,7 @@ export class WorkflowDatabase {
                 status: CaseDraftStatus;
                 validation_status: ValidationStatus;
                 filing_status: FilingStatus;
+                primary_document_id: string | null;
                 normalized_data_json: string | null;
                 reviewer_notes: string | null;
             }
@@ -3784,6 +4167,16 @@ export class WorkflowDatabase {
             JSON.stringify(previousFilingData) !== JSON.stringify(nextFilingData);
         next.filingData = nextFilingData;
 
+        const manualFilingFields = storedManualFilingFields(next);
+        if (filingDataInput !== undefined) {
+            for (const key of DRAFT_FILING_DATA_KEYS) {
+                if (!jsonValuesEqual(previousFilingData[key], nextFilingData[key])) {
+                    manualFilingFields.add(key);
+                }
+            }
+            next.manualFilingFields = Array.from(manualFilingFields).sort();
+        }
+
         if (filingDataInput !== undefined) {
             const plaintiffName = draftPartyName(nextFilingData.plaintiff);
             const defendantNames = nextFilingData.defendants
@@ -3808,6 +4201,39 @@ export class WorkflowDatabase {
         const notes = reviewerNotes === undefined
             ? existing.reviewer_notes
             : reviewerNotes.trim().slice(0, 10_000) || null;
+        let primaryDocumentId = existing.primary_document_id;
+        if (primaryDocumentIdInput !== undefined) {
+            primaryDocumentId = editableDraftValue(primaryDocumentIdInput);
+            if (primaryDocumentId) {
+                const primaryDocument = this.db
+                    .prepare(`
+                        SELECT id, document_type, current_filename, original_filename
+                        FROM document_records
+                        WHERE id = ?
+                          AND case_draft_id = ?
+                          AND is_active = 1
+                    `)
+                    .get(primaryDocumentId, caseDraftId) as
+                    | {
+                        id: string;
+                        document_type: string | null;
+                        current_filename: string | null;
+                        original_filename: string | null;
+                    }
+                    | undefined;
+                if (!primaryDocument) {
+                    throw new Error('The selected primary document does not belong to this Draft');
+                }
+                if (!isComplaintDocument(
+                    primaryDocument.document_type,
+                    primaryDocument.current_filename || primaryDocument.original_filename,
+                )) {
+                    throw new Error('Only a Complaint can be selected as the primary data source');
+                }
+            }
+        }
+        const primaryDocumentChanged = primaryDocumentId !== existing.primary_document_id;
+        if (primaryDocumentChanged) delete next.complaintExtraction;
         const issues = validateDraftData(next);
         const validationStatus: ValidationStatus = issues.some(issue => issue.severity === 'error')
             ? 'failed'
@@ -3822,7 +4248,8 @@ export class WorkflowDatabase {
         const changed =
             Object.keys(newFields).length > 0 ||
             filingDataChanged ||
-            documentMappings.length > 0;
+            documentMappings.length > 0 ||
+            primaryDocumentChanged;
         const status = changed && !protectedStatuses.has(existing.status)
             ? 'needs_review'
             : existing.status;
@@ -3834,6 +4261,7 @@ export class WorkflowDatabase {
                 .prepare(`
                     UPDATE case_drafts
                     SET normalized_data_json = ?,
+                        primary_document_id = ?,
                         reviewer_notes = ?,
                         status = ?,
                         validation_status = ?,
@@ -3842,6 +4270,7 @@ export class WorkflowDatabase {
                 `)
                 .run(
                     toJson(next),
+                    primaryDocumentId,
                     notes,
                     status,
                     validationStatus,
@@ -3903,6 +4332,18 @@ export class WorkflowDatabase {
                     );
                 updatedDocumentIds.push(documentId);
             }
+
+            if (primaryDocumentId) {
+                this.db
+                    .prepare(`
+                        UPDATE document_records
+                        SET required_for_filing = 1, updated_at = ?
+                        WHERE id = ?
+                          AND case_draft_id = ?
+                          AND is_active = 1
+                    `)
+                    .run(timestamp, primaryDocumentId, caseDraftId);
+            }
         });
 
         const detailAfterUpdate = this.getEmailDetail(existing.email_id);
@@ -3934,12 +4375,15 @@ export class WorkflowDatabase {
             {
                 changedFields: Object.keys(newFields),
                 filingDataChanged,
+                primaryDocumentChanged,
+                primaryDocumentId,
                 updatedDocumentIds,
                 validationIssues: completeIssues,
             },
             {
                 fields: oldFields,
                 reviewerNotes: existing.reviewer_notes,
+                primaryDocumentId: existing.primary_document_id,
                 status: existing.status,
                 validationStatus: existing.validation_status,
             },
@@ -3948,6 +4392,7 @@ export class WorkflowDatabase {
                 filingData: filingDataChanged ? nextFilingData : undefined,
                 updatedDocumentIds,
                 reviewerNotes: notes,
+                primaryDocumentId,
                 status,
                 validationStatus: completeValidationStatus,
             },
@@ -3976,6 +4421,207 @@ export class WorkflowDatabase {
                 mimeType: row.mime_type,
             }
             : null;
+    }
+
+    applyComplaintExtraction(
+        caseDraftId: string,
+        documentId: string,
+        extraction: ComplaintExtractionResult,
+    ): EmailDetail {
+        const existing = this.db
+            .prepare(`
+                SELECT
+                    email_id,
+                    status,
+                    extracted_data_json,
+                    normalized_data_json
+                FROM case_drafts
+                WHERE id = ?
+            `)
+            .get(caseDraftId) as
+            | {
+                email_id: string;
+                status: CaseDraftStatus;
+                extracted_data_json: string | null;
+                normalized_data_json: string | null;
+            }
+            | undefined;
+        if (!existing) throw new Error('Case draft not found');
+
+        const document = this.db
+            .prepare(`
+                SELECT id, document_type, current_filename, original_filename
+                FROM document_records
+                WHERE id = ?
+                  AND case_draft_id = ?
+                  AND is_active = 1
+            `)
+            .get(documentId, caseDraftId) as
+            | {
+                id: string;
+                document_type: string | null;
+                current_filename: string | null;
+                original_filename: string | null;
+            }
+            | undefined;
+        if (!document) throw new Error('Complaint document does not belong to this Draft');
+        if (!isComplaintDocument(
+            document.document_type,
+            document.current_filename || document.original_filename,
+        )) {
+            throw new Error('Only a Complaint can be used for Complaint field extraction');
+        }
+
+        const extractedData = this.safeJson(existing.extracted_data_json);
+        const normalizedData = this.safeJson(existing.normalized_data_json);
+        const next = normalizedData && typeof normalizedData === 'object' &&
+            !Array.isArray(normalizedData)
+            ? { ...normalizedData } as Record<string, unknown>
+            : {};
+        const filing = draftFilingData(next);
+        const manualFields = inferredManualFilingFields(extractedData, next);
+        const appliedFields: string[] = [];
+        const apply = <K extends DraftFilingDataKey>(key: K, value: DraftFilingData[K]) => {
+            if (manualFields.has(key) || value === undefined || value === null) return;
+            filing[key] = value;
+            appliedFields.push(key);
+        };
+
+        if (extraction.data.courtDistrict) {
+            apply('courtDistrict', extraction.data.courtDistrict);
+        }
+        if (extraction.data.plaintiff) {
+            apply('plaintiff', sanitizeDraftParty({
+                ...extraction.data.plaintiff,
+                partyType: 'entity',
+            }, 'plaintiff-1', 'entity'));
+        }
+        if (extraction.data.defendants?.length) {
+            apply('defendants', extraction.data.defendants.map((party, index) =>
+                sanitizeDraftParty({
+                    ...party,
+                    partyType: 'person',
+                }, `defendant-${index + 1}`, 'person')));
+        }
+        if (extraction.data.attorney) {
+            apply('attorney', sanitizeDraftAttorney(
+                extraction.data.attorney,
+                extraction.data.attorney.displayName,
+            ));
+        }
+        if (typeof extraction.data.includeAllOtherOccupants === 'boolean') {
+            apply('includeAllOtherOccupants', extraction.data.includeAllOtherOccupants);
+        }
+
+        const legacySources = draftFieldSources(extractedData, next);
+        if (extraction.data.caseNumber && legacySources.caseNumber !== 'manual') {
+            next.caseNumber = extraction.data.caseNumber;
+        }
+        if (extraction.data.plaintiff && legacySources.plaintiff !== 'manual') {
+            next.plaintiff = extraction.data.plaintiff.displayName;
+        }
+        if (extraction.data.defendants?.length && legacySources.defendant !== 'manual') {
+            next.defendant = extraction.data.defendants
+                .map(party => party.displayName)
+                .join(', ');
+        }
+        if (extraction.data.attorney && legacySources.filerName !== 'manual') {
+            next.filerName = extraction.data.attorney.displayName;
+        }
+
+        const timestamp = nowIso();
+        next.filingData = filing;
+        next.manualFilingFields = Array.from(manualFields).sort();
+        next.complaintExtraction = {
+            ...extraction,
+            documentId,
+            extractedAt: timestamp,
+            appliedFields,
+        } satisfies StoredComplaintExtraction;
+
+        const protectedStatuses = new Set<CaseDraftStatus>([
+            'filing_in_progress',
+            'filed_successfully',
+            'archived',
+        ]);
+        const nextStatus = protectedStatuses.has(existing.status)
+            ? existing.status
+            : 'needs_review';
+        this.db
+            .prepare(`
+                UPDATE case_drafts
+                SET primary_document_id = ?,
+                    normalized_data_json = ?,
+                    status = ?,
+                    validation_status = 'warnings',
+                    updated_at = ?
+                WHERE id = ?
+            `)
+            .run(documentId, toJson(next), nextStatus, timestamp, caseDraftId);
+        this.db
+            .prepare(`
+                UPDATE document_records
+                SET required_for_filing = 1, updated_at = ?
+                WHERE id = ?
+                  AND case_draft_id = ?
+                  AND is_active = 1
+            `)
+            .run(timestamp, documentId, caseDraftId);
+
+        this.insertAuditLog('case_draft', caseDraftId, 'complaint_fields_extracted', {
+            documentId,
+            extractorVersion: extraction.extractorVersion,
+            appliedFields,
+            preservedManualFields: Array.from(manualFields).sort(),
+            warnings: extraction.warnings.map(warning => warning.code),
+        });
+
+        const detail = this.getEmailDetail(existing.email_id);
+        if (!detail) throw new Error('Draft email record not found after Complaint extraction');
+        return detail;
+    }
+
+    refreshCaseDraftValidation(caseDraftId: string): EmailDetail {
+        const detail = this.getDraftDetail(caseDraftId);
+        if (!detail?.caseDraft) throw new Error('Case draft not found');
+        if (['filing_in_progress', 'filed_successfully', 'archived'].includes(
+            detail.caseDraft.status,
+        )) {
+            return detail;
+        }
+
+        const issues = detail.caseDraft.validationIssues;
+        const hasErrors = issues.some(issue => issue.severity === 'error');
+        const status: CaseDraftStatus = hasErrors
+            ? 'validation_failed'
+            : issues.length
+                ? 'needs_review'
+                : 'ready_to_file';
+        const validationStatus: ValidationStatus = hasErrors
+            ? 'failed'
+            : issues.length
+                ? 'warnings'
+                : 'passed';
+        if (
+            detail.caseDraft.status !== status ||
+            detail.caseDraft.validationStatus !== validationStatus
+        ) {
+            const timestamp = nowIso();
+            this.db
+                .prepare(`
+                    UPDATE case_drafts
+                    SET status = ?, validation_status = ?, updated_at = ?
+                    WHERE id = ?
+                `)
+                .run(status, validationStatus, timestamp, caseDraftId);
+            this.insertAuditLog('case_draft', caseDraftId, 'draft_validation_refreshed', {
+                status,
+                validationStatus,
+                issueCount: issues.length,
+            });
+        }
+
+        return this.getDraftDetail(caseDraftId) ?? detail;
     }
 
     createCaseDraft(emailId: string, parsed: ParsedEmailInfo): string {
@@ -4222,6 +4868,38 @@ export class WorkflowDatabase {
         );
     }
 
+    private assignPrimaryComplaint(
+        caseDraftId: string,
+        documentId: string,
+        documentType: string | null | undefined,
+        filename: string | null | undefined,
+    ): boolean {
+        if (!isComplaintDocument(documentType, filename)) return false;
+        const timestamp = nowIso();
+        const result = this.db
+            .prepare(`
+                UPDATE case_drafts
+                SET primary_document_id = ?, updated_at = ?
+                WHERE id = ?
+                  AND primary_document_id IS NULL
+            `)
+            .run(documentId, timestamp, caseDraftId);
+        const assigned = Number(result.changes ?? 0) > 0;
+        if (assigned) {
+            this.db
+                .prepare(`
+                    UPDATE document_records
+                    SET required_for_filing = 1, updated_at = ?
+                    WHERE id = ?
+                `)
+                .run(timestamp, documentId);
+            this.insertAuditLog('case_draft', caseDraftId, 'primary_complaint_assigned', {
+                documentId,
+            });
+        }
+        return assigned;
+    }
+
     addDocument(input: StoredDocumentInput): string {
         const id = randomUUID();
         const timestamp = nowIso();
@@ -4292,6 +4970,15 @@ export class WorkflowDatabase {
             caseDraftId: input.caseDraftId ?? null,
             documentType: input.documentType ?? null,
         });
+
+        if (input.caseDraftId) {
+            this.assignPrimaryComplaint(
+                input.caseDraftId,
+                id,
+                input.documentType,
+                input.currentFilename || input.originalFilename,
+            );
+        }
 
         return id;
     }

@@ -645,11 +645,21 @@ test('draft workspace supports listing, editable fields, validation, and reparse
         const documentId = db.addDocument({
             emailId: email.id,
             caseDraftId: draftId,
-            currentFilename: 'filing.pdf',
+            currentFilename: 'Complaint.pdf',
             oneDriveUrl: 'https://onedrive.example/draft-workspace',
             mimeType: 'application/pdf',
+            documentType: 'Complaint for Possession Only',
             uploadSource: 'test',
             status: 'uploaded',
+        });
+        db.applyComplaintExtraction(draftId, documentId, {
+            extractorVersion: 1,
+            formType: 'NONPAYMENT OF RENT',
+            pageCount: 1,
+            textHash: 'test-complaint-hash',
+            data: {},
+            fieldConfidence: {},
+            warnings: [],
         });
 
         const page = db.listDrafts({ search: '26-01000', pageSize: 10 });
@@ -667,6 +677,8 @@ test('draft workspace supports listing, editable fields, validation, and reparse
         );
         assert.equal(initial?.caseDraft?.filingData.action, 'Initiate a new case');
         assert.equal(initial?.caseDraft?.filingData.defendants.length, 1);
+        assert.equal(initial?.caseDraft?.primaryDocumentId, documentId);
+        assert.equal(initial?.documents[0].isPrimary, true);
 
         const updated = db.updateCaseDraft(
             draftId,
@@ -746,9 +758,154 @@ test('draft workspace supports listing, editable fields, validation, and reparse
         assert.deepEqual(db.getDocumentAccess(documentId), {
             id: documentId,
             oneDriveUrl: 'https://onedrive.example/draft-workspace',
-            currentFilename: 'filing.pdf',
+            currentFilename: 'Complaint.pdf',
             mimeType: 'application/pdf',
         });
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('Complaint extraction becomes authoritative while preserving later manual filing edits', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-complaint-source-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'complaint-source-message',
+            subject: 'Complaint source filing',
+            receivedDateTime: '2026-08-12T10:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Complaint source</p>' },
+        });
+        const draftId = db.createCaseDraft(email.id, {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: 'EMAIL-CASE-LT',
+            caseTitle: 'EMAIL PLAINTIFF V EMAIL DEFENDANT',
+            plaintiff: null,
+            defendant: null,
+            bundleNumber: null,
+            filerName: 'Email Filer',
+            filedAt: null,
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        });
+        const complaintId = db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            currentFilename: 'Complaint.pdf',
+            oneDriveUrl: 'https://onedrive.example/complaint',
+            documentType: 'Complaint for Possession Only',
+            mimeType: 'application/pdf',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+        const adviceId = db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            currentFilename: 'Advice.pdf',
+            oneDriveUrl: 'https://onedrive.example/advice',
+            documentType: 'Advice of Rights and Information (Landlord-Tenant)',
+            mimeType: 'application/pdf',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+
+        assert.throws(
+            () => db.updateCaseDraft(draftId, {}, undefined, undefined, [], adviceId),
+            /Only a Complaint can be selected/,
+        );
+
+        const first = db.applyComplaintExtraction(draftId, complaintId, {
+            extractorVersion: 1,
+            formType: 'NONPAYMENT OF RENT',
+            pageCount: 1,
+            textHash: 'first-hash',
+            data: {
+                courtDistrict: '25',
+                caseNumber: '26-02000-LT',
+                plaintiff: {
+                    displayName: 'Complaint Property LLC',
+                    entityName: 'Complaint Property LLC',
+                },
+                defendants: [{
+                    displayName: 'Taylor Tenant',
+                    firstName: 'Taylor',
+                    lastName: 'Tenant',
+                    address1: '10 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
+                }],
+                attorney: {
+                    displayName: 'Adam Devlin',
+                    firstName: 'Adam',
+                    lastName: 'Devlin',
+                    barNumber: 'P72877',
+                },
+                includeAllOtherOccupants: true,
+            },
+            fieldConfidence: { plaintiff: 'high', defendants: 'high' },
+            warnings: [{
+                code: 'related_action_review',
+                message: 'Confirm the related civil action answer.',
+            }],
+        });
+
+        assert.equal(first.caseDraft?.primaryDocumentId, complaintId);
+        assert.equal(first.caseDraft?.editableData.caseNumber, '26-02000-LT');
+        assert.equal(first.caseDraft?.filingData.plaintiff.entityName, 'Complaint Property LLC');
+        assert.equal(first.caseDraft?.filingData.defendants[0].address1, '10 Main Street');
+        assert.equal(first.caseDraft?.filingFieldSources.plaintiff, 'complaint');
+        assert.equal(first.caseDraft?.fieldSources.caseNumber, 'complaint');
+        assert.equal(
+            first.documents.find(document => document.id === complaintId)?.requiredForFiling,
+            true,
+        );
+        assert.equal(
+            first.documents.find(document => document.id === adviceId)?.requiredForFiling,
+            false,
+        );
+
+        const manualFiling = {
+            ...first.caseDraft?.filingData,
+            relatedCivilAction: 'none' as const,
+            plaintiff: {
+                ...first.caseDraft?.filingData.plaintiff,
+                entityName: 'Reviewed Plaintiff LLC',
+                displayName: 'Reviewed Plaintiff LLC',
+            },
+        };
+        db.updateCaseDraft(draftId, {}, undefined, manualFiling);
+
+        const second = db.applyComplaintExtraction(draftId, complaintId, {
+            extractorVersion: 1,
+            formType: 'NONPAYMENT OF RENT',
+            pageCount: 1,
+            textHash: 'second-hash',
+            data: {
+                caseNumber: '26-02001-LT',
+                plaintiff: {
+                    displayName: 'Changed PDF Plaintiff LLC',
+                    entityName: 'Changed PDF Plaintiff LLC',
+                },
+                defendants: [{
+                    displayName: 'Updated Tenant',
+                    firstName: 'Updated',
+                    lastName: 'Tenant',
+                }],
+            },
+            fieldConfidence: { plaintiff: 'high', defendants: 'high' },
+            warnings: [],
+        });
+
+        assert.equal(second.caseDraft?.filingData.plaintiff.entityName, 'Reviewed Plaintiff LLC');
+        assert.equal(second.caseDraft?.filingData.defendants[0].firstName, 'Updated');
+        assert.equal(second.caseDraft?.editableData.caseNumber, '26-02001-LT');
+        assert.equal(second.caseDraft?.filingFieldSources.plaintiff, 'manual');
+        assert.equal(second.caseDraft?.filingFieldSources.defendants, 'complaint');
     } finally {
         db.close();
         fs.rmSync(tempDir, { recursive: true, force: true });

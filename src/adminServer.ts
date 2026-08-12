@@ -22,9 +22,10 @@ import {
     renameDriveItem,
     resolveSharedDriveItem,
 } from './oneDriveClient';
+import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-08-12-court-email-backlog-v12';
+const ADMIN_BUILD_ID = '2026-08-12-primary-complaint-drafts-v15';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2035,7 +2036,8 @@ const html = String.raw`<!doctype html>
     }
     .draft-workspace-statuses,
     .draft-workspace-actions,
-    .draft-document-links {
+    .draft-document-links,
+    .draft-source-actions {
       display: flex;
       align-items: center;
       gap: 7px;
@@ -2082,6 +2084,23 @@ const html = String.raw`<!doctype html>
     }
     .draft-document-select select {
       width: min(100%, 470px);
+    }
+    .draft-source-actions {
+      flex: 0 0 auto;
+    }
+    .draft-source-actions button {
+      min-height: 34px;
+      padding: 0 9px;
+      white-space: nowrap;
+    }
+    .draft-source-actions button.is-primary {
+      border-color: #8a6d1f;
+      color: #6f5512;
+      background: #fff8dc;
+    }
+    .draft-source-actions button svg {
+      width: 14px;
+      height: 14px;
     }
     .button-link {
       min-height: 34px;
@@ -2254,6 +2273,9 @@ const html = String.raw`<!doctype html>
     .field-source.manual {
       color: var(--accent-strong);
     }
+    .field-source.complaint {
+      color: var(--good);
+    }
     .field-source.derived {
       color: var(--warn);
     }
@@ -2340,7 +2362,7 @@ const html = String.raw`<!doctype html>
     }
     .draft-document-mapping {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(150px, 1fr) 34px;
+      grid-template-columns: minmax(0, 1fr) minmax(150px, 1fr) 34px 34px;
       gap: 8px;
       align-items: end;
       padding: 10px 0;
@@ -2388,6 +2410,23 @@ const html = String.raw`<!doctype html>
       padding: 10px 0;
       color: var(--muted);
       font-size: 12px;
+    }
+    .draft-source-summary {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #fafbfc;
+    }
+    .draft-source-summary strong {
+      overflow-wrap: anywhere;
+      font-size: 12px;
+    }
+    .draft-source-summary span {
+      color: var(--muted);
+      font-size: 10px;
     }
     .draft-notes-field {
       display: block;
@@ -2517,6 +2556,12 @@ const html = String.raw`<!doctype html>
       .draft-document-links {
         width: 100%;
       }
+      .draft-source-actions {
+        width: 100%;
+      }
+      .draft-source-actions button {
+        flex: 1 1 0;
+      }
       .draft-document-links .button-link {
         flex: 1 1 0;
       }
@@ -2533,11 +2578,23 @@ const html = String.raw`<!doctype html>
         grid-column: auto;
       }
       .draft-document-mapping {
-        grid-template-columns: minmax(0, 1fr) 34px;
+        grid-template-columns: minmax(0, 1fr) 34px 34px;
       }
+      .draft-document-mapping > .draft-field:first-child,
       .draft-document-mapping .filing-type-field {
         grid-column: 1 / -1;
       }
+    }
+    .draft-primary-toggle {
+      width: 34px;
+      min-width: 34px;
+      height: 36px;
+      padding: 0;
+    }
+    .draft-primary-toggle.is-primary {
+      border-color: #8a6d1f;
+      color: #6f5512;
+      background: #fff8dc;
     }
 
     /* Admin UI v3: compact operations workspace */
@@ -3019,6 +3076,10 @@ const html = String.raw`<!doctype html>
                 <span>Document</span>
                 <select id="draftDocumentSelect" aria-label="Preview document"></select>
               </label>
+              <div class="draft-source-actions">
+                <button id="draftPrimaryBtn" type="button" title="Use the selected document as the primary source"><i data-lucide="star"></i>Primary source</button>
+                <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
+              </div>
               <div class="draft-document-links">
                 <a id="draftOneDriveLink" class="button-link" target="_blank" rel="noopener"><i data-lucide="cloud"></i>OneDrive</a>
                 <a id="draftSourceLink" class="button-link" target="_blank" rel="noopener"><i data-lucide="download"></i>MiFILE</a>
@@ -3217,8 +3278,10 @@ const html = String.raw`<!doctype html>
     ];
     const DRAFT_SOURCE_LABELS = {
       email: 'Email',
+      complaint: 'Complaint',
       manual: 'Manual',
       derived: 'Case title',
+      default: 'Default',
       empty: 'Missing',
     };
     const statusClass = value => String(value || 'unknown').replace(/[^a-z0-9_ -]/gi, '_');
@@ -3598,7 +3661,7 @@ const html = String.raw`<!doctype html>
       const last = Math.min(pagination.page * pagination.pageSize, pagination.totalItems);
       document.getElementById('draftMeta').textContent =
         pagination.totalItems + ' draft' + (pagination.totalItems === 1 ? '' : 's') +
-        ' В· Page ' + pagination.page + ' of ' + pagination.totalPages;
+        ' · Page ' + pagination.page + ' of ' + pagination.totalPages;
       document.getElementById('draftPageInfo').textContent =
         first + '-' + last + ' of ' + pagination.totalItems;
 
@@ -3696,10 +3759,13 @@ const html = String.raw`<!doctype html>
       state.selectedDraftId = draftId;
       state.draftDetail = detail;
       state.draftDirty = false;
+      const primary = (detail.documents || []).find(document => document.isPrimary);
       const viewable = (detail.documents || []).find(document => document.oneDriveUrl);
-      state.activeDraftDocumentId = viewable
-        ? viewable.id
-        : (detail.documents && detail.documents[0] ? detail.documents[0].id : null);
+      state.activeDraftDocumentId = primary
+        ? primary.id
+        : viewable
+          ? viewable.id
+          : (detail.documents && detail.documents[0] ? detail.documents[0].id : null);
       document.getElementById('draftListView').classList.add('hidden');
       document.getElementById('draftWorkspaceView').classList.remove('hidden');
       renderDraftWorkspace();
@@ -3758,6 +3824,27 @@ const html = String.raw`<!doctype html>
       } else {
         validationRoot.innerHTML = '';
       }
+
+      const primaryDocument = documents.find(document => document.isPrimary) || null;
+      const extraction = draft.complaintExtraction || null;
+      const extractionSummary =
+        '<section class="draft-field-section">' +
+          '<div class="draft-section-heading"><h3>Primary data source</h3>' +
+            (primaryDocument && primaryDocument.documentRole === 'primary_source'
+              ? '<span class="field-source complaint">Complaint</span>'
+              : '<span class="field-source empty">Missing Complaint</span>') +
+          '</div>' +
+          '<div class="draft-source-summary">' +
+            '<strong>' + escapeHtml(primaryDocument
+              ? (primaryDocument.currentFilename || primaryDocument.documentType || 'Complaint')
+              : 'No primary Complaint selected') + '</strong>' +
+            (extraction
+              ? '<span>Extracted ' + escapeHtml(fmtDate(extraction.extractedAt)) +
+                ' · ' + escapeHtml((extraction.appliedFields || []).length) +
+                ' field groups applied</span>'
+              : '<span>Extraction has not been completed.</span>') +
+          '</div>' +
+        '</section>';
 
       const legacyGroups = DRAFT_FIELD_GROUPS.map(group =>
         '<section class="draft-field-section"><h3>' + escapeHtml(group.title) + '</h3>' +
@@ -3926,7 +4013,7 @@ const html = String.raw`<!doctype html>
         '</datalist>';
 
       document.getElementById('draftFieldGroups').innerHTML =
-        legacyGroups + filingSetup + caseDetails + plaintiff + defendantSection +
+        extractionSummary + legacyGroups + filingSetup + caseDetails + plaintiff + defendantSection +
         attorney + documentMappings;
 
       document.querySelectorAll(
@@ -3934,6 +4021,11 @@ const html = String.raw`<!doctype html>
       ).forEach(input => {
         input.addEventListener('input', () => setDraftDirty(true));
         input.addEventListener('change', () => setDraftDirty(true));
+      });
+      document.querySelectorAll('[data-set-primary-document]').forEach(button => {
+        button.addEventListener('click', () => {
+          setDraftPrimaryDocument(button.dataset.setPrimaryDocument);
+        });
       });
       document.getElementById('draftReviewerNotes').oninput = () => setDraftDirty(true);
       const addDefendant = document.querySelector('[data-add-defendant]');
@@ -4059,7 +4151,8 @@ const html = String.raw`<!doctype html>
     function renderDraftDocumentMapping(document, index, issueByField) {
       const issue = issueByField.get('document.' + document.id);
       return '<div class="draft-document-mapping" data-draft-document-id="' +
-        escapeHtml(document.id) + '">' +
+        escapeHtml(document.id) + '" data-filing-sequence="' +
+        escapeHtml(document.filingSequence || document.suggestedFilingSequence || index + 1) + '">' +
         '<label class="draft-field">' +
           '<span class="draft-field-label" title="' +
             escapeHtml(document.currentFilename || document.documentType || '') + '">' +
@@ -4069,6 +4162,10 @@ const html = String.raw`<!doctype html>
           '<input type="text" data-document-field="filingName" value="' +
             escapeHtml(document.filingName || document.currentFilename || '') + '">' +
           '<span class="draft-document-status">' + statusPill(document.status) +
+            (document.isPrimary ? '<span>Primary source</span>' : '') +
+            (document.documentRole && document.documentRole !== 'unknown'
+              ? '<span>' + escapeHtml(statusLabel(document.documentRole)) + '</span>'
+              : '') +
             (document.filingTypeSource
               ? '<span>' + escapeHtml(statusLabel(document.filingTypeSource)) + ' type</span>'
               : '') + '</span>' +
@@ -4082,11 +4179,48 @@ const html = String.raw`<!doctype html>
             ? '<span class="draft-field-message">' + escapeHtml(issue.message) + '</span>'
             : '') +
         '</label>' +
+        (document.documentRole === 'primary_source'
+          ? '<button type="button" class="draft-primary-toggle icon-button ' +
+              (document.isPrimary ? 'is-primary' : '') + '" data-set-primary-document="' +
+              escapeHtml(document.id) + '" title="' +
+              (document.isPrimary ? 'Primary data source' : 'Use as primary data source') +
+              '" aria-label="' +
+              (document.isPrimary ? 'Primary data source' : 'Use as primary data source') + '">' +
+              icon('star') + '</button>'
+          : '<span class="draft-primary-placeholder" aria-hidden="true"></span>') +
         '<label class="draft-document-required" title="Required for filing">' +
           '<input type="checkbox" data-document-field="requiredForFiling"' +
-            (document.requiredForFiling ? ' checked' : '') + '>' +
+            (document.requiredForFiling ? ' checked' : '') +
+            (document.isPrimary ? ' disabled' : '') + '>' +
         '</label>' +
       '</div>';
+    }
+
+    function setDraftPrimaryDocument(documentId) {
+      const detail = state.draftDetail;
+      const draft = detail && detail.caseDraft;
+      const documents = (detail && detail.documents) || [];
+      const selectedDocument = documents.find(document => document.id === documentId);
+      if (!draft || !documentId || !selectedDocument) {
+        return;
+      }
+      if (selectedDocument.documentRole !== 'primary_source') {
+        toast('Only a Complaint can be used as the primary data source.', 'error');
+        return;
+      }
+      if (draft.primaryDocumentId === documentId) return;
+      snapshotDraftForm();
+      draft.primaryDocumentId = documentId;
+      if (draft.complaintExtraction && draft.complaintExtraction.documentId !== documentId) {
+        draft.complaintExtraction = null;
+      }
+      documents.forEach(document => {
+        document.isPrimary = document.id === documentId;
+      });
+      state.activeDraftDocumentId = documentId;
+      renderDraftFields(draft);
+      renderDraftDocuments(documents);
+      setDraftDirty(true);
     }
 
     function renderDraftDocuments(documents) {
@@ -4098,14 +4232,16 @@ const html = String.raw`<!doctype html>
         state.activeDraftDocumentId = null;
       }
       if (!state.activeDraftDocumentId && documents.length) {
+        const primary = documents.find(document => document.isPrimary);
         const viewable = documents.find(document => document.oneDriveUrl);
-        state.activeDraftDocumentId = (viewable || documents[0]).id;
+        state.activeDraftDocumentId = (primary || viewable || documents[0]).id;
       }
       select.innerHTML = documents.length
         ? documents.map((document, index) =>
           '<option value="' + escapeHtml(document.id) + '" ' +
             (document.id === state.activeDraftDocumentId ? 'selected' : '') + '>' +
             escapeHtml(document.currentFilename || document.documentType || ('Document ' + (index + 1))) +
+            (document.isPrimary ? ' · Primary' : '') +
             (document.oneDriveUrl ? '' : ' (not available)') +
           '</option>'
         ).join('')
@@ -4121,9 +4257,32 @@ const html = String.raw`<!doctype html>
       const viewer = window.document.getElementById('draftPdfViewer');
       const oneDriveLink = window.document.getElementById('draftOneDriveLink');
       const sourceLink = window.document.getElementById('draftSourceLink');
+      const primaryButton = window.document.getElementById('draftPrimaryBtn');
+      const extractButton = window.document.getElementById('draftExtractBtn');
 
       updateDraftDocumentLink(oneDriveLink, activeDocument && activeDocument.oneDriveUrl);
       updateDraftDocumentLink(sourceLink, activeDocument && activeDocument.sourceUrl);
+      const canBePrimary = Boolean(
+        activeDocument && activeDocument.documentRole === 'primary_source',
+      );
+      primaryButton.disabled = !canBePrimary;
+      primaryButton.classList.toggle('is-primary', Boolean(activeDocument && activeDocument.isPrimary));
+      primaryButton.innerHTML = icon('star') +
+        (activeDocument && activeDocument.isPrimary
+          ? 'Primary source'
+          : canBePrimary ? 'Use as primary' : 'Complaint required');
+      primaryButton.title = canBePrimary
+        ? (activeDocument && activeDocument.isPrimary
+          ? 'Primary data source'
+          : 'Use this Complaint as the primary data source')
+        : 'Only Complaint documents can be primary';
+      const canExtract = Boolean(
+        activeDocument &&
+        activeDocument.isPrimary &&
+        activeDocument.documentRole === 'primary_source' &&
+        activeDocument.oneDriveUrl,
+      );
+      extractButton.disabled = !canExtract;
       if (activeDocument && activeDocument.oneDriveUrl) {
         viewer.innerHTML = '<iframe title="' +
           escapeHtml(activeDocument.currentFilename || activeDocument.documentType || 'PDF document') +
@@ -4216,7 +4375,7 @@ const html = String.raw`<!doctype html>
             id: root.dataset.draftDocumentId,
             filingName: filingName ? filingName.value : '',
             filingType: filingType ? filingType.value : '',
-            filingSequence: index + 1,
+            filingSequence: Number(root.dataset.filingSequence || index + 1),
             requiredForFiling: required ? required.checked : true,
           };
         },
@@ -4255,6 +4414,7 @@ const html = String.raw`<!doctype html>
             fields: collectDraftFields(),
             filingData: collectDraftFilingData(),
             documents: collectDraftDocumentMappings(),
+            primaryDocumentId: detail.caseDraft.primaryDocumentId,
             reviewerNotes: document.getElementById('draftReviewerNotes').value,
           }),
         });
@@ -4266,6 +4426,28 @@ const html = String.raw`<!doctype html>
       } finally {
         setButtonBusy(button, false);
         setDraftDirty(saved ? false : true);
+      }
+    }
+
+    async function extractPrimaryComplaint() {
+      const detail = state.draftDetail;
+      if (!detail || !detail.caseDraft) return;
+      if (state.draftDirty) await saveDraft(true);
+      const button = document.getElementById('draftExtractBtn');
+      setButtonBusy(button, true, 'Extracting');
+      try {
+        state.draftDetail = await api('/api/drafts/' +
+          encodeURIComponent(detail.caseDraft.id) + '/extract-complaint', {
+          method: 'POST',
+        });
+        state.draftDirty = false;
+        const primary = (state.draftDetail.documents || []).find(document => document.isPrimary);
+        state.activeDraftDocumentId = primary ? primary.id : state.activeDraftDocumentId;
+        renderDraftWorkspace();
+        await loadDrafts(true);
+        showToast('Complaint fields extracted. Review the highlighted warnings.');
+      } finally {
+        setButtonBusy(button, false);
       }
     }
 
@@ -5314,6 +5496,12 @@ const html = String.raw`<!doctype html>
       state.activeDraftDocumentId = event.target.value || null;
       renderActiveDraftDocument((state.draftDetail && state.draftDetail.documents) || []);
     });
+    document.getElementById('draftPrimaryBtn').addEventListener('click', () => {
+      setDraftPrimaryDocument(state.activeDraftDocumentId);
+    });
+    document.getElementById('draftExtractBtn').addEventListener('click', () => {
+      extractPrimaryComplaint().catch(showDraftError);
+    });
     document.querySelectorAll('[data-draft-mobile-mode]').forEach(button => {
       button.addEventListener('click', () => setDraftMobileMode(button.dataset.draftMobileMode));
     });
@@ -5788,6 +5976,48 @@ export function createAdminServer(
                 return;
             }
 
+            const extractComplaintMatch = url.pathname.match(
+                /^\/api\/drafts\/([^/]+)\/extract-complaint$/,
+            );
+            if (req.method === 'POST' && extractComplaintMatch) {
+                const caseDraftId = decodeURIComponent(extractComplaintMatch[1]);
+                const detail = db.getDraftDetail(caseDraftId);
+                const primaryDocumentId = detail?.caseDraft?.primaryDocumentId;
+                const primary = primaryDocumentId
+                    ? detail?.documents.find(document => document.id === primaryDocumentId)
+                    : null;
+                if (!detail?.caseDraft || !primary) {
+                    sendJson(res, 400, { error: 'Select a primary Complaint first' });
+                    return;
+                }
+                if (!isComplaintDocument(
+                    primary.documentType,
+                    primary.currentFilename || primary.originalFilename,
+                )) {
+                    sendJson(res, 400, { error: 'The primary document is not a Complaint' });
+                    return;
+                }
+                if (!primary.oneDriveUrl) {
+                    sendJson(res, 409, { error: 'The primary Complaint is not available in OneDrive' });
+                    return;
+                }
+
+                const sharedItem = await resolveSharedDriveItem(primary.oneDriveUrl);
+                const content = await downloadDriveItemBuffer(
+                    sharedItem.driveId,
+                    sharedItem.itemId,
+                );
+                const extraction = await extractComplaintPdf(content, primary.documentType);
+                db.applyComplaintExtraction(
+                    caseDraftId,
+                    primary.id,
+                    extraction,
+                );
+                const updated = db.refreshCaseDraftValidation(caseDraftId);
+                sendJson(res, 200, updated);
+                return;
+            }
+
             if (req.method === 'PATCH' && draftMatch) {
                 const body = await readRequestBody(req);
                 const parsed = body ? JSON.parse(body) : {};
@@ -5799,6 +6029,9 @@ export function createAdminServer(
                         : undefined,
                     parsed.filingData,
                     Array.isArray(parsed.documents) ? parsed.documents : [],
+                    Object.prototype.hasOwnProperty.call(parsed, 'primaryDocumentId')
+                        ? parsed.primaryDocumentId
+                        : undefined,
                 );
                 sendJson(res, 200, detail);
                 return;

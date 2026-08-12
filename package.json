@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "npm run build && node --test dist/pdfValidation.test.js dist/database.test.js dist/emailProcessor.test.js dist/graphRetry.test.js",
+    "test": "npm run build && node --test dist/pdfValidation.test.js dist/complaintExtractor.test.js dist/database.test.js dist/emailProcessor.test.js dist/graphRetry.test.js",
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
     "start:once": "npm run build && node dist/index.js --once",
@@ -16,7 +16,7 @@
   },
   "keywords": [],
   "engines": {
-    "node": ">=22.5 <23"
+    "node": ">=22.13 <23"
   },
   "author": "",
   "license": "ISC",
@@ -39,6 +39,7 @@
     "isomorphic-fetch": "^3.0.0",
     "lucide": "1.26.0",
     "node-fetch": "^2.7.0",
+    "pdfjs-dist": "^6.2.108",
     "playwright": "1.58.2",
     "sharp": "^0.35.3",
     "tesseract.js": "^7.0.0"
