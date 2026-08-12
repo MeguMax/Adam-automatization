@@ -1773,6 +1773,47 @@ export class WorkflowDatabase {
         }));
     }
 
+    listPendingEmails(limit = 25): QueuedEmailRetry[] {
+        const safeLimit = Math.min(Math.max(Math.floor(limit), 1), 200);
+        const rows = this.db
+            .prepare(`
+                SELECT
+                    e.id,
+                    e.external_message_id,
+                    e.subject,
+                    e.sender,
+                    e.received_at
+                FROM email_records e
+                WHERE e.processing_status = 'new'
+                ORDER BY
+                    CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM audit_logs a
+                        WHERE a.entity_type = 'email_record'
+                          AND a.entity_id = e.id
+                          AND a.action = 'email_retry_queued'
+                    ) THEN 0 ELSE 1 END,
+                    e.updated_at,
+                    e.id
+                LIMIT ?
+            `)
+            .all(safeLimit) as Array<{
+                id: string;
+                external_message_id: string;
+                subject: string | null;
+                sender: string | null;
+                received_at: string | null;
+            }>;
+
+        return rows.map(row => ({
+            emailId: row.id,
+            externalMessageId: row.external_message_id,
+            subject: row.subject,
+            sender: row.sender,
+            receivedAt: row.received_at,
+        }));
+    }
+
     updateEmailExternalMessageId(emailId: string, externalMessageId: string): void {
         const conflict = this.db
             .prepare('SELECT id FROM email_records WHERE external_message_id = ?')

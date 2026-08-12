@@ -30,8 +30,12 @@ import {
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
 const MAX_EMAILS_PER_POLL = Number(process.env.WORKER_EMAIL_LIMIT || 50);
-const MAX_MANUAL_EMAIL_RETRIES_PER_POLL = Math.min(
-    Math.max(Number(process.env.EMAIL_RETRY_BATCH_SIZE || 10), 1),
+const MAX_PENDING_EMAILS_PER_POLL = Math.min(
+    Math.max(Number(
+        process.env.EMAIL_PROCESSING_BATCH_SIZE ||
+        process.env.EMAIL_RETRY_BATCH_SIZE ||
+        10,
+    ), 1),
     50,
 );
 const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
@@ -39,7 +43,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-08-12-mifile-history-fallback-v9';
+const WORKER_BUILD_ID = '2026-08-12-persistent-email-queue-v10';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -476,17 +480,17 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
     const emailsById = new Map<string, any>(
         recentEmails.map((email: any) => [String(email.id), email]),
     );
-    const queuedRetries = db.listQueuedEmailRetries(MAX_MANUAL_EMAIL_RETRIES_PER_POLL);
+    const pendingEmails = db.listPendingEmails(MAX_PENDING_EMAILS_PER_POLL);
 
-    for (const retry of queuedRetries) {
-        if (emailsById.has(retry.externalMessageId)) continue;
+    for (const pending of pendingEmails) {
+        if (emailsById.has(pending.externalMessageId)) continue;
         try {
-            const email = await recoverOutlookMessage(db, retry);
+            const email = await recoverOutlookMessage(db, pending);
             emailsById.set(String(email.id), email);
         } catch (error) {
             db.markEmailFailed(
-                retry.emailId,
-                `Unable to fetch the source email for manual retry: ${
+                pending.emailId,
+                `Unable to fetch the source email for queued processing: ${
                     error instanceof Error ? error.message : String(error)
                 }`,
             );

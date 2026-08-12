@@ -375,6 +375,55 @@ test('manual email retries are discoverable even when the source message is outs
     }
 });
 
+test('admin-synced new emails remain discoverable outside the recent Outlook window', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-persistent-email-queue-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'old-admin-synced-message',
+            subject: 'MiFILE - Document Filed 26-01340-LT',
+            receivedDateTime: '2026-07-30T12:46:18.000Z',
+            from: { emailAddress: { address: 'info@truefiling.com' } },
+            body: { content: '<p>Filing</p>' },
+        });
+        db.createCaseDraft(email.id, {
+            isMiFile: true,
+            courtName: 'District Court',
+            caseNumber: '26-01340-LT',
+            caseTitle: '3 TOWER MANAGEMENT V BARNES',
+            plaintiff: '3 TOWER MANAGEMENT',
+            defendant: 'BARNES',
+            bundleNumber: null,
+            filerName: null,
+            filedAt: '2026-07-30',
+            filedDocuments: [{
+                documentName: 'Summons',
+                documentType: 'Summons',
+                status: 'Filed',
+                comments: null,
+                downloadUrl: 'https://mifile.example/document/old',
+            }],
+            fileTypeByAttachmentId: {},
+        });
+
+        assert.deepEqual(db.listQueuedEmailRetries(), []);
+        assert.deepEqual(db.listPendingEmails(), [{
+            emailId: email.id,
+            externalMessageId: 'old-admin-synced-message',
+            subject: 'MiFILE - Document Filed 26-01340-LT',
+            sender: 'info@truefiling.com',
+            receivedAt: '2026-07-30T12:46:18.000Z',
+        }]);
+
+        db.markEmailProcessed(email.id);
+        assert.deepEqual(db.listPendingEmails(), []);
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
 test('failed emails expose pending documents to the retry worker with stored draft data', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-pending-retry-'));
     const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
