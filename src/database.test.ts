@@ -60,6 +60,10 @@ test('processing reports keep the active Plaintiff mapping available on repeat s
         assert.equal(firstResult.applied, true);
         assert.equal(firstResult.targetEmailId, email.id);
         assert.equal(firstResult.plaintiffMappingId, mapping.id);
+        assert.equal(
+            db.getDraftDetail(firstResult.caseDraftId!)?.caseDraft?.status,
+            'validation_failed',
+        );
 
         const repeatedResult = db.applyProcessingReport(report);
         assert.equal(repeatedResult.applied, false);
@@ -732,7 +736,9 @@ test('draft workspace supports listing, editable fields, validation, and reparse
         assert.equal(updated.caseDraft?.fieldSources.courtName, 'manual');
         assert.equal(updated.caseDraft?.reviewerNotes, 'Ready for legal review');
         assert.equal(updated.caseDraft?.status, 'needs_review');
-        assert.equal(updated.caseDraft?.validationStatus, 'passed');
+        assert.equal(updated.caseDraft?.validationStatus, 'failed');
+        assert.ok(updated.caseDraft?.validationIssues.some(issue =>
+            issue.message.includes('missing Advice')));
         assert.equal(updated.caseDraft?.filingData.defendants.length, 2);
         assert.equal(updated.caseDraft?.editableData.defendant, 'MANUAL DEFENDANT, SECOND DEFENDANT');
         assert.equal(updated.documents[0].filingName, 'Story Summons');
@@ -866,7 +872,7 @@ test('Complaint extraction becomes authoritative while preserving later manual f
         );
         assert.equal(
             first.documents.find(document => document.id === adviceId)?.requiredForFiling,
-            false,
+            true,
         );
 
         const manualFiling = {
@@ -906,6 +912,311 @@ test('Complaint extraction becomes authoritative while preserving later manual f
         assert.equal(second.caseDraft?.editableData.caseNumber, '26-02001-LT');
         assert.equal(second.caseDraft?.filingFieldSources.plaintiff, 'manual');
         assert.equal(second.caseDraft?.filingFieldSources.defendants, 'complaint');
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('complete first-hearing nonpayment packages become ready with Complaint-driven filing rules', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-standard-package-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'standard-package-message',
+            subject: 'Standard nonpayment package',
+            receivedDateTime: '2026-08-14T10:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Standard package</p>' },
+        });
+        const draftId = db.createCaseDraft(email.id, {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: '26-03000-LT',
+            caseTitle: 'EXAMPLE PROPERTY LLC V TAYLOR TENANT',
+            plaintiff: 'EXAMPLE PROPERTY LLC',
+            defendant: 'TAYLOR TENANT',
+            bundleNumber: null,
+            filerName: 'Adam Devlin',
+            filedAt: null,
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        });
+
+        const addUploadedDocument = (documentType: string, filename: string) => db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            currentFilename: filename,
+            oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
+            documentType,
+            mimeType: 'application/pdf',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+        const complaintId = addUploadedDocument(
+            'Complaint for Possession Only',
+            'Complaint.pdf',
+        );
+        addUploadedDocument(
+            'Advice of Rights and Information (Landlord-Tenant)',
+            'Advice.pdf',
+        );
+        addUploadedDocument('Local Rental and Housing Information', 'Local.pdf');
+        addUploadedDocument(
+            'Request for Court Mailing and Record (Landlord-Tenant)',
+            'Request.pdf',
+        );
+        addUploadedDocument(
+            'Summons, Landlord-Tenant/Land Contract',
+            'Summons.pdf',
+        );
+        const connectedId = addUploadedDocument('CONNECTED FILING', 'Demand.pdf');
+
+        db.applyComplaintExtraction(draftId, complaintId, {
+            extractorVersion: 2,
+            formType: 'NONPAYMENT OF RENT',
+            pageCount: 1,
+            textHash: 'standard-package-hash',
+            data: {
+                courtDistrict: '25',
+                caseNumber: '26-03000-LT',
+                plaintiff: {
+                    displayName: 'Example Property LLC',
+                    entityName: 'Example Property LLC',
+                },
+                defendants: [{
+                    displayName: 'Taylor Tenant',
+                    firstName: 'Taylor',
+                    lastName: 'Tenant',
+                    address1: '100 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
+                }],
+                attorney: {
+                    displayName: 'Adam Devlin',
+                    firstName: 'Adam',
+                    lastName: 'Devlin',
+                    barNumber: 'P72877',
+                },
+                includeAllOtherOccupants: true,
+                relatedCivilAction: 'none',
+                moneyJudgmentRequested: true,
+                claimAmount: '1471.01',
+                mailingRequested: true,
+            },
+            fieldConfidence: {
+                plaintiff: 'high',
+                defendants: 'high',
+                relatedCivilAction: 'high',
+                moneyJudgmentRequested: 'high',
+                claimAmount: 'high',
+            },
+            warnings: [],
+        });
+
+        const ready = db.refreshCaseDraftValidation(draftId);
+        assert.equal(ready.caseDraft?.status, 'ready_to_file');
+        assert.equal(ready.caseDraft?.validationStatus, 'passed');
+        assert.deepEqual(ready.caseDraft?.validationIssues, []);
+        assert.equal(ready.caseDraft?.filingData.moneyJudgmentRequested, true);
+        assert.equal(ready.caseDraft?.filingData.claimAmount, '1471.01');
+
+        const complaint = ready.documents.find(document => document.id === complaintId);
+        assert.equal(
+            complaint?.filingType,
+            'Complaint for Possession and Supplemental Money Judgment (Fee Varies)',
+        );
+        assert.equal(complaint?.filingTypeSource, 'complaint');
+        assert.equal(complaint?.filingRelation, 'separate');
+
+        const connected = ready.documents.find(document => document.id === connectedId);
+        assert.equal(connected?.filingType, 'Other');
+        assert.equal(connected?.filingRelation, 'connected_to_complaint');
+        assert.equal(connected?.filingSequence, null);
+        assert.ok(ready.documents.every(document => document.requiredForFiling));
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('paragraph 10 selects possession-only filing and keeps Other as a separate filing', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-possession-only-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'possession-only-message',
+            subject: 'Possession-only nonpayment package',
+            receivedDateTime: '2026-08-14T11:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Possession only</p>' },
+        });
+        const draftId = db.createCaseDraft(email.id, {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: '26-03001-LT',
+            caseTitle: 'EXAMPLE PROPERTY LLC V MORGAN TENANT',
+            plaintiff: 'EXAMPLE PROPERTY LLC',
+            defendant: 'MORGAN TENANT',
+            bundleNumber: null,
+            filerName: 'Adam Devlin',
+            filedAt: null,
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        });
+        const addDocument = (documentType: string, filename: string) => db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            currentFilename: filename,
+            oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
+            documentType,
+            mimeType: 'application/pdf',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+        const complaintId = addDocument(
+            'Complaint for Possession and Supplemental Money Judgment (Fee Varies)',
+            'Complaint.pdf',
+        );
+        addDocument('Advice of Rights and Information (Landlord-Tenant)', 'Advice.pdf');
+        addDocument('Local Rental and Housing Information', 'Local.pdf');
+        addDocument('Request for Court Mailing and Record (Landlord-Tenant)', 'Request.pdf');
+        addDocument('Summons, Landlord-Tenant/Land Contract', 'Summons.pdf');
+        const otherId = addDocument('Other', 'Seven-Day Notice.pdf');
+
+        db.applyComplaintExtraction(draftId, complaintId, {
+            extractorVersion: 2,
+            formType: 'NONPAYMENT OF RENT',
+            pageCount: 1,
+            textHash: 'possession-only-hash',
+            data: {
+                courtDistrict: '25',
+                caseNumber: '26-03001-LT',
+                plaintiff: {
+                    displayName: 'Example Property LLC',
+                    entityName: 'Example Property LLC',
+                },
+                defendants: [{
+                    displayName: 'Morgan Tenant',
+                    firstName: 'Morgan',
+                    lastName: 'Tenant',
+                    address1: '101 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
+                }],
+                relatedCivilAction: 'none',
+                moneyJudgmentRequested: false,
+                claimAmount: '0.00',
+                mailingRequested: true,
+            },
+            fieldConfidence: {},
+            warnings: [],
+        });
+
+        const ready = db.refreshCaseDraftValidation(draftId);
+        assert.equal(ready.caseDraft?.status, 'ready_to_file');
+        assert.equal(ready.caseDraft?.filingData.claimAmount, '0.00');
+        assert.equal(
+            ready.documents.find(document => document.id === complaintId)?.filingType,
+            'Complaint for Possession Only',
+        );
+        assert.equal(
+            ready.documents.find(document => document.id === otherId)?.filingRelation,
+            'separate',
+        );
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('duplicate, missing, and unknown documents block automatic nonpayment filing', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-unsafe-package-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'unsafe-package-message',
+            subject: 'Unsafe nonpayment package',
+            receivedDateTime: '2026-08-14T12:00:00.000Z',
+            from: { emailAddress: { address: 'court@example.com' } },
+            body: { content: '<p>Unsafe package</p>' },
+        });
+        const draftId = db.createCaseDraft(email.id, {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: '26-03002-LT',
+            caseTitle: 'EXAMPLE PROPERTY LLC V CASEY TENANT',
+            plaintiff: 'EXAMPLE PROPERTY LLC',
+            defendant: 'CASEY TENANT',
+            bundleNumber: null,
+            filerName: 'Adam Devlin',
+            filedAt: null,
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        });
+        const addDocument = (documentType: string, filename: string) => db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            currentFilename: filename,
+            oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
+            documentType,
+            mimeType: 'application/pdf',
+            uploadSource: 'test',
+            status: 'uploaded',
+        });
+        const complaintId = addDocument('Complaint for Possession Only', 'Complaint.pdf');
+        addDocument('Advice of Rights and Information (Landlord-Tenant)', 'Advice.pdf');
+        addDocument('Local Rental and Housing Information', 'Local.pdf');
+        addDocument('Request for Court Mailing and Record (Landlord-Tenant)', 'Request.pdf');
+        addDocument('Summons, Landlord-Tenant/Land Contract', 'Summons.pdf');
+        addDocument('Summons, Landlord-Tenant/Land Contract', 'Duplicate Summons.pdf');
+        addDocument('Supporting Exhibit', 'Unexpected Exhibit.pdf');
+
+        db.applyComplaintExtraction(draftId, complaintId, {
+            extractorVersion: 2,
+            formType: 'NONPAYMENT OF RENT',
+            pageCount: 1,
+            textHash: 'unsafe-package-hash',
+            data: {
+                courtDistrict: '25',
+                caseNumber: '26-03002-LT',
+                plaintiff: {
+                    displayName: 'Example Property LLC',
+                    entityName: 'Example Property LLC',
+                },
+                defendants: [{
+                    displayName: 'Casey Tenant',
+                    firstName: 'Casey',
+                    lastName: 'Tenant',
+                    address1: '102 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
+                }],
+                relatedCivilAction: 'none',
+                moneyJudgmentRequested: false,
+                claimAmount: '0.00',
+                mailingRequested: true,
+            },
+            fieldConfidence: {},
+            warnings: [],
+        });
+
+        const blocked = db.refreshCaseDraftValidation(draftId);
+        const messages = blocked.caseDraft?.validationIssues.map(issue => issue.message) ?? [];
+        assert.equal(blocked.caseDraft?.status, 'validation_failed');
+        assert.ok(messages.some(message => message.includes('2 Summons documents')));
+        assert.ok(messages.some(message => message.includes('at least one demand')));
+        assert.ok(messages.some(message => message.includes('is not recognized')));
+        assert.throws(
+            () => db.reviewCaseDraft(draftId, 'approve'),
+            /Cannot approve draft/,
+        );
     } finally {
         db.close();
         fs.rmSync(tempDir, { recursive: true, force: true });

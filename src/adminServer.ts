@@ -25,7 +25,7 @@ import {
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-08-12-primary-complaint-drafts-v16';
+const ADMIN_BUILD_ID = '2026-08-14-standard-nonpayment-drafts-v17';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2217,6 +2217,11 @@ const html = String.raw`<!doctype html>
       color: var(--bad);
       background: var(--bad-soft);
     }
+    .draft-validation.is-ready {
+      border-color: #a9cdb5;
+      color: var(--good);
+      background: #eef8f1;
+    }
     .draft-validation-row {
       display: flex;
       align-items: flex-start;
@@ -2362,7 +2367,7 @@ const html = String.raw`<!doctype html>
     }
     .draft-document-mapping {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(150px, 1fr) 34px 34px;
+      grid-template-columns: minmax(0, 1fr) minmax(170px, 1fr) minmax(145px, .8fr) 34px 34px;
       gap: 8px;
       align-items: end;
       padding: 10px 0;
@@ -2581,7 +2586,8 @@ const html = String.raw`<!doctype html>
         grid-template-columns: minmax(0, 1fr) 34px 34px;
       }
       .draft-document-mapping > .draft-field:first-child,
-      .draft-document-mapping .filing-type-field {
+      .draft-document-mapping .filing-type-field,
+      .draft-document-mapping .filing-relation-field {
         grid-column: 1 / -1;
       }
     }
@@ -3822,7 +3828,9 @@ const html = String.raw`<!doctype html>
             '<span>' + escapeHtml(issue.message) + '</span></div>').join('') +
           '</div>';
       } else {
-        validationRoot.innerHTML = '';
+        validationRoot.innerHTML = '<div class="draft-validation is-ready">' +
+          '<div class="draft-validation-row">' + icon('circle-check') +
+          '<span>Standard first-hearing nonpayment package passed validation.</span></div></div>';
       }
 
       const primaryDocument = documents.find(document => document.isPrimary) || null;
@@ -3840,8 +3848,16 @@ const html = String.raw`<!doctype html>
               : 'No primary Complaint selected') + '</strong>' +
             (extraction
               ? '<span>Extracted ' + escapeHtml(fmtDate(extraction.extractedAt)) +
-                ' · ' + escapeHtml((extraction.appliedFields || []).length) +
-                ' field groups applied</span>'
+                ' | ' + escapeHtml((extraction.appliedFields || []).length) +
+                ' field groups applied</span>' +
+                '<span>' + escapeHtml(extraction.formType || 'Unknown Complaint type') +
+                ' | Paragraph 10: ' + escapeHtml(
+                  extraction.data && extraction.data.moneyJudgmentRequested === true
+                    ? 'money judgment'
+                    : extraction.data && extraction.data.moneyJudgmentRequested === false
+                      ? 'possession only'
+                      : 'review required',
+                ) + '</span>'
               : '<span>Extraction has not been completed.</span>') +
           '</div>' +
         '</section>';
@@ -3893,8 +3909,23 @@ const html = String.raw`<!doctype html>
               ],
               true,
             ) +
+            renderDraftSelect(
+              'Money judgment (Complaint paragraph 10)',
+              'data-filing-field="moneyJudgmentRequested"',
+              filing.moneyJudgmentRequested === true
+                ? 'true'
+                : filing.moneyJudgmentRequested === false
+                  ? 'false'
+                  : '',
+              [
+                { value: '', label: 'Review required' },
+                { value: 'false', label: 'No - possession only' },
+                { value: 'true', label: 'Yes - supplemental money judgment' },
+              ],
+              true,
+            ) +
             renderDraftInput(
-              'Claim amount',
+              'Claim amount from paragraph 10',
               'data-filing-field="claimAmount"',
               filing.claimAmount,
               false,
@@ -3937,7 +3968,7 @@ const html = String.raw`<!doctype html>
             ) +
             renderDraftCheckbox(
               'Request court service by mail',
-              'data-filing-field="mailingRequested"',
+              'data-filing-field="mailingRequested" disabled',
               filing.mailingRequested !== false,
             ) +
             renderDraftCheckbox(
@@ -4022,6 +4053,17 @@ const html = String.raw`<!doctype html>
         input.addEventListener('input', () => setDraftDirty(true));
         input.addEventListener('change', () => setDraftDirty(true));
       });
+      const moneyJudgment = document.querySelector(
+        '[data-filing-field="moneyJudgmentRequested"]',
+      );
+      const claimAmount = document.querySelector('[data-filing-field="claimAmount"]');
+      const syncClaimAmount = () => {
+        if (!moneyJudgment || !claimAmount) return;
+        const possessionOnly = moneyJudgment.value === 'false';
+        claimAmount.disabled = possessionOnly;
+      };
+      if (moneyJudgment) moneyJudgment.addEventListener('change', syncClaimAmount);
+      syncClaimAmount();
       document.querySelectorAll('[data-set-primary-document]').forEach(button => {
         button.addEventListener('click', () => {
           setDraftPrimaryDocument(button.dataset.setPrimaryDocument);
@@ -4150,9 +4192,10 @@ const html = String.raw`<!doctype html>
 
     function renderDraftDocumentMapping(document, index, issueByField) {
       const issue = issueByField.get('document.' + document.id);
+      const coreDocument = ['complaint', 'advice', 'local', 'request', 'summons']
+        .includes(document.packageRole);
       return '<div class="draft-document-mapping" data-draft-document-id="' +
-        escapeHtml(document.id) + '" data-filing-sequence="' +
-        escapeHtml(document.filingSequence || document.suggestedFilingSequence || index + 1) + '">' +
+        escapeHtml(document.id) + '">' +
         '<label class="draft-field">' +
           '<span class="draft-field-label" title="' +
             escapeHtml(document.currentFilename || document.documentType || '') + '">' +
@@ -4165,6 +4208,9 @@ const html = String.raw`<!doctype html>
             (document.isPrimary ? '<span>Primary source</span>' : '') +
             (document.documentRole && document.documentRole !== 'unknown'
               ? '<span>' + escapeHtml(statusLabel(document.documentRole)) + '</span>'
+              : '') +
+            (document.packageRole
+              ? '<span>' + escapeHtml(statusLabel(document.packageRole)) + '</span>'
               : '') +
             (document.filingTypeSource
               ? '<span>' + escapeHtml(statusLabel(document.filingTypeSource)) + ' type</span>'
@@ -4179,6 +4225,19 @@ const html = String.raw`<!doctype html>
             ? '<span class="draft-field-message">' + escapeHtml(issue.message) + '</span>'
             : '') +
         '</label>' +
+        '<label class="draft-field filing-relation-field ' +
+          (issue ? 'has-' + escapeHtml(issue.severity) : '') + '">' +
+          '<span class="draft-field-label"><span>Submission</span></span>' +
+          '<select data-document-field="filingRelation"' +
+            (coreDocument || document.packageRole === 'fee' ? ' disabled' : '') + '>' +
+            '<option value="unknown"' +
+              (document.filingRelation === 'unknown' ? ' selected' : '') + '>Review required</option>' +
+            '<option value="separate"' +
+              (document.filingRelation === 'separate' ? ' selected' : '') + '>Separate filing / Other</option>' +
+            '<option value="connected_to_complaint"' +
+              (document.filingRelation === 'connected_to_complaint' ? ' selected' : '') + '>Connect to Complaint</option>' +
+          '</select>' +
+        '</label>' +
         (document.documentRole === 'primary_source'
           ? '<button type="button" class="draft-primary-toggle icon-button ' +
               (document.isPrimary ? 'is-primary' : '') + '" data-set-primary-document="' +
@@ -4191,7 +4250,7 @@ const html = String.raw`<!doctype html>
         '<label class="draft-document-required" title="Required for filing">' +
           '<input type="checkbox" data-document-field="requiredForFiling"' +
             (document.requiredForFiling ? ' checked' : '') +
-            (document.isPrimary ? ' disabled' : '') + '>' +
+            (coreDocument || document.packageRole === 'fee' ? ' disabled' : '') + '>' +
         '</label>' +
       '</div>';
     }
@@ -4353,7 +4412,7 @@ const html = String.raw`<!doctype html>
         const key = input.dataset.filingField;
         if (input.type === 'checkbox') {
           result[key] = input.checked;
-        } else if (key === 'relatedCasePending') {
+        } else if (key === 'relatedCasePending' || key === 'moneyJudgmentRequested') {
           result[key] = input.value === '' ? null : input.value === 'true';
         } else {
           result[key] = input.value;
@@ -4370,12 +4429,13 @@ const html = String.raw`<!doctype html>
         (root, index) => {
           const filingName = root.querySelector('[data-document-field="filingName"]');
           const filingType = root.querySelector('[data-document-field="filingType"]');
+          const filingRelation = root.querySelector('[data-document-field="filingRelation"]');
           const required = root.querySelector('[data-document-field="requiredForFiling"]');
           return {
             id: root.dataset.draftDocumentId,
             filingName: filingName ? filingName.value : '',
             filingType: filingType ? filingType.value : '',
-            filingSequence: Number(root.dataset.filingSequence || index + 1),
+            filingRelation: filingRelation ? filingRelation.value : 'unknown',
             requiredForFiling: required ? required.checked : true,
           };
         },
@@ -4394,7 +4454,7 @@ const html = String.raw`<!doctype html>
         if (!mapping) return;
         document.filingName = mapping.filingName;
         document.filingType = mapping.filingType;
-        document.filingSequence = mapping.filingSequence;
+        document.filingRelation = mapping.filingRelation;
         document.requiredForFiling = mapping.requiredForFiling;
       });
     }

@@ -8,8 +8,19 @@ export function buildSuccessBody(args: {
     files: NotificationFile[];
     plaintiffFullName?: string | null;
     plaintiffShortName?: string | null;
+    draftValidation?: {
+        status: string;
+        issues: Array<{ severity: 'error' | 'warning'; message: string }>;
+    } | null;
 }) {
-    const { msg, parsed, files, plaintiffFullName, plaintiffShortName } = args;
+    const {
+        msg,
+        parsed,
+        files,
+        plaintiffFullName,
+        plaintiffShortName,
+        draftValidation,
+    } = args;
 
     const header =
         `Original email:\n` +
@@ -32,7 +43,18 @@ export function buildSuccessBody(args: {
         )
         .join('\n');
 
-    return header + docs;
+    const validation = draftValidation
+        ? `\n\nFiling Draft:\n` +
+          `Status: ${draftValidation.status}\n` +
+          `Automatic submission: ${draftValidation.issues.length ? 'BLOCKED - correction or review required' : 'READY'}\n` +
+          (draftValidation.issues.length
+              ? draftValidation.issues
+                  .map(issue => `- ${issue.severity.toUpperCase()}: ${issue.message}`)
+                  .join('\n')
+              : '- Standard first-hearing nonpayment package passed validation.')
+        : '';
+
+    return header + docs + validation;
 }
 
 export function buildErrorBody(args: {

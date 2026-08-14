@@ -25,6 +25,14 @@ export interface ComplaintExtractionData {
     defendants?: ComplaintPartyExtraction[];
     attorney?: ComplaintPartyExtraction & { barNumber?: string };
     includeAllOtherOccupants?: boolean;
+    relatedCivilAction?: 'none' | 'previously_filed';
+    relatedCaseCourt?: string;
+    relatedCaseDocketNumber?: string;
+    relatedCaseJudge?: string;
+    relatedCasePending?: boolean;
+    moneyJudgmentRequested?: boolean;
+    claimAmount?: string;
+    mailingRequested?: true;
 }
 
 export interface ComplaintExtractionWarning {
@@ -40,7 +48,7 @@ export interface ComplaintExtractionWarning {
 }
 
 export interface ComplaintExtractionResult {
-    extractorVersion: 1;
+    extractorVersion: 1 | 2;
     formType: string | null;
     pageCount: number;
     textHash: string;
@@ -53,6 +61,13 @@ interface TextItemLike {
     str?: unknown;
     transform?: unknown;
     hasEOL?: unknown;
+}
+
+export interface ComplaintPositionedValue {
+    text: string;
+    x: number;
+    y: number;
+    pageNumber?: number;
 }
 
 let pdfJsPromise: Promise<any> | null = null;
@@ -154,6 +169,180 @@ function districtFromLines(lines: string[], endIndex: number): string | undefine
     return undefined;
 }
 
+function isCheckboxMark(value: string): boolean {
+    return /^(?:4|x|yes)$/i.test(normalizeLine(value));
+}
+
+function valuesInBox(
+    values: ComplaintPositionedValue[],
+    box: { xMin: number; xMax: number; yMin: number; yMax: number },
+): ComplaintPositionedValue[] {
+    return values.filter(value =>
+        (value.pageNumber ?? 1) === 1 &&
+        value.x >= box.xMin && value.x <= box.xMax &&
+        value.y >= box.yMin && value.y <= box.yMax);
+}
+
+function checkedInBox(
+    values: ComplaintPositionedValue[],
+    box: { xMin: number; xMax: number; yMin: number; yMax: number },
+): boolean {
+    return valuesInBox(values, box).some(value => isCheckboxMark(value.text));
+}
+
+function textInBox(
+    values: ComplaintPositionedValue[],
+    box: { xMin: number; xMax: number; yMin: number; yMax: number },
+): string | undefined {
+    const text = valuesInBox(values, box)
+        .filter(value => !isCheckboxMark(value.text))
+        .sort((left, right) => right.y - left.y || left.x - right.x)
+        .map(value => normalizeLine(value.text))
+        .filter(Boolean)
+        .join(' ');
+    return text || undefined;
+}
+
+function normalizedMoney(value: string | undefined): string | undefined {
+    if (!value) return undefined;
+    const match = value.replace(/[$,\s]/g, '').match(/^\d+(?:\.\d+)?$/);
+    if (!match) return undefined;
+    const amount = Number(match[0]);
+    if (!Number.isFinite(amount) || amount < 0) return undefined;
+    return amount.toFixed(2);
+}
+
+function amountInBox(
+    values: ComplaintPositionedValue[],
+    box: { xMin: number; xMax: number; yMin: number; yMax: number },
+): string | undefined {
+    const candidates = valuesInBox(values, box)
+        .filter(value => !isCheckboxMark(value.text))
+        .sort((left, right) => left.x - right.x);
+    for (const candidate of candidates) {
+        const amount = normalizedMoney(candidate.text);
+        if (amount) return amount;
+    }
+    return undefined;
+}
+
+function applyPositionedCheckboxData(
+    data: ComplaintExtractionData,
+    fieldConfidence: Record<string, ComplaintFieldConfidence>,
+    warnings: ComplaintExtractionWarning[],
+    values: ComplaintPositionedValue[],
+): void {
+    if (!values.length) return;
+
+    const noRelatedAction = checkedInBox(values, {
+        xMin: 35,
+        xMax: 72,
+        yMin: 508,
+        yMax: 528,
+    });
+    const previousRelatedAction = checkedInBox(values, {
+        xMin: 35,
+        xMax: 72,
+        yMin: 482,
+        yMax: 504,
+    });
+    if (noRelatedAction !== previousRelatedAction) {
+        data.relatedCivilAction = noRelatedAction ? 'none' : 'previously_filed';
+        fieldConfidence.relatedCivilAction = 'high';
+    } else {
+        warnings.push({
+            code: 'related_action_review',
+            message: 'The related civil action selection in paragraph 2 is missing or ambiguous.',
+        });
+    }
+
+    if (data.relatedCivilAction === 'previously_filed') {
+        data.relatedCaseCourt = textInBox(values, {
+            xMin: 175,
+            xMax: 350,
+            yMin: 471,
+            yMax: 489,
+        });
+        const docketAndJudge = textInBox(values, {
+            xMin: 60,
+            xMax: 580,
+            yMin: 459,
+            yMax: 477,
+        });
+        if (docketAndJudge) {
+            const docketMatch = docketAndJudge.match(/\b[A-Z0-9]+(?:-[A-Z0-9]+){1,4}\b/i);
+            data.relatedCaseDocketNumber = docketMatch?.[0];
+            data.relatedCaseJudge = cleanName(
+                docketMatch ? docketAndJudge.replace(docketMatch[0], '') : docketAndJudge,
+            ) || undefined;
+        }
+        const remainsPending = checkedInBox(values, {
+            xMin: 100,
+            xMax: 150,
+            yMin: 447,
+            yMax: 467,
+        });
+        const noLongerPending = checkedInBox(values, {
+            xMin: 165,
+            xMax: 225,
+            yMin: 447,
+            yMax: 467,
+        });
+        if (remainsPending !== noLongerPending) {
+            data.relatedCasePending = remainsPending;
+            fieldConfidence.relatedCasePending = 'high';
+        }
+        if (data.relatedCaseCourt) fieldConfidence.relatedCaseCourt = 'medium';
+        if (data.relatedCaseDocketNumber) fieldConfidence.relatedCaseDocketNumber = 'medium';
+        if (data.relatedCaseJudge) fieldConfidence.relatedCaseJudge = 'medium';
+        if (
+            !data.relatedCaseCourt ||
+            !data.relatedCaseDocketNumber ||
+            data.relatedCasePending === undefined
+        ) {
+            warnings.push({
+                code: 'related_action_review',
+                message: 'A prior civil action is selected; review its court, docket, judge, and status.',
+            });
+        }
+    }
+
+    const moneyJudgmentRequested = checkedInBox(values, {
+        xMin: 30,
+        xMax: 65,
+        yMin: 88,
+        yMax: 108,
+    });
+    data.moneyJudgmentRequested = moneyJudgmentRequested;
+    fieldConfidence.moneyJudgmentRequested = 'high';
+    if (!moneyJudgmentRequested) {
+        data.claimAmount = '0.00';
+        fieldConfidence.claimAmount = 'high';
+    } else {
+        data.claimAmount = amountInBox(values, {
+            xMin: 120,
+            xMax: 480,
+            yMin: 50,
+            yMax: 74,
+        }) ?? amountInBox(values, {
+            xMin: 380,
+            xMax: 500,
+            yMin: 305,
+            yMax: 329,
+        });
+        if (data.claimAmount) {
+            fieldConfidence.claimAmount = 'high';
+        } else {
+            warnings.push({
+                code: 'claim_amount_review',
+                message: 'Paragraph 10 requests a money judgment, but the claim amount was not found.',
+            });
+        }
+    }
+    data.mailingRequested = true;
+    fieldConfidence.mailingRequested = 'high';
+}
+
 export function isComplaintDocument(
     documentType: string | null | undefined,
     filename?: string | null,
@@ -164,7 +353,11 @@ export function isComplaintDocument(
 
 export function parseComplaintText(
     text: string | string[],
-    options: { pageCount?: number; documentType?: string | null } = {},
+    options: {
+        pageCount?: number;
+        documentType?: string | null;
+        positionedValues?: ComplaintPositionedValue[];
+    } = {},
 ): ComplaintExtractionResult {
     const lines = normalizedLines(text);
     const joined = lines.join('\n');
@@ -273,19 +466,28 @@ export function parseComplaintText(
             message: 'Defendant information was not confidently extracted from the Complaint.',
         });
     }
-    warnings.push({
-        code: 'related_action_review',
-        message: 'Confirm the related civil action answer; checkbox extraction is not yet reliable.',
-    });
-    if (/Supplemental Money Judgment/i.test(options.documentType ?? '')) {
+
+    applyPositionedCheckboxData(
+        data,
+        fieldConfidence,
+        warnings,
+        options.positionedValues ?? [],
+    );
+    if (!options.positionedValues?.length) {
         warnings.push({
-            code: 'claim_amount_review',
-            message: 'Confirm the claim amount for the supplemental money judgment.',
+            code: 'related_action_review',
+            message: 'Confirm the related civil action answer; checkbox positions were not available.',
         });
+        if (/Supplemental Money Judgment/i.test(options.documentType ?? '')) {
+            warnings.push({
+                code: 'claim_amount_review',
+                message: 'Confirm the claim amount for the supplemental money judgment.',
+            });
+        }
     }
 
     return {
-        extractorVersion: 1,
+        extractorVersion: 2,
         formType,
         pageCount: options.pageCount ?? 1,
         textHash: createHash('sha256').update(joined).digest('hex'),
@@ -319,9 +521,18 @@ export async function extractComplaintPdf(
     try {
         const document = await loadingTask.promise;
         const lines: string[] = [];
+        const positionedValues: ComplaintPositionedValue[] = [];
         for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
             const page = await document.getPage(pageNumber);
             const content = await page.getTextContent();
+            const textItems = content.items as TextItemLike[];
+            let filledMarkerIndex = -1;
+            for (let index = textItems.length - 1; index >= 0; index--) {
+                if (normalizeLine(textItems[index]?.str) === 'K') {
+                    filledMarkerIndex = index;
+                    break;
+                }
+            }
             let current = '';
             let currentY: number | null = null;
             const flush = () => {
@@ -331,10 +542,25 @@ export async function extractComplaintPdf(
                 currentY = null;
             };
 
-            for (const rawItem of content.items as TextItemLike[]) {
+            for (const [itemIndex, rawItem] of textItems.entries()) {
                 if (typeof rawItem.str !== 'string') continue;
                 const transform = Array.isArray(rawItem.transform) ? rawItem.transform : [];
                 const y = typeof transform[5] === 'number' ? Math.round(transform[5]) : null;
+                const x = typeof transform[4] === 'number' ? transform[4] : null;
+                if (
+                    filledMarkerIndex >= 0 &&
+                    itemIndex > filledMarkerIndex &&
+                    x !== null &&
+                    y !== null &&
+                    normalizeLine(rawItem.str)
+                ) {
+                    positionedValues.push({
+                        text: normalizeLine(rawItem.str),
+                        x,
+                        y,
+                        pageNumber,
+                    });
+                }
                 if (current && currentY !== null && y !== null && Math.abs(y - currentY) > 2) {
                     flush();
                 }
@@ -349,6 +575,7 @@ export async function extractComplaintPdf(
         return parseComplaintText(lines, {
             pageCount: document.numPages,
             documentType,
+            positionedValues,
         });
     } finally {
         await loadingTask.destroy();

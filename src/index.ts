@@ -44,7 +44,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-08-12-primary-complaint-drafts-v16';
+const WORKER_BUILD_ID = '2026-08-14-standard-nonpayment-drafts-v17';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -497,7 +497,9 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
         }
 
         db.refreshEmailAfterDocumentRetries(emailId, caseDraftId);
-        if (caseDraftId) db.refreshCaseDraftValidation(caseDraftId);
+        const validatedDraft = caseDraftId
+            ? db.refreshCaseDraftValidation(caseDraftId)
+            : null;
 
         if (recoveredFiles.length) {
             try {
@@ -511,6 +513,12 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                         files: recoveredFiles,
                         plaintiffFullName: reportPlaintiffNaming.fullName,
                         plaintiffShortName: reportPlaintiffNaming.shortName,
+                        draftValidation: validatedDraft?.caseDraft
+                            ? {
+                                status: validatedDraft.caseDraft.status,
+                                issues: validatedDraft.caseDraft.validationIssues,
+                            }
+                            : null,
                     }),
                     files: recoveredFiles,
                 });
@@ -682,6 +690,21 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 notificationFiles.map(f => ({ name: f.fileName, url: f.webUrl })),
             );
 
+            const validatedDraft = db.refreshCaseDraftValidation(caseDraftId);
+            const draftValidation = validatedDraft.caseDraft
+                ? {
+                    status: validatedDraft.caseDraft.status,
+                    issues: validatedDraft.caseDraft.validationIssues,
+                }
+                : null;
+            console.log('Filing package validation:', {
+                draftStatus: draftValidation?.status ?? 'missing',
+                issues: draftValidation?.issues.map(issue => ({
+                    severity: issue.severity,
+                    message: issue.message,
+                })) ?? [],
+            });
+
             const subjectLine =
                 `MiFILE/TrueFiling processed: ` +
                 `${parsed.caseNumber ?? 'NO CASE'} - ${notificationFiles.length} doc(s)`;
@@ -692,6 +715,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 files: notificationFiles,
                 plaintiffFullName: plaintiffNaming.fullName,
                 plaintiffShortName: plaintiffNaming.shortName,
+                draftValidation,
             });
 
             try {
@@ -706,7 +730,6 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 console.error('Error sending success report email:', e);
             }
 
-            db.refreshCaseDraftValidation(caseDraftId);
             db.markEmailProcessed(emailRecord.id);
         } catch (err) {
             console.error(`Error while processing message ${externalMessageId}:`, err);

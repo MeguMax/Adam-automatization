@@ -78,3 +78,24 @@ test('keeps ambiguous multiple Defendants together and requests review', () => {
     assert.ok(result.warnings.some(warning => warning.code === 'multiple_defendants_review'));
     assert.ok(result.warnings.some(warning => warning.code === 'claim_amount_review'));
 });
+
+test('reads paragraph 2, paragraph 10, and the claim amount from positioned PDF values', () => {
+    const result = parseComplaintText(POSSESSION_ONLY_TEXT, {
+        documentType: 'Complaint for Possession and Supplemental Money Judgment (Fee Varies)',
+        positionedValues: [
+            { text: '4', x: 53.9, y: 518.8 },
+            { text: '4', x: 41.9, y: 98.8 },
+            { text: '1471.010000', x: 169.2, y: 63.0 },
+        ],
+    });
+
+    assert.equal(result.extractorVersion, 2);
+    assert.equal(result.data.relatedCivilAction, 'none');
+    assert.equal(result.data.moneyJudgmentRequested, true);
+    assert.equal(result.data.claimAmount, '1471.01');
+    assert.equal(result.data.mailingRequested, true);
+    assert.equal(result.fieldConfidence.relatedCivilAction, 'high');
+    assert.equal(result.fieldConfidence.moneyJudgmentRequested, 'high');
+    assert.ok(!result.warnings.some(warning => warning.code === 'related_action_review'));
+    assert.ok(!result.warnings.some(warning => warning.code === 'claim_amount_review'));
+});

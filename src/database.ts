@@ -270,6 +270,16 @@ export type DraftFilingFieldSource =
     | 'empty';
 
 export type DraftDocumentRole = 'primary_source' | 'supporting' | 'fee' | 'unknown';
+export type FilingPackageRole =
+    | 'complaint'
+    | 'advice'
+    | 'local'
+    | 'request'
+    | 'summons'
+    | 'ancillary'
+    | 'fee'
+    | 'unknown';
+export type DraftFilingRelation = 'separate' | 'connected_to_complaint' | 'unknown';
 
 export type DraftPartyType = 'person' | 'entity';
 export type RelatedCivilAction = 'none' | 'previously_filed' | 'unknown';
@@ -313,6 +323,7 @@ export interface DraftFilingData {
     relatedCaseDocketNumber: string | null;
     relatedCaseJudge: string | null;
     relatedCasePending: boolean | null;
+    moneyJudgmentRequested: boolean | null;
     claimAmount: string | null;
     mailingRequested: boolean;
     includeAllOtherOccupants: boolean;
@@ -325,6 +336,7 @@ export interface DraftDocumentFilingUpdate {
     id: string;
     filingName?: unknown;
     filingType?: unknown;
+    filingRelation?: unknown;
     filingSequence?: unknown;
     requiredForFiling?: unknown;
 }
@@ -363,12 +375,15 @@ export interface DocumentRecordView {
     documentType: string | null;
     filingName: string | null;
     filingType: string | null;
-    filingTypeSource: 'suggested' | 'manual' | null;
+    filingTypeSource: 'suggested' | 'complaint' | 'manual' | null;
+    filingRelation: DraftFilingRelation;
+    filingRelationSource: 'suggested' | 'manual' | null;
     filingSequence: number | null;
     suggestedFilingSequence: number | null;
     requiredForFiling: boolean;
     isPrimary: boolean;
     documentRole: DraftDocumentRole;
+    packageRole: FilingPackageRole;
     uploadSource: string;
     status: string;
     errorMessage: string | null;
@@ -781,7 +796,14 @@ function draftFilingData(data: unknown): DraftFilingData {
     const relatedCasePending = typeof source.relatedCasePending === 'boolean'
         ? source.relatedCasePending
         : null;
-    const claimAmount = boundedDraftValue(source.claimAmount, 'claimAmount', 50);
+    const moneyJudgmentRequested = typeof source.moneyJudgmentRequested === 'boolean'
+        ? source.moneyJudgmentRequested
+        : source.claimAmount !== undefined && source.claimAmount !== null
+            ? Number(String(source.claimAmount).replace(/[$,\s]/g, '')) > 0
+            : null;
+    const claimAmount = moneyJudgmentRequested === false
+        ? '0.00'
+        : boundedDraftValue(source.claimAmount, 'claimAmount', 50);
     if (claimAmount && !/^\d+(?:\.\d{1,2})?$/.test(claimAmount.replace(/[$,\s]/g, ''))) {
         throw new Error('Claim amount must be a valid non-negative amount');
     }
@@ -811,6 +833,7 @@ function draftFilingData(data: unknown): DraftFilingData {
         ),
         relatedCaseJudge: boundedDraftValue(source.relatedCaseJudge, 'relatedCaseJudge', 200),
         relatedCasePending,
+        moneyJudgmentRequested,
         claimAmount: claimAmount ? claimAmount.replace(/[$,\s]/g, '') : null,
         mailingRequested: typeof source.mailingRequested === 'boolean'
             ? source.mailingRequested
@@ -834,6 +857,7 @@ const DRAFT_FILING_DATA_KEYS = [
     'relatedCaseDocketNumber',
     'relatedCaseJudge',
     'relatedCasePending',
+    'moneyJudgmentRequested',
     'claimAmount',
     'mailingRequested',
     'includeAllOtherOccupants',
@@ -864,7 +888,7 @@ function complaintExtractionFromDraft(data: unknown): StoredComplaintExtraction 
     if (
         typeof source.documentId !== 'string' ||
         typeof source.extractedAt !== 'string' ||
-        source.extractorVersion !== 1 ||
+        (source.extractorVersion !== 1 && source.extractorVersion !== 2) ||
         !source.data ||
         typeof source.data !== 'object'
     ) {
@@ -1043,20 +1067,57 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
         issues.push({
             field: 'filingData.relatedCivilAction',
             severity: 'warning',
-            message: 'Confirm whether a related civil action exists.',
+            message: 'Paragraph 2 could not be read; confirm whether a related civil action exists.',
+        });
+    }
+    if (filing.relatedCivilAction === 'previously_filed') {
+        const missingRelatedFields = [
+            !filing.relatedCaseCourt ? 'court' : null,
+            !filing.relatedCaseDocketNumber ? 'docket number' : null,
+            filing.relatedCasePending === null ? 'status' : null,
+        ].filter((value): value is string => Boolean(value));
+        if (missingRelatedFields.length) {
+            issues.push({
+                field: 'filingData.relatedCivilAction',
+                severity: 'warning',
+                message: `Complete the prior civil action ${missingRelatedFields.join(', ')} from paragraph 2.`,
+            });
+        }
+    }
+    if (filing.moneyJudgmentRequested === null) {
+        issues.push({
+            field: 'filingData.moneyJudgmentRequested',
+            severity: 'warning',
+            message: 'Paragraph 10 could not be read; confirm whether a money judgment is requested.',
+        });
+    } else if (
+        filing.moneyJudgmentRequested &&
+        (!filing.claimAmount || Number(filing.claimAmount) <= 0)
+    ) {
+        issues.push({
+            field: 'filingData.claimAmount',
+            severity: 'error',
+            message: 'A positive claim amount is required when paragraph 10 requests a money judgment.',
+        });
+    }
+    if (!filing.mailingRequested) {
+        issues.push({
+            field: 'filingData.mailingRequested',
+            severity: 'error',
+            message: 'Court service by mail must be requested for the supported filing workflow.',
         });
     }
     if (!draftPartyName(filing.plaintiff)) {
         issues.push({
             field: 'filingData.plaintiff',
-            severity: 'warning',
+            severity: 'error',
             message: 'Complete the Plaintiff party information.',
         });
     }
     if (!filing.defendants.length) {
         issues.push({
             field: 'filingData.defendants',
-            severity: 'warning',
+            severity: 'error',
             message: 'Add at least one Defendant.',
         });
     }
@@ -1064,8 +1125,21 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
         if (!draftPartyName(party)) {
             issues.push({
                 field: `filingData.defendants.${index}`,
-                severity: 'warning',
+                severity: 'error',
                 message: `Complete the name for Defendant ${index + 1}.`,
+            });
+        }
+        const missingAddress = [
+            !party.address1 ? 'street address' : null,
+            !party.city ? 'city' : null,
+            !party.state ? 'state' : null,
+            !party.postalCode ? 'ZIP code' : null,
+        ].filter((value): value is string => Boolean(value));
+        if (missingAddress.length) {
+            issues.push({
+                field: `filingData.defendants.${index}`,
+                severity: 'error',
+                message: `Complete Defendant ${index + 1} ${missingAddress.join(', ')} from the Complaint.`,
             });
         }
     });
@@ -1085,16 +1159,21 @@ export const MIFILE_FILING_TYPES = [
 function suggestMiFileFilingType(
     documentType: string | null | undefined,
     filename: string | null | undefined,
+    moneyJudgmentRequested?: boolean | null,
 ): string | null {
     const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
     if (!value.trim()) return null;
     if (value.includes('advice')) return MIFILE_FILING_TYPES[0];
     if (value.includes('local')) return MIFILE_FILING_TYPES[1];
     if (value.includes('complaint')) {
+        if (moneyJudgmentRequested === true) return MIFILE_FILING_TYPES[2];
+        if (moneyJudgmentRequested === false) return MIFILE_FILING_TYPES[3];
         if (value.includes('possession only')) return MIFILE_FILING_TYPES[3];
         return MIFILE_FILING_TYPES[2];
     }
-    if (value.includes('demand')) return MIFILE_FILING_TYPES[4];
+    if (/\b(?:demand|notice|lease|deed|ancillary|other)\b/.test(value)) {
+        return MIFILE_FILING_TYPES[4];
+    }
     if (value.includes('request')) return MIFILE_FILING_TYPES[5];
     if (value.includes('summons')) return MIFILE_FILING_TYPES[6];
     if (value.includes('connected filing')) return MIFILE_FILING_TYPES[4];
@@ -1102,28 +1181,60 @@ function suggestMiFileFilingType(
 }
 
 function suggestedDocumentSequence(
+    _documentType: string | null | undefined,
+    _filename: string | null | undefined,
+): number | null {
+    return null;
+}
+
+function filingPackageRole(
     documentType: string | null | undefined,
     filename: string | null | undefined,
-): number | null {
-    const filingType = suggestMiFileFilingType(documentType, filename);
-    if (!filingType) return null;
-    if (filingType === MIFILE_FILING_TYPES[0]) return 1;
-    if (filingType === MIFILE_FILING_TYPES[1]) return 2;
-    if (filingType === MIFILE_FILING_TYPES[2] || filingType === MIFILE_FILING_TYPES[3]) return 3;
-    if (filingType === MIFILE_FILING_TYPES[4]) return 4;
-    if (filingType === MIFILE_FILING_TYPES[5]) return 5;
-    if (filingType === MIFILE_FILING_TYPES[6]) return 6;
-    return null;
+): FilingPackageRole {
+    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    if (isComplaintDocument(documentType, filename)) return 'complaint';
+    if (/\b(?:mailing|filing) fee\b/.test(value)) return 'fee';
+    if (/\badvice\b/.test(value)) return 'advice';
+    if (/\blocal\b/.test(value)) return 'local';
+    if (/\brequest\b/.test(value)) return 'request';
+    if (/\bsummons\b/.test(value)) return 'summons';
+    if (/connected filing|\b(?:demand|notice|lease|deed|ancillary|other)\b/.test(value)) {
+        return 'ancillary';
+    }
+    return 'unknown';
+}
+
+function suggestedFilingRelation(
+    documentType: string | null | undefined,
+    filename: string | null | undefined,
+): DraftFilingRelation {
+    const role = filingPackageRole(documentType, filename);
+    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    if (['complaint', 'advice', 'local', 'request', 'summons'].includes(role)) {
+        return 'separate';
+    }
+    if (role === 'ancillary') {
+        if (value.includes('connected filing')) return 'connected_to_complaint';
+        if (/\bother\b/.test(value)) return 'separate';
+    }
+    return 'unknown';
+}
+
+function requiredForStandardPackage(
+    documentType: string | null | undefined,
+    filename: string | null | undefined,
+): boolean {
+    return filingPackageRole(documentType, filename) !== 'fee';
 }
 
 function draftDocumentRole(
     documentType: string | null | undefined,
     filename: string | null | undefined,
 ): DraftDocumentRole {
-    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
-    if (isComplaintDocument(documentType, filename)) return 'primary_source';
-    if (/\b(?:mailing|filing) fee\b/.test(value)) return 'fee';
-    return suggestMiFileFilingType(documentType, filename) ? 'supporting' : 'unknown';
+    const role = filingPackageRole(documentType, filename);
+    if (role === 'complaint') return 'primary_source';
+    if (role === 'fee') return 'fee';
+    return role === 'unknown' ? 'unknown' : 'supporting';
 }
 
 function validatePrimaryComplaint(
@@ -1145,7 +1256,7 @@ function validatePrimaryComplaint(
     if (!primary) {
         issues.push({
             field: 'primaryDocumentId',
-            severity: 'warning',
+            severity: 'error',
             message: complaintDocuments.length
                 ? 'Select the Complaint as the primary data source.'
                 : 'No Complaint document is available for this Draft.',
@@ -1159,38 +1270,57 @@ function validatePrimaryComplaint(
     )) {
         issues.push({
             field: 'primaryDocumentId',
-            severity: 'warning',
+            severity: 'error',
             message: 'The selected primary source is not recognized as a Complaint.',
         });
     }
     if (!primary.oneDriveUrl || !['uploaded', 'downloaded', 'replaced'].includes(primary.status)) {
         issues.push({
             field: 'primaryDocumentId',
-            severity: 'warning',
+            severity: 'error',
             message: 'The primary Complaint is not yet available for field extraction.',
         });
     } else if (!extraction || extraction.documentId !== primary.id) {
         issues.push({
             field: 'complaintExtraction',
-            severity: 'warning',
-            message: 'Extract the filing fields from the primary Complaint and review them.',
+            severity: 'error',
+            message: 'Complaint fields have not been extracted; automatic filing is blocked.',
         });
     }
 
     if (extraction?.documentId === primary.id) {
+        if (extraction.extractorVersion < 2) {
+            issues.push({
+                field: 'complaintExtraction',
+                severity: 'warning',
+                message: 'Re-extract this Complaint to read paragraphs 2 and 10 with the current rules.',
+            });
+        }
+        if (extraction.formType !== 'NONPAYMENT OF RENT') {
+            issues.push({
+                field: 'complaintExtraction.formType',
+                severity: 'error',
+                message: 'Automatic filing is currently limited to first-hearing nonpayment Complaints.',
+            });
+        }
         for (const warning of extraction.warnings) {
             if (
-                warning.code === 'related_action_review' ||
-                (warning.code === 'claim_amount_review' && Boolean(filing.claimAmount)) ||
+                (warning.code === 'related_action_review' && filing.relatedCivilAction !== 'unknown') ||
+                (warning.code === 'claim_amount_review' &&
+                    filing.moneyJudgmentRequested !== null &&
+                    (!filing.moneyJudgmentRequested || Boolean(filing.claimAmount))) ||
                 (warning.code === 'multiple_defendants_review' && filing.defendants.length > 1) ||
-                warning.code === 'missing_plaintiff' ||
-                warning.code === 'missing_defendant'
+                (warning.code === 'missing_plaintiff' && Boolean(draftPartyName(filing.plaintiff))) ||
+                (warning.code === 'missing_defendant' && filing.defendants.length > 0)
             ) {
                 continue;
             }
             issues.push({
                 field: `complaintExtraction.${warning.code}`,
-                severity: 'warning',
+                severity: warning.code === 'unsupported_form' ||
+                    warning.code === 'missing_filled_section'
+                    ? 'error'
+                    : 'warning',
                 message: warning.message,
             });
         }
@@ -1198,10 +1328,72 @@ function validatePrimaryComplaint(
     return issues;
 }
 
-function validateDraftDocuments(documents: DocumentRecordView[]): DraftValidationIssue[] {
+function validateDraftDocuments(
+    documents: DocumentRecordView[],
+    filing: DraftFilingData,
+): DraftValidationIssue[] {
     const issues: DraftValidationIssue[] = [];
+    const coreRoles: Array<{ role: FilingPackageRole; label: string }> = [
+        { role: 'complaint', label: 'Complaint' },
+        { role: 'advice', label: 'Advice' },
+        { role: 'local', label: 'court-specific Local form' },
+        { role: 'request', label: 'Request' },
+        { role: 'summons', label: 'Summons' },
+    ];
+    for (const { role, label } of coreRoles) {
+        const matching = documents.filter(document => document.packageRole === role);
+        if (!matching.length) {
+            issues.push({
+                field: `package.${role}`,
+                severity: 'error',
+                message: `The standard nonpayment package is missing ${label}.`,
+            });
+            continue;
+        }
+        if (matching.length > 1) {
+            issues.push({
+                field: `package.${role}`,
+                severity: 'error',
+                message: `The standard nonpayment package contains ${matching.length} ${label} documents; exactly one is required.`,
+            });
+        }
+        if (matching.some(document => !document.requiredForFiling)) {
+            issues.push({
+                field: `package.${role}`,
+                severity: 'error',
+                message: `${label} cannot be excluded from the standard nonpayment package.`,
+            });
+        }
+    }
+
+    const includedAncillary = documents.filter(document =>
+        document.packageRole === 'ancillary' && document.requiredForFiling);
+    if (!includedAncillary.length) {
+        issues.push({
+            field: 'package.ancillary',
+            severity: 'error',
+            message: 'Attach at least one demand, notice, lease, deed, or other ancillary document.',
+        });
+    }
+
     for (const document of documents) {
-        if (!document.requiredForFiling || document.status === 'not_downloadable') continue;
+        if (document.packageRole === 'fee' || !document.requiredForFiling) continue;
+        if (document.packageRole === 'unknown') {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${document.currentFilename || document.documentType || 'Additional document'} is not recognized; classify or exclude it before filing.`,
+            });
+            continue;
+        }
+        if (document.status === 'not_downloadable') {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${document.currentFilename || document.documentType || 'Document'} has no downloadable PDF.`,
+            });
+            continue;
+        }
         if (['failed', 'invalid'].includes(document.status)) {
             issues.push({
                 field: `document.${document.id}`,
@@ -1217,13 +1409,43 @@ function validateDraftDocuments(documents: DocumentRecordView[]): DraftValidatio
                 message: `${document.currentFilename || document.documentType || 'Document'} is still processing.`,
             });
         }
-        if (!document.filingType) {
+        const expectedFilingType = document.packageRole === 'complaint'
+            ? suggestMiFileFilingType(
+                document.documentType,
+                document.currentFilename || document.originalFilename,
+                filing.moneyJudgmentRequested,
+            )
+            : suggestMiFileFilingType(
+                document.documentType,
+                document.currentFilename || document.originalFilename,
+            );
+        if (!document.filingType || document.filingType !== expectedFilingType) {
             issues.push({
                 field: `document.${document.id}`,
                 severity: 'error',
-                message: `Select a MiFILE Filing Type for ${
+                message: `Set the MiFILE Filing Type to "${expectedFilingType || 'Other'}" for ${
                     document.currentFilename || document.documentType || 'the document'
                 }.`,
+            });
+        }
+        if (
+            document.packageRole !== 'ancillary' &&
+            document.filingRelation !== 'separate'
+        ) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${document.documentType || 'This document'} must be a separate filing.`,
+            });
+        }
+        if (
+            document.packageRole === 'ancillary' &&
+            document.filingRelation === 'unknown'
+        ) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'warning',
+                message: `Choose whether ${document.currentFilename || document.documentType || 'the ancillary document'} is filed as Other or connected to the Complaint.`,
             });
         }
     }
@@ -1821,6 +2043,97 @@ const migrations: Migration[] = [
                       normalized_data_json IS NULL
                       OR normalized_data_json NOT LIKE '%"complaintExtraction"%'
                   )
+            `).run(timestamp);
+        },
+    },
+    {
+        version: 17,
+        name: 'standard_nonpayment_package_rules',
+        up: db => {
+            const columns = db
+                .prepare('PRAGMA table_info(document_records)')
+                .all() as Array<{ name: string }>;
+            const names = new Set(columns.map(column => column.name));
+            if (!names.has('filing_relation')) {
+                db.exec("ALTER TABLE document_records ADD COLUMN filing_relation TEXT");
+            }
+            if (!names.has('filing_relation_source')) {
+                db.exec("ALTER TABLE document_records ADD COLUMN filing_relation_source TEXT");
+            }
+
+            db.exec(`
+                UPDATE document_records
+                SET filing_sequence = NULL,
+                    required_for_filing = CASE
+                        WHEN LOWER(
+                            COALESCE(document_type, '') || ' ' ||
+                            COALESCE(current_filename, '') || ' ' ||
+                            COALESCE(original_filename, '')
+                        ) LIKE '%mailing fee%'
+                          OR LOWER(
+                            COALESCE(document_type, '') || ' ' ||
+                            COALESCE(current_filename, '') || ' ' ||
+                            COALESCE(original_filename, '')
+                        ) LIKE '%filing fee%'
+                        THEN 0
+                        ELSE 1
+                    END
+                WHERE is_active = 1;
+
+                UPDATE document_records
+                SET filing_type = CASE
+                        WHEN filing_type_source = 'manual' THEN filing_type
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%advice%'
+                            THEN 'Advice of Rights and Information (Landlord-Tenant)'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%local%'
+                            THEN 'Local Rental and Housing Information'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%complaint%possession only%'
+                            THEN 'Complaint for Possession Only'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%complaint%'
+                            THEN 'Complaint for Possession and Supplemental Money Judgment (Fee Varies)'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%request%'
+                            THEN 'Request for Court Mailing and Record (Landlord-Tenant)'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%summons%'
+                            THEN 'Summons, Landlord-Tenant/Land Contract'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%connected filing%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%demand%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%notice%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%lease%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%deed%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%other%'
+                            THEN 'Other'
+                        ELSE filing_type
+                    END,
+                    filing_type_source = CASE
+                        WHEN filing_type_source = 'manual' THEN 'manual'
+                        ELSE 'suggested'
+                    END
+                WHERE is_active = 1;
+
+                UPDATE document_records
+                SET filing_relation = CASE
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%connected filing%'
+                            THEN 'connected_to_complaint'
+                        WHEN LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%complaint%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%advice%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%local%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%request%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%summons%'
+                          OR LOWER(COALESCE(document_type, '') || ' ' || COALESCE(current_filename, '')) LIKE '%other%'
+                            THEN 'separate'
+                        ELSE 'unknown'
+                    END,
+                    filing_relation_source = 'suggested'
+                WHERE is_active = 1;
+            `);
+
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE case_drafts
+                SET status = 'needs_review',
+                    validation_status = 'warnings',
+                    updated_at = ?
+                WHERE status IN ('new', 'parsed', 'ready_to_file')
             `).run(timestamp);
         },
     },
@@ -3343,6 +3656,10 @@ export class WorkflowDatabase {
             });
         });
 
+        // Processing reports from an older worker prove that files reached OneDrive,
+        // but they do not prove that the filing package is safe to submit.
+        this.refreshCaseDraftValidation(target.case_draft_id);
+
         return {
             ...targetResult,
             applied: true,
@@ -3917,6 +4234,8 @@ export class WorkflowDatabase {
                     filing_name,
                     filing_type,
                     filing_type_source,
+                    filing_relation,
+                    filing_relation_source,
                     filing_sequence,
                     required_for_filing,
                     upload_source,
@@ -3931,6 +4250,7 @@ export class WorkflowDatabase {
                     updated_at
                 FROM document_records
                 WHERE email_id = ?
+                  AND is_active = 1
                 ORDER BY created_at ASC
             `)
             .all(emailId) as any[];
@@ -3971,11 +4291,21 @@ export class WorkflowDatabase {
         const normalizedDraftData = caseDraft
             ? this.safeJson(caseDraft.normalized_data_json)
             : null;
+        const normalizedFilingData = draftFilingData(normalizedDraftData);
         const complaintExtraction = caseDraft
             ? complaintExtractionFromDraft(normalizedDraftData)
             : null;
         const documentViews: DocumentRecordView[] = documents.map(row => {
             const suggestedFilingType = suggestMiFileFilingType(
+                row.document_type,
+                row.current_filename || row.original_filename,
+                normalizedFilingData.moneyJudgmentRequested,
+            );
+            const suggestedRelation = suggestedFilingRelation(
+                row.document_type,
+                row.current_filename || row.original_filename,
+            );
+            const packageRole = filingPackageRole(
                 row.document_type,
                 row.current_filename || row.original_filename,
             );
@@ -3997,10 +4327,22 @@ export class WorkflowDatabase {
                 filingName: row.filing_name || row.current_filename || row.original_filename,
                 filingType: row.filing_type || suggestedFilingType,
                 filingTypeSource: row.filing_type
-                    ? (row.filing_type_source === 'manual' ? 'manual' : 'suggested')
+                    ? row.filing_type_source === 'manual'
+                        ? 'manual'
+                        : row.filing_type_source === 'complaint'
+                            ? 'complaint'
+                            : 'suggested'
                     : suggestedFilingType
                         ? 'suggested'
                         : null,
+                filingRelation:
+                    row.filing_relation === 'separate' ||
+                    row.filing_relation === 'connected_to_complaint'
+                        ? row.filing_relation
+                        : suggestedRelation,
+                filingRelationSource: row.filing_relation
+                    ? (row.filing_relation_source === 'manual' ? 'manual' : 'suggested')
+                    : 'suggested',
                 filingSequence: row.filing_sequence === null
                     ? suggestedSequence
                     : Number(row.filing_sequence),
@@ -4011,6 +4353,7 @@ export class WorkflowDatabase {
                     row.document_type,
                     row.current_filename || row.original_filename,
                 ),
+                packageRole,
                 uploadSource: row.upload_source,
                 status: row.status,
                 errorMessage: row.error_message,
@@ -4025,9 +4368,6 @@ export class WorkflowDatabase {
         });
         documentViews.sort((left, right) => {
             if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
-            const leftSequence = left.filingSequence ?? Number.MAX_SAFE_INTEGER;
-            const rightSequence = right.filingSequence ?? Number.MAX_SAFE_INTEGER;
-            if (leftSequence !== rightSequence) return leftSequence - rightSequence;
             return left.createdAt.localeCompare(right.createdAt);
         });
         const validationIssues = caseDraft
@@ -4037,9 +4377,9 @@ export class WorkflowDatabase {
                     caseDraft.primary_document_id,
                     documentViews,
                     complaintExtraction,
-                    draftFilingData(normalizedDraftData),
+                    normalizedFilingData,
                 ),
-                ...validateDraftDocuments(documentViews),
+                ...validateDraftDocuments(documentViews, normalizedFilingData),
             ]
             : [];
 
@@ -4302,7 +4642,7 @@ export class WorkflowDatabase {
                 if (!documentId) throw new Error('Every document mapping requires an id');
                 const existingDocument = this.db
                     .prepare(`
-                        SELECT id
+                        SELECT id, document_type, current_filename, original_filename
                         FROM document_records
                         WHERE id = ?
                           AND case_draft_id = ?
@@ -4323,11 +4663,40 @@ export class WorkflowDatabase {
                     'document.filingType',
                     300,
                 );
-                const rawSequence = Number(mapping.filingSequence ?? index + 1);
-                const filingSequence = Number.isFinite(rawSequence)
-                    ? Math.min(Math.max(Math.floor(rawSequence), 0), 10_000)
-                    : index + 1;
-                const requiredForFiling = mapping.requiredForFiling !== false;
+                const requestedRelation = boundedDraftValue(
+                    mapping.filingRelation,
+                    'document.filingRelation',
+                    100,
+                );
+                if (
+                    requestedRelation &&
+                    !['separate', 'connected_to_complaint', 'unknown'].includes(requestedRelation)
+                ) {
+                    throw new Error(`Invalid filing relation for document: ${documentId}`);
+                }
+                const packageRole = filingPackageRole(
+                    (existingDocument as any).document_type,
+                    (existingDocument as any).current_filename ||
+                        (existingDocument as any).original_filename,
+                );
+                const coreDocument = [
+                    'complaint',
+                    'advice',
+                    'local',
+                    'request',
+                    'summons',
+                ].includes(packageRole);
+                const filingRelation: DraftFilingRelation = coreDocument
+                    ? 'separate'
+                    : requestedRelation === 'separate' ||
+                        requestedRelation === 'connected_to_complaint'
+                        ? requestedRelation
+                        : 'unknown';
+                const requiredForFiling = coreDocument
+                    ? true
+                    : packageRole === 'fee'
+                        ? false
+                        : mapping.requiredForFiling !== false;
 
                 this.db
                     .prepare(`
@@ -4335,7 +4704,9 @@ export class WorkflowDatabase {
                         SET filing_name = ?,
                             filing_type = ?,
                             filing_type_source = ?,
-                            filing_sequence = ?,
+                            filing_relation = ?,
+                            filing_relation_source = ?,
+                            filing_sequence = NULL,
                             required_for_filing = ?,
                             updated_at = ?
                         WHERE id = ?
@@ -4344,7 +4715,8 @@ export class WorkflowDatabase {
                         filingName,
                         filingType,
                         filingType ? 'manual' : null,
-                        filingSequence,
+                        filingRelation,
+                        'manual',
                         requiredForFiling ? 1 : 0,
                         timestamp,
                         documentId,
@@ -4531,6 +4903,30 @@ export class WorkflowDatabase {
         if (typeof extraction.data.includeAllOtherOccupants === 'boolean') {
             apply('includeAllOtherOccupants', extraction.data.includeAllOtherOccupants);
         }
+        if (extraction.data.relatedCivilAction) {
+            apply('relatedCivilAction', extraction.data.relatedCivilAction);
+        }
+        if (extraction.data.relatedCaseCourt) {
+            apply('relatedCaseCourt', extraction.data.relatedCaseCourt);
+        }
+        if (extraction.data.relatedCaseDocketNumber) {
+            apply('relatedCaseDocketNumber', extraction.data.relatedCaseDocketNumber);
+        }
+        if (extraction.data.relatedCaseJudge) {
+            apply('relatedCaseJudge', extraction.data.relatedCaseJudge);
+        }
+        if (typeof extraction.data.relatedCasePending === 'boolean') {
+            apply('relatedCasePending', extraction.data.relatedCasePending);
+        }
+        if (typeof extraction.data.moneyJudgmentRequested === 'boolean') {
+            apply('moneyJudgmentRequested', extraction.data.moneyJudgmentRequested);
+        }
+        if (extraction.data.claimAmount) {
+            apply('claimAmount', extraction.data.claimAmount);
+        }
+        if (extraction.data.mailingRequested === true) {
+            apply('mailingRequested', true);
+        }
 
         const legacySources = draftFieldSources(extractedData, next);
         if (extraction.data.caseNumber && legacySources.caseNumber !== 'manual') {
@@ -4580,12 +4976,35 @@ export class WorkflowDatabase {
         this.db
             .prepare(`
                 UPDATE document_records
-                SET required_for_filing = 1, updated_at = ?
+                SET filing_type = CASE
+                        WHEN filing_type_source = 'manual' THEN filing_type
+                        ELSE ?
+                    END,
+                    filing_type_source = CASE
+                        WHEN filing_type_source = 'manual' THEN filing_type_source
+                        ELSE 'complaint'
+                    END,
+                    filing_relation = 'separate',
+                    filing_relation_source = CASE
+                        WHEN filing_relation_source = 'manual' THEN filing_relation_source
+                        ELSE 'suggested'
+                    END,
+                    required_for_filing = 1,
+                    updated_at = ?
                 WHERE id = ?
                   AND case_draft_id = ?
                   AND is_active = 1
             `)
-            .run(timestamp, documentId, caseDraftId);
+            .run(
+                suggestMiFileFilingType(
+                    document.document_type,
+                    document.current_filename || document.original_filename,
+                    filing.moneyJudgmentRequested,
+                ),
+                timestamp,
+                documentId,
+                caseDraftId,
+            );
 
         this.insertAuditLog('case_draft', caseDraftId, 'complaint_fields_extracted', {
             documentId,
@@ -4693,6 +5112,16 @@ export class WorkflowDatabase {
                 !Array.isArray(oldNormalizedObject.filingData)
             ) {
                 nextNormalized.filingData = oldNormalizedObject.filingData;
+            }
+            if (
+                oldNormalizedObject.complaintExtraction &&
+                typeof oldNormalizedObject.complaintExtraction === 'object' &&
+                !Array.isArray(oldNormalizedObject.complaintExtraction)
+            ) {
+                nextNormalized.complaintExtraction = oldNormalizedObject.complaintExtraction;
+            }
+            if (Array.isArray(oldNormalizedObject.manualFilingFields)) {
+                nextNormalized.manualFilingFields = oldNormalizedObject.manualFilingFields;
             }
             const nextNormalizedJson = toJson(nextNormalized);
 
@@ -4922,6 +5351,16 @@ export class WorkflowDatabase {
     addDocument(input: StoredDocumentInput): string {
         const id = randomUUID();
         const timestamp = nowIso();
+        const filingFilename = input.currentFilename || input.originalFilename;
+        const suggestedFilingType = suggestMiFileFilingType(
+            input.documentType,
+            filingFilename,
+        );
+        const filingRelation = suggestedFilingRelation(input.documentType, filingFilename);
+        const requiredForFiling = requiredForStandardPackage(
+            input.documentType,
+            filingFilename,
+        );
         const automaticRetryCount = input.automaticRetryCount ?? 0;
         const nextRetryAt = input.nextRetryAt === undefined
             ? (input.status === 'failed' && input.sourceUrl
@@ -4946,6 +5385,12 @@ export class WorkflowDatabase {
                     mime_type,
                     file_size,
                     document_type,
+                    filing_name,
+                    filing_type,
+                    filing_type_source,
+                    filing_relation,
+                    filing_relation_source,
+                    required_for_filing,
                     upload_source,
                     status,
                     error_message,
@@ -4957,7 +5402,7 @@ export class WorkflowDatabase {
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `)
             .run(
                 id,
@@ -4972,6 +5417,12 @@ export class WorkflowDatabase {
                 input.mimeType ?? null,
                 input.fileSize ?? null,
                 input.documentType ?? null,
+                filingFilename ?? null,
+                suggestedFilingType,
+                suggestedFilingType ? 'suggested' : null,
+                filingRelation,
+                'suggested',
+                requiredForFiling ? 1 : 0,
                 input.uploadSource,
                 input.status,
                 input.errorMessage ?? null,
@@ -5327,6 +5778,12 @@ export class WorkflowDatabase {
                     mime_type,
                     file_size,
                     document_type,
+                    filing_name,
+                    filing_type,
+                    filing_type_source,
+                    filing_relation,
+                    filing_relation_source,
+                    required_for_filing,
                     upload_source,
                     status,
                     error_message,
@@ -5334,12 +5791,24 @@ export class WorkflowDatabase {
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, 'application/pdf', NULL, ?, 'parsed_email', ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, 'application/pdf', NULL, ?, ?, ?, ?, ?, 'suggested', ?, 'parsed_email', ?, ?, ?, ?, ?)
             `);
 
             for (const doc of expectedDocuments) {
                 const status: DocumentStatus = doc.downloadUrl ? 'pending' : 'not_downloadable';
                 const errorMessage = doc.downloadUrl ? null : 'No downloadable file in source email';
+                const filingType = suggestMiFileFilingType(
+                    doc.documentType,
+                    doc.documentName,
+                );
+                const filingRelation = suggestedFilingRelation(
+                    doc.documentType,
+                    doc.documentName,
+                );
+                const requiredForFiling = requiredForStandardPackage(
+                    doc.documentType,
+                    doc.documentName,
+                );
 
                 insert.run(
                     randomUUID(),
@@ -5348,6 +5817,11 @@ export class WorkflowDatabase {
                     doc.documentName ?? null,
                     doc.downloadUrl ?? null,
                     doc.documentType ?? null,
+                    doc.documentName ?? null,
+                    filingType,
+                    filingType ? 'suggested' : null,
+                    filingRelation,
+                    requiredForFiling ? 1 : 0,
                     status,
                     errorMessage,
                     toJson({
