@@ -763,6 +763,7 @@ test('draft workspace supports listing, editable fields, validation, and reparse
 
         assert.deepEqual(db.getDocumentAccess(documentId), {
             id: documentId,
+            caseDraftId: draftId,
             oneDriveUrl: 'https://onedrive.example/draft-workspace',
             currentFilename: 'Complaint.pdf',
             mimeType: 'application/pdf',
@@ -931,7 +932,7 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
             body: { content: '<p>Standard package</p>' },
         });
         const draftId = db.createCaseDraft(email.id, {
-            isMiFile: true,
+            isMiFile: false,
             courtName: '25th District Court',
             caseNumber: '26-03000-LT',
             caseTitle: 'EXAMPLE PROPERTY LLC V TAYLOR TENANT',
@@ -984,6 +985,10 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
                 plaintiff: {
                     displayName: 'Example Property LLC',
                     entityName: 'Example Property LLC',
+                    address1: '200 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
                 },
                 defendants: [{
                     displayName: 'Taylor Tenant',
@@ -1017,7 +1022,11 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
         });
 
         const ready = db.refreshCaseDraftValidation(draftId);
-        assert.equal(ready.caseDraft?.status, 'ready_to_file');
+        assert.equal(
+            ready.caseDraft?.status,
+            'ready_to_file',
+            JSON.stringify(ready.caseDraft?.validationIssues),
+        );
         assert.equal(ready.caseDraft?.validationStatus, 'passed');
         assert.deepEqual(ready.caseDraft?.validationIssues, []);
         assert.equal(ready.caseDraft?.filingData.moneyJudgmentRequested, true);
@@ -1036,6 +1045,39 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
         assert.equal(connected?.filingRelation, 'connected_to_complaint');
         assert.equal(connected?.filingSequence, null);
         assert.ok(ready.documents.every(document => document.requiredForFiling));
+
+        db.reviewCaseDraft(draftId, 'approve');
+        const queued = db.queueFilingJob(draftId, 'prepare', 'test', 'test-suite');
+        assert.equal(queued.status, 'queued');
+        assert.equal(queued.payload?.documents.length, 6);
+        assert.equal(queued.payload?.documents[0].isPrimary, true);
+        assert.equal(queued.payload?.documents[1].filingRelation, 'connected_to_complaint');
+        assert.throws(
+            () => db.queueFilingJob(draftId, 'prepare', 'test', 'test-suite'),
+            /active MiFILE job/,
+        );
+        const claimed = db.claimNextFilingJob();
+        assert.equal(claimed?.id, queued.id);
+        assert.equal(claimed?.status, 'running');
+        db.appendFilingJobLog(queued.id, {
+            level: 'info',
+            checkpoint: 'case_form',
+            message: 'Case form completed in test.',
+        });
+        assert.equal(db.recoverInterruptedFilingJobs(), 1);
+        assert.equal(db.getFilingJob(queued.id)?.errorCode, 'PROCESS_INTERRUPTED');
+        const retry = db.queueFilingJob(draftId, 'prepare', 'test_retry', 'test-suite');
+        assert.equal(retry.attemptNumber, 2);
+        assert.equal(db.claimNextFilingJob()?.id, retry.id);
+        const prepared = db.completeFilingJob({
+            filingJobId: retry.id,
+            status: 'prepared',
+            checkpoint: 'saved_unsubmitted',
+            externalBundleId: 'bundle-test-1',
+            temporaryCaseNumber: 'TEMP-TEST-1',
+        });
+        assert.equal(prepared.status, 'prepared');
+        assert.equal(db.getDraftDetail(draftId)?.caseDraft?.status, 'filing_prepared');
     } finally {
         db.close();
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1055,7 +1097,7 @@ test('paragraph 10 selects possession-only filing and keeps Other as a separate 
             body: { content: '<p>Possession only</p>' },
         });
         const draftId = db.createCaseDraft(email.id, {
-            isMiFile: true,
+            isMiFile: false,
             courtName: '25th District Court',
             caseNumber: '26-03001-LT',
             caseTitle: 'EXAMPLE PROPERTY LLC V MORGAN TENANT',
@@ -1098,6 +1140,10 @@ test('paragraph 10 selects possession-only filing and keeps Other as a separate 
                 plaintiff: {
                     displayName: 'Example Property LLC',
                     entityName: 'Example Property LLC',
+                    address1: '201 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
                 },
                 defendants: [{
                     displayName: 'Morgan Tenant',
@@ -1147,7 +1193,7 @@ test('duplicate, missing, and unknown documents block automatic nonpayment filin
             body: { content: '<p>Unsafe package</p>' },
         });
         const draftId = db.createCaseDraft(email.id, {
-            isMiFile: true,
+            isMiFile: false,
             courtName: '25th District Court',
             caseNumber: '26-03002-LT',
             caseTitle: 'EXAMPLE PROPERTY LLC V CASEY TENANT',
@@ -1188,6 +1234,10 @@ test('duplicate, missing, and unknown documents block automatic nonpayment filin
                 plaintiff: {
                     displayName: 'Example Property LLC',
                     entityName: 'Example Property LLC',
+                    address1: '202 Main Street',
+                    city: 'Lincoln Park',
+                    state: 'MI',
+                    postalCode: '48146',
                 },
                 defendants: [{
                     displayName: 'Casey Tenant',
@@ -1216,6 +1266,45 @@ test('duplicate, missing, and unknown documents block automatic nonpayment filin
         assert.throws(
             () => db.reviewCaseDraft(draftId, 'approve'),
             /Cannot approve draft/,
+        );
+    } finally {
+        db.close();
+        fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('filed MiFILE notifications cannot be queued as new cases', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-filed-notification-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+
+    try {
+        const email = db.registerEmail({
+            id: 'already-filed-message',
+            subject: 'MiFILE - Document Filed 26-03003-LT, EXAMPLE LLC V TENANT',
+            receivedDateTime: '2026-08-14T13:00:00.000Z',
+            from: { emailAddress: { address: 'info@truefiling.com' } },
+            body: { content: '<p>Filed notification</p>' },
+        });
+        const draftId = db.createCaseDraft(email.id, {
+            isMiFile: true,
+            courtName: '25th District Court',
+            caseNumber: '26-03003-LT',
+            caseTitle: 'EXAMPLE LLC V TENANT',
+            plaintiff: 'EXAMPLE LLC',
+            defendant: 'TENANT',
+            bundleNumber: '12345678',
+            filerName: 'Adam Devlin',
+            filedAt: '8/14/2026',
+            filedDocuments: [],
+            fileTypeByAttachmentId: {},
+        });
+
+        const detail = db.getDraftDetail(draftId);
+        assert.ok(detail?.caseDraft?.filingEligibilityIssues.some(issue =>
+            issue.field === 'filingEligibility' && issue.severity === 'error'));
+        assert.throws(
+            () => db.queueFilingJob(draftId, 'prepare', 'test', 'test-suite'),
+            /Approve the Draft|existing court filing/,
         );
     } finally {
         db.close();

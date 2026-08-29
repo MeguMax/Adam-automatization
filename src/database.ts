@@ -24,13 +24,28 @@ export type CaseDraftStatus =
     | 'needs_review'
     | 'ready_to_file'
     | 'filing_in_progress'
+    | 'filing_prepared'
     | 'filed_successfully'
     | 'filing_failed'
     | 'rejected'
     | 'archived';
 
 export type ValidationStatus = 'unknown' | 'passed' | 'warnings' | 'failed';
-export type FilingStatus = 'not_started' | 'queued' | 'running' | 'succeeded' | 'failed';
+export type FilingStatus =
+    | 'not_started'
+    | 'queued'
+    | 'running'
+    | 'prepared'
+    | 'succeeded'
+    | 'failed';
+export type FilingJobMode = 'prepare' | 'submit';
+export type FilingJobStatus =
+    | 'queued'
+    | 'running'
+    | 'prepared'
+    | 'succeeded'
+    | 'failed'
+    | 'cancelled';
 export type DocumentStatus =
     | 'pending'
     | 'retry_queued'
@@ -343,6 +358,7 @@ export interface DraftDocumentFilingUpdate {
 
 export interface DraftDocumentAccess {
     id: string;
+    caseDraftId: string | null;
     oneDriveUrl: string;
     currentFilename: string | null;
     mimeType: string | null;
@@ -445,6 +461,66 @@ export interface QueuedEmailRetry {
     receivedAt: string | null;
 }
 
+export interface FilingDocumentPayload {
+    id: string;
+    filename: string;
+    filingName: string;
+    filingType: string;
+    filingRelation: DraftFilingRelation;
+    packageRole: FilingPackageRole;
+    oneDriveUrl: string;
+    mimeType: string | null;
+    fileSize: number | null;
+    isPrimary: boolean;
+}
+
+export interface FilingPayload {
+    version: 1;
+    caseDraftId: string;
+    emailId: string;
+    subject: string | null;
+    courtName: string;
+    action: 'Initiate a new case';
+    caseType: 'LT - Landlord-Tenant Summary Proceedings';
+    filingData: DraftFilingData;
+    documents: FilingDocumentPayload[];
+    createdAt: string;
+}
+
+export interface FilingJobLogEntry {
+    at: string;
+    level: 'info' | 'warning' | 'error';
+    checkpoint: string;
+    message: string;
+    details?: Record<string, unknown>;
+}
+
+export interface FilingJobView {
+    id: string;
+    caseDraftId: string;
+    emailId: string | null;
+    subject: string | null;
+    attemptNumber: number;
+    mode: FilingJobMode;
+    status: FilingJobStatus;
+    triggerSource: string | null;
+    checkpoint: string | null;
+    externalBundleId: string | null;
+    temporaryCaseNumber: string | null;
+    startedAt: string | null;
+    finishedAt: string | null;
+    durationMs: number | null;
+    errorCode: string | null;
+    errorMessage: string | null;
+    executionLog: FilingJobLogEntry[];
+    payload: FilingPayload | null;
+    result: Record<string, unknown> | null;
+    debugArtifactPath: string | null;
+    triggeredBy: string | null;
+    createdAt: string;
+    updatedAt: string;
+}
+
 export interface EmailDetail {
     email: {
         id: string;
@@ -482,6 +558,8 @@ export interface EmailDetail {
             appliedFields: string[];
         }) | null;
         validationIssues: DraftValidationIssue[];
+        filingEligible: boolean;
+        filingEligibilityIssues: DraftValidationIssue[];
         createdAt: string;
         updatedAt: string;
     } | null;
@@ -1024,15 +1102,8 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
     if (!values.courtName) {
         issues.push({
             field: 'courtName',
-            severity: 'warning',
-            message: 'Court name was not extracted.',
-        });
-    }
-    if (!values.caseNumber && !values.newCaseNumber && !values.temporaryCaseNumber) {
-        issues.push({
-            field: 'caseNumber',
             severity: 'error',
-            message: 'A case number or temporary case number is required.',
+            message: 'Select the MiFILE court before preparing this filing.',
         });
     }
     if (!values.caseTitle) {
@@ -1112,6 +1183,19 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
             field: 'filingData.plaintiff',
             severity: 'error',
             message: 'Complete the Plaintiff party information.',
+        });
+    }
+    const missingPlaintiffAddress = [
+        !filing.plaintiff.address1 ? 'street address' : null,
+        !filing.plaintiff.city ? 'city' : null,
+        !filing.plaintiff.state ? 'state' : null,
+        !filing.plaintiff.postalCode ? 'ZIP code' : null,
+    ].filter((value): value is string => Boolean(value));
+    if (missingPlaintiffAddress.length) {
+        issues.push({
+            field: 'filingData.plaintiff',
+            severity: 'error',
+            message: `Complete Plaintiff ${missingPlaintiffAddress.join(', ')} from the Complaint.`,
         });
     }
     if (!filing.defendants.length) {
@@ -1326,6 +1410,35 @@ function validatePrimaryComplaint(
         }
     }
     return issues;
+}
+
+function validateNewCaseSource(
+    data: unknown,
+    subject: string | null | undefined,
+    sender: string | null | undefined,
+): DraftValidationIssue[] {
+    const root = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : {};
+    const normalizedSubject = String(subject || '').toLowerCase();
+    const normalizedSender = String(sender || '').toLowerCase();
+    const isFiledNotification =
+        root.isMiFile === true ||
+        Boolean(editableDraftValue(root.bundleNumber)) ||
+        Boolean(editableDraftValue(root.filedAt)) ||
+        /mifile\s*-\s*document filed|filing (?:accepted|submitted)|processed:/.test(
+            normalizedSubject,
+        ) ||
+        (
+            normalizedSender.includes('truefiling.com') &&
+            /document filed|filing accepted|filing submitted/.test(normalizedSubject)
+        );
+    if (!isFiledNotification) return [];
+    return [{
+        field: 'filingEligibility',
+        severity: 'error',
+        message: 'This email records an existing court filing and cannot be submitted as a new case.',
+    }];
 }
 
 function validateDraftDocuments(
@@ -2134,6 +2247,60 @@ const migrations: Migration[] = [
                     validation_status = 'warnings',
                     updated_at = ?
                 WHERE status IN ('new', 'parsed', 'ready_to_file')
+            `).run(timestamp);
+        },
+    },
+    {
+        version: 18,
+        name: 'persistent_mifile_filing_jobs',
+        up: db => {
+            const columns = db
+                .prepare('PRAGMA table_info(filing_jobs)')
+                .all() as Array<{ name: string }>;
+            const names = new Set(columns.map(column => column.name));
+            const additions: Array<[string, string]> = [
+                ['mode', "TEXT NOT NULL DEFAULT 'prepare'"],
+                ['checkpoint', 'TEXT'],
+                ['payload_json', 'TEXT'],
+                ['result_json', 'TEXT'],
+                ['external_bundle_id', 'TEXT'],
+                ['temporary_case_number', 'TEXT'],
+                ['last_heartbeat_at', 'TEXT'],
+                ['error_code', 'TEXT'],
+                ['debug_artifact_path', 'TEXT'],
+            ];
+            for (const [name, definition] of additions) {
+                if (!names.has(name)) {
+                    db.exec(`ALTER TABLE filing_jobs ADD COLUMN ${name} ${definition}`);
+                }
+            }
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_filing_jobs_status_created
+                    ON filing_jobs(status, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_filing_jobs_one_active_per_draft
+                    ON filing_jobs(case_draft_id)
+                    WHERE status IN ('queued', 'running');
+            `);
+        },
+    },
+    {
+        version: 19,
+        name: 'classify_existing_court_filings_as_completed',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`
+                UPDATE case_drafts
+                SET status = 'filed_successfully',
+                    validation_status = 'passed',
+                    filing_status = 'succeeded',
+                    updated_at = ?
+                WHERE normalized_data_json IS NOT NULL
+                  AND (
+                    json_extract(normalized_data_json, '$.isMiFile') = 1
+                    OR NULLIF(json_extract(normalized_data_json, '$.bundleNumber'), '') IS NOT NULL
+                    OR NULLIF(json_extract(normalized_data_json, '$.filedAt'), '') IS NOT NULL
+                  )
+                  AND filing_status NOT IN ('queued', 'running', 'prepared')
             `).run(timestamp);
         },
     },
@@ -4382,6 +4549,13 @@ export class WorkflowDatabase {
                 ...validateDraftDocuments(documentViews, normalizedFilingData),
             ]
             : [];
+        const filingEligibilityIssues = caseDraft
+            ? validateNewCaseSource(
+                normalizedDraftData,
+                email.subject,
+                email.sender,
+            )
+            : [];
 
         return {
             email: {
@@ -4420,6 +4594,8 @@ export class WorkflowDatabase {
                     ),
                     complaintExtraction,
                     validationIssues,
+                    filingEligible: filingEligibilityIssues.length === 0,
+                    filingEligibilityIssues,
                     createdAt: caseDraft.created_at,
                     updatedAt: caseDraft.updated_at,
                 }
@@ -4446,6 +4622,360 @@ export class WorkflowDatabase {
             .prepare('SELECT email_id FROM case_drafts WHERE id = ?')
             .get(caseDraftId) as { email_id: string } | undefined;
         return row ? this.getEmailDetail(row.email_id) : null;
+    }
+
+    buildFilingPayload(caseDraftId: string): FilingPayload {
+        const detail = this.getDraftDetail(caseDraftId);
+        if (!detail?.caseDraft) throw new Error('Case draft not found');
+        const blockingIssue = detail.caseDraft.validationIssues.find(
+            issue => issue.severity === 'error',
+        );
+        if (blockingIssue) {
+            throw new Error(`Filing is blocked: ${blockingIssue.message}`);
+        }
+        const eligibilityIssue = detail.caseDraft.filingEligibilityIssues[0];
+        if (eligibilityIssue) {
+            throw new Error(`Filing is blocked: ${eligibilityIssue.message}`);
+        }
+        const courtName = detail.caseDraft.editableData.courtName;
+        if (!courtName) throw new Error('Filing is blocked: MiFILE court is required');
+        const filingData = detail.caseDraft.filingData;
+        if (filingData.action !== 'Initiate a new case') {
+            throw new Error('Only new-case initiation is supported');
+        }
+        if (filingData.caseType !== 'LT - Landlord-Tenant Summary Proceedings') {
+            throw new Error('Only LT - Landlord-Tenant Summary Proceedings is supported');
+        }
+
+        const documents = detail.documents
+            .filter(document => document.requiredForFiling && document.packageRole !== 'fee')
+            .map(document => {
+                const filename = document.currentFilename || document.originalFilename;
+                if (!filename || !document.oneDriveUrl || !document.filingType) {
+                    throw new Error(
+                        `${filename || document.documentType || 'Document'} is not ready for MiFILE`,
+                    );
+                }
+                return {
+                    id: document.id,
+                    filename,
+                    filingName: document.filingName || filename.replace(/\.pdf$/i, ''),
+                    filingType: document.filingType,
+                    filingRelation: document.filingRelation,
+                    packageRole: document.packageRole,
+                    oneDriveUrl: document.oneDriveUrl,
+                    mimeType: document.mimeType,
+                    fileSize: document.fileSize,
+                    isPrimary: document.isPrimary,
+                } satisfies FilingDocumentPayload;
+            });
+        const uploadRank = (document: FilingDocumentPayload): number => {
+            if (document.isPrimary) return 0;
+            if (document.filingRelation === 'connected_to_complaint') return 1;
+            return 2;
+        };
+        documents.sort((left, right) => uploadRank(left) - uploadRank(right));
+
+        return {
+            version: 1,
+            caseDraftId,
+            emailId: detail.email.id,
+            subject: detail.email.subject,
+            courtName,
+            action: 'Initiate a new case',
+            caseType: 'LT - Landlord-Tenant Summary Proceedings',
+            filingData,
+            documents,
+            createdAt: nowIso(),
+        };
+    }
+
+    queueFilingJob(
+        caseDraftId: string,
+        mode: FilingJobMode = 'prepare',
+        triggerSource = 'admin',
+        triggeredBy = 'admin',
+    ): FilingJobView {
+        const detail = this.getDraftDetail(caseDraftId);
+        if (!detail?.caseDraft) throw new Error('Case draft not found');
+        const allowedStatuses = mode === 'submit'
+            ? new Set(['filing_prepared'])
+            : new Set(['ready_to_file', 'filing_failed']);
+        if (!allowedStatuses.has(detail.caseDraft.status)) {
+            throw new Error(
+                mode === 'submit'
+                    ? 'The filing must be prepared in MiFILE before final submission'
+                    : 'Approve the Draft before preparing it in MiFILE',
+            );
+        }
+        const active = this.db
+            .prepare(`
+                SELECT id FROM filing_jobs
+                WHERE case_draft_id = ? AND status IN ('queued', 'running')
+                LIMIT 1
+            `)
+            .get(caseDraftId) as { id: string } | undefined;
+        if (active) throw new Error('This Draft already has an active MiFILE job');
+
+        const payload = this.buildFilingPayload(caseDraftId);
+        const attempt = this.db
+            .prepare(`
+                SELECT COALESCE(MAX(attempt_number), 0) + 1 AS attempt
+                FROM filing_jobs WHERE case_draft_id = ?
+            `)
+            .get(caseDraftId) as { attempt: number };
+        const previousPrepared = mode === 'submit'
+            ? this.db.prepare(`
+                SELECT external_bundle_id, temporary_case_number
+                FROM filing_jobs
+                WHERE case_draft_id = ? AND status = 'prepared'
+                ORDER BY attempt_number DESC LIMIT 1
+            `).get(caseDraftId) as
+                | { external_bundle_id: string | null; temporary_case_number: string | null }
+                | undefined
+            : undefined;
+        if (mode === 'submit' && !previousPrepared?.external_bundle_id) {
+            throw new Error('Prepared MiFILE bundle reference is missing');
+        }
+
+        const id = randomUUID();
+        const timestamp = nowIso();
+        const initialLog: FilingJobLogEntry[] = [{
+            at: timestamp,
+            level: 'info',
+            checkpoint: 'queued',
+            message: mode === 'prepare'
+                ? 'MiFILE preparation queued from Draft Editor.'
+                : 'Final MiFILE submission queued from Draft Editor.',
+        }];
+        this.runInTransaction(() => {
+            this.db.prepare(`
+                INSERT INTO filing_jobs (
+                    id, case_draft_id, attempt_number, mode, status,
+                    trigger_source, checkpoint, payload_json, execution_log,
+                    external_bundle_id, temporary_case_number, triggered_by,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 'queued', ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                id,
+                caseDraftId,
+                Number(attempt.attempt),
+                mode,
+                triggerSource,
+                toJson(payload),
+                toJson(initialLog),
+                previousPrepared?.external_bundle_id ?? null,
+                previousPrepared?.temporary_case_number ?? null,
+                triggeredBy,
+                timestamp,
+                timestamp,
+            );
+            this.db.prepare(`
+                UPDATE case_drafts
+                SET filing_status = 'queued', updated_at = ?
+                WHERE id = ?
+            `).run(timestamp, caseDraftId);
+            this.insertAuditLog('filing_job', id, 'filing_job_queued', {
+                caseDraftId,
+                mode,
+                attemptNumber: Number(attempt.attempt),
+                triggerSource,
+            });
+        });
+        const job = this.getFilingJob(id);
+        if (!job) throw new Error('Queued MiFILE job could not be loaded');
+        return job;
+    }
+
+    recoverInterruptedFilingJobs(): number {
+        const rows = this.db.prepare(`
+            SELECT id, case_draft_id, execution_log
+            FROM filing_jobs
+            WHERE status = 'running'
+        `).all() as Array<{
+            id: string;
+            case_draft_id: string;
+            execution_log: string | null;
+        }>;
+        if (!rows.length) return 0;
+        const timestamp = nowIso();
+        this.runInTransaction(() => {
+            for (const row of rows) {
+                const parsed = this.safeJson(row.execution_log);
+                const log = Array.isArray(parsed) ? parsed.slice(-999) : [];
+                log.push({
+                    at: timestamp,
+                    level: 'error',
+                    checkpoint: 'process_interrupted',
+                    message: 'The service restarted while this MiFILE attempt was running. Retry it from the Draft.',
+                    details: { code: 'PROCESS_INTERRUPTED' },
+                } satisfies FilingJobLogEntry);
+                this.db.prepare(`
+                    UPDATE filing_jobs
+                    SET status = 'failed', checkpoint = 'process_interrupted',
+                        finished_at = ?, error_code = 'PROCESS_INTERRUPTED',
+                        error_message = 'The service restarted during MiFILE preparation.',
+                        execution_log = ?, updated_at = ?
+                    WHERE id = ?
+                `).run(timestamp, toJson(log), timestamp, row.id);
+                this.db.prepare(`
+                    UPDATE case_drafts
+                    SET status = 'filing_failed', filing_status = 'failed', updated_at = ?
+                    WHERE id = ?
+                `).run(timestamp, row.case_draft_id);
+                this.insertAuditLog('filing_job', row.id, 'filing_job_interrupted', {
+                    caseDraftId: row.case_draft_id,
+                });
+            }
+        });
+        return rows.length;
+    }
+
+    claimNextFilingJob(): FilingJobView | null {
+        const jobId = this.runInTransaction(() => {
+            const queued = this.db.prepare(`
+                SELECT id, case_draft_id
+                FROM filing_jobs
+                WHERE status = 'queued'
+                ORDER BY created_at ASC
+                LIMIT 1
+            `).get() as { id: string; case_draft_id: string } | undefined;
+            if (!queued) return null;
+            const timestamp = nowIso();
+            const result = this.db.prepare(`
+                UPDATE filing_jobs
+                SET status = 'running', checkpoint = 'starting',
+                    started_at = COALESCE(started_at, ?), last_heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'queued'
+            `).run(timestamp, timestamp, timestamp, queued.id);
+            if (Number(result.changes ?? 0) !== 1) return null;
+            this.db.prepare(`
+                UPDATE case_drafts
+                SET status = 'filing_in_progress', filing_status = 'running', updated_at = ?
+                WHERE id = ?
+            `).run(timestamp, queued.case_draft_id);
+            return queued.id;
+        });
+        return jobId ? this.getFilingJob(jobId) : null;
+    }
+
+    getFilingJob(filingJobId: string): FilingJobView | null {
+        const row = this.db.prepare(`
+            SELECT fj.*, cd.email_id, er.subject
+            FROM filing_jobs fj
+            JOIN case_drafts cd ON cd.id = fj.case_draft_id
+            JOIN email_records er ON er.id = cd.email_id
+            WHERE fj.id = ?
+        `).get(filingJobId) as Record<string, unknown> | undefined;
+        return row ? this.filingJobFromRow(row) : null;
+    }
+
+    listFilingJobs(caseDraftId?: string, limit = 100): FilingJobView[] {
+        const safeLimit = Math.min(Math.max(Math.floor(limit) || 100, 1), 500);
+        const rows = (caseDraftId
+            ? this.db.prepare(`
+                SELECT fj.*, cd.email_id, er.subject
+                FROM filing_jobs fj
+                JOIN case_drafts cd ON cd.id = fj.case_draft_id
+                JOIN email_records er ON er.id = cd.email_id
+                WHERE fj.case_draft_id = ?
+                ORDER BY fj.created_at DESC LIMIT ?
+            `).all(caseDraftId, safeLimit)
+            : this.db.prepare(`
+                SELECT fj.*, cd.email_id, er.subject
+                FROM filing_jobs fj
+                JOIN case_drafts cd ON cd.id = fj.case_draft_id
+                JOIN email_records er ON er.id = cd.email_id
+                ORDER BY fj.created_at DESC LIMIT ?
+            `).all(safeLimit)) as Array<Record<string, unknown>>;
+        return rows.map(row => this.filingJobFromRow(row));
+    }
+
+    appendFilingJobLog(
+        filingJobId: string,
+        entry: Omit<FilingJobLogEntry, 'at'> & { at?: string },
+    ): void {
+        const row = this.db.prepare(
+            'SELECT execution_log FROM filing_jobs WHERE id = ?',
+        ).get(filingJobId) as { execution_log: string | null } | undefined;
+        if (!row) throw new Error('MiFILE job not found');
+        const parsed = this.safeJson(row.execution_log);
+        const log = Array.isArray(parsed) ? parsed.slice(-999) : [];
+        log.push({ ...entry, at: entry.at || nowIso() });
+        const timestamp = nowIso();
+        this.db.prepare(`
+            UPDATE filing_jobs
+            SET execution_log = ?, checkpoint = ?, last_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+        `).run(toJson(log), entry.checkpoint, timestamp, timestamp, filingJobId);
+    }
+
+    completeFilingJob(input: {
+        filingJobId: string;
+        status: 'prepared' | 'succeeded' | 'failed';
+        checkpoint: string;
+        errorCode?: string | null;
+        errorMessage?: string | null;
+        externalBundleId?: string | null;
+        temporaryCaseNumber?: string | null;
+        result?: Record<string, unknown> | null;
+        debugArtifactPath?: string | null;
+    }): FilingJobView {
+        const existing = this.getFilingJob(input.filingJobId);
+        if (!existing) throw new Error('MiFILE job not found');
+        const timestamp = nowIso();
+        const startedAt = existing.startedAt ? Date.parse(existing.startedAt) : Date.now();
+        const durationMs = Math.max(0, Date.now() - startedAt);
+        const draftState = input.status === 'prepared'
+            ? { status: 'filing_prepared', filingStatus: 'prepared' }
+            : input.status === 'succeeded'
+                ? { status: 'filed_successfully', filingStatus: 'succeeded' }
+                : { status: 'filing_failed', filingStatus: 'failed' };
+        this.runInTransaction(() => {
+            this.db.prepare(`
+                UPDATE filing_jobs
+                SET status = ?, checkpoint = ?, finished_at = ?, duration_ms = ?,
+                    error_code = ?, error_message = ?, result_json = ?,
+                    external_bundle_id = COALESCE(?, external_bundle_id),
+                    temporary_case_number = COALESCE(?, temporary_case_number),
+                    debug_artifact_path = ?, last_heartbeat_at = ?, updated_at = ?
+                WHERE id = ?
+            `).run(
+                input.status,
+                input.checkpoint,
+                timestamp,
+                durationMs,
+                input.errorCode ?? null,
+                input.errorMessage ?? null,
+                toJson(input.result),
+                input.externalBundleId ?? null,
+                input.temporaryCaseNumber ?? null,
+                input.debugArtifactPath ?? null,
+                timestamp,
+                timestamp,
+                input.filingJobId,
+            );
+            this.db.prepare(`
+                UPDATE case_drafts
+                SET status = ?, filing_status = ?, updated_at = ?
+                WHERE id = ?
+            `).run(
+                draftState.status,
+                draftState.filingStatus,
+                timestamp,
+                existing.caseDraftId,
+            );
+            this.insertAuditLog('filing_job', input.filingJobId, `filing_job_${input.status}`, {
+                caseDraftId: existing.caseDraftId,
+                checkpoint: input.checkpoint,
+                durationMs,
+                errorCode: input.errorCode ?? null,
+            });
+        });
+        const completed = this.getFilingJob(input.filingJobId);
+        if (!completed) throw new Error('Completed MiFILE job could not be loaded');
+        return completed;
     }
 
     updateCaseDraft(
@@ -4797,7 +5327,7 @@ export class WorkflowDatabase {
     getDocumentAccess(documentId: string): DraftDocumentAccess | null {
         const row = this.db
             .prepare(`
-                SELECT id, one_drive_url, current_filename, mime_type
+                SELECT id, case_draft_id, one_drive_url, current_filename, mime_type
                 FROM document_records
                 WHERE id = ?
                   AND is_active = 1
@@ -4807,11 +5337,77 @@ export class WorkflowDatabase {
         return row
             ? {
                 id: row.id,
+                caseDraftId: row.case_draft_id,
                 oneDriveUrl: row.one_drive_url,
                 currentFilename: row.current_filename,
                 mimeType: row.mime_type,
             }
             : null;
+    }
+
+    recordDocumentReplacement(
+        documentId: string,
+        input: { fileSize: number; mimeType?: string | null },
+    ): EmailDetail {
+        const row = this.db.prepare(`
+            SELECT d.case_draft_id, d.email_id, c.primary_document_id,
+                   c.extracted_data_json, c.normalized_data_json
+            FROM document_records d
+            LEFT JOIN case_drafts c ON c.id = d.case_draft_id
+            WHERE d.id = ? AND d.is_active = 1
+        `).get(documentId) as
+            | {
+                case_draft_id: string | null;
+                email_id: string;
+                primary_document_id: string | null;
+                extracted_data_json: string | null;
+                normalized_data_json: string | null;
+            }
+            | undefined;
+        if (!row) throw new Error('Document not found');
+        const timestamp = nowIso();
+        this.runInTransaction(() => {
+            this.db.prepare(`
+                UPDATE document_records
+                SET status = 'replaced', file_size = ?, mime_type = ?,
+                    error_message = NULL, updated_at = ?
+                WHERE id = ?
+            `).run(input.fileSize, input.mimeType || 'application/pdf', timestamp, documentId);
+            if (row.case_draft_id) {
+                if (row.primary_document_id === documentId) {
+                    const extracted = this.safeJson(row.extracted_data_json) || {};
+                    const normalized = this.safeJson(row.normalized_data_json) || {};
+                    delete extracted.complaintExtraction;
+                    delete normalized.complaintExtraction;
+                    this.db.prepare(`
+                        UPDATE case_drafts
+                        SET extracted_data_json = ?, normalized_data_json = ?,
+                            status = 'needs_review', validation_status = 'warnings',
+                            filing_status = 'not_started', updated_at = ?
+                        WHERE id = ?
+                    `).run(
+                        toJson(extracted),
+                        toJson(normalized),
+                        timestamp,
+                        row.case_draft_id,
+                    );
+                } else {
+                    this.db.prepare(`
+                        UPDATE case_drafts
+                        SET status = 'needs_review', filing_status = 'not_started', updated_at = ?
+                        WHERE id = ?
+                    `).run(timestamp, row.case_draft_id);
+                }
+            }
+            this.insertAuditLog('document_record', documentId, 'draft_document_replaced', {
+                fileSize: input.fileSize,
+                primaryComplaint: row.primary_document_id === documentId,
+            });
+        });
+        if (row.case_draft_id) return this.refreshCaseDraftValidation(row.case_draft_id);
+        const detail = this.getEmailDetail(row.email_id);
+        if (!detail) throw new Error('Document email record not found');
+        return detail;
     }
 
     applyComplaintExtraction(
@@ -4956,6 +5552,7 @@ export class WorkflowDatabase {
 
         const protectedStatuses = new Set<CaseDraftStatus>([
             'filing_in_progress',
+            'filing_prepared',
             'filed_successfully',
             'archived',
         ]);
@@ -5022,7 +5619,7 @@ export class WorkflowDatabase {
     refreshCaseDraftValidation(caseDraftId: string): EmailDetail {
         const detail = this.getDraftDetail(caseDraftId);
         if (!detail?.caseDraft) throw new Error('Case draft not found');
-        if (['filing_in_progress', 'filed_successfully', 'archived'].includes(
+        if (['filing_in_progress', 'filing_prepared', 'filed_successfully', 'archived'].includes(
             detail.caseDraft.status,
         )) {
             return detail;
@@ -5723,6 +6320,49 @@ export class WorkflowDatabase {
 
     private countMissingPlaintiffMappings(): number {
         return this.listPlaintiffMappings().missing.length;
+    }
+
+    private filingJobFromRow(row: Record<string, unknown>): FilingJobView {
+        const executionLog = this.safeJson(String(row.execution_log || ''));
+        const payload = this.safeJson(String(row.payload_json || ''));
+        const result = this.safeJson(String(row.result_json || ''));
+        return {
+            id: String(row.id),
+            caseDraftId: String(row.case_draft_id),
+            emailId: row.email_id ? String(row.email_id) : null,
+            subject: row.subject ? String(row.subject) : null,
+            attemptNumber: Number(row.attempt_number || 0),
+            mode: row.mode === 'submit' ? 'submit' : 'prepare',
+            status: String(row.status) as FilingJobStatus,
+            triggerSource: row.trigger_source ? String(row.trigger_source) : null,
+            checkpoint: row.checkpoint ? String(row.checkpoint) : null,
+            externalBundleId: row.external_bundle_id ? String(row.external_bundle_id) : null,
+            temporaryCaseNumber: row.temporary_case_number
+                ? String(row.temporary_case_number)
+                : null,
+            startedAt: row.started_at ? String(row.started_at) : null,
+            finishedAt: row.finished_at ? String(row.finished_at) : null,
+            durationMs: row.duration_ms === null || row.duration_ms === undefined
+                ? null
+                : Number(row.duration_ms),
+            errorCode: row.error_code ? String(row.error_code) : null,
+            errorMessage: row.error_message ? String(row.error_message) : null,
+            executionLog: Array.isArray(executionLog)
+                ? executionLog as FilingJobLogEntry[]
+                : [],
+            payload: payload && typeof payload === 'object'
+                ? payload as FilingPayload
+                : null,
+            result: result && typeof result === 'object' && !Array.isArray(result)
+                ? result as Record<string, unknown>
+                : null,
+            debugArtifactPath: row.debug_artifact_path
+                ? String(row.debug_artifact_path)
+                : null,
+            triggeredBy: row.triggered_by ? String(row.triggered_by) : null,
+            createdAt: String(row.created_at),
+            updatedAt: String(row.updated_at),
+        };
     }
 
     private safeJson(value: string | null | undefined): any {

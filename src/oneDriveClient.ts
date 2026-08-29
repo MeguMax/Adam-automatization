@@ -60,6 +60,7 @@ export async function ensureRootFolder(): Promise<{ driveId: string; itemId: str
 export interface OneDriveSharedItem {
     driveId: string;
     itemId: string;
+    parentItemId: string | null;
     fileName: string;
     webUrl: string | null;
 }
@@ -80,6 +81,7 @@ export async function resolveSharedDriveItem(shareUrl: string): Promise<OneDrive
     return {
         driveId,
         itemId,
+        parentItemId: (item.parentReference?.id as string | undefined) ?? null,
         fileName,
         webUrl: (item.webUrl as string | undefined) ?? null,
     };
@@ -97,6 +99,24 @@ export async function renameDriveItem(
     return {
         driveId,
         itemId: item.id as string,
+        parentItemId: (item.parentReference?.id as string | undefined) ?? null,
+        fileName: item.name as string,
+        webUrl: (item.webUrl as string | undefined) ?? null,
+    };
+}
+
+export async function replaceDriveItemContent(
+    driveId: string,
+    itemId: string,
+    content: Buffer,
+): Promise<OneDriveSharedItem> {
+    const item = await oneDriveClient
+        .api(`/drives/${driveId}/items/${itemId}/content`)
+        .put(content);
+    return {
+        driveId,
+        itemId: item.id as string,
+        parentItemId: (item.parentReference?.id as string | undefined) ?? null,
         fileName: item.name as string,
         webUrl: (item.webUrl as string | undefined) ?? null,
     };

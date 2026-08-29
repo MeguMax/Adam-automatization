@@ -49,6 +49,22 @@ services:
         value: "30000"
       - key: MIFILE_COOKIE_CACHE_MS
         value: "600000"
+      - key: MIFILE_FILING_WORKER_ENABLED
+        value: "true"
+      - key: MIFILE_FILING_POLL_MS
+        value: "5000"
+      - key: MIFILE_FILING_HEADLESS
+        value: "true"
+      - key: MIFILE_FILING_TIMEOUT_MS
+        value: "30000"
+      - key: MIFILE_FILING_UPLOAD_TIMEOUT_MS
+        value: "180000"
+      - key: MIFILE_FILING_DEBUG_DIR
+        value: /var/data/mifile_filing_debug
+      - key: MIFILE_FILER_NAME
+        value: Devlin, Adam
+      - key: MIFILE_FINAL_SUBMISSION_ENABLED
+        value: "false"
       - key: TENANT_ID
         sync: false
       - key: CLIENT_ID

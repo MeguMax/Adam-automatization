@@ -18,14 +18,18 @@ import {
 import { addEmailAttachmentSources } from './emailAttachmentSource';
 import { loadLegacyProcessed } from './legacyState';
 import {
+    createFileLink,
     downloadDriveItemBuffer,
     renameDriveItem,
+    replaceDriveItemContent,
     resolveSharedDriveItem,
+    uploadFileBufferToFolder,
 } from './oneDriveClient';
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
+import { validatePdfBuffer } from './pdfValidation';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-08-14-standard-nonpayment-drafts-v17';
+const ADMIN_BUILD_ID = '2026-08-29-mifile-draft-preparation-v19';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -133,6 +137,25 @@ function readRequestBody(req: http.IncomingMessage): Promise<string> {
     });
 }
 
+function readRequestBuffer(req: http.IncomingMessage, maxBytes: number): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        req.on('data', chunk => {
+            const buffer = Buffer.from(chunk);
+            size += buffer.length;
+            if (size > maxBytes) {
+                reject(new Error(`Uploaded file exceeds ${Math.floor(maxBytes / 1024 / 1024)} MB`));
+                req.destroy();
+                return;
+            }
+            chunks.push(buffer);
+        });
+        req.on('end', () => resolve(Buffer.concat(chunks)));
+        req.on('error', reject);
+    });
+}
+
 function parseDateBoundary(value: string | null | undefined, endExclusive = false): string | null {
     if (!value) return null;
     const normalized = value.trim();
@@ -153,6 +176,14 @@ function parseEmailIds(value: unknown): string[] {
             .map(id => id.trim())
             .filter(Boolean),
     )).slice(0, 200);
+}
+
+function uploadedPdfFilename(value: string | string[] | undefined): string {
+    const raw = Array.isArray(value) ? value[0] : value;
+    const decoded = raw ? decodeURIComponent(raw) : 'document.pdf';
+    const base = decoded.replace(/[/\\:*?"<>|\u0000-\u001f]/g, '_').trim();
+    const withExtension = /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+    return withExtension.slice(0, 180) || 'document.pdf';
 }
 
 function bodyToText(msg: any): string {
@@ -2234,6 +2265,47 @@ const html = String.raw`<!doctype html>
       margin-top: 1px;
       flex: 0 0 auto;
     }
+    .draft-filing-job-panel {
+      margin-bottom: 14px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafb;
+    }
+    .draft-filing-job-heading,
+    .draft-filing-job-meta,
+    .draft-filing-job-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .draft-filing-job-heading {
+      justify-content: space-between;
+      margin-bottom: 7px;
+    }
+    .draft-filing-job-heading strong { font-size: 12px; }
+    .draft-filing-job-meta { color: var(--muted); font-size: 11px; }
+    .draft-filing-job-error {
+      margin-top: 8px;
+      color: var(--bad);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .draft-filing-log {
+      max-height: 150px;
+      margin-top: 9px;
+      overflow: auto;
+      border-top: 1px solid var(--line);
+      font-size: 11px;
+    }
+    .draft-filing-log-row {
+      display: grid;
+      grid-template-columns: 74px 118px minmax(0, 1fr);
+      gap: 7px;
+      padding: 6px 0;
+      border-bottom: 1px solid #e8edf1;
+    }
     .draft-field-section {
       margin-bottom: 18px;
     }
@@ -3012,6 +3084,8 @@ const html = String.raw`<!doctype html>
               <option value="needs_review">Needs review</option>
               <option value="parsed">Parsed</option>
               <option value="ready_to_file">Ready to file</option>
+              <option value="filing_in_progress">Filing in progress</option>
+              <option value="filing_prepared">Prepared in MiFILE</option>
               <option value="validation_failed">Validation failed</option>
               <option value="rejected">Rejected</option>
               <option value="filed_successfully">Filed successfully</option>
@@ -3068,6 +3142,7 @@ const html = String.raw`<!doctype html>
           <div class="draft-workspace-actions">
             <button id="draftRejectBtn" class="danger" type="button"><i data-lucide="x"></i>Reject</button>
             <button id="draftApproveBtn" type="button"><i data-lucide="check-check"></i>Approve</button>
+            <button id="draftPrepareBtn" type="button"><i data-lucide="upload-cloud"></i>Prepare in MiFILE</button>
             <button id="draftSaveBtn" class="primary" type="button"><i data-lucide="save"></i>Save changes</button>
           </div>
         </div>
@@ -3085,6 +3160,9 @@ const html = String.raw`<!doctype html>
               <div class="draft-source-actions">
                 <button id="draftPrimaryBtn" type="button" title="Use the selected document as the primary source"><i data-lucide="star"></i>Primary source</button>
                 <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
+                <button id="draftAddDocumentBtn" type="button" title="Add a PDF to this Draft"><i data-lucide="file-plus-2"></i>Add PDF</button>
+                <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF while keeping its OneDrive name and link"><i data-lucide="replace"></i>Replace PDF</button>
+                <input id="draftDocumentFileInput" class="hidden" type="file" accept="application/pdf,.pdf">
               </div>
               <div class="draft-document-links">
                 <a id="draftOneDriveLink" class="button-link" target="_blank" rel="noopener"><i data-lucide="cloud"></i>OneDrive</a>
@@ -3103,6 +3181,7 @@ const html = String.raw`<!doctype html>
             </div>
             <form id="draftFieldsForm">
               <div id="draftValidationSummary"></div>
+              <div id="draftFilingJobPanel"></div>
               <div id="draftFieldGroups"></div>
               <label class="draft-notes-field">
                 <span>Reviewer notes</span>
@@ -3221,7 +3300,9 @@ const html = String.raw`<!doctype html>
       drafts: [],
       selectedDraftId: null,
       draftDetail: null,
+      draftFilingJobs: [],
       activeDraftDocumentId: null,
+      draftFileAction: null,
       draftDirty: false,
       draftMobileMode: 'document',
       editingMappingId: null,
@@ -3244,6 +3325,8 @@ const html = String.raw`<!doctype html>
       not_downloadable: 'Not downloadable',
       retry_queued: 'Retry queued',
       filing_in_progress: 'Filing in progress',
+      filing_prepared: 'Prepared in MiFILE',
+      prepared: 'Prepared',
       filed_successfully: 'Filed successfully',
       filing_failed: 'Filing failed',
       not_started: 'Not started',
@@ -3764,6 +3847,8 @@ const html = String.raw`<!doctype html>
       if (!detail.caseDraft) throw new Error('Draft data is not available');
       state.selectedDraftId = draftId;
       state.draftDetail = detail;
+      state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
+        encodeURIComponent(draftId));
       state.draftDirty = false;
       const primary = (detail.documents || []).find(document => document.isPrimary);
       const viewable = (detail.documents || []).find(document => document.oneDriveUrl);
@@ -3781,6 +3866,7 @@ const html = String.raw`<!doctype html>
       if (state.draftDirty && !window.confirm('Discard unsaved draft changes?')) return;
       state.selectedDraftId = null;
       state.draftDetail = null;
+      state.draftFilingJobs = [];
       state.activeDraftDocumentId = null;
       state.draftDirty = false;
       document.getElementById('draftWorkspaceView').classList.add('hidden');
@@ -3799,15 +3885,112 @@ const html = String.raw`<!doctype html>
       document.getElementById('draftWorkspaceSubject').textContent =
         detail.email.subject || '(no subject)';
       document.getElementById('draftWorkspaceStatuses').innerHTML =
-        statusPill(draft.status) + statusPill(draft.validationStatus);
+        statusPill(draft.status) + statusPill(draft.validationStatus) +
+        statusPill(draft.filingStatus);
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
       renderDraftFields(draft);
+      renderDraftFilingJobs();
       renderDraftDocuments(detail.documents || []);
       setDraftDirty(false);
       setDraftMobileMode(state.draftMobileMode);
       document.getElementById('draftApproveBtn').disabled =
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
+      document.getElementById('draftPrepareBtn').disabled =
+        !['ready_to_file', 'filing_failed'].includes(draft.status) ||
+        draft.filingEligible === false ||
+        (draft.validationIssues || []).some(issue => issue.severity === 'error');
       renderIcons();
+    }
+
+    function renderDraftFilingJobs() {
+      const root = document.getElementById('draftFilingJobPanel');
+      const jobs = state.draftFilingJobs || [];
+      if (!jobs.length) {
+        const eligibilityIssues = state.draftDetail.caseDraft.filingEligibilityIssues || [];
+        root.innerHTML = '<div class="draft-filing-job-panel">' +
+          '<div class="draft-filing-job-heading"><strong>MiFILE preparation</strong>' +
+          statusPill(eligibilityIssues.length ? 'not_available' : 'not_started') + '</div>' +
+          '<div class="draft-filing-job-meta">' + escapeHtml(
+            eligibilityIssues.length
+              ? eligibilityIssues[0].message
+              : 'Approve this Draft, then prepare an unsubmitted MiFILE bundle.',
+          ) + '</div>' +
+        '</div>';
+        return;
+      }
+      const job = jobs[0];
+      const log = (job.executionLog || []).slice(-12).reverse();
+      root.innerHTML = '<div class="draft-filing-job-panel">' +
+        '<div class="draft-filing-job-heading"><strong>MiFILE attempt ' +
+          escapeHtml(job.attemptNumber) + '</strong>' + statusPill(job.status) + '</div>' +
+        '<div class="draft-filing-job-meta">' +
+          '<span>Checkpoint: ' + escapeHtml(job.checkpoint || 'queued') + '</span>' +
+          '<span>Started: ' + escapeHtml(fmtDate(job.startedAt || job.createdAt)) + '</span>' +
+          (job.durationMs !== null ? '<span>Duration: ' +
+            escapeHtml(Math.round(Number(job.durationMs) / 1000)) + 's</span>' : '') +
+          (job.temporaryCaseNumber ? '<span>Temporary case: ' +
+            escapeHtml(job.temporaryCaseNumber) + '</span>' : '') +
+        '</div>' +
+        (job.errorMessage ? '<div class="draft-filing-job-error">' +
+          escapeHtml((job.errorCode ? job.errorCode + ': ' : '') + job.errorMessage) + '</div>' : '') +
+        (job.status === 'failed' ? '<div class="draft-filing-job-actions">' +
+          '<button type="button" data-retry-filing-job="' + escapeHtml(job.id) + '">' +
+          icon('rotate-cw') + 'Retry preparation</button></div>' : '') +
+        (log.length ? '<div class="draft-filing-log">' + log.map(entry =>
+          '<div class="draft-filing-log-row"><span>' + escapeHtml(fmtDate(entry.at)) +
+          '</span><strong>' + escapeHtml(entry.checkpoint) + '</strong><span>' +
+          escapeHtml(entry.message) + '</span></div>').join('') + '</div>' : '') +
+      '</div>';
+      root.querySelectorAll('[data-retry-filing-job]').forEach(button => {
+        button.addEventListener('click', () => {
+          queueDraftFiling(true).catch(showDraftError);
+        });
+      });
+      renderIcons();
+    }
+
+    async function refreshDraftFilingState() {
+      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty) return;
+      const jobs = await api('/api/filing-jobs?caseDraftId=' +
+        encodeURIComponent(state.selectedDraftId));
+      const previous = state.draftFilingJobs[0];
+      const latest = jobs[0];
+      state.draftFilingJobs = jobs;
+      if (!previous || !latest || previous.updatedAt !== latest.updatedAt) {
+        state.draftDetail = await api('/api/drafts/' +
+          encodeURIComponent(state.selectedDraftId));
+        renderDraftWorkspace();
+      } else {
+        renderDraftFilingJobs();
+      }
+    }
+
+    async function queueDraftFiling(isRetry) {
+      const detail = state.draftDetail;
+      if (!detail || !detail.caseDraft) return;
+      if (state.draftDirty) await saveDraft(true);
+      if (!isRetry && !window.confirm(
+        'Prepare this case in MiFILE? The system will save an unsubmitted bundle. It will not pay or submit it to the court.',
+      )) return;
+      const button = document.getElementById('draftPrepareBtn');
+      setButtonBusy(button, true, 'Queueing');
+      try {
+        await api('/api/drafts/' + encodeURIComponent(detail.caseDraft.id) +
+          '/filing-jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: 'prepare', retry: Boolean(isRetry) }),
+        });
+        state.draftDetail = await api('/api/drafts/' +
+          encodeURIComponent(detail.caseDraft.id));
+        state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
+          encodeURIComponent(detail.caseDraft.id));
+        renderDraftWorkspace();
+        await loadDrafts(true);
+        showToast('MiFILE preparation queued. Progress will update here.');
+      } finally {
+        setButtonBusy(button, false);
+      }
     }
 
     function renderDraftFields(draft) {
@@ -4318,6 +4501,8 @@ const html = String.raw`<!doctype html>
       const sourceLink = window.document.getElementById('draftSourceLink');
       const primaryButton = window.document.getElementById('draftPrimaryBtn');
       const extractButton = window.document.getElementById('draftExtractBtn');
+      const addButton = window.document.getElementById('draftAddDocumentBtn');
+      const replaceButton = window.document.getElementById('draftReplaceDocumentBtn');
 
       updateDraftDocumentLink(oneDriveLink, activeDocument && activeDocument.oneDriveUrl);
       updateDraftDocumentLink(sourceLink, activeDocument && activeDocument.sourceUrl);
@@ -4342,6 +4527,14 @@ const html = String.raw`<!doctype html>
         activeDocument.oneDriveUrl,
       );
       extractButton.disabled = !canExtract;
+      const draft = state.draftDetail && state.draftDetail.caseDraft;
+      const canModifyDocuments = Boolean(
+        draft && draft.filingEligible !== false &&
+        !['filing_in_progress', 'filing_prepared', 'filed_successfully'].includes(draft.status),
+      );
+      addButton.disabled = !canModifyDocuments;
+      replaceButton.disabled = !canModifyDocuments ||
+        !activeDocument || !activeDocument.oneDriveUrl;
       if (activeDocument && activeDocument.oneDriveUrl) {
         viewer.innerHTML = '<iframe title="' +
           escapeHtml(activeDocument.currentFilename || activeDocument.documentType || 'PDF document') +
@@ -4507,6 +4700,63 @@ const html = String.raw`<!doctype html>
         await loadDrafts(true);
         showToast('Complaint fields extracted. Review the highlighted warnings.');
       } finally {
+        setButtonBusy(button, false);
+      }
+    }
+
+    function chooseDraftPdf(action) {
+      if (!state.draftDetail || !state.draftDetail.caseDraft) return;
+      if (action === 'replace' && !state.activeDraftDocumentId) return;
+      state.draftFileAction = action;
+      const input = document.getElementById('draftDocumentFileInput');
+      input.value = '';
+      input.click();
+    }
+
+    async function uploadDraftPdf(file) {
+      const detail = state.draftDetail;
+      const action = state.draftFileAction;
+      if (!detail || !detail.caseDraft || !file || !action) return;
+      if (!/\.pdf$/i.test(file.name) || file.type && file.type !== 'application/pdf') {
+        throw new Error('Select a PDF file.');
+      }
+      if (file.size > 25 * 1024 * 1024) {
+        throw new Error('MiFILE accepts PDF documents up to 25 MB.');
+      }
+      if (state.draftDirty) await saveDraft(true);
+      if (action === 'replace' && !window.confirm(
+        'Replace the selected OneDrive PDF? Its current filename and link will be preserved.',
+      )) return;
+
+      const button = document.getElementById(
+        action === 'replace' ? 'draftReplaceDocumentBtn' : 'draftAddDocumentBtn',
+      );
+      setButtonBusy(button, true, action === 'replace' ? 'Replacing' : 'Adding');
+      try {
+        const endpoint = action === 'replace'
+          ? '/api/documents/' + encodeURIComponent(state.activeDraftDocumentId) + '/content'
+          : '/api/drafts/' + encodeURIComponent(detail.caseDraft.id) + '/documents';
+        state.draftDetail = await api(endpoint, {
+          method: action === 'replace' ? 'PUT' : 'POST',
+          headers: {
+            'Content-Type': 'application/pdf',
+            'X-File-Name': encodeURIComponent(file.name),
+          },
+          body: file,
+        });
+        if (action === 'add') {
+          const added = (state.draftDetail.documents || []).find(document =>
+            document.currentFilename === file.name);
+          if (added) state.activeDraftDocumentId = added.id;
+        }
+        state.draftDirty = false;
+        renderDraftWorkspace();
+        await loadDrafts(true);
+        showToast(action === 'replace'
+          ? 'PDF replaced. Re-extract the Complaint if it was the primary source.'
+          : 'PDF added. Set its Filing Type and submission relation.');
+      } finally {
+        state.draftFileAction = null;
         setButtonBusy(button, false);
       }
     }
@@ -5549,6 +5799,9 @@ const html = String.raw`<!doctype html>
     document.getElementById('draftApproveBtn').addEventListener('click', () => {
       reviewDraft('approve').catch(showDraftError);
     });
+    document.getElementById('draftPrepareBtn').addEventListener('click', () => {
+      queueDraftFiling(false).catch(showDraftError);
+    });
     document.getElementById('draftRejectBtn').addEventListener('click', () => {
       reviewDraft('reject').catch(showDraftError);
     });
@@ -5561,6 +5814,15 @@ const html = String.raw`<!doctype html>
     });
     document.getElementById('draftExtractBtn').addEventListener('click', () => {
       extractPrimaryComplaint().catch(showDraftError);
+    });
+    document.getElementById('draftAddDocumentBtn').addEventListener('click', () => {
+      chooseDraftPdf('add');
+    });
+    document.getElementById('draftReplaceDocumentBtn').addEventListener('click', () => {
+      chooseDraftPdf('replace');
+    });
+    document.getElementById('draftDocumentFileInput').addEventListener('change', event => {
+      uploadDraftPdf(event.target.files && event.target.files[0]).catch(showDraftError);
     });
     document.querySelectorAll('[data-draft-mobile-mode]').forEach(button => {
       button.addEventListener('click', () => setDraftMobileMode(button.dataset.draftMobileMode));
@@ -5622,6 +5884,9 @@ const html = String.raw`<!doctype html>
       if (state.view === 'activity') loadActivity().catch(showActivityError);
       if (state.view === 'drafts' && !state.selectedDraftId) {
         loadDrafts().catch(showDraftError);
+      }
+      if (state.view === 'drafts' && state.selectedDraftId) {
+        refreshDraftFilingState().catch(showDraftError);
       }
     }, 3000);
   </script>
@@ -5735,6 +6000,7 @@ export function createAdminServer(
                     'needs_review',
                     'ready_to_file',
                     'filing_in_progress',
+                    'filing_prepared',
                     'filed_successfully',
                     'filing_failed',
                     'rejected',
@@ -5761,6 +6027,52 @@ export function createAdminServer(
                     dateFrom: parseDateBoundary(url.searchParams.get('dateFrom')),
                     dateTo: parseDateBoundary(url.searchParams.get('dateTo'), true),
                 }));
+                return;
+            }
+
+            if (req.method === 'GET' && url.pathname === '/api/filing-jobs') {
+                const caseDraftId = url.searchParams.get('caseDraftId')?.trim() || undefined;
+                sendJson(
+                    res,
+                    200,
+                    db.listFilingJobs(
+                        caseDraftId,
+                        Number(url.searchParams.get('limit') || 100),
+                    ),
+                );
+                return;
+            }
+
+            const filingJobMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)$/);
+            if (req.method === 'GET' && filingJobMatch) {
+                const job = db.getFilingJob(decodeURIComponent(filingJobMatch[1]));
+                if (!job) {
+                    sendJson(res, 404, { error: 'MiFILE job not found' });
+                    return;
+                }
+                sendJson(res, 200, job);
+                return;
+            }
+
+            const queueFilingMatch = url.pathname.match(
+                /^\/api\/drafts\/([^/]+)\/filing-jobs$/,
+            );
+            if (req.method === 'POST' && queueFilingMatch) {
+                const body = await readRequestBody(req);
+                const parsed = body ? JSON.parse(body) : {};
+                if (parsed.mode && parsed.mode !== 'prepare') {
+                    sendJson(res, 400, {
+                        error: 'Only safe MiFILE preparation is enabled. Final court submission is disabled.',
+                    });
+                    return;
+                }
+                const job = db.queueFilingJob(
+                    decodeURIComponent(queueFilingMatch[1]),
+                    'prepare',
+                    parsed.retry === true ? 'admin_retry' : 'admin',
+                    'admin',
+                );
+                sendJson(res, 202, job);
                 return;
             }
 
@@ -5992,6 +6304,46 @@ export function createAdminServer(
             const documentContentMatch = url.pathname.match(
                 /^\/api\/documents\/([^/]+)\/content$/,
             );
+            if (req.method === 'PUT' && documentContentMatch) {
+                const documentId = decodeURIComponent(documentContentMatch[1]);
+                const document = db.getDocumentAccess(documentId);
+                if (!document) {
+                    sendJson(res, 404, { error: 'Document not found' });
+                    return;
+                }
+                const detail = document.caseDraftId
+                    ? db.getDraftDetail(document.caseDraftId)
+                    : null;
+                if (detail?.caseDraft?.filingEligible === false) {
+                    sendJson(res, 409, {
+                        error: 'Documents from an existing court filing cannot be replaced here',
+                    });
+                    return;
+                }
+                if (detail?.caseDraft && ['filing_in_progress', 'filing_prepared', 'filed_successfully'].includes(
+                    detail.caseDraft.status,
+                )) {
+                    sendJson(res, 409, {
+                        error: 'Documents cannot be replaced while this Draft is being filed or has already been prepared',
+                    });
+                    return;
+                }
+                const content = await readRequestBuffer(req, 25 * 1024 * 1024);
+                const validation = validatePdfBuffer(content);
+                if (!validation.valid) {
+                    sendJson(res, 415, {
+                        error: validation.reason || 'The replacement is not a valid PDF',
+                    });
+                    return;
+                }
+                const sharedItem = await resolveSharedDriveItem(document.oneDriveUrl);
+                await replaceDriveItemContent(sharedItem.driveId, sharedItem.itemId, content);
+                sendJson(res, 200, db.recordDocumentReplacement(documentId, {
+                    fileSize: content.length,
+                    mimeType: 'application/pdf',
+                }));
+                return;
+            }
             if (req.method === 'GET' && documentContentMatch) {
                 const document = db.getDocumentAccess(
                     decodeURIComponent(documentContentMatch[1]),
@@ -6022,6 +6374,74 @@ export function createAdminServer(
                     'X-Frame-Options': 'SAMEORIGIN',
                 });
                 res.end(content);
+                return;
+            }
+
+            const addDraftDocumentMatch = url.pathname.match(
+                /^\/api\/drafts\/([^/]+)\/documents$/,
+            );
+            if (req.method === 'POST' && addDraftDocumentMatch) {
+                const caseDraftId = decodeURIComponent(addDraftDocumentMatch[1]);
+                const detail = db.getDraftDetail(caseDraftId);
+                if (!detail?.caseDraft) {
+                    sendJson(res, 404, { error: 'Case draft not found' });
+                    return;
+                }
+                if (!detail.caseDraft.filingEligible) {
+                    sendJson(res, 409, {
+                        error: 'Documents cannot be added to an existing court filing',
+                    });
+                    return;
+                }
+                if (['filing_in_progress', 'filing_prepared', 'filed_successfully'].includes(
+                    detail.caseDraft.status,
+                )) {
+                    sendJson(res, 409, { error: 'This Draft cannot accept new documents' });
+                    return;
+                }
+                const anchor = detail.documents.find(document => document.oneDriveUrl);
+                if (!anchor?.oneDriveUrl) {
+                    sendJson(res, 409, {
+                        error: 'At least one OneDrive document is required to locate the case folder',
+                    });
+                    return;
+                }
+                const content = await readRequestBuffer(req, 25 * 1024 * 1024);
+                const validation = validatePdfBuffer(content);
+                if (!validation.valid) {
+                    sendJson(res, 415, {
+                        error: validation.reason || 'The uploaded file is not a valid PDF',
+                    });
+                    return;
+                }
+                const anchorItem = await resolveSharedDriveItem(anchor.oneDriveUrl);
+                if (!anchorItem.parentItemId) {
+                    sendJson(res, 409, { error: 'The OneDrive case folder could not be resolved' });
+                    return;
+                }
+                const fileName = uploadedPdfFilename(req.headers['x-file-name']);
+                const uploaded = await uploadFileBufferToFolder(
+                    anchorItem.driveId,
+                    anchorItem.parentItemId,
+                    fileName,
+                    content,
+                );
+                const oneDriveUrl = await createFileLink(uploaded.driveId, uploaded.itemId);
+                db.addDocument({
+                    emailId: detail.email.id,
+                    caseDraftId,
+                    originalFilename: fileName,
+                    currentFilename: fileName,
+                    fileUrl: oneDriveUrl,
+                    oneDriveUrl,
+                    mimeType: 'application/pdf',
+                    fileSize: content.length,
+                    documentType: fileName.replace(/\.pdf$/i, ''),
+                    uploadSource: 'admin_draft_upload',
+                    status: 'uploaded',
+                    metadata: { addedFromDraftEditor: true },
+                });
+                sendJson(res, 201, db.refreshCaseDraftValidation(caseDraftId));
                 return;
             }
 

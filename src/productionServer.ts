@@ -4,9 +4,15 @@ import http from 'http';
 import { createAdminServer } from './adminServer';
 import { getWorkflowDatabase, PlaintiffMappingSeed } from './database';
 import { runWorker } from './index';
+import { runFilingWorker } from './filingWorker';
 
 function isWorkerEnabled(): boolean {
     const value = (process.env.WORKER_ENABLED ?? 'true').trim().toLowerCase();
+    return !['0', 'false', 'no', 'off'].includes(value);
+}
+
+function isFilingWorkerEnabled(): boolean {
+    const value = (process.env.MIFILE_FILING_WORKER_ENABLED ?? 'true').trim().toLowerCase();
     return !['0', 'false', 'no', 'off'].includes(value);
 }
 
@@ -39,6 +45,10 @@ async function main(): Promise<void> {
     const workerPromise = workerEnabled
         ? runWorker({ signal: controller.signal, closeDatabaseOnExit: false })
         : Promise.resolve();
+    const filingWorkerEnabled = isFilingWorkerEnabled();
+    const filingWorkerPromise = filingWorkerEnabled
+        ? runFilingWorker({ signal: controller.signal })
+        : Promise.resolve();
     let shuttingDown = false;
 
     const shutdown = async (reason: string, exitCode = 0) => {
@@ -50,6 +60,9 @@ async function main(): Promise<void> {
             closeServer(server),
             workerPromise.catch(error => {
                 console.error('Worker stopped during shutdown:', error);
+            }),
+            filingWorkerPromise.catch(error => {
+                console.error('MiFILE filing worker stopped during shutdown:', error);
             }),
         ]);
         getWorkflowDatabase().close();
@@ -67,6 +80,14 @@ async function main(): Promise<void> {
         });
     } else {
         console.log('Production worker disabled; admin-only bootstrap mode is active.');
+    }
+    if (!filingWorkerEnabled) {
+        console.log('MiFILE filing worker is disabled.');
+    } else {
+        filingWorkerPromise.catch(error => {
+            console.error('MiFILE filing worker stopped unexpectedly:', error);
+            void shutdown('MiFILE filing worker failure', 1);
+        });
     }
 }
 
