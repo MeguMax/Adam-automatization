@@ -1056,6 +1056,10 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
             () => db.queueFilingJob(draftId, 'prepare', 'test', 'test-suite'),
             /active MiFILE job/,
         );
+        assert.throws(
+            () => db.queueFilingJob(draftId, 'submit', 'test', 'test-suite'),
+            /Final court submission is disabled/,
+        );
         const claimed = db.claimNextFilingJob();
         assert.equal(claimed?.id, queued.id);
         assert.equal(claimed?.status, 'running');
@@ -1069,8 +1073,33 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
         const retry = db.queueFilingJob(draftId, 'prepare', 'test_retry', 'test-suite');
         assert.equal(retry.attemptNumber, 2);
         assert.equal(db.claimNextFilingJob()?.id, retry.id);
-        const prepared = db.completeFilingJob({
+        db.appendFilingJobLog(retry.id, {
+            level: 'info',
+            checkpoint: 'save_progress',
+            message: 'Save Progress clicked in test.',
+        });
+        assert.equal(db.recoverInterruptedFilingJobs(), 1);
+        assert.equal(db.getFilingJob(retry.id)?.status, 'reconciliation_required');
+        assert.equal(
+            db.getDraftDetail(draftId)?.caseDraft?.status,
+            'filing_reconciliation',
+        );
+        assert.throws(
+            () => db.queueFilingJob(draftId, 'prepare', 'unsafe_retry', 'test-suite'),
+            /Approve the Draft/,
+        );
+        const reconciled = db.resolveFilingJobReconciliation({
             filingJobId: retry.id,
+            resolution: 'not_found',
+        });
+        assert.equal(reconciled.status, 'failed');
+        assert.equal(reconciled.errorCode, 'RECONCILED_NOT_CREATED');
+
+        const finalRetry = db.queueFilingJob(draftId, 'prepare', 'test_retry', 'test-suite');
+        assert.equal(finalRetry.attemptNumber, 3);
+        assert.equal(db.claimNextFilingJob()?.id, finalRetry.id);
+        const prepared = db.completeFilingJob({
+            filingJobId: finalRetry.id,
             status: 'prepared',
             checkpoint: 'saved_unsubmitted',
             externalBundleId: 'bundle-test-1',

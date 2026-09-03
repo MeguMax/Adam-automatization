@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "npm run build && node --test dist/pdfValidation.test.js dist/complaintExtractor.test.js dist/database.test.js dist/emailProcessor.test.js dist/graphRetry.test.js",
+    "test": "npm run build && node --test dist/pdfValidation.test.js dist/complaintExtractor.test.js dist/database.test.js dist/emailProcessor.test.js dist/graphRetry.test.js dist/mifileRuntimeConfig.test.js",
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
     "start:once": "npm run build && node dist/index.js --once",

@@ -27,9 +27,10 @@ import {
 } from './oneDriveClient';
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
 import { validatePdfBuffer } from './pdfValidation';
+import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-08-29-mifile-draft-preparation-v19';
+const ADMIN_BUILD_ID = '2026-08-29-mifile-unsubmitted-hardening-v20';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -669,11 +670,11 @@ const html = String.raw`<!doctype html>
       color: #384456;
       max-width: 100%;
     }
-    .status.processed, .status.ready_to_file, .status.passed, .status.uploaded, .status.active, .status.mapped, .status.applied {
+    .status.processed, .status.ready_to_file, .status.filing_prepared, .status.prepared, .status.passed, .status.uploaded, .status.active, .status.mapped, .status.applied {
       background: #e6f4ee;
       color: var(--ok);
     }
-    .status.pending, .status.retry_queued, .status.retrying, .status.parsed, .status.new, .status.processing {
+    .status.pending, .status.retry_queued, .status.retrying, .status.parsed, .status.new, .status.processing, .status.filing_in_progress {
       background: #e8f2fa;
       color: var(--accent-strong);
     }
@@ -681,7 +682,7 @@ const html = String.raw`<!doctype html>
       background: #fdecec;
       color: var(--bad);
     }
-    .status.partial_failure, .status.needs_review, .status.missing, .status.needs_short_name, .status.needs_application {
+    .status.partial_failure, .status.needs_review, .status.filing_reconciliation, .status.reconciliation_required, .status.missing, .status.needs_short_name, .status.needs_application {
       background: #fff4dd;
       color: var(--warn);
     }
@@ -2292,6 +2293,42 @@ const html = String.raw`<!doctype html>
       font-size: 11px;
       overflow-wrap: anywhere;
     }
+    .mifile-account-strip {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 10px;
+      padding: 8px 9px;
+      border: 1px solid #d7c989;
+      border-radius: 5px;
+      color: #624f09;
+      background: #fffbe9;
+      font-size: 11px;
+    }
+    .mifile-account-strip.production {
+      border-color: #a9cdb5;
+      color: var(--good);
+      background: #eef8f1;
+    }
+    .mifile-account-strip.error {
+      border-color: #db8881;
+      color: var(--bad);
+      background: #fff4f3;
+    }
+    .mifile-account-strip svg {
+      width: 15px;
+      height: 15px;
+      flex: 0 0 auto;
+    }
+    .reconciliation-notice {
+      margin-top: 9px;
+      padding: 9px;
+      border: 1px solid #d7c989;
+      border-radius: 5px;
+      color: #624f09;
+      background: #fffbe9;
+      font-size: 11px;
+    }
     .draft-filing-log {
       max-height: 150px;
       margin-top: 9px;
@@ -3085,6 +3122,7 @@ const html = String.raw`<!doctype html>
               <option value="parsed">Parsed</option>
               <option value="ready_to_file">Ready to file</option>
               <option value="filing_in_progress">Filing in progress</option>
+              <option value="filing_reconciliation">Reconciliation required</option>
               <option value="filing_prepared">Prepared in MiFILE</option>
               <option value="validation_failed">Validation failed</option>
               <option value="rejected">Rejected</option>
@@ -3295,6 +3333,7 @@ const html = String.raw`<!doctype html>
       selectedIds: new Set(),
       detail: null,
       live: null,
+      mifileConfig: null,
       plaintiffMappings: { mappings: [], missing: [] },
       activity: [],
       drafts: [],
@@ -3325,6 +3364,8 @@ const html = String.raw`<!doctype html>
       not_downloadable: 'Not downloadable',
       retry_queued: 'Retry queued',
       filing_in_progress: 'Filing in progress',
+      filing_reconciliation: 'Reconciliation required',
+      reconciliation_required: 'Reconciliation required',
       filing_prepared: 'Prepared in MiFILE',
       prepared: 'Prepared',
       filed_successfully: 'Filed successfully',
@@ -3507,7 +3548,10 @@ const html = String.raw`<!doctype html>
         metric('Failed files', docs.failed || 0, 'file-x-2', 'danger'),
         metric('Waiting to download', (docs.pending || 0) + (docs.retry_queued || 0) + (docs.retrying || 0), 'clock-3'),
         metric('Downloaded', docs.uploaded || 0, 'circle-check-big', 'success'),
-        metric('Active drafts', (drafts.parsed || 0) + (drafts.needs_review || 0) + (drafts.ready_to_file || 0), 'files'),
+        metric('Active drafts', (drafts.parsed || 0) + (drafts.needs_review || 0) +
+          (drafts.validation_failed || 0) + (drafts.ready_to_file || 0) +
+          (drafts.filing_in_progress || 0) + (drafts.filing_reconciliation || 0) +
+          (drafts.filing_failed || 0), 'files'),
         metric('Not downloadable', docs.not_downloadable || 0, 'file-warning'),
         metric('Plaintiff names needed', s.missingPlaintiffMappings, 'user-round-search', 'warning'),
         metric('Database', formatBytes(s.databaseBytes), 'database'),
@@ -3893,10 +3937,21 @@ const html = String.raw`<!doctype html>
       renderDraftDocuments(detail.documents || []);
       setDraftDirty(false);
       setDraftMobileMode(state.draftMobileMode);
+      const draftLocked = [
+        'filing_in_progress',
+        'filing_reconciliation',
+        'filing_prepared',
+        'filed_successfully',
+      ].includes(draft.status);
+      document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea')
+        .forEach(control => { control.disabled = draftLocked; });
+      document.getElementById('draftRejectBtn').disabled = draftLocked;
       document.getElementById('draftApproveBtn').disabled =
+        draftLocked ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
       document.getElementById('draftPrepareBtn').disabled =
         !['ready_to_file', 'filing_failed'].includes(draft.status) ||
+        !state.mifileConfig || !state.mifileConfig.ready ||
         draft.filingEligible === false ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
       renderIcons();
@@ -3905,9 +3960,27 @@ const html = String.raw`<!doctype html>
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
       const jobs = state.draftFilingJobs || [];
+      const config = state.mifileConfig || {
+        accountEnvironment: 'test',
+        accountLabel: 'MiFILE account',
+        preparationMode: 'unsubmitted_only',
+        ready: false,
+        issues: ['MiFILE account status is unavailable.'],
+      };
+      const accountTone = !config.ready
+        ? ' error'
+        : config.accountEnvironment === 'production' ? ' production' : '';
+      const accountStrip = '<div class="mifile-account-strip' + accountTone + '">' +
+        icon(!config.ready ? 'circle-alert' : config.accountEnvironment === 'production'
+          ? 'shield-check' : 'flask-conical') +
+        '<span><strong>' + escapeHtml(config.accountLabel) + '</strong> · ' +
+        'Unsubmitted only. Payment and court submission are disabled.' +
+        (!config.ready && config.issues && config.issues.length
+          ? '<br>' + escapeHtml(config.issues.join(' '))
+          : '') + '</span></div>';
       if (!jobs.length) {
         const eligibilityIssues = state.draftDetail.caseDraft.filingEligibilityIssues || [];
-        root.innerHTML = '<div class="draft-filing-job-panel">' +
+        root.innerHTML = accountStrip + '<div class="draft-filing-job-panel">' +
           '<div class="draft-filing-job-heading"><strong>MiFILE preparation</strong>' +
           statusPill(eligibilityIssues.length ? 'not_available' : 'not_started') + '</div>' +
           '<div class="draft-filing-job-meta">' + escapeHtml(
@@ -3920,7 +3993,7 @@ const html = String.raw`<!doctype html>
       }
       const job = jobs[0];
       const log = (job.executionLog || []).slice(-12).reverse();
-      root.innerHTML = '<div class="draft-filing-job-panel">' +
+      root.innerHTML = accountStrip + '<div class="draft-filing-job-panel">' +
         '<div class="draft-filing-job-heading"><strong>MiFILE attempt ' +
           escapeHtml(job.attemptNumber) + '</strong>' + statusPill(job.status) + '</div>' +
         '<div class="draft-filing-job-meta">' +
@@ -3933,6 +4006,14 @@ const html = String.raw`<!doctype html>
         '</div>' +
         (job.errorMessage ? '<div class="draft-filing-job-error">' +
           escapeHtml((job.errorCode ? job.errorCode + ': ' : '') + job.errorMessage) + '</div>' : '') +
+        (job.status === 'reconciliation_required' ?
+          '<div class="reconciliation-notice"><strong>Check MiFILE first.</strong> ' +
+          'Open History → Unsubmitted and look for this case. Do not retry until the result is confirmed.</div>' +
+          '<div class="draft-filing-job-actions">' +
+          '<button type="button" data-reconcile-filing-job="found">' +
+          icon('circle-check') + 'Bundle found</button>' +
+          '<button type="button" data-reconcile-filing-job="not_found">' +
+          icon('search-x') + 'No bundle found</button></div>' : '') +
         (job.status === 'failed' ? '<div class="draft-filing-job-actions">' +
           '<button type="button" data-retry-filing-job="' + escapeHtml(job.id) + '">' +
           icon('rotate-cw') + 'Retry preparation</button></div>' : '') +
@@ -3946,7 +4027,33 @@ const html = String.raw`<!doctype html>
           queueDraftFiling(true).catch(showDraftError);
         });
       });
+      root.querySelectorAll('[data-reconcile-filing-job]').forEach(button => {
+        button.addEventListener('click', () => {
+          reconcileFilingJob(job.id, button.dataset.reconcileFilingJob)
+            .catch(showDraftError);
+        });
+      });
       renderIcons();
+    }
+
+    async function reconcileFilingJob(jobId, resolution) {
+      const found = resolution === 'found';
+      const message = found
+        ? 'Confirm that you found this case in MiFILE History → Unsubmitted. The Draft will be marked Prepared.'
+        : 'Confirm that no matching case exists in MiFILE History → Unsubmitted. Retry will be enabled.';
+      if (!window.confirm(message)) return;
+      await api('/api/filing-jobs/' + encodeURIComponent(jobId) + '/reconcile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolution }),
+      });
+      state.draftDetail = await api('/api/drafts/' +
+        encodeURIComponent(state.selectedDraftId));
+      state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
+        encodeURIComponent(state.selectedDraftId));
+      renderDraftWorkspace();
+      await loadDrafts(true);
+      showToast(found ? 'Bundle confirmed as prepared.' : 'No bundle recorded. Retry is now available.');
     }
 
     async function refreshDraftFilingState() {
@@ -3969,8 +4076,14 @@ const html = String.raw`<!doctype html>
       const detail = state.draftDetail;
       if (!detail || !detail.caseDraft) return;
       if (state.draftDirty) await saveDraft(true);
+      if (!state.mifileConfig || !state.mifileConfig.ready) {
+        throw new Error((state.mifileConfig && state.mifileConfig.issues || [
+          'MiFILE account is not ready.',
+        ]).join(' '));
+      }
       if (!isRetry && !window.confirm(
-        'Prepare this case in MiFILE? The system will save an unsubmitted bundle. It will not pay or submit it to the court.',
+        'Prepare this case using ' + state.mifileConfig.accountLabel +
+        '? The system will save an unsubmitted bundle. It will not pay or submit it to the court.',
       )) return;
       const button = document.getElementById('draftPrepareBtn');
       setButtonBusy(button, true, 'Queueing');
@@ -4509,7 +4622,13 @@ const html = String.raw`<!doctype html>
       const canBePrimary = Boolean(
         activeDocument && activeDocument.documentRole === 'primary_source',
       );
-      primaryButton.disabled = !canBePrimary;
+      const draft = state.draftDetail && state.draftDetail.caseDraft;
+      const canModifyDocuments = Boolean(
+        draft && draft.filingEligible !== false &&
+        !['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
+          .includes(draft.status),
+      );
+      primaryButton.disabled = !canBePrimary || !canModifyDocuments;
       primaryButton.classList.toggle('is-primary', Boolean(activeDocument && activeDocument.isPrimary));
       primaryButton.innerHTML = icon('star') +
         (activeDocument && activeDocument.isPrimary
@@ -4521,17 +4640,13 @@ const html = String.raw`<!doctype html>
           : 'Use this Complaint as the primary data source')
         : 'Only Complaint documents can be primary';
       const canExtract = Boolean(
+        canModifyDocuments &&
         activeDocument &&
         activeDocument.isPrimary &&
         activeDocument.documentRole === 'primary_source' &&
         activeDocument.oneDriveUrl,
       );
       extractButton.disabled = !canExtract;
-      const draft = state.draftDetail && state.draftDetail.caseDraft;
-      const canModifyDocuments = Boolean(
-        draft && draft.filingEligible !== false &&
-        !['filing_in_progress', 'filing_prepared', 'filed_successfully'].includes(draft.status),
-      );
       addButton.disabled = !canModifyDocuments;
       replaceButton.disabled = !canModifyDocuments ||
         !activeDocument || !activeDocument.oneDriveUrl;
@@ -4562,7 +4677,14 @@ const html = String.raw`<!doctype html>
     function setDraftDirty(dirty) {
       state.draftDirty = !!dirty;
       document.getElementById('draftUnsavedBadge').classList.toggle('hidden', !dirty);
-      document.getElementById('draftSaveBtn').disabled = !dirty;
+      const draft = state.draftDetail && state.draftDetail.caseDraft;
+      const locked = draft && [
+        'filing_in_progress',
+        'filing_reconciliation',
+        'filing_prepared',
+        'filed_successfully',
+      ].includes(draft.status);
+      document.getElementById('draftSaveBtn').disabled = !dirty || Boolean(locked);
     }
 
     function collectDraftFields() {
@@ -5721,10 +5843,11 @@ const html = String.raw`<!doctype html>
         if (dateFrom) params.set('dateFrom', localDateBoundaryIso(dateFrom, false));
         if (dateTo) params.set('dateTo', localDateBoundaryIso(dateTo, true));
 
-        const [summary, queuePage, live] = await Promise.all([
+        const [summary, queuePage, live, mifileConfig] = await Promise.all([
           api('/api/summary'),
           api('/api/queue?' + params.toString()),
           api('/api/live-status'),
+          api('/api/mifile-config'),
         ]);
         state.summary = summary;
         state.queue = queuePage.items || [];
@@ -5735,6 +5858,7 @@ const html = String.raw`<!doctype html>
           totalPages: Number(queuePage.totalPages || 1),
         };
         state.live = live;
+        state.mifileConfig = mifileConfig;
         renderSummary();
         renderQueue();
         renderLiveStatus();
@@ -5932,7 +6056,16 @@ export function createAdminServer(
             const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
             if (req.method === 'GET' && url.pathname === '/healthz') {
-                sendJson(res, 200, { ok: true, buildId: ADMIN_BUILD_ID });
+                const mifileConfig = getMiFileRuntimeConfig();
+                sendJson(res, 200, {
+                    ok: true,
+                    buildId: ADMIN_BUILD_ID,
+                    mifile: {
+                        accountEnvironment: mifileConfig.accountEnvironment,
+                        preparationMode: mifileConfig.preparationMode,
+                        ready: mifileConfig.ready,
+                    },
+                });
                 return;
             }
 
@@ -5958,6 +6091,11 @@ export function createAdminServer(
 
             if (req.method === 'GET' && url.pathname === '/api/live-status') {
                 sendJson(res, 200, { ...syncStatus, dbPath: db.getPath() });
+                return;
+            }
+
+            if (req.method === 'GET' && url.pathname === '/api/mifile-config') {
+                sendJson(res, 200, getMiFileRuntimeConfig());
                 return;
             }
 
@@ -6000,6 +6138,7 @@ export function createAdminServer(
                     'needs_review',
                     'ready_to_file',
                     'filing_in_progress',
+                    'filing_reconciliation',
                     'filing_prepared',
                     'filed_successfully',
                     'filing_failed',
@@ -6051,6 +6190,31 @@ export function createAdminServer(
                     return;
                 }
                 sendJson(res, 200, job);
+                return;
+            }
+
+            const reconcileFilingJobMatch = url.pathname.match(
+                /^\/api\/filing-jobs\/([^/]+)\/reconcile$/,
+            );
+            if (req.method === 'POST' && reconcileFilingJobMatch) {
+                const body = await readRequestBody(req);
+                const parsed = body ? JSON.parse(body) : {};
+                if (!['found', 'not_found'].includes(parsed.resolution)) {
+                    sendJson(res, 400, {
+                        error: 'Resolution must be found or not_found',
+                    });
+                    return;
+                }
+                sendJson(res, 200, db.resolveFilingJobReconciliation({
+                    filingJobId: decodeURIComponent(reconcileFilingJobMatch[1]),
+                    resolution: parsed.resolution,
+                    externalBundleId: typeof parsed.externalBundleId === 'string'
+                        ? parsed.externalBundleId.trim() || null
+                        : null,
+                    temporaryCaseNumber: typeof parsed.temporaryCaseNumber === 'string'
+                        ? parsed.temporaryCaseNumber.trim() || null
+                        : null,
+                }));
                 return;
             }
 
@@ -6320,7 +6484,7 @@ export function createAdminServer(
                     });
                     return;
                 }
-                if (detail?.caseDraft && ['filing_in_progress', 'filing_prepared', 'filed_successfully'].includes(
+                if (detail?.caseDraft && ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
                     detail.caseDraft.status,
                 )) {
                     sendJson(res, 409, {
@@ -6393,7 +6557,7 @@ export function createAdminServer(
                     });
                     return;
                 }
-                if (['filing_in_progress', 'filing_prepared', 'filed_successfully'].includes(
+                if (['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
                     detail.caseDraft.status,
                 )) {
                     sendJson(res, 409, { error: 'This Draft cannot accept new documents' });

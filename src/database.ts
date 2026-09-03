@@ -24,6 +24,7 @@ export type CaseDraftStatus =
     | 'needs_review'
     | 'ready_to_file'
     | 'filing_in_progress'
+    | 'filing_reconciliation'
     | 'filing_prepared'
     | 'filed_successfully'
     | 'filing_failed'
@@ -35,6 +36,7 @@ export type FilingStatus =
     | 'not_started'
     | 'queued'
     | 'running'
+    | 'reconciliation_required'
     | 'prepared'
     | 'succeeded'
     | 'failed';
@@ -42,6 +44,7 @@ export type FilingJobMode = 'prepare' | 'submit';
 export type FilingJobStatus =
     | 'queued'
     | 'running'
+    | 'reconciliation_required'
     | 'prepared'
     | 'succeeded'
     | 'failed'
@@ -4066,7 +4069,9 @@ export class WorkflowDatabase {
                 GROUP BY c.id, e.id
                 ORDER BY
                     CASE
-                        WHEN c.status IN ('validation_failed', 'needs_review', 'filing_failed') THEN 0
+                        WHEN c.status IN (
+                            'validation_failed', 'needs_review', 'filing_reconciliation', 'filing_failed'
+                        ) THEN 0
                         WHEN c.status = 'parsed' THEN 1
                         WHEN c.status = 'ready_to_file' THEN 2
                         ELSE 3
@@ -4696,17 +4701,16 @@ export class WorkflowDatabase {
         triggerSource = 'admin',
         triggeredBy = 'admin',
     ): FilingJobView {
+        if (mode !== 'prepare') {
+            throw new Error(
+                'Final court submission is disabled. Only unsubmitted MiFILE preparation is available.',
+            );
+        }
         const detail = this.getDraftDetail(caseDraftId);
         if (!detail?.caseDraft) throw new Error('Case draft not found');
-        const allowedStatuses = mode === 'submit'
-            ? new Set(['filing_prepared'])
-            : new Set(['ready_to_file', 'filing_failed']);
+        const allowedStatuses = new Set(['ready_to_file', 'filing_failed']);
         if (!allowedStatuses.has(detail.caseDraft.status)) {
-            throw new Error(
-                mode === 'submit'
-                    ? 'The filing must be prepared in MiFILE before final submission'
-                    : 'Approve the Draft before preparing it in MiFILE',
-            );
+            throw new Error('Approve the Draft before preparing it in MiFILE');
         }
         const active = this.db
             .prepare(`
@@ -4724,29 +4728,13 @@ export class WorkflowDatabase {
                 FROM filing_jobs WHERE case_draft_id = ?
             `)
             .get(caseDraftId) as { attempt: number };
-        const previousPrepared = mode === 'submit'
-            ? this.db.prepare(`
-                SELECT external_bundle_id, temporary_case_number
-                FROM filing_jobs
-                WHERE case_draft_id = ? AND status = 'prepared'
-                ORDER BY attempt_number DESC LIMIT 1
-            `).get(caseDraftId) as
-                | { external_bundle_id: string | null; temporary_case_number: string | null }
-                | undefined
-            : undefined;
-        if (mode === 'submit' && !previousPrepared?.external_bundle_id) {
-            throw new Error('Prepared MiFILE bundle reference is missing');
-        }
-
         const id = randomUUID();
         const timestamp = nowIso();
         const initialLog: FilingJobLogEntry[] = [{
             at: timestamp,
             level: 'info',
             checkpoint: 'queued',
-            message: mode === 'prepare'
-                ? 'MiFILE preparation queued from Draft Editor.'
-                : 'Final MiFILE submission queued from Draft Editor.',
+            message: 'Unsubmitted MiFILE preparation queued from Draft Editor.',
         }];
         this.runInTransaction(() => {
             this.db.prepare(`
@@ -4765,8 +4753,8 @@ export class WorkflowDatabase {
                 triggerSource,
                 toJson(payload),
                 toJson(initialLog),
-                previousPrepared?.external_bundle_id ?? null,
-                previousPrepared?.temporary_case_number ?? null,
+                null,
+                null,
                 triggeredBy,
                 timestamp,
                 timestamp,
@@ -4790,42 +4778,71 @@ export class WorkflowDatabase {
 
     recoverInterruptedFilingJobs(): number {
         const rows = this.db.prepare(`
-            SELECT id, case_draft_id, execution_log
+            SELECT id, case_draft_id, checkpoint, execution_log
             FROM filing_jobs
             WHERE status = 'running'
         `).all() as Array<{
             id: string;
             case_draft_id: string;
+            checkpoint: string | null;
             execution_log: string | null;
         }>;
         if (!rows.length) return 0;
         const timestamp = nowIso();
         this.runInTransaction(() => {
             for (const row of rows) {
+                const outcomeUnknown = ['save_progress', 'saved_unsubmitted'].includes(
+                    row.checkpoint || '',
+                );
+                const jobStatus: FilingJobStatus = outcomeUnknown
+                    ? 'reconciliation_required'
+                    : 'failed';
+                const draftStatus: CaseDraftStatus = outcomeUnknown
+                    ? 'filing_reconciliation'
+                    : 'filing_failed';
+                const filingStatus: FilingStatus = outcomeUnknown
+                    ? 'reconciliation_required'
+                    : 'failed';
+                const errorCode = outcomeUnknown
+                    ? 'UNSUBMITTED_OUTCOME_UNKNOWN'
+                    : 'PROCESS_INTERRUPTED';
+                const errorMessage = outcomeUnknown
+                    ? 'The service restarted while MiFILE was saving. Check History > Unsubmitted before taking another action.'
+                    : 'The service restarted during MiFILE preparation.';
                 const parsed = this.safeJson(row.execution_log);
                 const log = Array.isArray(parsed) ? parsed.slice(-999) : [];
                 log.push({
                     at: timestamp,
-                    level: 'error',
-                    checkpoint: 'process_interrupted',
-                    message: 'The service restarted while this MiFILE attempt was running. Retry it from the Draft.',
-                    details: { code: 'PROCESS_INTERRUPTED' },
+                    level: outcomeUnknown ? 'warning' : 'error',
+                    checkpoint: outcomeUnknown ? 'reconciliation_required' : 'process_interrupted',
+                    message: errorMessage,
+                    details: { code: errorCode },
                 } satisfies FilingJobLogEntry);
                 this.db.prepare(`
                     UPDATE filing_jobs
-                    SET status = 'failed', checkpoint = 'process_interrupted',
-                        finished_at = ?, error_code = 'PROCESS_INTERRUPTED',
-                        error_message = 'The service restarted during MiFILE preparation.',
+                    SET status = ?, checkpoint = ?,
+                        finished_at = ?, error_code = ?, error_message = ?,
                         execution_log = ?, updated_at = ?
                     WHERE id = ?
-                `).run(timestamp, toJson(log), timestamp, row.id);
+                `).run(
+                    jobStatus,
+                    outcomeUnknown ? 'reconciliation_required' : 'process_interrupted',
+                    timestamp,
+                    errorCode,
+                    errorMessage,
+                    toJson(log),
+                    timestamp,
+                    row.id,
+                );
                 this.db.prepare(`
                     UPDATE case_drafts
-                    SET status = 'filing_failed', filing_status = 'failed', updated_at = ?
+                    SET status = ?, filing_status = ?, updated_at = ?
                     WHERE id = ?
-                `).run(timestamp, row.case_draft_id);
+                `).run(draftStatus, filingStatus, timestamp, row.case_draft_id);
                 this.insertAuditLog('filing_job', row.id, 'filing_job_interrupted', {
                     caseDraftId: row.case_draft_id,
+                    outcomeUnknown,
+                    errorCode,
                 });
             }
         });
@@ -4913,7 +4930,7 @@ export class WorkflowDatabase {
 
     completeFilingJob(input: {
         filingJobId: string;
-        status: 'prepared' | 'succeeded' | 'failed';
+        status: 'reconciliation_required' | 'prepared' | 'succeeded' | 'failed';
         checkpoint: string;
         errorCode?: string | null;
         errorMessage?: string | null;
@@ -4931,7 +4948,12 @@ export class WorkflowDatabase {
             ? { status: 'filing_prepared', filingStatus: 'prepared' }
             : input.status === 'succeeded'
                 ? { status: 'filed_successfully', filingStatus: 'succeeded' }
-                : { status: 'filing_failed', filingStatus: 'failed' };
+                : input.status === 'reconciliation_required'
+                    ? {
+                        status: 'filing_reconciliation',
+                        filingStatus: 'reconciliation_required',
+                    }
+                    : { status: 'filing_failed', filingStatus: 'failed' };
         this.runInTransaction(() => {
             this.db.prepare(`
                 UPDATE filing_jobs
@@ -4978,6 +5000,39 @@ export class WorkflowDatabase {
         return completed;
     }
 
+    resolveFilingJobReconciliation(input: {
+        filingJobId: string;
+        resolution: 'found' | 'not_found';
+        externalBundleId?: string | null;
+        temporaryCaseNumber?: string | null;
+    }): FilingJobView {
+        const existing = this.getFilingJob(input.filingJobId);
+        if (!existing) throw new Error('MiFILE job not found');
+        if (existing.status !== 'reconciliation_required') {
+            throw new Error('This MiFILE job does not require reconciliation');
+        }
+        this.appendFilingJobLog(input.filingJobId, {
+            level: 'info',
+            checkpoint: 'manually_reconciled',
+            message: input.resolution === 'found'
+                ? 'User confirmed that the bundle exists in MiFILE History > Unsubmitted.'
+                : 'User confirmed that no matching bundle exists in MiFILE History > Unsubmitted.',
+            details: { resolution: input.resolution },
+        });
+        return this.completeFilingJob({
+            filingJobId: input.filingJobId,
+            status: input.resolution === 'found' ? 'prepared' : 'failed',
+            checkpoint: 'manually_reconciled',
+            errorCode: input.resolution === 'found' ? null : 'RECONCILED_NOT_CREATED',
+            errorMessage: input.resolution === 'found'
+                ? null
+                : 'No matching unsubmitted MiFILE bundle was found. Preparation may now be retried.',
+            externalBundleId: input.externalBundleId ?? null,
+            temporaryCaseNumber: input.temporaryCaseNumber ?? null,
+            result: { reconciliationResolution: input.resolution },
+        });
+    }
+
     updateCaseDraft(
         caseDraftId: string,
         fields: Record<string, unknown>,
@@ -5011,6 +5066,12 @@ export class WorkflowDatabase {
             }
             | undefined;
         if (!existing) throw new Error('Case draft not found');
+        if (['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
+            .includes(existing.status)) {
+            throw new Error(
+                'This Draft is locked because MiFILE preparation has started. Resolve the filing state before editing it.',
+            );
+        }
         if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
             throw new Error('Draft fields must be an object');
         }
@@ -5131,6 +5192,8 @@ export class WorkflowDatabase {
                 : 'passed';
         const protectedStatuses = new Set<CaseDraftStatus>([
             'filing_in_progress',
+            'filing_reconciliation',
+            'filing_prepared',
             'filed_successfully',
             'archived',
         ]);
@@ -5552,6 +5615,7 @@ export class WorkflowDatabase {
 
         const protectedStatuses = new Set<CaseDraftStatus>([
             'filing_in_progress',
+            'filing_reconciliation',
             'filing_prepared',
             'filed_successfully',
             'archived',
@@ -5619,7 +5683,7 @@ export class WorkflowDatabase {
     refreshCaseDraftValidation(caseDraftId: string): EmailDetail {
         const detail = this.getDraftDetail(caseDraftId);
         if (!detail?.caseDraft) throw new Error('Case draft not found');
-        if (['filing_in_progress', 'filing_prepared', 'filed_successfully', 'archived'].includes(
+        if (['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived'].includes(
             detail.caseDraft.status,
         )) {
             return detail;
@@ -5834,6 +5898,14 @@ export class WorkflowDatabase {
 
         if (!existing) {
             throw new Error('Case draft not found');
+        }
+
+        if (
+            action !== 'save_note' &&
+            ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
+                .includes(existing.status)
+        ) {
+            throw new Error('Resolve or complete the current MiFILE preparation before changing review status');
         }
 
         const timestamp = nowIso();

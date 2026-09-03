@@ -10,6 +10,7 @@ import {
 } from './database';
 import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClient';
 import { validatePdfBuffer } from './pdfValidation';
+import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 
 const MIFILE_LOGIN_URL =
     'https://mifile.courts.michigan.gov/login?returnurl=%2Ffile';
@@ -163,13 +164,20 @@ export class MiFileFilingRunner {
                 'starting',
             );
         }
-        if (!process.env.MIFILE_USER || !process.env.MIFILE_PASSWORD) {
+        const runtimeConfig = getMiFileRuntimeConfig();
+        if (!runtimeConfig.ready) {
             throw new MiFileFilingError(
-                'MIFILE_USER and MIFILE_PASSWORD are required.',
-                'MISSING_CREDENTIALS',
+                runtimeConfig.issues.join(' '),
+                'MIFILE_ACCOUNT_NOT_READY',
                 'login',
             );
         }
+        await this.log(
+            'info',
+            'account_preflight',
+            `${runtimeConfig.accountLabel} verified for unsubmitted-only preparation.`,
+            { accountEnvironment: runtimeConfig.accountEnvironment },
+        );
 
         const jobDirectory = path.join(this.debugRoot, safePathToken(job.id));
         const documentDirectory = path.join(jobDirectory, 'documents');
@@ -199,6 +207,11 @@ export class MiFileFilingRunner {
             lastCheckpoint = 'document_upload';
             await this.uploadDocuments(page, documents);
             lastCheckpoint = 'save_progress';
+            await this.log(
+                'info',
+                'save_progress',
+                'Saving the bundle to MiFILE History > Unsubmitted.',
+            );
             await this.saveProgress(page);
 
             const screenshotPath = path.join(jobDirectory, 'prepared.png');

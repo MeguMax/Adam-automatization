@@ -63,8 +63,12 @@ services:
         value: /var/data/mifile_filing_debug
       - key: MIFILE_FILER_NAME
         value: Devlin, Adam
-      - key: MIFILE_FINAL_SUBMISSION_ENABLED
-        value: "false"
+      - key: MIFILE_ACCOUNT_ENVIRONMENT
+        sync: false
+      - key: MIFILE_ACCOUNT_LABEL
+        sync: false
+      - key: MIFILE_PRODUCTION_ACCOUNT_CONFIRMED
+        sync: false
       - key: TENANT_ID
         sync: false
       - key: CLIENT_ID

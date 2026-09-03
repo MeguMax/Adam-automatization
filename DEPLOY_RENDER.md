@@ -31,6 +31,8 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
    Required secrets: `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `USER_EMAIL`, `NOTIFY_TO_EMAIL`, `SENDER_USER_ID`, `ONEDRIVE_ROOT_SHARE_URL`, `MIFILE_USER`, `MIFILE_PASSWORD`, `TWO_CAPTCHA_API_KEY`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD`. `TRUECERTIFY_HEADLESS=true` and `TRUECERTIFY_DEBUG_DIR=/var/data/captcha_debug` are configured by the Blueprint.
 
+   MiFILE preparation is hard-limited to **History -> Unsubmitted**. There is no payment or final court-submission action in the worker.
+
 5. Leave `WORKER_ENABLED=false` for the first deploy. Open `https://<service>.onrender.com/`, authenticate with `ADMIN_USERNAME` and `ADMIN_PASSWORD`, and verify `https://<service>.onrender.com/healthz` returns `{"ok":true}`.
 
 6. While the worker is disabled, the admin synchronizes 100 recent inbox messages per background pass. Use **Sync 1000** once when a larger metadata backfill is needed; this does not download historical court files again.
@@ -69,6 +71,26 @@ The new Render database is persistent from its first deploy onward. Transfer the
    OneDrive file name selected: ...
    ```
 
+## Switch the MiFILE Account
+
+The application defaults to `MIFILE_ACCOUNT_ENVIRONMENT=test`. These account-control values use `sync: false` in the Blueprint so a later Blueprint sync cannot overwrite the selection made in Render. The Draft Editor shows the active account class and always states that preparation is unsubmitted-only.
+
+1. Ask the client to confirm the exact production MiFILE username, that it has access to the required courts, and that `Devlin, Adam` is available as the filer.
+2. In Render Environment, replace `MIFILE_USER` and `MIFILE_PASSWORD` with the production-account credentials.
+3. Set these values:
+
+   ```text
+   MIFILE_ACCOUNT_ENVIRONMENT=production
+   MIFILE_ACCOUNT_LABEL=Production MiFILE account
+   MIFILE_PRODUCTION_ACCOUNT_CONFIRMED=true
+   ```
+
+4. Optionally set `MIFILE_EXPECTED_ACCOUNT_EMAIL` to the exact production username. The preparation worker will refuse to run when it does not match `MIFILE_USER`.
+5. Deploy, open a Draft, and verify that the green account strip says **Production MiFILE account** and **Unsubmitted only**.
+6. Use one approved first-hearing nonpayment package for the first production-account test. Confirm the resulting bundle manually under **History -> Unsubmitted**. Do not submit or pay.
+
+If the service restarts while **Save Progress** is completing, the Draft becomes **Reconciliation required**. Check MiFILE History -> Unsubmitted first, then choose **Bundle found** or **No bundle found** in the Draft Editor. This prevents an automatic retry from creating a duplicate bundle.
+
 ## Notes
 
 - Render provides `PORT`; the admin binds to it automatically on `0.0.0.0`.
@@ -76,5 +98,6 @@ The new Render database is persistent from its first deploy onward. Transfer the
 - `DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS=3` keeps a bad file from monopolizing the worker. Failed documents are retried later up to `DOCUMENT_AUTO_RETRY_LIMIT`, two due retry jobs per poll.
 - Document retries use the URL and parsed case data already stored in SQLite. They do not require the original Outlook message unless the source is a PDF email attachment. If Outlook changed the message ID after moving the email, the worker recovers it by subject, sender, and received time.
 - MiFILE authentication is verified by its identity cookie and cached for ten minutes. A response redirected to the login page invalidates and refreshes that session before the download is marked failed.
+- The filing worker only prepares bundles in History -> Unsubmitted. Final payment and court submission are not implemented or enabled.
 - Queue history is paginated from SQLite and is not capped at the newest 100 or 200 records. Period cleanup deletes database records and tombstones their mailbox IDs; it never deletes OneDrive files.
 - Do not copy a live SQLite file over the running Render database. This deployment starts with a clean operational database, restores Plaintiff mappings from the seed, and rebuilds recent inbox state from Microsoft 365. A full historical SQLite migration should be handled separately if old audit history is required.

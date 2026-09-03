@@ -5,6 +5,7 @@ import { createAdminServer } from './adminServer';
 import { getWorkflowDatabase, PlaintiffMappingSeed } from './database';
 import { runWorker } from './index';
 import { runFilingWorker } from './filingWorker';
+import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 
 function isWorkerEnabled(): boolean {
     const value = (process.env.WORKER_ENABLED ?? 'true').trim().toLowerCase();
@@ -84,6 +85,14 @@ async function main(): Promise<void> {
     if (!filingWorkerEnabled) {
         console.log('MiFILE filing worker is disabled.');
     } else {
+        const mifileConfig = getMiFileRuntimeConfig();
+        console.log('MiFILE preparation runtime:', {
+            accountEnvironment: mifileConfig.accountEnvironment,
+            accountLabel: mifileConfig.accountLabel,
+            preparationMode: mifileConfig.preparationMode,
+            ready: mifileConfig.ready,
+            issues: mifileConfig.issues,
+        });
         filingWorkerPromise.catch(error => {
             console.error('MiFILE filing worker stopped unexpectedly:', error);
             void shutdown('MiFILE filing worker failure', 1);

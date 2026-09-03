@@ -65,21 +65,33 @@ export async function runFilingWorker(options: {
                     'MIFILE_AUTOMATION_FAILED',
                     'unknown',
                 );
+            const outcomeUnknown = ['save_progress', 'saved_unsubmitted'].includes(
+                filingError.checkpoint,
+            );
+            const errorCode = outcomeUnknown
+                ? 'UNSUBMITTED_OUTCOME_UNKNOWN'
+                : filingError.code;
+            const errorMessage = outcomeUnknown
+                ? `${filingError.message} Check MiFILE History > Unsubmitted before retrying.`
+                : filingError.message;
             db.appendFilingJobLog(job.id, {
-                level: 'error',
-                checkpoint: filingError.checkpoint,
-                message: filingError.message,
-                details: { code: filingError.code },
+                level: outcomeUnknown ? 'warning' : 'error',
+                checkpoint: outcomeUnknown ? 'reconciliation_required' : filingError.checkpoint,
+                message: errorMessage,
+                details: { code: errorCode },
             });
             db.completeFilingJob({
                 filingJobId: job.id,
-                status: 'failed',
-                checkpoint: filingError.checkpoint,
-                errorCode: filingError.code,
-                errorMessage: filingError.message,
+                status: outcomeUnknown ? 'reconciliation_required' : 'failed',
+                checkpoint: outcomeUnknown ? 'reconciliation_required' : filingError.checkpoint,
+                errorCode,
+                errorMessage,
                 debugArtifactPath: filingError.debugArtifactPath,
             });
-            console.error(`MiFILE job ${job.id} failed at ${filingError.checkpoint}:`, filingError.message);
+            console.error(
+                `MiFILE job ${job.id} ${outcomeUnknown ? 'needs reconciliation' : 'failed'} at ${filingError.checkpoint}:`,
+                errorMessage,
+            );
         }
     }
     console.log('MiFILE filing worker stopped.');
