@@ -6,7 +6,7 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
 - Use the Render Professional tier. In `render.yaml`, its valid Blueprint value is `pro`. SQLite requires the persistent disk and must run in one service instance.
 - Keep exactly one active worker. Disable the old Render worker before enabling the new one.
-- The public admin uses HTTP Basic Auth. Choose a long `ADMIN_PASSWORD` without a colon (`:`).
+- The public admin uses a login page at `/login` with `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Choose a long unique password. Browser sessions use HttpOnly, Secure, SameSite cookies and expire after 12 hours or a service restart. Changing the credentials invalidates existing sessions. Explicit Basic Auth headers remain supported for API clients, but the server no longer opens a browser authentication popup.
 
 ## First Deployment
 
@@ -98,7 +98,7 @@ If the service restarts while **Save Progress** is completing, the Draft becomes
 ## Notes
 
 - Render provides `PORT`; the admin binds to it automatically on `0.0.0.0`.
-- `/healthz` is public only for Render health checks. The dashboard and all `/api/*` endpoints require admin credentials.
+- `/healthz` is public for Render health checks. `/login` and the sign-in endpoint are public; the dashboard and all `/api/*` endpoints require admin authentication. Sign-in attempts are rate-limited, and cookie-authenticated changes require a same-origin request. Use the Sign out button to end a session.
 - `DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS=3` keeps a bad file from monopolizing the worker. Failed documents are retried later up to `DOCUMENT_AUTO_RETRY_LIMIT`, two due retry jobs per poll.
 - Document retries use the URL and parsed case data already stored in SQLite. They do not require the original Outlook message unless the source is a PDF email attachment. If Outlook changed the message ID after moving the email, the worker recovers it by subject, sender, and received time.
 - MiFILE authentication is verified by its identity cookie and cached for ten minutes. A response redirected to the login page invalidates and refreshes that session before the download is marked failed.

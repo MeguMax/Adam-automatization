@@ -1,7 +1,8 @@
 import http from 'http';
 import fs from 'fs';
 import { URL } from 'url';
-import { randomUUID, timingSafeEqual } from 'crypto';
+import { randomUUID } from 'crypto';
+import { createAdminAuth, hasAdminCredentials } from './adminAuth';
 import {
     CaseDraftStatus,
     EmailProcessingStatus,
@@ -39,7 +40,7 @@ import { invalidateMifileSession, testMiFileCredentials } from './mifileSession'
 import { pdfPreviewHtml } from './pdfPreview';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-09-09-email-intake-account-settings-v21';
+const ADMIN_BUILD_ID = '2026-09-09-admin-login-v22';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -93,49 +94,6 @@ function sendJavascript(res: http.ServerResponse, script: Buffer): void {
         'Cache-Control': 'public, max-age=604800, immutable',
     });
     res.end(script);
-}
-
-function constantTimeEquals(left: string, right: string): boolean {
-    const leftBuffer = Buffer.from(left);
-    const rightBuffer = Buffer.from(right);
-    return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function hasAdminCredentials(): boolean {
-    return !!process.env.ADMIN_USERNAME && !!process.env.ADMIN_PASSWORD;
-}
-
-function isAdminRequestAuthorized(req: http.IncomingMessage): boolean {
-    if (!hasAdminCredentials()) {
-        return process.env.NODE_ENV !== 'production';
-    }
-
-    const header = req.headers.authorization;
-    if (!header?.startsWith('Basic ')) return false;
-
-    try {
-        const decoded = Buffer.from(header.slice('Basic '.length), 'base64').toString('utf8');
-        const separator = decoded.indexOf(':');
-        if (separator < 0) return false;
-
-        return (
-            constantTimeEquals(decoded.slice(0, separator), process.env.ADMIN_USERNAME!) &&
-            constantTimeEquals(decoded.slice(separator + 1), process.env.ADMIN_PASSWORD!)
-        );
-    } catch {
-        return false;
-    }
-}
-
-function sendUnauthorized(res: http.ServerResponse): void {
-    const body = 'Authentication required';
-    res.writeHead(401, {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Content-Length': Buffer.byteLength(body),
-        'WWW-Authenticate': 'Basic realm="Legal Workflow Admin", charset="UTF-8"',
-        'Cache-Control': 'no-store',
-    });
-    res.end(body);
 }
 
 function readRequestBody(req: http.IncomingMessage): Promise<string> {
@@ -3039,6 +2997,7 @@ const html = String.raw`<!doctype html>
       </select>
       <button id="syncBtn" type="button"><i data-lucide="mail-check"></i>Sync inbox</button>
       <button id="refreshBtn" class="primary icon-button" type="button" title="Refresh data" aria-label="Refresh data"><i data-lucide="refresh-cw"></i></button>
+      <button id="signOutBtn" class="icon-button" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
     </div>
   </header>
   <main>
@@ -3536,6 +3495,10 @@ const html = String.raw`<!doctype html>
 
     async function api(path, options) {
       const res = await fetch(path, options);
+      if (res.status === 401) {
+        window.location.replace('/login');
+        throw new Error('Please sign in again.');
+      }
       const text = await res.text();
       let payload = null;
       try {
@@ -6118,6 +6081,14 @@ const html = String.raw`<!doctype html>
 
     renderIcons();
     loadData().catch(showQueueError);
+    document.getElementById('signOutBtn').addEventListener('click', async () => {
+      if (state.draftDirty && !confirm('Discard unsaved changes and sign out?')) return;
+      try {
+        await api('/auth/logout', { method: 'POST' });
+        state.draftDirty = false;
+        window.location.replace('/login');
+      } catch (error) { alert(error.message); }
+    });
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         loadData(true).catch(showQueueError);
@@ -6185,6 +6156,7 @@ export function createAdminServer(
     };
 
     let accountTestRunning = false;
+    const authorize = createAdminAuth();
     const server = http.createServer(async (req, res) => {
         try {
             const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -6203,10 +6175,7 @@ export function createAdminServer(
                 return;
             }
 
-            if (!isAdminRequestAuthorized(req)) {
-                sendUnauthorized(res);
-                return;
-            }
+            if (!await authorize(req, res, url.pathname)) return;
 
             if (req.method === 'GET' && url.pathname === '/assets/lucide.js') {
                 sendJavascript(res, LUCIDE_BROWSER_SCRIPT);

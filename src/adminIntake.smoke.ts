@@ -51,7 +51,7 @@ async function main() {
     const port = (server.address() as { port: number }).port;
     const url = `http://127.0.0.1:${port}`;
     const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({ httpCredentials: { username: 'qa', password: 'qa-admin-only' } });
+    const context = await browser.newContext();
     await context.route('**/*', route => {
         if (route.request().url().startsWith(url)) return route.continue();
         return route.abort();
@@ -62,6 +62,21 @@ async function main() {
     try {
         await page.setViewportSize({ width: 1440, height: 1000 });
         await page.goto(url);
+        await page.locator('#loginForm').waitFor();
+        assert.ok(page.url().endsWith('/login'));
+        await page.locator('#username').fill('qa');
+        await page.locator('#password').fill('wrong-password');
+        await page.locator('#signIn').click();
+        await page.waitForFunction(() => document.getElementById('error')?.textContent === 'Incorrect username or password.');
+        assert.equal(await page.locator('#username').inputValue(), 'qa');
+        await page.screenshot({ path: path.join(screenshots, 'login-desktop.png'), fullPage: true });
+        await page.setViewportSize({ width: 390, height: 844 });
+        await page.screenshot({ path: path.join(screenshots, 'login-mobile.png'), fullPage: true });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+        await page.locator('#password').fill('qa-admin-only');
+        await page.locator('#signIn').click();
+        await page.waitForURL(url + '/');
+        await page.setViewportSize({ width: 1440, height: 1000 });
         await page.locator('#settingsTab').click();
         await page.waitForFunction(() => document.getElementById('intakeMailbox')?.textContent === 'intake@example.com');
         await page.locator('#miFileAccountEmail').fill('primary@example.com');
@@ -125,7 +140,12 @@ async function main() {
         assert.ok(linkBox && viewerBox && linkBox.y + linkBox.height <= viewerBox.y + 1);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), true);
         assert.deepEqual(errors, []);
-        console.log('Admin smoke passed: account save, secret redaction, cross-origin rejection, empty Draft upload, PDF preview, desktop and mobile layouts.');
+        await page.locator('#signOutBtn').click();
+        await page.waitForURL(url + '/login');
+        assert.equal((await context.request.get(`${url}/api/settings`)).status(), 401);
+        await page.goto(url);
+        await page.locator('#loginForm').waitFor();
+        console.log('Admin smoke passed: form login, invalid password, logout, account save, secret redaction, cross-origin rejection, empty Draft upload, PDF preview, desktop and mobile layouts.');
         console.log(`Screenshots: ${screenshots}`);
     } finally {
         await browser.close();
