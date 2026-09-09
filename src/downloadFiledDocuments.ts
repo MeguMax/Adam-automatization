@@ -10,10 +10,12 @@ import {
     uploadFileBufferToFolder,
     createFileLink,
     itemExistsInFolder,
+    ensureIntakeFolder,
 } from './oneDriveClient';
 import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
 import { validatePdfBuffer } from './pdfValidation';
 import { isEmailAttachmentSource } from './emailAttachmentSource';
+import { downloadIntakeDocuments } from './filingIntakeDownload';
 
 // === ТИПЫ ДЛЯ РЕЗУЛЬТАТОВ ===
 
@@ -459,6 +461,20 @@ export async function downloadFiledDocuments(
     receivedAtIso?: string,
     options: DownloadFiledDocumentsOptions = {},
 ): Promise<DownloadResult> {
+    if (parsed.sourceKind === 'new_filing_intake') {
+        return downloadIntakeDocuments(parsed, {
+            download: async document => {
+                if (!options.resolveDocumentBuffer) throw new Error('The source email attachment is unavailable');
+                return options.resolveDocumentBuffer(document);
+            },
+            upload: async (storageKey, fileName, buffer) => {
+                const folder = await ensureIntakeFolder(storageKey);
+                const uploaded = await uploadFileBufferToFolder(folder.driveId, folder.itemId, fileName, buffer);
+                return { ...uploaded, webUrl: await createFileLink(uploaded.driveId, uploaded.itemId) };
+            },
+            wait: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        });
+    }
     if (!parsed.isMiFile) return { downloaded: [], notificationFiles: [], failures: [] };
     if (!parsed.filedDocuments.length) {
         return {

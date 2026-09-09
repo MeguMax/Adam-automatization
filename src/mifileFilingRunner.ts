@@ -11,6 +11,7 @@ import {
 import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClient';
 import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
+import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
 
 const MIFILE_LOGIN_URL =
     'https://mifile.courts.michigan.gov/login?returnurl=%2Ffile';
@@ -165,6 +166,7 @@ export class MiFileFilingRunner {
             );
         }
         const runtimeConfig = getMiFileRuntimeConfig();
+        const credentials = getMiFileCredentials();
         if (!runtimeConfig.ready) {
             throw new MiFileFilingError(
                 runtimeConfig.issues.join(' '),
@@ -199,7 +201,7 @@ export class MiFileFilingRunner {
             page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
             page.setDefaultTimeout(this.timeoutMs);
             lastCheckpoint = 'login';
-            await this.login(page);
+            await this.login(page, credentials);
             lastCheckpoint = 'select_filing';
             await this.openNewLtCase(page, job.payload);
             lastCheckpoint = 'case_form';
@@ -234,6 +236,12 @@ export class MiFileFilingRunner {
             );
             return result;
         } catch (error) {
+            if (lastCheckpoint === 'login') {
+                throw new MiFileFilingError(
+                    'MiFILE sign-in failed or timed out. Check the account and any verification requirements.',
+                    'LOGIN_FAILED', 'login',
+                );
+            }
             if (page) {
                 failureScreenshot = path.join(jobDirectory, `failed-${safePathToken(lastCheckpoint)}.png`);
                 await page.screenshot({ path: failureScreenshot, fullPage: true }).catch(() => {});
@@ -299,13 +307,13 @@ export class MiFileFilingRunner {
         return materialized;
     }
 
-    private async login(page: Page): Promise<void> {
+    private async login(page: Page, credentials: MiFileCredentials): Promise<void> {
         await page.goto(MIFILE_LOGIN_URL, {
             waitUntil: 'domcontentloaded',
             timeout: this.timeoutMs,
         });
-        await page.locator('#Email').fill(process.env.MIFILE_USER!);
-        await page.locator('#Password').fill(process.env.MIFILE_PASSWORD!);
+        await page.locator('#Email').fill(credentials.username);
+        await page.locator('#Password').fill(credentials.password);
         await page.locator('button.login-button').click({ noWaitAfter: true });
         await page.waitForURL(url => !url.pathname.toLowerCase().includes('/login'), {
             timeout: this.timeoutMs,
@@ -348,11 +356,8 @@ export class MiFileFilingRunner {
         await courtOption.click();
         await page.selectOption('#actionSelect', { label: 'Initiate a new case' });
         await page.locator('#filer-input-empty').click();
-        const configuredFiler = process.env.MIFILE_FILER_NAME?.trim() || 'Devlin, Adam';
-        let filer = await firstVisible(page.getByText(configuredFiler, { exact: true }));
-        if (!filer) {
-            filer = await firstVisible(page.locator('.case-row').filter({ hasText: 'Attorney' }));
-        }
+        const configuredFiler = 'Devlin, Adam';
+        const filer = await firstVisible(page.getByText(configuredFiler, { exact: true }));
         if (!filer) {
             throw new MiFileFilingError(
                 `MiFILE filer is unavailable: ${configuredFiler}`,

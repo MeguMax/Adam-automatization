@@ -536,6 +536,7 @@ export interface EmailDetail {
         processingError: string | null;
         processingAttempts: number;
         lastAttemptAt: string | null;
+        nextRetryAt: string | null;
         processedAt: string | null;
         createdAt: string;
         updatedAt: string;
@@ -757,6 +758,7 @@ function inferCourtDistrict(courtName: unknown): string | null {
 function inferCaseType(data: Record<string, unknown>): string | null {
     const explicit = editableDraftValue(data.caseType);
     if (explicit) return explicit;
+    if (data.sourceKind === 'new_filing_intake') return 'LT - Landlord-Tenant Summary Proceedings';
     const caseNumber = editableDraftValue(
         data.newCaseNumber ?? data.caseNumber ?? data.temporaryCaseNumber,
     );
@@ -2307,6 +2309,25 @@ const migrations: Migration[] = [
             `).run(timestamp);
         },
     },
+    {
+        version: 20,
+        name: 'runtime_account_settings',
+        up: db => db.exec(`
+            CREATE TABLE runtime_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+        `),
+    },
+    {
+        version: 21,
+        name: 'email_discovery_retry_schedule',
+        up: db => db.exec(`
+            ALTER TABLE email_records ADD COLUMN next_retry_at TEXT;
+            CREATE INDEX idx_email_discovery_retry ON email_records(processing_status, next_retry_at);
+        `),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2324,6 +2345,24 @@ export class WorkflowDatabase {
 
     getPath(): string {
         return this.databasePath;
+    }
+
+    getRuntimeSetting(key: string): string | null {
+        return (this.db.prepare('SELECT value_json FROM runtime_settings WHERE key = ?')
+            .get(key) as { value_json: string } | undefined)?.value_json || null;
+    }
+
+    saveMiFileAccountSetting(value: string): void {
+        if (this.hasActiveFilingJobs()) throw new Error('Wait for queued and running MiFILE jobs to finish before switching accounts.');
+        this.db.prepare(`
+            INSERT INTO runtime_settings (key, value_json, updated_at) VALUES ('mifile_account', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+        `).run(value, nowIso());
+        this.insertAuditLog('settings', 'mifile_account', 'mifile_account_updated');
+    }
+
+    hasActiveFilingJobs(): boolean {
+        return Boolean(this.db.prepare("SELECT 1 FROM filing_jobs WHERE status IN ('queued', 'running') LIMIT 1").get());
     }
 
     close(): void {
@@ -2368,8 +2407,10 @@ export class WorkflowDatabase {
         if (this.isEmailDeleted(externalMessageId)) return true;
 
         const row = this.db
-            .prepare('SELECT processing_status FROM email_records WHERE external_message_id = ?')
-            .get(externalMessageId) as { processing_status: EmailProcessingStatus } | undefined;
+            .prepare('SELECT processing_status, next_retry_at FROM email_records WHERE external_message_id = ?')
+            .get(externalMessageId) as { processing_status: EmailProcessingStatus; next_retry_at: string | null } | undefined;
+
+        if (row?.processing_status === 'failed' && row.next_retry_at) return row.next_retry_at > nowIso();
 
         return row ? TERMINAL_EMAIL_STATUSES.has(row.processing_status) : false;
     }
@@ -2475,6 +2516,7 @@ export class WorkflowDatabase {
                     processing_attempts = processing_attempts + 1,
                     last_attempt_at = ?,
                     processing_error = NULL,
+                    next_retry_at = NULL,
                     updated_at = ?
                 WHERE id = ?
             `)
@@ -2533,6 +2575,19 @@ export class WorkflowDatabase {
         });
     }
 
+    scheduleEmailDiscoveryRetry(emailId: string, error: unknown): void {
+        const row = this.db.prepare('SELECT processing_attempts FROM email_records WHERE id = ?')
+            .get(emailId) as { processing_attempts: number } | undefined;
+        if (!row) throw new Error('Email record not found');
+        const delay = Math.min(60_000 * 2 ** Math.min(Math.max(row.processing_attempts - 1, 0), 5), 30 * 60_000);
+        const retryAt = new Date(Date.now() + delay).toISOString();
+        this.db.prepare(`
+            UPDATE email_records SET processing_status = 'failed', processing_error = ?,
+                next_retry_at = ?, updated_at = ? WHERE id = ?
+        `).run(normalizeError(error), retryAt, nowIso(), emailId);
+        this.insertAuditLog('email_record', emailId, 'email_discovery_retry_scheduled', { retryAt });
+    }
+
     queueEmailRetry(emailId: string, reason?: string): void {
         const existing = this.db
             .prepare(`
@@ -2545,6 +2600,12 @@ export class WorkflowDatabase {
         if (existing.processing_status === 'processing') {
             throw new Error('A processing email cannot be queued again');
         }
+        const lockedDraft = this.db.prepare(`
+            SELECT 1 FROM case_drafts WHERE email_id = ?
+              AND json_extract(normalized_data_json, '$.sourceKind') = 'new_filing_intake'
+              AND (filing_status = 'queued' OR status IN ('filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived'))
+        `).get(emailId);
+        if (lockedDraft) throw new Error('This new-case package is locked by its current MiFILE filing state.');
 
         const activeRetry = this.db
             .prepare(`
@@ -2565,6 +2626,7 @@ export class WorkflowDatabase {
                 UPDATE email_records
                 SET processing_status = 'new',
                     processing_error = NULL,
+                    next_retry_at = NULL,
                     updated_at = ?
                 WHERE id = ?
             `)
@@ -2622,7 +2684,8 @@ export class WorkflowDatabase {
                     e.sender,
                     e.received_at
                 FROM email_records e
-                WHERE e.processing_status = 'new'
+                WHERE (e.processing_status = 'new' OR
+                    (e.processing_status = 'failed' AND e.next_retry_at IS NOT NULL AND e.next_retry_at <= ?))
                   AND (
                     EXISTS (
                         SELECT 1 FROM case_drafts c WHERE c.email_id = e.id
@@ -2637,6 +2700,7 @@ export class WorkflowDatabase {
                     OR LOWER(COALESCE(e.sender, '')) LIKE '%@truefiling.com'
                     OR LOWER(COALESCE(e.subject, '')) LIKE '%mifile%'
                     OR LOWER(COALESCE(e.subject, '')) LIKE '%truefiling%'
+                    OR UPPER(LTRIM(COALESCE(e.subject, ''))) LIKE 'NEW LT FILING%'
                   )
                 ORDER BY
                     CASE WHEN EXISTS (
@@ -2650,7 +2714,7 @@ export class WorkflowDatabase {
                     e.id
                 LIMIT ?
             `)
-            .all(safeLimit) as Array<{
+            .all(nowIso(), safeLimit) as Array<{
                 id: string;
                 external_message_id: string;
                 subject: string | null;
@@ -3113,7 +3177,7 @@ export class WorkflowDatabase {
         if (uploaded > 0) {
             this.markEmailProcessed(emailId);
             if (caseDraftId) {
-                this.setCaseDraftStatus(caseDraftId, 'ready_to_file', 'passed', 'not_started');
+                this.refreshCaseDraftValidation(caseDraftId);
             }
             return;
         }
@@ -4357,6 +4421,7 @@ export class WorkflowDatabase {
                     processing_status,
                     processing_error,
                     processing_attempts,
+                    next_retry_at,
                     last_attempt_at,
                     processed_at,
                     created_at,
@@ -4545,6 +4610,7 @@ export class WorkflowDatabase {
         const validationIssues = caseDraft
             ? [
                 ...validateDraftData(normalizedDraftData),
+                ...this.intakeValidationIssues(normalizedDraftData),
                 ...validatePrimaryComplaint(
                     caseDraft.primary_document_id,
                     documentViews,
@@ -4572,6 +4638,7 @@ export class WorkflowDatabase {
                 bodySummary: email.body_summary,
                 processingStatus: email.processing_status,
                 processingError: email.processing_error,
+                nextRetryAt: email.next_retry_at,
                 processingAttempts: Number(email.processing_attempts ?? 0),
                 lastAttemptAt: email.last_attempt_at,
                 processedAt: email.processed_at,
@@ -5066,7 +5133,7 @@ export class WorkflowDatabase {
             }
             | undefined;
         if (!existing) throw new Error('Case draft not found');
-        if (['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
+        if (existing.filing_status === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
             .includes(existing.status)) {
             throw new Error(
                 'This Draft is locked because MiFILE preparation has started. Resolve the filing state before editing it.',
@@ -5483,6 +5550,7 @@ export class WorkflowDatabase {
                 SELECT
                     email_id,
                     status,
+                    filing_status,
                     extracted_data_json,
                     normalized_data_json
                 FROM case_drafts
@@ -5492,11 +5560,15 @@ export class WorkflowDatabase {
             | {
                 email_id: string;
                 status: CaseDraftStatus;
+                filing_status: FilingStatus;
                 extracted_data_json: string | null;
                 normalized_data_json: string | null;
             }
             | undefined;
         if (!existing) throw new Error('Case draft not found');
+        if (existing.filing_status === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived'].includes(existing.status)) {
+            throw new Error('This Draft is locked by its current MiFILE preparation.');
+        }
 
         const document = this.db
             .prepare(`
@@ -5599,6 +5671,9 @@ export class WorkflowDatabase {
                 .map(party => party.displayName)
                 .join(', ');
         }
+        if (next.sourceKind === 'new_filing_intake' && !next.caseTitle && next.plaintiff && next.defendant) {
+            next.caseTitle = `${next.plaintiff} V ${next.defendant}`;
+        }
         if (extraction.data.attorney && legacySources.filerName !== 'manual') {
             next.filerName = extraction.data.attorney.displayName;
         }
@@ -5612,6 +5687,7 @@ export class WorkflowDatabase {
             extractedAt: timestamp,
             appliedFields,
         } satisfies StoredComplaintExtraction;
+        delete next.complaintExtractionError;
 
         const protectedStatuses = new Set<CaseDraftStatus>([
             'filing_in_progress',
@@ -5723,13 +5799,40 @@ export class WorkflowDatabase {
         return this.getDraftDetail(caseDraftId) ?? detail;
     }
 
+    private intakeValidationIssues(data: unknown): DraftValidationIssue[] {
+        const root = data as Record<string, any> | null;
+        const issues: DraftValidationIssue[] = [];
+        if (root?.sourceKind === 'new_filing_intake' && Array.isArray(root.intake?.issues)) {
+            for (const message of root.intake.issues) {
+                issues.push({ field: 'intake', severity: 'warning', message: String(message) });
+            }
+        }
+        if (root?.complaintExtractionError) issues.push({
+            field: 'complaintExtraction', severity: 'error',
+            message: `Complaint extraction failed: ${root.complaintExtractionError}. Replace the PDF or run Extract again.`,
+        });
+        return issues;
+    }
+
+    recordComplaintExtractionFailure(caseDraftId: string, documentId: string, error: unknown): void {
+        const message = normalizeError(error);
+        const result = this.db.prepare(`
+            UPDATE case_drafts
+            SET normalized_data_json = json_set(normalized_data_json, '$.complaintExtractionError', ?),
+                status = 'needs_review', validation_status = 'failed', updated_at = ?
+            WHERE id = ? AND filing_status != 'queued'
+              AND status NOT IN ('filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived')
+        `).run(message, nowIso(), caseDraftId);
+        if (result.changes) this.insertAuditLog('case_draft', caseDraftId, 'complaint_extraction_failed', { documentId, message });
+    }
+
     createCaseDraft(emailId: string, parsed: ParsedEmailInfo): string {
         const parsedJson = toJson(parsed);
         this.ensurePlaintiffCandidateFromParsed(parsed);
 
         const existing = this.db
             .prepare(`
-                SELECT id, extracted_data_json, normalized_data_json
+                SELECT id, status, filing_status, extracted_data_json, normalized_data_json
                 FROM case_drafts
                 WHERE email_id = ?
                 ORDER BY created_at DESC
@@ -5738,12 +5841,16 @@ export class WorkflowDatabase {
             .get(emailId) as
             | {
                 id: string;
+                status: CaseDraftStatus;
+                filing_status: FilingStatus;
                 extracted_data_json: string | null;
                 normalized_data_json: string | null;
             }
             | undefined;
 
         if (existing) {
+            if (existing.filing_status === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived']
+                .includes(existing.status)) return existing.id;
             this.ensureExpectedDocuments(emailId, existing.id, parsed);
 
             const previousExtracted = this.safeJson(existing.extracted_data_json);
@@ -5783,6 +5890,12 @@ export class WorkflowDatabase {
             }
             if (Array.isArray(oldNormalizedObject.manualFilingFields)) {
                 nextNormalized.manualFilingFields = oldNormalizedObject.manualFilingFields;
+            }
+            if (oldNormalizedObject.complaintExtractionError) {
+                nextNormalized.complaintExtractionError = oldNormalizedObject.complaintExtractionError;
+            }
+            if (oldNormalizedObject.sourceKind === 'new_filing_intake' && oldNormalizedObject.intake) {
+                nextNormalized.intake = oldNormalizedObject.intake;
             }
             const nextNormalizedJson = toJson(nextNormalized);
 
@@ -5902,8 +6015,8 @@ export class WorkflowDatabase {
 
         if (
             action !== 'save_note' &&
-            ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
-                .includes(existing.status)
+            (existing.filing_status === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
+                .includes(existing.status))
         ) {
             throw new Error('Resolve or complete the current MiFILE preparation before changing review status');
         }

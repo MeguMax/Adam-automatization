@@ -139,25 +139,46 @@ export async function ensureChildFolder(
     parentItemId: string,
     folderName: string,
 ): Promise<string> {
-    const children = await oneDriveClient
-        .api(`/drives/${driveId}/items/${parentItemId}/children`)
-        .query({ $select: 'id,name,folder' })
-        .get();
+    const findExisting = async (): Promise<string | null> => {
+        let next: string | null = `/drives/${driveId}/items/${parentItemId}/children?$select=id,name,folder`;
+        const visited = new Set<string>();
+        while (next) {
+            if (visited.has(next)) throw new Error('OneDrive folder pagination repeated a page');
+            visited.add(next);
+            const children: any = await oneDriveClient.api(next).get();
+            const existing = (children.value ?? []).find(
+                (child: any) => child.folder && child.name.toLowerCase() === folderName.toLowerCase(),
+            );
+            if (existing) return String(existing.id);
+            next = children['@odata.nextLink'] || null;
+        }
+        return null;
+    };
+    const existing = await findExisting();
+    if (existing) return existing;
+    try {
+        const created = await oneDriveClient
+            .api(`/drives/${driveId}/items/${parentItemId}/children`)
+            .post({
+                name: folderName,
+                folder: {},
+                '@microsoft.graph.conflictBehavior': 'fail',
+            });
+        return created.id as string;
+    } catch (error) {
+        if ((error as any)?.statusCode !== 409) throw error;
+        const concurrentlyCreated = await findExisting();
+        if (!concurrentlyCreated) throw error;
+        return concurrentlyCreated;
+    }
+}
 
-    const existing = (children.value ?? []).find(
-        (c: any) => c.folder && c.name === folderName,
-    );
-    if (existing) return existing.id as string;
-
-    const created = await oneDriveClient
-        .api(`/drives/${driveId}/items/${parentItemId}/children`)
-        .post({
-            name: folderName,
-            folder: {},
-            '@microsoft.graph.conflictBehavior': 'rename',
-        });
-
-    return created.id as string;
+export async function ensureIntakeFolder(storageKey: string): Promise<{ driveId: string; itemId: string }> {
+    if (!/^[a-f0-9]{24}$/.test(storageKey)) throw new Error('Invalid intake folder identity');
+    const root = await ensureRootFolder();
+    const intakeRoot = await ensureChildFolder(root.driveId, root.itemId, 'New filings');
+    const itemId = await ensureChildFolder(root.driveId, intakeRoot, storageKey);
+    return { driveId: root.driveId, itemId };
 }
 
 // загрузка Buffer в папку

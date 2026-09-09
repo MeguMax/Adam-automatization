@@ -3,6 +3,7 @@ import { Client, ResponseType } from '@microsoft/microsoft-graph-client';
 import { ClientSecretCredential } from '@azure/identity';
 import 'isomorphic-fetch';
 import { graphErrorReason, withGraphRetry } from './graphRetry';
+import type { FilingIntakeInfo } from './filingIntake';
 
 export interface FiledDocumentInfo {
     documentName?: string | null;      // для single-док писем
@@ -15,6 +16,8 @@ export interface FiledDocumentInfo {
 export interface ParsedEmailInfo {
     // флаг, что это реально MiFILE/TrueFiling письмо
     isMiFile: boolean;
+    sourceKind?: 'new_filing_intake';
+    intake?: FilingIntakeInfo;
 
     // общие поля
     courtName: string | null;
@@ -281,33 +284,40 @@ export async function findCourtEmailByMetadata(lookup: CourtEmailLookup): Promis
     return fetchCourtEmailById(String(best.id));
 }
 
-export async function fetchCourtEmailPdfAttachments(
+export async function fetchCourtEmailAttachments(
     messageId: string,
 ): Promise<CourtEmailAttachment[]> {
-    const result = await withGraphRetry(
-        () => graphClient
-            .api(`/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}/attachments`)
-            .header('Accept-Encoding', 'identity')
-            .top(100)
-            .select('id,name,contentType,size,isInline')
-            .get(),
-        graphRetryOptions(`Graph PDF attachment list for ${messageId}`),
-    );
+    const attachments: CourtEmailAttachment[] = [];
+    let next: string | null = `/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}/attachments`;
+    const visited = new Set<string>();
+    while (next) {
+        if (visited.has(next)) throw new Error('Graph attachment pagination repeated a page');
+        visited.add(next);
+        const requestUrl: string = next;
+        const result: any = await withGraphRetry(
+            () => graphClient
+                .api(requestUrl)
+                .header('Accept-Encoding', 'identity')
+                .query(visited.size === 1 ? { $top: 100, $select: 'id,name,contentType,size,isInline' } : {})
+                .get(),
+            graphRetryOptions(`Graph PDF attachment list for ${messageId}`),
+        );
+        attachments.push(...((result.value ?? []) as any[]).map(attachment => ({
+                id: String(attachment.id),
+                name: String(attachment.name || 'attachment.pdf'),
+                contentType: attachment.contentType ? String(attachment.contentType) : null,
+                size: Number(attachment.size ?? 0),
+                isInline: Boolean(attachment.isInline),
+            })));
+        next = result['@odata.nextLink'] || null;
+    }
+    return attachments;
+}
 
-    return ((result.value ?? []) as any[])
-        .filter(attachment => {
-            if (attachment.isInline) return false;
-            const contentType = String(attachment.contentType ?? '').toLowerCase();
-            const name = String(attachment.name ?? '').toLowerCase();
-            return contentType === 'application/pdf' || name.endsWith('.pdf');
-        })
-        .map(attachment => ({
-            id: String(attachment.id),
-            name: String(attachment.name || 'attachment.pdf'),
-            contentType: attachment.contentType ? String(attachment.contentType) : null,
-            size: Number(attachment.size ?? 0),
-            isInline: Boolean(attachment.isInline),
-        }));
+export async function fetchCourtEmailPdfAttachments(messageId: string): Promise<CourtEmailAttachment[]> {
+    return (await fetchCourtEmailAttachments(messageId)).filter(attachment =>
+        !attachment.isInline && (attachment.contentType?.toLowerCase() === 'application/pdf' ||
+            /\.pdf$/i.test(attachment.name)));
 }
 
 export async function downloadCourtEmailAttachment(

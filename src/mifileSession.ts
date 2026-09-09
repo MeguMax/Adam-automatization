@@ -1,11 +1,10 @@
 import { chromium, Browser, Page, LaunchOptions } from 'playwright';
-
-const MIFILE_USER = process.env.MIFILE_USER!;
-const MIFILE_PASSWORD = process.env.MIFILE_PASSWORD!;
+import { getMiFileCredentials, MiFileCredentials, miFileCredentialIdentity } from './mifileAccountSettings';
 
 let browser: Browser | null = null;
-let cachedCookieHeader: { value: string; createdAt: number } | null = null;
+let cachedCookieHeader: { value: string; createdAt: number; identity: string } | null = null;
 let cookieRefreshPromise: Promise<string> | null = null;
+let cookieRefreshIdentity: string | null = null;
 
 function boundedEnvironmentInteger(
     value: string | undefined,
@@ -77,8 +76,8 @@ async function closeLoginModalIfAny(page: Page): Promise<void> {
     await page.waitForTimeout(500);
 }
 
-async function loginToMifile(page: Page): Promise<void> {
-    if (!MIFILE_USER || !MIFILE_PASSWORD) {
+async function loginToMifile(page: Page, credentials = getMiFileCredentials()): Promise<void> {
+    if (!credentials.username || !credentials.password) {
         throw new Error('MIFILE_USER / MIFILE_PASSWORD not set in env');
     }
 
@@ -97,28 +96,29 @@ async function loginToMifile(page: Page): Promise<void> {
 
     await closeLoginModalIfAny(page);
 
-    await page.fill('input#Email', MIFILE_USER);
-    await page.fill('input#Password', MIFILE_PASSWORD);
-
-    const loginButton = page.locator('button.flatButton.login-button');
-    await loginButton.click({ force: true });
-
-    // даём немного времени на установку cookies
-    await waitForAuthenticatedCookies(page);
+    try {
+        await page.fill('input#Email', credentials.username);
+        await page.fill('input#Password', credentials.password);
+        const loginButton = page.locator('button.flatButton.login-button');
+        await loginButton.click({ force: true });
+        await waitForAuthenticatedCookies(page);
+    } catch {
+        throw new Error('MiFILE sign-in failed or timed out. Check the account and any verification requirements.');
+    }
 }
 
 /**
  * Возвращает заголовок Cookie для домена MiFILE после логина.
  */
-async function createMifileCookieHeader(): Promise<string> {
+async function createMifileCookieHeader(credentials: MiFileCredentials): Promise<string> {
     const br = await getBrowser();
     const page = await br.newPage();
     try {
-        await loginToMifile(page);
+        await loginToMifile(page, credentials);
         const cookies = await page.context().cookies('https://mifile.courts.michigan.gov');
         const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
         if (!cookieHeader) throw new Error('MiFILE login returned an empty cookie set');
-        cachedCookieHeader = { value: cookieHeader, createdAt: Date.now() };
+        cachedCookieHeader = { value: cookieHeader, createdAt: Date.now(), identity: miFileCredentialIdentity(credentials) };
         return cookieHeader;
     } finally {
         await page.close().catch(() => {});
@@ -130,21 +130,39 @@ export function invalidateMifileSession(): void {
 }
 
 export async function getMifileCookieHeader(forceRefresh = false): Promise<string> {
+    const credentials = getMiFileCredentials();
+    const identity = miFileCredentialIdentity(credentials);
     if (
         !forceRefresh &&
         cachedCookieHeader &&
+        cachedCookieHeader.identity === identity &&
         Date.now() - cachedCookieHeader.createdAt < MIFILE_COOKIE_CACHE_MS
     ) {
         return cachedCookieHeader.value;
     }
-    if (cookieRefreshPromise) return cookieRefreshPromise;
+    if (cookieRefreshPromise && cookieRefreshIdentity === identity) return cookieRefreshPromise;
 
-    const refresh = createMifileCookieHeader();
+    const refresh = createMifileCookieHeader(credentials);
     cookieRefreshPromise = refresh;
+    cookieRefreshIdentity = identity;
     try {
         return await refresh;
     } finally {
         if (cookieRefreshPromise === refresh) cookieRefreshPromise = null;
+    }
+}
+
+export async function testMiFileCredentials(credentials: MiFileCredentials): Promise<void> {
+    const testBrowser = await chromium.launch({
+        headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    try {
+        const page = await testBrowser.newPage();
+        await loginToMifile(page, credentials);
+    } catch {
+        throw new Error('MiFILE sign-in could not be verified. Check the credentials, service availability, or additional verification requirements.');
+    } finally {
+        await testBrowser.close();
     }
 }
 

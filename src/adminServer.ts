@@ -1,7 +1,7 @@
 import http from 'http';
 import fs from 'fs';
 import { URL } from 'url';
-import { timingSafeEqual } from 'crypto';
+import { randomUUID, timingSafeEqual } from 'crypto';
 import {
     CaseDraftStatus,
     EmailProcessingStatus,
@@ -24,13 +24,22 @@ import {
     replaceDriveItemContent,
     resolveSharedDriveItem,
     uploadFileBufferToFolder,
+    ensureIntakeFolder,
 } from './oneDriveClient';
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
-import { validatePdfBuffer } from './pdfValidation';
+import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
+import { parseWorkflowEmail } from './workflowEmail';
+import { getFilingIntakeConfig, intakeFileName } from './filingIntake';
+import {
+    accountSettingsEnabled, accountSettingsView, credentialsFromSettingsInput,
+    encryptMiFileAccount, getMiFileCredentials,
+} from './mifileAccountSettings';
+import { invalidateMifileSession, testMiFileCredentials } from './mifileSession';
+import { pdfPreviewHtml } from './pdfPreview';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-08-29-mifile-unsubmitted-hardening-v20';
+const ADMIN_BUILD_ID = '2026-09-09-email-intake-account-settings-v21';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -383,14 +392,18 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
                 continue;
             }
 
-            const parsed = addEmailAttachmentSources(
-                parseEmailBody((msg as any).body?.content ?? ''),
-            );
-            if (parsed.isMiFile) {
+            let parsed;
+            try {
+                parsed = await parseWorkflowEmail(msg);
+            } catch (error) {
+                console.error('Admin sync could not load email attachments; leaving the email queued:', error);
+                continue;
+            }
+            if (parsed) {
                 db.createCaseDraft(emailRecord.id, parsed);
                 miFileDrafts += 1;
             } else {
-                db.markEmailIgnored(emailRecord.id, 'Not a MiFILE/TrueFiling email');
+                db.markEmailIgnored(emailRecord.id, 'Not a court notification or authorized NEW LT FILING intake');
             }
         }
 
@@ -2975,6 +2988,26 @@ const html = String.raw`<!doctype html>
       #queue tr[data-id] td:nth-child(3)::before { display: none; }
       #queue .queue-issue { max-width: none; }
     }
+    .settings-layout { max-width: 850px; padding: 24px; }
+    .draft-panel-toolbar { flex: 0 0 auto; }
+    .draft-pdf-viewer iframe { min-height: 0; }
+    .settings-section { padding: 0 0 28px; margin-bottom: 24px; border-bottom: 1px solid var(--line); }
+    .settings-section h2 { font-size: 18px; margin: 0 0 20px; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .settings-grid .field { min-width: 0; }
+    .settings-grid input, .settings-grid select { width: 100%; min-width: 0; }
+    .settings-value { overflow-wrap: anywhere; padding: 8px 0; }
+    .settings-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 20px; }
+    #miFilePrimaryConfirmationLabel { flex-wrap: nowrap; justify-content: flex-start; }
+    #miFilePrimaryConfirmation { width: 18px; height: 18px; min-height: 18px; min-width: 18px; padding: 0; margin: 0; flex: 0 0 18px; }
+    #settingsMessage { margin: 16px 0; overflow-wrap: anywhere; }
+    @media (max-width: 640px) {
+      .settings-layout { padding: 16px; }
+      .settings-grid { grid-template-columns: 1fr; }
+      header.app-header > .controls { min-width: 0; max-width: 100%; }
+      .nav-tabs { min-width: 0; max-width: 100%; overflow-x: auto; }
+      .nav-tabs button { padding: 0 7px; gap: 5px; font-size: 12px; }
+    }
   </style>
 </head>
 <body>
@@ -2992,6 +3025,7 @@ const html = String.raw`<!doctype html>
         <button id="draftsTab" type="button"><i data-lucide="file-pen-line"></i>Drafts</button>
         <button id="mappingsTab" type="button"><i data-lucide="users"></i>Plaintiffs</button>
         <button id="activityTab" type="button"><i data-lucide="history"></i>Activity</button>
+        <button id="settingsTab" type="button"><i data-lucide="settings"></i>Settings</button>
       </nav>
     </div>
     <div class="controls header-actions">
@@ -3229,6 +3263,36 @@ const html = String.raw`<!doctype html>
           </section>
         </div>
       </div>
+    </section>
+    <section id="settingsPane" class="full-span hidden settings-layout">
+      <section class="settings-section">
+        <h2>Email intake</h2>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">Automation inbox</span><div id="intakeMailbox" class="settings-value"></div></div>
+          <div class="field"><span class="field-label">Subject prefix</span><div id="intakeSubject" class="settings-value"></div></div>
+          <div class="field"><span class="field-label">Accepted senders</span><div id="intakeSenders" class="settings-value"></div></div>
+          <div class="field"><span class="field-label">Package</span><div class="settings-value">One case per email · PDF attachments · 25 MB per file</div></div>
+        </div>
+      </section>
+      <section class="settings-section">
+        <h2>MiFILE account</h2>
+        <form id="miFileSettingsForm">
+          <div class="settings-grid">
+            <label class="field"><span class="field-label">Login email</span><input id="miFileAccountEmail" type="email" autocomplete="username" required></label>
+            <label class="field"><span class="field-label">New password (blank keeps current)</span><input id="miFileAccountPassword" type="password" autocomplete="new-password" maxlength="1024"></label>
+            <label class="field"><span class="field-label">Account</span><select id="miFileAccountType"><option value="test">Alternate account · Live MiFILE</option><option value="production">Primary account · Live MiFILE</option></select></label>
+            <div class="field"><span class="field-label">Filer</span><div class="settings-value">Devlin, Adam</div></div>
+            <div class="field"><span class="field-label">Preparation limit</span><div class="settings-value">History → Unsubmitted</div></div>
+            <div class="field"><span class="field-label">Credentials</span><div id="miFileCredentialStatus" class="settings-value"></div></div>
+          </div>
+          <label id="miFilePrimaryConfirmationLabel" class="settings-actions hidden"><input id="miFilePrimaryConfirmation" type="checkbox">Activate this primary account</label>
+          <div class="settings-actions">
+            <button id="miFileAccountSave" type="submit" class="primary"><i data-lucide="save"></i>Verify and save</button>
+            <button id="miFileAccountTest" type="button"><i data-lucide="plug-zap"></i>Test sign-in</button>
+          </div>
+        </form>
+        <div id="settingsMessage" role="status" aria-live="polite"></div>
+      </section>
     </section>
     <section id="mappingsPane" class="full-span hidden">
       <div class="summary" id="mappingSummary"></div>
@@ -3492,6 +3556,9 @@ const html = String.raw`<!doctype html>
       document.getElementById('draftsPane').classList.toggle('hidden', view !== 'drafts');
       document.getElementById('mappingsPane').classList.toggle('hidden', view !== 'mappings');
       document.getElementById('activityPane').classList.toggle('hidden', view !== 'activity');
+      document.getElementById('settingsPane').classList.toggle('hidden', view !== 'settings');
+      document.getElementById('settingsTab').classList.toggle('active', view === 'settings');
+      document.getElementById('settingsTab').setAttribute('aria-current', view === 'settings' ? 'page' : 'false');
       document.getElementById('queueTab').classList.toggle('active', view === 'queue');
       document.getElementById('draftsTab').classList.toggle('active', view === 'drafts');
       document.getElementById('mappingsTab').classList.toggle('active', view === 'mappings');
@@ -3512,6 +3579,57 @@ const html = String.raw`<!doctype html>
         loadPlaintiffMappings().catch(showMappingError);
       } else if (view === 'activity') {
         loadActivity().catch(showActivityError);
+      } else if (view === 'settings') {
+        loadAccountSettings().catch(error => { document.getElementById('settingsMessage').textContent = error.message; });
+      }
+    }
+
+    let accountSettingsBusy = false;
+    async function loadAccountSettings() {
+      const data = await api('/api/settings');
+      document.getElementById('intakeMailbox').textContent = data.intake.mailbox || 'Not configured';
+      document.getElementById('intakeSubject').textContent = data.intake.subjectPrefix + ' - [case reference]';
+      document.getElementById('intakeSenders').textContent = data.intake.allowedSenders.join(', ');
+      document.getElementById('miFileAccountEmail').value = data.account.username;
+      document.getElementById('miFileAccountPassword').value = '';
+      document.getElementById('miFileAccountType').value = data.account.accountEnvironment;
+      document.getElementById('miFilePrimaryConfirmation').checked = false;
+      document.getElementById('miFilePrimaryConfirmationLabel').classList.toggle('hidden', data.account.accountEnvironment !== 'production');
+      document.getElementById('miFileCredentialStatus').textContent = data.account.passwordConfigured
+        ? (data.account.source === 'admin' ? 'Saved in admin · Encrypted' : 'Configured on server') : 'Not configured';
+      document.getElementById('miFileAccountSave').disabled = !data.account.editable;
+      document.getElementById('settingsMessage').textContent = data.account.error ||
+        (!data.account.editable ? 'Account updates need server encryption and admin authentication to be configured.' : '');
+    }
+
+    async function testOrSaveAccount(save) {
+      if (accountSettingsBusy) return;
+      accountSettingsBusy = true;
+      const message = document.getElementById('settingsMessage');
+      const saveButton = document.getElementById('miFileAccountSave');
+      const testButton = document.getElementById('miFileAccountTest');
+      const previouslyDisabled = saveButton.disabled;
+      saveButton.disabled = testButton.disabled = true;
+      message.textContent = 'Verifying MiFILE sign-in...';
+      try {
+        await api(save ? '/api/settings/mifile' : '/api/settings/mifile/test', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Admin-Action': 'account-settings' },
+          body: JSON.stringify({
+            username: document.getElementById('miFileAccountEmail').value,
+            password: document.getElementById('miFileAccountPassword').value,
+            accountEnvironment: document.getElementById('miFileAccountType').value,
+            productionConfirmed: document.getElementById('miFilePrimaryConfirmation').checked,
+          }),
+        });
+        if (save) await loadAccountSettings();
+        state.mifileConfig = await api('/api/mifile-config');
+        message.textContent = save ? 'Sign-in verified. Account saved.' : 'Sign-in verified. No account changes saved.';
+      } catch (error) {
+        message.textContent = error.message;
+      } finally {
+        accountSettingsBusy = false;
+        saveButton.disabled = previouslyDisabled;
+        testButton.disabled = false;
       }
     }
 
@@ -3937,7 +4055,7 @@ const html = String.raw`<!doctype html>
       renderDraftDocuments(detail.documents || []);
       setDraftDirty(false);
       setDraftMobileMode(state.draftMobileMode);
-      const draftLocked = [
+      const draftLocked = draft.filingStatus === 'queued' || [
         'filing_in_progress',
         'filing_reconciliation',
         'filing_prepared',
@@ -3950,6 +4068,7 @@ const html = String.raw`<!doctype html>
         draftLocked ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
       document.getElementById('draftPrepareBtn').disabled =
+        draftLocked ||
         !['ready_to_file', 'filing_failed'].includes(draft.status) ||
         !state.mifileConfig || !state.mifileConfig.ready ||
         draft.filingEligible === false ||
@@ -4624,7 +4743,7 @@ const html = String.raw`<!doctype html>
       );
       const draft = state.draftDetail && state.draftDetail.caseDraft;
       const canModifyDocuments = Boolean(
-        draft && draft.filingEligible !== false &&
+        draft && draft.filingEligible !== false && draft.filingStatus !== 'queued' &&
         !['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
           .includes(draft.status),
       );
@@ -4651,11 +4770,16 @@ const html = String.raw`<!doctype html>
       replaceButton.disabled = !canModifyDocuments ||
         !activeDocument || !activeDocument.oneDriveUrl;
       if (activeDocument && activeDocument.oneDriveUrl) {
-        viewer.innerHTML = '<iframe title="' +
-          escapeHtml(activeDocument.currentFilename || activeDocument.documentType || 'PDF document') +
-          '" src="/api/documents/' + encodeURIComponent(activeDocument.id) +
-          '/content?v=' + encodeURIComponent(activeDocument.updatedAt || '') + '"></iframe>';
+        const previewKey = activeDocument.id + ':' + (activeDocument.updatedAt || '');
+        if (viewer.dataset.previewKey !== previewKey) {
+          viewer.innerHTML = '<iframe title="' +
+            escapeHtml(activeDocument.currentFilename || activeDocument.documentType || 'PDF document') +
+            '" src="/api/documents/' + encodeURIComponent(activeDocument.id) +
+            '/preview?v=' + encodeURIComponent(activeDocument.updatedAt || '') + '"></iframe>';
+          viewer.dataset.previewKey = previewKey;
+        }
       } else {
+        delete viewer.dataset.previewKey;
         viewer.innerHTML = '<div class="draft-preview-empty">' + icon('file-question') +
           '<strong>PDF preview is not available</strong>' +
           '<span>' + escapeHtml(activeDocument
@@ -4678,12 +4802,12 @@ const html = String.raw`<!doctype html>
       state.draftDirty = !!dirty;
       document.getElementById('draftUnsavedBadge').classList.toggle('hidden', !dirty);
       const draft = state.draftDetail && state.draftDetail.caseDraft;
-      const locked = draft && [
+      const locked = draft && (draft.filingStatus === 'queued' || [
         'filing_in_progress',
         'filing_reconciliation',
         'filing_prepared',
         'filed_successfully',
-      ].includes(draft.status);
+      ].includes(draft.status));
       document.getElementById('draftSaveBtn').disabled = !dirty || Boolean(locked);
     }
 
@@ -5242,6 +5366,7 @@ const html = String.raw`<!doctype html>
             '<span>' + icon('repeat-2') + escapeHtml(email.processingAttempts || 0) + ' attempt' + (Number(email.processingAttempts || 0) === 1 ? '' : 's') + '</span>' +
           '</div>' +
           (email.processingError ? '<div class="error-callout">' + icon('triangle-alert') + '<div>' + escapeHtml(email.processingError) + '</div></div>' : '') +
+          (email.nextRetryAt ? '<div class="detail-meta">' + icon('clock') + 'Inbox retry: ' + escapeHtml(fmtDate(email.nextRetryAt)) + '</div>' : '') +
         '</div>' +
         (draft ? '<div class="detail-section">' +
           '<div class="detail-section-title"><span>' + icon('file-text') + 'Draft</span></div>' +
@@ -5914,6 +6039,14 @@ const html = String.raw`<!doctype html>
     });
     document.getElementById('queueTab').addEventListener('click', () => setView('queue'));
     document.getElementById('draftsTab').addEventListener('click', () => setView('drafts'));
+    document.getElementById('settingsTab').addEventListener('click', () => setView('settings'));
+    document.getElementById('miFileAccountType').addEventListener('change', event => {
+      document.getElementById('miFilePrimaryConfirmationLabel').classList.toggle('hidden', event.target.value !== 'production');
+    });
+    document.getElementById('miFileSettingsForm').addEventListener('submit', event => {
+      event.preventDefault(); testOrSaveAccount(true);
+    });
+    document.getElementById('miFileAccountTest').addEventListener('click', () => testOrSaveAccount(false));
     document.getElementById('mappingsTab').addEventListener('click', () => setView('mappings'));
     document.getElementById('activityTab').addEventListener('click', () => setView('activity'));
     document.getElementById('closeDraftBtn').addEventListener('click', closeDraft);
@@ -6051,6 +6184,7 @@ export function createAdminServer(
             });
     };
 
+    let accountTestRunning = false;
     const server = http.createServer(async (req, res) => {
         try {
             const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -6093,9 +6227,82 @@ export function createAdminServer(
                 sendJson(res, 200, { ...syncStatus, dbPath: db.getPath() });
                 return;
             }
+            if (req.method === 'GET' && ['/assets/pdfjs/pdf.mjs', '/assets/pdfjs/pdf.worker.mjs'].includes(url.pathname)) {
+                const name = url.pathname.endsWith('pdf.worker.mjs') ? 'pdf.worker.mjs' : 'pdf.mjs';
+                sendJavascript(res, fs.readFileSync(require.resolve(`pdfjs-dist/build/${name}`)));
+                return;
+            }
+            const previewMatch = url.pathname.match(/^\/api\/documents\/([^/]+)\/preview$/);
+            if (req.method === 'GET' && previewMatch) {
+                const documentId = decodeURIComponent(previewMatch[1]);
+                if (!db.getDocumentAccess(documentId)) {
+                    sendJson(res, 404, { error: 'Viewable PDF not found' });
+                    return;
+                }
+                sendHtml(res, pdfPreviewHtml(documentId, url.searchParams.get('v') || ''));
+                return;
+            }
 
             if (req.method === 'GET' && url.pathname === '/api/mifile-config') {
                 sendJson(res, 200, getMiFileRuntimeConfig());
+                return;
+            }
+
+            if (req.method === 'GET' && url.pathname === '/api/settings') {
+                const account = accountSettingsView();
+                sendJson(res, 200, {
+                    intake: getFilingIntakeConfig(),
+                    account: { ...account, editable: account.editable && hasAdminCredentials() },
+                });
+                return;
+            }
+            if (req.method === 'POST' && ['/api/settings/mifile', '/api/settings/mifile/test'].includes(url.pathname)) {
+                const origin = req.headers.origin;
+                if (!hasAdminCredentials() || req.headers['x-admin-action'] !== 'account-settings' ||
+                    !String(req.headers['content-type']).startsWith('application/json') ||
+                    (origin && new URL(origin).host !== req.headers.host) ||
+                    req.headers['sec-fetch-site'] === 'cross-site') {
+                    sendJson(res, 403, { error: 'Account settings require an authenticated same-origin admin request.' });
+                    return;
+                }
+                const save = url.pathname === '/api/settings/mifile';
+                if (save && !accountSettingsEnabled()) {
+                    sendJson(res, 409, { error: 'Server encryption is not configured for account updates.' });
+                    return;
+                }
+                if (accountTestRunning || (save && db.hasActiveFilingJobs())) {
+                    sendJson(res, 409, { error: 'Wait for the current account check or MiFILE preparation to finish.' });
+                    return;
+                }
+                let input;
+                try { input = JSON.parse((await readRequestBuffer(req, 8 * 1024)).toString('utf8')); }
+                catch {
+                    sendJson(res, 400, { error: 'Invalid account settings request.' });
+                    return;
+                }
+                let current = null;
+                try { current = getMiFileCredentials(); } catch { /* A new verified account can repair the stored credentials. */ }
+                let credentials;
+                try { credentials = credentialsFromSettingsInput(input, current); }
+                catch (error) {
+                    sendJson(res, 400, { error: (error as Error).message });
+                    return;
+                }
+                if (accountTestRunning) {
+                    sendJson(res, 409, { error: 'An account check is already running.' });
+                    return;
+                }
+                accountTestRunning = true;
+                try {
+                    await testMiFileCredentials(credentials);
+                    if (save) {
+                        db.saveMiFileAccountSetting(encryptMiFileAccount(credentials, process.env));
+                        invalidateMifileSession();
+                    }
+                } finally {
+                    accountTestRunning = false;
+                }
+                sendJson(res, 200, { verified: true, saved: save });
                 return;
             }
 
@@ -6484,9 +6691,9 @@ export function createAdminServer(
                     });
                     return;
                 }
-                if (detail?.caseDraft && ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
+                if (detail?.caseDraft && (detail.caseDraft.filingStatus === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
                     detail.caseDraft.status,
-                )) {
+                ))) {
                     sendJson(res, 409, {
                         error: 'Documents cannot be replaced while this Draft is being filed or has already been prepared',
                     });
@@ -6500,6 +6707,7 @@ export function createAdminServer(
                     });
                     return;
                 }
+                await inspectFilingPdf(content);
                 const sharedItem = await resolveSharedDriveItem(document.oneDriveUrl);
                 await replaceDriveItemContent(sharedItem.driveId, sharedItem.itemId, content);
                 sendJson(res, 200, db.recordDocumentReplacement(documentId, {
@@ -6522,7 +6730,7 @@ export function createAdminServer(
                     sharedItem.driveId,
                     sharedItem.itemId,
                 );
-                if (content.length < 5 || content.subarray(0, 5).toString('ascii') !== '%PDF-') {
+                if (!validatePdfBuffer(content).valid) {
                     sendJson(res, 415, { error: 'The stored OneDrive file is not a valid PDF' });
                     return;
                 }
@@ -6557,14 +6765,15 @@ export function createAdminServer(
                     });
                     return;
                 }
-                if (['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
+                if (detail.caseDraft.filingStatus === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
                     detail.caseDraft.status,
                 )) {
                     sendJson(res, 409, { error: 'This Draft cannot accept new documents' });
                     return;
                 }
                 const anchor = detail.documents.find(document => document.oneDriveUrl);
-                if (!anchor?.oneDriveUrl) {
+                const intake = JSON.parse(detail.caseDraft.normalizedDataJson || '{}').intake;
+                if (!anchor?.oneDriveUrl && !intake?.storageKey) {
                     sendJson(res, 409, {
                         error: 'At least one OneDrive document is required to locate the case folder',
                     });
@@ -6578,12 +6787,18 @@ export function createAdminServer(
                     });
                     return;
                 }
-                const anchorItem = await resolveSharedDriveItem(anchor.oneDriveUrl);
+                await inspectFilingPdf(content);
+                const anchorItem = intake?.storageKey
+                    ? await ensureIntakeFolder(intake.storageKey).then(folder => ({
+                        driveId: folder.driveId, parentItemId: folder.itemId,
+                    }))
+                    : await resolveSharedDriveItem(anchor!.oneDriveUrl!);
                 if (!anchorItem.parentItemId) {
                     sendJson(res, 409, { error: 'The OneDrive case folder could not be resolved' });
                     return;
                 }
-                const fileName = uploadedPdfFilename(req.headers['x-file-name']);
+                const originalFilename = uploadedPdfFilename(req.headers['x-file-name']);
+                const fileName = intakeFileName(originalFilename, randomUUID());
                 const uploaded = await uploadFileBufferToFolder(
                     anchorItem.driveId,
                     anchorItem.parentItemId,
@@ -6591,20 +6806,27 @@ export function createAdminServer(
                     content,
                 );
                 const oneDriveUrl = await createFileLink(uploaded.driveId, uploaded.itemId);
-                db.addDocument({
+                const addedDocumentId = db.addDocument({
                     emailId: detail.email.id,
                     caseDraftId,
-                    originalFilename: fileName,
+                    originalFilename,
                     currentFilename: fileName,
                     fileUrl: oneDriveUrl,
                     oneDriveUrl,
                     mimeType: 'application/pdf',
                     fileSize: content.length,
-                    documentType: fileName.replace(/\.pdf$/i, ''),
+                    documentType: originalFilename.replace(/\.pdf$/i, ''),
                     uploadSource: 'admin_draft_upload',
                     status: 'uploaded',
                     metadata: { addedFromDraftEditor: true },
                 });
+                if (isComplaintDocument(null, fileName)) {
+                    try {
+                        db.applyComplaintExtraction(caseDraftId, addedDocumentId, await extractComplaintPdf(content));
+                    } catch (error) {
+                        db.recordComplaintExtractionFailure(caseDraftId, addedDocumentId, error);
+                    }
+                }
                 sendJson(res, 201, db.refreshCaseDraftValidation(caseDraftId));
                 return;
             }
@@ -6651,7 +6873,14 @@ export function createAdminServer(
                     sharedItem.driveId,
                     sharedItem.itemId,
                 );
-                const extraction = await extractComplaintPdf(content, primary.documentType);
+                let extraction;
+                try {
+                    extraction = await extractComplaintPdf(content, primary.documentType);
+                } catch (error) {
+                    db.recordComplaintExtractionFailure(caseDraftId, primary.id, error);
+                    sendJson(res, 422, { error: 'Complaint extraction failed. Check the Draft validation details.' });
+                    return;
+                }
                 db.applyComplaintExtraction(
                     caseDraftId,
                     primary.id,

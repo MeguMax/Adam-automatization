@@ -87,6 +87,8 @@ services:
         sync: false
       - key: MIFILE_PASSWORD
         sync: false
+      - key: MIFILE_CREDENTIALS_KEY
+        sync: false
       - key: TWO_CAPTCHA_API_KEY
         sync: false
       - key: TRUECERTIFY_HEADLESS

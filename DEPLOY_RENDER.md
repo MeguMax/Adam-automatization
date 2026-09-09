@@ -73,6 +73,10 @@ The new Render database is persistent from its first deploy onward. Transfer the
 
 ## Switch the MiFILE Account
 
+The September intake update adds **Settings > MiFILE account**. For this version, prefer **Verify and save** in the admin panel after configuring `MIFILE_CREDENTIALS_KEY` (64 hexadecimal characters) and admin authentication. Saved credentials are encrypted in persistent SQLite, take precedence over environment credentials, and are used by both downloading and preparation sessions. Preserve the same encryption key across deploys. See [INTAKE_WORKFLOW.md](INTAKE_WORKFLOW.md) for the key-generation command, sender configuration, and rollout checks.
+
+Both account labels refer to live MiFILE, not a sandbox. The instructions below remain the environment-only fallback until an account has been saved in the admin panel.
+
 The application defaults to `MIFILE_ACCOUNT_ENVIRONMENT=test`. These account-control values use `sync: false` in the Blueprint so a later Blueprint sync cannot overwrite the selection made in Render. The Draft Editor shows the active account class and always states that preparation is unsubmitted-only.
 
 1. Ask the client to confirm the exact production MiFILE username, that it has access to the required courts, and that `Devlin, Adam` is available as the filer.

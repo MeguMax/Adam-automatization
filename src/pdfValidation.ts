@@ -41,3 +41,30 @@ export function validatePdfBuffer(buffer: Buffer): PdfValidationResult {
 export function isValidPdfBuffer(buffer: Buffer): boolean {
     return validatePdfBuffer(buffer).valid;
 }
+
+let pdfInspector: Promise<any> | null = null;
+
+export async function inspectFilingPdf(buffer: Buffer): Promise<void> {
+    const basic = validatePdfBuffer(buffer);
+    if (!basic.valid) throw new Error(basic.reason || 'Invalid PDF');
+    const nativeImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
+    pdfInspector ??= nativeImport('pdfjs-dist/legacy/build/pdf.mjs');
+    const pdfJs = await pdfInspector;
+    const task = pdfJs.getDocument({
+        data: new Uint8Array(buffer), isEvalSupported: false, stopAtErrors: true,
+        useSystemFonts: true, verbosity: pdfJs.VerbosityLevel.ERRORS,
+    });
+    try {
+        const document = await task.promise;
+        if (!document.numPages) throw new Error('The PDF has no pages');
+        for (let number = 1; number <= document.numPages; number++) {
+            const page = await document.getPage(number);
+            await page.getOperatorList();
+            page.cleanup();
+        }
+    } catch {
+        throw new Error('The PDF cannot be read completely or requires a password. Replace it with an unlocked, readable PDF.');
+    } finally {
+        await task.destroy();
+    }
+}

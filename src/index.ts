@@ -25,9 +25,13 @@ import {
     addEmailAttachmentSources,
     createEmailAttachmentSource,
     emailAttachmentSourceName,
+    emailAttachmentSourceId,
     isEmailAttachmentSource,
 } from './emailAttachmentSource';
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
+import { parseWorkflowEmail } from './workflowEmail';
+import { processFilingIntake } from './filingIntakeWorker';
+import { intakeSenderAllowed, isFilingIntakeSubject } from './filingIntake';
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
 const MAX_EMAILS_PER_POLL = Number(process.env.WORKER_EMAIL_LIMIT || 50);
@@ -44,7 +48,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-08-29-mifile-unsubmitted-hardening-v20';
+const WORKER_BUILD_ID = '2026-09-09-email-intake-account-settings-v21';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -283,7 +287,13 @@ function createEmailAttachmentResolver(
         attachmentsPromise ??= fetchCourtEmailPdfAttachments(String(message.id));
         const attachments = await attachmentsPromise;
         const sourceName = emailAttachmentSourceName(document.downloadUrl);
-        const attachment = selectPdfAttachment(
+        const sourceId = emailAttachmentSourceId(document.downloadUrl);
+        const exact = sourceId ? attachments.find(item => item.id === sourceId) : null;
+        const matches = attachments.filter(item => item.name === sourceName);
+        if (sourceId && !exact && matches.length !== 1) {
+            throw new Error('The original attachment cannot be uniquely identified in the source email');
+        }
+        const attachment = exact || selectPdfAttachment(
             sourceName || document.documentName || document.documentType,
             attachments,
         );
@@ -405,7 +415,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                 };
                 const oneDocumentParsed: ParsedEmailInfo = {
                     ...parsed,
-                    isMiFile: true,
+                    isMiFile: parsed.isMiFile,
                     filedDocuments: [retryDocument],
                 };
                 const plaintiffNaming = lookupPlaintiffNaming(db, oneDocumentParsed);
@@ -544,6 +554,10 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             const email = await recoverOutlookMessage(db, pending);
             emailsById.set(String(email.id), email);
         } catch (error) {
+            if (isFilingIntakeSubject(pending.subject)) {
+                db.scheduleEmailDiscoveryRetry(pending.emailId, error);
+                continue;
+            }
             db.markEmailFailed(
                 pending.emailId,
                 `Unable to fetch the source email for queued processing: ${
@@ -574,10 +588,11 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
 
         let msg = candidate;
         if (!(msg as any).body?.content) {
-            db.registerEmail(candidate);
+            const registered = db.registerEmail(candidate);
             try {
                 msg = await fetchCourtEmailById(externalMessageId);
             } catch (error) {
+                if (isFilingIntakeSubject(candidate.subject)) db.scheduleEmailDiscoveryRetry(registered.id, error);
                 console.error(
                     `Unable to fetch message body ${externalMessageId}; ` +
                     'the email remains new and will be retried on the next poll:',
@@ -604,16 +619,41 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 continue;
             }
 
-            const bodyContent = (msg as any).body?.content ?? '';
-            parsed = addEmailAttachmentSources(parseEmailBody(bodyContent));
+            try {
+                parsed = await parseWorkflowEmail(msg) || undefined;
+            } catch (error) {
+                if (isFilingIntakeSubject(msg.subject) && intakeSenderAllowed(msg)) {
+                    db.scheduleEmailDiscoveryRetry(emailRecord.id, error);
+                    continue;
+                }
+                throw error;
+            }
             console.log('Parsed info:', parsed);
 
-            if (!parsed.isMiFile) {
-                db.markEmailIgnored(emailRecord.id, 'Not a MiFILE/TrueFiling email');
+            if (!parsed) {
+                db.markEmailIgnored(emailRecord.id, 'Not a court notification or authorized NEW LT FILING intake');
                 continue;
             }
 
             caseDraftId = db.createCaseDraft(emailRecord.id, parsed);
+            if (parsed.sourceKind === 'new_filing_intake') {
+                const stored = db.getDraftDetail(caseDraftId)?.caseDraft?.normalizedDataJson;
+                if (stored) parsed.intake = JSON.parse(stored).intake;
+                const resolver = createEmailAttachmentResolver(async () => msg);
+                const detail = await processFilingIntake(db, emailRecord.id, caseDraftId, parsed, {
+                    download: oneDocument => downloadFiledDocuments(oneDocument, 'downloads', msg.receivedDateTime, {
+                        resolveDocumentBuffer: resolver,
+                    }),
+                    extract: extractComplaintPdf,
+                });
+                console.log('New filing intake completed:', {
+                    draftId: caseDraftId,
+                    documents: detail.documents.length,
+                    uploaded: detail.documents.filter(document => document.oneDriveUrl).length,
+                    status: detail.caseDraft?.status,
+                });
+                continue;
+            }
             const plaintiffNaming = lookupPlaintiffNaming(db, parsed);
 
             const { downloaded, notificationFiles, failures } = await downloadFiledDocuments(

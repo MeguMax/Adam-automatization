@@ -1,3 +1,5 @@
+import { getMiFileCredentials } from './mifileAccountSettings';
+
 export type MiFileAccountEnvironment = 'test' | 'production';
 
 export interface MiFileRuntimeConfig {
@@ -17,6 +19,23 @@ function enabled(value: string | undefined): boolean {
 export function getMiFileRuntimeConfig(
     environment: NodeJS.ProcessEnv = process.env,
 ): MiFileRuntimeConfig {
+    let credentialError: string | null = null;
+    if (environment === process.env) {
+        try {
+            const credentials = getMiFileCredentials();
+            if (credentials.source === 'admin') environment = {
+                ...environment,
+                MIFILE_USER: credentials.username,
+                MIFILE_PASSWORD: credentials.password,
+                MIFILE_ACCOUNT_ENVIRONMENT: credentials.accountEnvironment,
+                MIFILE_ACCOUNT_LABEL: credentials.accountLabel,
+                MIFILE_EXPECTED_ACCOUNT_EMAIL: credentials.username,
+                MIFILE_PRODUCTION_ACCOUNT_CONFIRMED: String(credentials.productionConfirmed),
+            };
+        } catch (error) {
+            credentialError = (error as Error).message;
+        }
+    }
     const rawEnvironment = String(environment.MIFILE_ACCOUNT_ENVIRONMENT || 'test')
         .trim()
         .toLowerCase();
@@ -24,6 +43,7 @@ export function getMiFileRuntimeConfig(
         ? 'production'
         : 'test';
     const issues: string[] = [];
+    if (credentialError) issues.push(credentialError);
 
     if (!['test', 'production'].includes(rawEnvironment)) {
         issues.push('MIFILE_ACCOUNT_ENVIRONMENT must be test or production.');
@@ -54,7 +74,7 @@ export function getMiFileRuntimeConfig(
     return {
         accountEnvironment,
         accountLabel: String(environment.MIFILE_ACCOUNT_LABEL || '').trim() ||
-            (accountEnvironment === 'production' ? 'Production account' : 'Test account'),
+            (accountEnvironment === 'production' ? 'Production account' : 'Alternate account (live MiFILE)'),
         preparationMode: 'unsubmitted_only',
         credentialsConfigured,
         productionConfirmed,
