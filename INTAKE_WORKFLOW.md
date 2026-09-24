@@ -6,7 +6,7 @@ One authorized email creates one new Draft and one OneDrive folder. The worker p
 
 The Draft editor displays the PDF with page navigation and zoom beside the editable fields. On mobile, switch between Document and Fields. Missing data, unreadable files, ambiguous document roles, and incomplete packages require review.
 
-After correction and approval, **Prepare in MiFILE** queues a Playwright job. Its only destination is **History > Unsubmitted**. Final submission and payment remain disabled. Both the alternate and primary accounts access live MiFILE; "alternate" does not mean sandbox. The only permitted filer is **Devlin, Adam**.
+Completed email packages with no validation issues and no previous filing job can be queued automatically for preparation. Manual packages and packages requiring correction use the Draft review controls and **Prepare in MiFILE**. The only destination is **History > Unsubmitted**. Final submission and payment remain disabled. Both the alternate and primary accounts access live MiFILE; "alternate" does not mean sandbox. The only permitted filer is **Devlin, Adam**.
 
 ## Sending a package
 
@@ -20,13 +20,13 @@ NEW LT FILING - Example Property LLC v Morgan Tenant
 
 Attach individual PDFs: Complaint, Summons, Request, and applicable Demand/Notice/Lease/Deed or other supporting documents. Include Advice and court-specific Local until the verified forms have been added to Settings > Form library. Keep each PDF within 25 MB. Word files, ZIP archives, and cloud-link-only packages are not supported as intake documents.
 
-Document types are recognized from known titles in the PDF text layer. Filenames are a fallback, not the source of case facts. Filename-only recognition, conflicting titles, combined packages, and unknown files require manual Filing Type confirmation. Scans without a usable text layer are not automatically classified through OCR in this release. Case facts continue to come from the Complaint.
+Document types are recognized from known titles in the PDF text layer or offline OCR when the text layer is insufficient. Filenames are a fallback, not the source of case facts. Filename-only recognition, low-confidence OCR, conflicting titles, combined packages, and unknown files require manual Filing Type confirmation. OCR can suggest Complaint parties and addresses, but scan-derived fields and paragraph 2/10 answers require review. Case facts continue to come from the Complaint.
 
 ## Reusable forms
 
 In **Settings > Form library**, upload the attorney-approved Advice PDF for all courts and a Local PDF for each exact MiFILE court name. Confirm the document type and court assignment before saving. No legal forms are preinstalled or downloaded from third parties.
 
-The worker adds missing forms after intake. Saving a new-case Draft or extracting its Complaint also checks the library. **Add standard forms** performs the same check manually. Existing Advice/Local attachments are preserved, and repeated checks do not create duplicates. An exact court match is required; a district number alone does not select a Local form.
+The worker adds missing forms after intake. Saving a new-case Draft or extracting its Complaint also checks the library. **Add standard forms** performs the same check manually. Existing Advice/Local attachments are preserved, and repeated checks do not create duplicates. An exact court match is required. A district code can resolve to a court only when it uniquely matches a known full court name; ambiguous matches require manual selection.
 
 Each form is copied into that case's OneDrive folder and pinned to its library version. Saving an updated form or disabling it affects future additions only. Existing Drafts and pending retries keep their original version. To replace a pinned form, remove it from the Draft and add the correct one. Changing a Draft's court blocks preparation if its Local form belongs to the previous court.
 
@@ -45,7 +45,7 @@ Replies and forwards with `Re:` or `FW:` subjects do not create another intake. 
 - Failures before the attachment list has been obtained get an email-level retry, with a delay starting at one minute and capped at thirty minutes. Record Detail shows the next Inbox retry time.
 - Every completed retry reruns package validation. Download success alone does not make a case ready for preparation.
 - The court must be explicitly selected if the Complaint has not provided a usable MiFILE court name. Court-specific Other/Connected relationships must be reviewed where no definitive mapping is available.
-- Intake itself does not automatically queue a MiFILE job or send a correction email to the sender. Review and preparation are controlled from the Draft editor in this release.
+- Completed email intakes with zero current validation issues and no previous filing job can automatically queue preparation when the filing worker is enabled and ready. Set `MIFILE_AUTO_PREPARE_ENABLED=false` to disable this. Manual packages are excluded. Failed or uncertain filing jobs require review instead of automatic resubmission. The system does not automatically email a correction request to the sender.
 
 ## Account settings
 
