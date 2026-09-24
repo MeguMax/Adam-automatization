@@ -1,3 +1,10 @@
+import path from 'node:path';
+
+export function pdfResourceOptions() {
+    const root = path.dirname(require.resolve('pdfjs-dist/package.json')).replace(/\\/g, '/');
+    return { wasmUrl: root + '/wasm/', standardFontDataUrl: root + '/standard_fonts/', cMapUrl: root + '/cmaps/', cMapPacked: true };
+}
+
 export interface PdfValidationResult {
     valid: boolean;
     reason?: string;
@@ -44,24 +51,38 @@ export function isValidPdfBuffer(buffer: Buffer): boolean {
 
 let pdfInspector: Promise<any> | null = null;
 
-export async function inspectFilingPdf(buffer: Buffer): Promise<void> {
+export async function inspectFilingPdf(buffer: Buffer): Promise<string[]> {
     const basic = validatePdfBuffer(buffer);
     if (!basic.valid) throw new Error(basic.reason || 'Invalid PDF');
     const nativeImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<any>;
     pdfInspector ??= nativeImport('pdfjs-dist/legacy/build/pdf.mjs');
     const pdfJs = await pdfInspector;
     const task = pdfJs.getDocument({
+        ...pdfResourceOptions(),
         data: new Uint8Array(buffer), isEvalSupported: false, stopAtErrors: true,
         useSystemFonts: true, verbosity: pdfJs.VerbosityLevel.ERRORS,
     });
     try {
         const document = await task.promise;
+        const pages: string[] = [];
         if (!document.numPages) throw new Error('The PDF has no pages');
         for (let number = 1; number <= document.numPages; number++) {
             const page = await document.getPage(number);
             await page.getOperatorList();
+            const text = await page.getTextContent();
+            let previousY: number | null = null;
+            let lines = '';
+            for (const item of text.items) {
+                if (typeof item.str !== 'string') continue;
+                const y = item.transform?.[5] ?? null;
+                if (previousY !== null && y !== null && Math.abs(previousY - y) > 2) lines += '\n';
+                lines += item.str + (item.hasEOL ? '\n' : ' ');
+                previousY = y;
+            }
+            pages.push(lines);
             page.cleanup();
         }
+        return pages;
     } catch {
         throw new Error('The PDF cannot be read completely or requires a password. Replace it with an unlocked, readable PDF.');
     } finally {

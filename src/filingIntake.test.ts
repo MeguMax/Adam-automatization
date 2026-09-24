@@ -146,7 +146,7 @@ test('a failed attachment does not block the remaining package and can be retrie
         const failed = detail.documents.find(document => document.status === 'failed')!;
         assert.match(failed.errorMessage!, /Graph unavailable/);
         assert.ok(failed.nextRetryAt);
-        assert.equal(detail.caseDraft?.status, 'validation_failed');
+        assert.equal(detail.caseDraft?.status, 'needs_review');
         await processFilingIntake(f.db, f.email.id, f.draftId, f.parsed, f.dependencies);
         assert.equal(f.uploaded.length, 3);
         const recovered = f.db.getDraftDetail(f.draftId)!;
@@ -204,6 +204,11 @@ test('a validated intake queues only preparation, locks account changes, and can
         await processFilingIntake(f.db, f.email.id, f.draftId, f.parsed, f.dependencies);
         const detail = f.db.updateCaseDraft(f.draftId, { courtName: '25th District Court' });
         assert.equal(detail.caseDraft?.filingData.caseType, 'LT - Landlord-Tenant Summary Proceedings');
+        assert.throws(() => f.db.reviewCaseDraft(f.draftId, 'approve'), /filename only/);
+        f.db.updateCaseDraft(f.draftId, {}, undefined, undefined, detail.documents.map(doc => ({
+            id: doc.id, filingType: doc.filingType, filingName: doc.currentFilename,
+            filingRelation: 'separate', requiredForFiling: true,
+        })));
         f.db.reviewCaseDraft(f.draftId, 'approve');
         assert.throws(() => f.db.queueFilingJob(f.draftId, 'submit' as any), /Final court submission is disabled/);
         const job = f.db.queueFilingJob(f.draftId);
@@ -218,5 +223,24 @@ test('a validated intake queues only preparation, locks account changes, and can
         assert.throws(() => f.db.reviewCaseDraft(f.draftId, 'reject'), /Resolve or complete/);
         assert.equal(f.db.claimNextFilingJob()?.id, job.id);
         assert.throws(() => f.db.queueEmailRetry(f.email.id), /locked/);
+    } finally { f.close(); }
+});
+
+test('automatic preparation only queues complete new intakes once and never skips warnings', async () => {
+    const f = fixture(['Complaint.pdf', 'Advice.pdf', 'Local.pdf', 'Summons.pdf', 'Request.pdf', 'Other.pdf']);
+    try {
+        await processFilingIntake(f.db, f.email.id, f.draftId, f.parsed, f.dependencies);
+        assert.equal(f.db.queueValidatedIntakes(), 0);
+        const detail = f.db.updateCaseDraft(f.draftId, {courtName:'25th District Court'});
+        f.db.updateCaseDraft(f.draftId, {}, undefined, undefined, detail.documents.map(doc => ({
+            id:doc.id, filingType:doc.filingType, filingName:doc.currentFilename,
+            filingRelation:'separate', requiredForFiling:true,
+        })));
+        f.db.refreshCaseDraftValidation(f.draftId);
+        assert.equal(f.db.queueValidatedIntakes(), 1);
+        assert.equal(f.db.queueValidatedIntakes(), 0);
+        const job = f.db.claimNextFilingJob();
+        assert.equal(job?.mode, 'prepare');
+        assert.equal(job?.triggerSource, 'validated_intake');
     } finally { f.close(); }
 });

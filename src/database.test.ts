@@ -62,7 +62,7 @@ test('processing reports keep the active Plaintiff mapping available on repeat s
         assert.equal(firstResult.plaintiffMappingId, mapping.id);
         assert.equal(
             db.getDraftDetail(firstResult.caseDraftId!)?.caseDraft?.status,
-            'validation_failed',
+            'parsed',
         );
 
         const repeatedResult = db.applyProcessingReport(report);
@@ -632,16 +632,17 @@ test('draft workspace supports listing, editable fields, validation, and reparse
             body: { content: '<p>Draft workspace</p>' },
         });
         const parsed: ParsedEmailInfo = {
-            isMiFile: true,
+            isMiFile: false,
+            sourceKind: 'new_filing_intake',
             courtName: '25th District Court',
             caseNumber: '26-01000-LT',
             caseTitle: 'ORIGINAL PLAINTIFF V ORIGINAL DEFENDANT',
             plaintiff: null,
             defendant: null,
-            bundleNumber: '1000',
+            bundleNumber: null,
             filerName: 'Adam Devlin',
             submitterName: 'Adam Devlin',
-            filedAt: '7/24/2026',
+            filedAt: null,
             filedDocuments: [],
             fileTypeByAttachmentId: {},
         };
@@ -1288,7 +1289,7 @@ test('duplicate, missing, and unknown documents block automatic nonpayment filin
 
         const blocked = db.refreshCaseDraftValidation(draftId);
         const messages = blocked.caseDraft?.validationIssues.map(issue => issue.message) ?? [];
-        assert.equal(blocked.caseDraft?.status, 'validation_failed');
+        assert.equal(blocked.caseDraft?.status, 'needs_review');
         assert.ok(messages.some(message => message.includes('2 Summons documents')));
         assert.ok(messages.some(message => message.includes('at least one demand')));
         assert.ok(messages.some(message => message.includes('is not recognized')));

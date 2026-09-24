@@ -3,6 +3,10 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { ParsedEmailInfo } from './emailProcessor';
+import { DOCUMENT_LABELS, documentLabel, DocumentRecognition } from './documentRecognition';
+import { LibraryForm, FormRole, courtKey } from './formLibraryTypes';
+import { isProcessingReportSubject } from './processingReport';
+import { resolveCourt } from './courtForms';
 import {
     ComplaintExtractionResult,
     isComplaintDocument,
@@ -237,6 +241,7 @@ export interface QueuePage {
 }
 
 export interface DraftListOptions {
+    source?: 'intake' | 'all';
     page?: number;
     pageSize?: number;
     status?: CaseDraftStatus | '';
@@ -382,6 +387,8 @@ export interface EmailPurgeResult extends EmailDeleteResult {
 }
 
 export interface DocumentRecordView {
+    recognition?: DocumentRecognition | null;
+    formTemplate?: { id: string; role: FormRole; courtKey: string; courtName: string } | null;
     id: string;
     originalFilename: string | null;
     currentFilename: string | null;
@@ -1250,7 +1257,7 @@ function suggestMiFileFilingType(
     filename: string | null | undefined,
     moneyJudgmentRequested?: boolean | null,
 ): string | null {
-    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    const value = documentLabel(documentType, filename).toLowerCase();
     if (!value.trim()) return null;
     if (value.includes('advice')) return MIFILE_FILING_TYPES[0];
     if (value.includes('local')) return MIFILE_FILING_TYPES[1];
@@ -1280,7 +1287,7 @@ function filingPackageRole(
     documentType: string | null | undefined,
     filename: string | null | undefined,
 ): FilingPackageRole {
-    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    const value = documentLabel(documentType, filename).toLowerCase();
     if (isComplaintDocument(documentType, filename)) return 'complaint';
     if (/\b(?:mailing|filing) fee\b/.test(value)) return 'fee';
     if (/\badvice\b/.test(value)) return 'advice';
@@ -1298,7 +1305,7 @@ function suggestedFilingRelation(
     filename: string | null | undefined,
 ): DraftFilingRelation {
     const role = filingPackageRole(documentType, filename);
-    const value = `${documentType || ''} ${filename || ''}`.toLowerCase();
+    const value = documentLabel(documentType, filename).toLowerCase();
     if (['complaint', 'advice', 'local', 'request', 'summons'].includes(role)) {
         return 'separate';
     }
@@ -1496,6 +1503,9 @@ function validateDraftDocuments(
 
     for (const document of documents) {
         if (document.packageRole === 'fee' || !document.requiredForFiling) continue;
+        if (document.recognition && document.recognition.source !== 'content' && document.filingTypeSource !== 'manual') {
+            issues.push({ field: `document.${document.id}`, severity: 'error', message: document.recognition.message });
+        }
         if (document.packageRole === 'unknown') {
             issues.push({
                 field: `document.${document.id}`,
@@ -2328,6 +2338,46 @@ const migrations: Migration[] = [
             CREATE INDEX idx_email_discovery_retry ON email_records(processing_status, next_retry_at);
         `),
     },
+    {
+        version: 22,
+        name: 'reusable_filing_forms',
+        up: db => db.exec(`
+            CREATE TABLE filing_forms (
+                id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('advice', 'local')),
+                court_name TEXT NOT NULL, court_key TEXT NOT NULL, filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL, file_size INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_active_form ON filing_forms(role, court_key) WHERE active = 1;
+        `),
+    },
+    {
+        version: 23,
+        name: 'separate_correspondence_and_new_case_validation',
+        up: db => {
+            const timestamp = nowIso();
+            const rows = db.prepare(`SELECT e.id, e.subject FROM email_records e
+                WHERE NOT EXISTS (SELECT 1 FROM case_drafts c JOIN filing_jobs j ON j.case_draft_id = c.id WHERE c.email_id = e.id)
+                AND NOT EXISTS (SELECT 1 FROM case_drafts c WHERE c.email_id = e.id
+                    AND json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake')`).all() as Array<{id: string; subject: string}>;
+            for (const row of rows.filter(row => isProcessingReportSubject(row.subject))) {
+                db.prepare(`UPDATE email_records SET processing_status = 'ignored', next_retry_at = NULL,
+                    processing_error = 'Processing report or reply; original source email is processed separately', updated_at = ? WHERE id = ?`).run(timestamp, row.id);
+                db.prepare(`UPDATE document_records SET status = 'not_downloadable', next_retry_at = NULL,
+                    error_message = 'Report correspondence has no source PDF. See the original court notification.', updated_at = ?
+                    WHERE email_id = ? AND one_drive_url IS NULL AND source_url LIKE 'email-attachment://%'`).run(timestamp, row.id);
+                db.prepare(`UPDATE case_drafts SET status = 'archived', validation_status = 'unknown', updated_at = ?
+                    WHERE email_id = ?`).run(timestamp, row.id);
+            }
+            db.prepare(`UPDATE case_drafts SET status = 'parsed', validation_status = 'unknown', updated_at = ?
+                WHERE status IN ('validation_failed', 'needs_review') AND filing_status = 'not_started'
+                AND COALESCE(json_extract(normalized_data_json, '$.sourceKind'), '') != 'new_filing_intake'
+                AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = case_drafts.id)`).run(timestamp);
+            db.prepare(`UPDATE case_drafts SET status = 'needs_review', updated_at = ?
+                WHERE status = 'validation_failed' AND filing_status = 'not_started'
+                AND json_extract(normalized_data_json, '$.sourceKind') = 'new_filing_intake'`).run(timestamp);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2345,6 +2395,113 @@ export class WorkflowDatabase {
 
     getPath(): string {
         return this.databasePath;
+    }
+
+    getKnownCourtNames(): string[] {
+        const rows = this.db.prepare(`SELECT DISTINCT json_extract(normalized_data_json, '$.courtName') AS name
+            FROM case_drafts WHERE json_extract(normalized_data_json, '$.courtName') LIKE 'MI % District Court%'
+            UNION SELECT court_name FROM filing_forms WHERE role = 'local' AND active = 1`).all() as Array<{name:string}>;
+        return rows.map(row => row.name).filter(Boolean).sort();
+    }
+
+    queueValidatedIntakes(limit = 5): number {
+        const rows = this.db.prepare(`SELECT c.id FROM case_drafts c
+            WHERE json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'
+              AND c.status = 'ready_to_file' AND c.validation_status = 'passed' AND c.filing_status = 'not_started'
+              AND COALESCE(json_extract(c.normalized_data_json, '$.intake.manual'), 0) = 0
+              AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status = 'processed')
+              AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = c.id)
+            ORDER BY c.created_at LIMIT ?`).all(limit) as Array<{id:string}>;
+        let queued = 0;
+        for (const row of rows) {
+            const detail = this.getDraftDetail(row.id);
+            if (!detail?.caseDraft?.filingEligible || detail.caseDraft.validationIssues.length) continue;
+            this.queueFilingJob(row.id, 'prepare', 'validated_intake', 'worker');
+            queued++;
+        }
+        return queued;
+    }
+
+    listLibraryForms(): LibraryForm[] {
+        return this.db.prepare(`SELECT id, role, court_name AS courtName, court_key AS courtKey,
+            filename, sha256, file_size AS fileSize, active, created_at AS createdAt
+            FROM filing_forms ORDER BY active DESC, role, court_name, created_at DESC`).all() as unknown as LibraryForm[];
+    }
+
+    saveLibraryForm(input: Omit<LibraryForm, 'id' | 'courtKey' | 'active' | 'createdAt'>): LibraryForm {
+        if (!['advice', 'local'].includes(input.role)) throw new Error('Invalid form role');
+        const name = input.role === 'advice' ? '' : input.courtName.trim();
+        if (input.role === 'local' && (!name || name.length > 300)) throw new Error('Select the exact court for the Local form');
+        if (!/^[a-f0-9]{64}$/.test(input.sha256)) throw new Error('Invalid PDF fingerprint');
+        const key = courtKey(name);
+        const current = this.listLibraryForms().find(form => form.active && form.role === input.role && form.courtKey === key);
+        if (current?.sha256 === input.sha256) return current;
+        const id = randomUUID();
+        this.runInTransaction(() => {
+            this.db.prepare('UPDATE filing_forms SET active = 0 WHERE role = ? AND court_key = ?').run(input.role, key);
+            this.db.prepare(`INSERT INTO filing_forms (id, role, court_name, court_key, filename, sha256, file_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, input.role, name, key, input.filename, input.sha256, input.fileSize, nowIso());
+            this.insertAuditLog('filing_form', id, 'library_form_saved', { role: input.role, courtName: name });
+        });
+        return this.listLibraryForms().find(form => form.id === id)!;
+    }
+
+    disableLibraryForm(id: string): void {
+        if (!this.listLibraryForms().some(form => form.id === id)) throw new Error('Form not found');
+        this.db.prepare('UPDATE filing_forms SET active = 0 WHERE id = ?').run(id);
+        this.insertAuditLog('filing_form', id, 'library_form_disabled');
+    }
+
+    assertEditableIntake(id: string): EmailDetail {
+        const detail = this.getDraftDetail(id);
+        const draft = detail?.caseDraft;
+        if (!draft || JSON.parse(draft.normalizedDataJson || '{}').sourceKind !== 'new_filing_intake') throw new Error('Only new filing intake Drafts can use library forms');
+        if (draft.filingStatus === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived', 'rejected'].includes(draft.status)) {
+            throw new Error('This Draft is locked for document changes');
+        }
+        return detail!;
+    }
+
+    reserveLibraryDocument(draftId: string, form: LibraryForm): string | null {
+        const detail = this.assertEditableIntake(draftId);
+        const data = JSON.parse(detail.caseDraft!.normalizedDataJson || '{}');
+        if (detail.documents.some(doc => doc.packageRole === form.role)) return null;
+        const active = this.listLibraryForms().find(item => item.id === form.id && item.active);
+        if (!active || (form.role === 'local' && courtKey(data.courtName || '') !== form.courtKey)) return null;
+        return this.addDocument({ emailId: detail.email.id, caseDraftId: draftId,
+            originalFilename: form.filename, documentType: DOCUMENT_LABELS[form.role],
+            sourceUrl: `form-library:${form.id}`, uploadSource: 'form_library', status: 'retrying',
+            lastRetryAt: nowIso(), metadata: { formTemplate: { id: form.id, role: form.role, courtKey: form.courtKey, courtName: form.courtName } } });
+    }
+
+    recordDocumentRecognition(documentId: string, recognition: DocumentRecognition): void {
+        const row = this.db.prepare('SELECT * FROM document_records WHERE id = ? AND is_active = 1').get(documentId) as any;
+        if (!row?.case_draft_id) throw new Error('Document not found');
+        this.assertEditableIntake(row.case_draft_id);
+        if (row.filing_type_source === 'manual') return;
+        const label = DOCUMENT_LABELS[recognition.role];
+        const metadata = { ...this.safeJson(row.metadata_json), recognition };
+        this.db.prepare(`UPDATE document_records SET document_type = ?, filing_type = ?, filing_type_source = 'suggested',
+            filing_relation = ?, metadata_json = ?, updated_at = ? WHERE id = ?`).run(label,
+            suggestMiFileFilingType(label, null), suggestedFilingRelation(label, null), toJson(metadata), nowIso(), documentId);
+        if (recognition.role !== 'complaint') {
+            this.db.prepare('UPDATE case_drafts SET primary_document_id = NULL WHERE id = ? AND primary_document_id = ?')
+                .run(row.case_draft_id, documentId);
+        } else this.assignPrimaryComplaint(row.case_draft_id, documentId, label, null);
+        this.insertAuditLog('document_record', documentId, 'document_type_recognized', recognition);
+    }
+
+    removeLibraryDocument(draftId: string, documentId: string): EmailDetail {
+        const detail = this.assertEditableIntake(draftId);
+        const document = detail.documents.find(item => item.id === documentId && item.formTemplate);
+        if (!document) throw new Error('Library document not found in this Draft');
+        if (document.status === 'retrying') throw new Error('Wait for this form upload to finish before removing it');
+        this.db.prepare('DELETE FROM document_records WHERE id = ? AND case_draft_id = ?').run(documentId, draftId);
+        this.insertAuditLog('case_draft', draftId, 'library_document_removed', {
+            documentId, template: document.formTemplate, oneDriveFilePreserved: document.oneDriveUrl,
+        });
+        this.refreshEmailAfterDocumentRetries(detail.email.id, draftId);
+        return this.refreshCaseDraftValidation(draftId);
     }
 
     getRuntimeSetting(key: string): string | null {
@@ -2758,10 +2915,13 @@ export class WorkflowDatabase {
 
     queueDocumentRetry(documentId: string, reason = 'Queued from admin UI'): void {
         const existing = this.db
-            .prepare('SELECT id, source_url, status FROM document_records WHERE id = ?')
-            .get(documentId) as { id: string; source_url: string | null; status: string } | undefined;
+            .prepare('SELECT id, source_url, status, case_draft_id FROM document_records WHERE id = ? AND is_active = 1')
+            .get(documentId) as { id: string; source_url: string | null; status: string; case_draft_id: string | null } | undefined;
 
         if (!existing) throw new Error('Document record not found');
+        if (existing.case_draft_id && JSON.parse(this.getDraftDetail(existing.case_draft_id)?.caseDraft?.normalizedDataJson || '{}').sourceKind === 'new_filing_intake') {
+            this.assertEditableIntake(existing.case_draft_id);
+        }
         if (!existing.source_url) throw new Error('This document has no source URL to retry');
         if (!['pending', 'failed', 'retry_queued'].includes(existing.status)) {
             throw new Error('Only pending or failed documents can be queued for retry');
@@ -2847,6 +3007,12 @@ export class WorkflowDatabase {
                 JOIN email_records e ON e.id = d.email_id
                 LEFT JOIN case_drafts c ON c.id = d.case_draft_id
                 WHERE d.source_url IS NOT NULL
+                  AND d.is_active = 1
+                  AND (
+                    COALESCE(json_extract(c.normalized_data_json, '$.sourceKind'), '') != 'new_filing_intake'
+                    OR (c.filing_status NOT IN ('queued', 'running', 'prepared')
+                        AND c.status NOT IN ('filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived', 'rejected'))
+                  )
                   AND d.source_url != ''
                   AND (
                     d.status = 'retry_queued'
@@ -2943,6 +3109,8 @@ export class WorkflowDatabase {
         downloadAttempts: number;
     }): void {
         const timestamp = nowIso();
+        const previous = this.db.prepare('SELECT metadata_json FROM document_records WHERE id = ?').get(input.documentId) as any;
+        const metadata = { ...this.safeJson(previous?.metadata_json), ...(input.metadata && typeof input.metadata === 'object' ? input.metadata : {}) };
         this.db
             .prepare(`
                 UPDATE document_records
@@ -2974,7 +3142,7 @@ export class WorkflowDatabase {
                 input.fileSize,
                 input.documentType,
                 input.uploadSource,
-                toJson(input.metadata),
+                toJson(metadata),
                 input.downloadAttempts,
                 timestamp,
                 input.documentId,
@@ -3903,9 +4071,9 @@ export class WorkflowDatabase {
     getDashboardSummary(): DashboardSummary {
         return {
             emailStatuses: this.countBy('email_records', 'processing_status'),
-            draftStatuses: this.countBy('case_drafts', 'status'),
+            draftStatuses: this.countBy('case_drafts', 'status', "json_extract(normalized_data_json, '$.sourceKind') = 'new_filing_intake'"),
             documentStatuses: this.countBy('document_records', 'status'),
-            filingStatuses: this.countBy('case_drafts', 'filing_status'),
+            filingStatuses: this.countBy('case_drafts', 'filing_status', "json_extract(normalized_data_json, '$.sourceKind') = 'new_filing_intake'"),
             documentsToday: this.countSinceToday('document_records'),
             emailsToday: this.countSinceToday(
                 'email_records',
@@ -4063,6 +4231,10 @@ export class WorkflowDatabase {
         const requestedPage = Math.max(Math.floor(options.page ?? 1), 1);
         const whereParts = ['1 = 1'];
         const parameters: Array<string | number> = [];
+
+        if (options.source === 'intake') {
+            whereParts.push("json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'");
+        }
 
         if (options.status) {
             whereParts.push('c.status = ?');
@@ -4591,6 +4763,8 @@ export class WorkflowDatabase {
                     row.current_filename || row.original_filename,
                 ),
                 packageRole,
+                recognition: this.safeJson(row.metadata_json)?.recognition || null,
+                formTemplate: this.safeJson(row.metadata_json)?.formTemplate || null,
                 uploadSource: row.upload_source,
                 status: row.status,
                 errorMessage: row.error_message,
@@ -4607,7 +4781,7 @@ export class WorkflowDatabase {
             if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
             return left.createdAt.localeCompare(right.createdAt);
         });
-        const validationIssues = caseDraft
+        const validationIssues = caseDraft && !validateNewCaseSource(normalizedDraftData, email.subject, email.sender).length
             ? [
                 ...validateDraftData(normalizedDraftData),
                 ...this.intakeValidationIssues(normalizedDraftData),
@@ -4618,6 +4792,11 @@ export class WorkflowDatabase {
                     normalizedFilingData,
                 ),
                 ...validateDraftDocuments(documentViews, normalizedFilingData),
+                ...documentViews.filter(document => document.requiredForFiling && document.formTemplate?.role === 'local' &&
+                    document.formTemplate.courtKey !== courtKey(normalizedDraftData?.courtName || '')).map(document => ({
+                        field: `document.${document.id}`, severity: 'error' as const,
+                        message: 'The library Local form belongs to another court. Remove it and add the form for the selected court.',
+                    })),
             ]
             : [];
         const filingEligibilityIssues = caseDraft
@@ -5362,6 +5541,7 @@ export class WorkflowDatabase {
                     .prepare(`
                         UPDATE document_records
                         SET filing_name = ?,
+                            document_type = COALESCE(?, document_type),
                             filing_type = ?,
                             filing_type_source = ?,
                             filing_relation = ?,
@@ -5373,6 +5553,7 @@ export class WorkflowDatabase {
                     `)
                     .run(
                         filingName,
+                        filingType,
                         filingType,
                         filingType ? 'manual' : null,
                         filingRelation,
@@ -5500,6 +5681,7 @@ export class WorkflowDatabase {
             this.db.prepare(`
                 UPDATE document_records
                 SET status = 'replaced', file_size = ?, mime_type = ?,
+                    filing_type_source = 'suggested',
                     error_message = NULL, updated_at = ?
                 WHERE id = ?
             `).run(input.fileSize, input.mimeType || 'application/pdf', timestamp, documentId);
@@ -5611,6 +5793,10 @@ export class WorkflowDatabase {
 
         if (extraction.data.courtDistrict) {
             apply('courtDistrict', extraction.data.courtDistrict);
+            if (!next.courtName && !manualFields.has('courtDistrict')) {
+                const court = resolveCourt(extraction.data.courtDistrict, this.getKnownCourtNames());
+                if (court) next.courtName = court;
+            }
         }
         if (extraction.data.plaintiff) {
             apply('plaintiff', sanitizeDraftParty({
@@ -5759,6 +5945,16 @@ export class WorkflowDatabase {
     refreshCaseDraftValidation(caseDraftId: string): EmailDetail {
         const detail = this.getDraftDetail(caseDraftId);
         if (!detail?.caseDraft) throw new Error('Case draft not found');
+        // Download-only court notifications must never undergo new-case package validation.
+        const source = this.safeJson(detail.caseDraft.normalizedDataJson);
+        if (validateNewCaseSource(source, detail.email.subject, detail.email.sender).length) {
+            if (['validation_failed', 'needs_review', 'ready_to_file'].includes(detail.caseDraft.status) && detail.caseDraft.filingStatus === 'not_started') {
+                this.setCaseDraftStatus(caseDraftId, 'parsed', 'unknown', 'not_started');
+                return this.getDraftDetail(caseDraftId) || detail;
+            }
+            return detail;
+        }
+        if (detail.caseDraft.filingStatus === 'queued' || detail.caseDraft.status === 'rejected') return detail;
         if (['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived'].includes(
             detail.caseDraft.status,
         )) {
@@ -5768,7 +5964,7 @@ export class WorkflowDatabase {
         const issues = detail.caseDraft.validationIssues;
         const hasErrors = issues.some(issue => issue.severity === 'error');
         const status: CaseDraftStatus = hasErrors
-            ? 'validation_failed'
+            ? 'needs_review'
             : issues.length
                 ? 'needs_review'
                 : 'ready_to_file';
@@ -6038,6 +6234,7 @@ export class WorkflowDatabase {
             next.auditAction = 'moved_to_review';
         } else if (action === 'approve') {
             const detail = this.getDraftDetail(caseDraftId);
+            if (detail?.caseDraft && !detail.caseDraft.filingEligible) throw new Error('This court notification is not a new filing package.');
             const issues = detail?.caseDraft?.validationIssues ??
                 validateDraftData(this.safeJson(existing.normalized_data_json));
             const blockingIssue = issues.find(issue => issue.severity === 'error');
@@ -6275,11 +6472,12 @@ export class WorkflowDatabase {
         }
     }
 
-    private countBy(tableName: string, columnName: string): Record<string, number> {
+    private countBy(tableName: string, columnName: string, where = '1 = 1'): Record<string, number> {
         const rows = this.db
             .prepare(`
                 SELECT ${columnName} AS key, COUNT(*) AS count
                 FROM ${tableName}
+                WHERE ${where}
                 GROUP BY ${columnName}
             `)
             .all() as { key: string; count: number }[];

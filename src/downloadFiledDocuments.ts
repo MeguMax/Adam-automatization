@@ -16,10 +16,12 @@ import { TrueCertifyBufferDownloader } from './truecertifyDownloader';
 import { validatePdfBuffer } from './pdfValidation';
 import { isEmailAttachmentSource } from './emailAttachmentSource';
 import { downloadIntakeDocuments } from './filingIntakeDownload';
+import type { DocumentRecognition } from './documentRecognition';
 
 // === ТИПЫ ДЛЯ РЕЗУЛЬТАТОВ ===
 
 export interface DownloadedFile {
+    recognition?: DocumentRecognition;
     documentType: string | null;
     documentName?: string | null;
     localPath: string;

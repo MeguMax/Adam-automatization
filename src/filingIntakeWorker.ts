@@ -1,7 +1,9 @@
 import type { WorkflowDatabase } from './database';
 import type { ParsedEmailInfo } from './emailProcessor';
 import type { DownloadResult } from './downloadFiledDocuments';
-import { isComplaintDocument, ComplaintExtractionResult } from './complaintExtractor';
+import { ComplaintExtractionResult } from './complaintExtractor';
+import { recognizeDocumentPdf } from './documentRecognition';
+import { applyLibraryForms } from './formLibrary';
 
 export async function processFilingIntake(
     db: WorkflowDatabase,
@@ -54,7 +56,9 @@ export async function processFilingIntake(
                 downloadAttempts: downloaded.downloadAttempts || 1,
                 metadata: { driveId: file.driveId, itemId: file.itemId },
             });
-            if (isComplaintDocument(source.documentType, source.documentName)) {
+            const recognition = downloaded.recognition || await recognizeDocumentPdf(file.buffer, source.documentName || file.displayName);
+            db.recordDocumentRecognition(document.id, recognition);
+            if (recognition.role === 'complaint' && recognition.source !== 'conflict') {
                 try {
                     const extraction = await dependencies.extract(file.buffer, source.documentType);
                     db.applyComplaintExtraction(draftId, document.id, extraction);
@@ -72,5 +76,5 @@ export async function processFilingIntake(
     }
     if (parsed.filedDocuments.length) db.refreshEmailAfterDocumentRetries(emailId, draftId);
     else db.markEmailProcessed(emailId);
-    return db.refreshCaseDraftValidation(draftId);
+    return applyLibraryForms(db, draftId);
 }

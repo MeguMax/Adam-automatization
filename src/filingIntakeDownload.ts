@@ -2,6 +2,7 @@ import type { DownloadResult, DocumentAttemptLog } from './downloadFiledDocument
 import type { ParsedEmailInfo, FiledDocumentInfo } from './emailProcessor';
 import { INTAKE_MAX_PDF_BYTES, intakeFileName } from './filingIntake';
 import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
+import { recognizeDocumentPages, DocumentRecognition } from './documentRecognition';
 
 export interface IntakeDownloadDependencies {
     download(document: FiledDocumentInfo): Promise<Buffer>;
@@ -26,6 +27,7 @@ export async function downloadIntakeDocuments(
         let buffer: Buffer | undefined;
         let complete = false;
         let inspected = false;
+        let recognition: DocumentRecognition | undefined;
         for (let attempt = 1; attempt <= 3; attempt++) {
             attempts = attempt;
             try {
@@ -38,7 +40,8 @@ export async function downloadIntakeDocuments(
                     throw new Error('The PDF exceeds the 25 MB filing limit. Replace it with a smaller PDF.');
                 }
                 if (!inspected) {
-                    await inspectFilingPdf(buffer);
+                    const pages = await inspectFilingPdf(buffer);
+                    recognition = await recognizeDocumentPages(buffer, pages, document.documentName || document.documentType || '');
                     inspected = true;
                 }
                 stage = 'upload';
@@ -47,6 +50,7 @@ export async function downloadIntakeDocuments(
                 result.downloaded.push({
                     documentName: document.documentName,
                     documentType: document.documentType,
+                    recognition,
                     downloadUrl: document.downloadUrl,
                     downloadAttempts: attempts,
                     localPath: `New filings/${parsed.intake.storageKey}/${uploaded.fileName}`,

@@ -1,6 +1,8 @@
 import { createHash } from 'crypto';
 import path from 'path';
-import { validatePdfBuffer } from './pdfValidation';
+import { validatePdfBuffer, pdfResourceOptions } from './pdfValidation';
+import { documentLabel } from './documentRecognition';
+import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -43,11 +45,13 @@ export interface ComplaintExtractionWarning {
         | 'missing_defendant'
         | 'multiple_defendants_review'
         | 'related_action_review'
-        | 'claim_amount_review';
+        | 'claim_amount_review'
+        | 'scan_review';
     message: string;
 }
 
 export interface ComplaintExtractionResult {
+    textSource?: 'pdf' | 'ocr';
     extractorVersion: 1 | 2;
     formType: string | null;
     pageCount: number;
@@ -347,7 +351,7 @@ export function isComplaintDocument(
     documentType: string | null | undefined,
     filename?: string | null,
 ): boolean {
-    const value = `${documentType ?? ''} ${filename ?? ''}`.toLowerCase();
+    const value = documentLabel(documentType, filename).toLowerCase();
     return /\bcomplaint\b/.test(value) && !/supplemental complaint attachment/.test(value);
 }
 
@@ -510,6 +514,7 @@ export async function extractComplaintPdf(
     const packageRoot = path.dirname(require.resolve('pdfjs-dist/package.json'));
     const standardFontDataUrl = `${path.join(packageRoot, 'standard_fonts').replace(/\\/g, '/')}/`;
     const loadingTask = pdfJs.getDocument({
+        ...pdfResourceOptions(),
         data: new Uint8Array(buffer),
         disableWorker: true,
         useSystemFonts: true,
@@ -572,12 +577,77 @@ export async function extractComplaintPdf(
             flush();
         }
 
-        return parseComplaintText(lines, {
+        const result = parseComplaintText(lines, {
             pageCount: document.numPages,
             documentType,
             positionedValues,
         });
+        if (result.warnings.some(warning => warning.code === 'missing_filled_section')) {
+            // Flattened PDFs and scans have no reliable PDF fill-order marker.
+            // OCR reads their visible fields instead; never infer unchecked boxes from missing text.
+            return parseScannedComplaint(await recognizeScannedPdf(buffer), document.numPages);
+        }
+        return { ...result, textSource: 'pdf' };
     } finally {
         await loadingTask.destroy();
     }
+}
+
+export function parseScannedComplaint(pages: OcrPage[], pageCount = pages.length): ComplaintExtractionResult {
+    const text = pages.map(page => page.text).join('\n');
+    const result = parseComplaintText(text, { pageCount });
+    result.textSource = 'ocr';
+    result.data = {};
+    result.fieldConfidence = {};
+    result.warnings = result.warnings.filter(warning => !['missing_filled_section', 'missing_plaintiff', 'missing_defendant'].includes(warning.code));
+    const first = pages.find(page => /plaintiff.{0,10}name/i.test(page.text) && /defendant.{0,10}name/i.test(page.text));
+    const words = first?.words || [];
+    const groupLines = (items: OcrLine[]) => {
+        const rows: OcrLine[][] = [];
+        for (const word of [...items].sort((a, b) => a.y - b.y || a.x - b.x)) {
+            const row = rows.find(row => Math.abs(row[0].y - word.y) < 5);
+            if (row) row.push(word); else rows.push([word]);
+        }
+        return rows.map(row => ({ y: row[0].y, text: row.sort((a, b) => a.x - b.x).map(word => word.text).join(' ') }));
+    };
+    const left = groupLines(words.filter(word => word.x < 300));
+    const right = groupLines(words.filter(word => word.x >= 300));
+    const plaintiffLabel = left.find(line => /plaintiff.{0,6}name/i.test(line.text));
+    const defendantLabel = right.find(line => /defendant.{0,6}name/i.test(line.text));
+    const attorneyLabel = left.find(line => /plaintiff.{0,6}attorney/i.test(line.text));
+    const statesLabel = left.find(line => /the plaintiff states/i.test(line.text));
+    function party(rows: Array<{y: number; text: string}>, start?: number, end?: number): ComplaintPartyExtraction | undefined {
+        if (start === undefined || end === undefined) return;
+        const values = rows.filter(line => line.y > start + 6 && line.y < end - 2).map(line => line.text.trim());
+        const name = values[0];
+        if (!name || !/[a-z]{2}/i.test(name) || /name,? address|telephone|plaintiff|defendant|attorney/i.test(name)) return;
+        const cityIndex = values.findIndex(value => Boolean(parseCityStateZip(value).state));
+        return { displayName: cleanName(name), ...personNameParts(name),
+            ...(cityIndex > 0 ? { address1: values.slice(1, cityIndex).join(' '), ...parseCityStateZip(values[cityIndex]) } : {}),
+            phone: values.map(normalizedPhone).find(Boolean) };
+    }
+    const plaintiff = party(left, plaintiffLabel?.y, attorneyLabel?.y);
+    if (plaintiff) {
+        result.data.plaintiff = { ...plaintiff, entityName: plaintiff.displayName };
+        result.fieldConfidence.plaintiff = 'medium';
+    }
+    const defendant = party(right, defendantLabel?.y, statesLabel?.y);
+    if (defendant) {
+        result.data.includeAllOtherOccupants = /all other occupants/i.test(defendant.displayName);
+        defendant.displayName = cleanName(defendant.displayName.replace(/(?:,?\s+and\s+)?all other occupants/ig, ''));
+        Object.assign(defendant, personNameParts(defendant.displayName));
+        result.data.defendants = [defendant];
+        result.fieldConfidence.defendants = 'medium';
+    }
+    const district = text.match(/\b(\d{1,3}[AB]?)(?:st|nd|rd|th)?\s+(?:judicial\s+)?district\b/i);
+    if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = 'medium'; }
+    result.data.mailingRequested = true;
+    delete result.data.moneyJudgmentRequested;
+    delete result.data.claimAmount;
+    delete result.data.relatedCivilAction;
+    result.warnings.push({ code: 'claim_amount_review', message: 'Confirm paragraph 10 and the claim amount against the scanned Complaint. OCR does not assume that an unread checkbox is unchecked.' });
+    result.warnings.push({ code: 'scan_review', message: 'Fields were read from a scan. Check the parties and addresses against the PDF before approving this package.' });
+    if (!result.data.plaintiff) result.warnings.push({ code: 'missing_plaintiff', message: 'Enter the Plaintiff from the scanned Complaint.' });
+    if (!result.data.defendants?.length) result.warnings.push({ code: 'missing_defendant', message: 'Enter the Defendant names and address from the scanned Complaint.' });
+    return result;
 }

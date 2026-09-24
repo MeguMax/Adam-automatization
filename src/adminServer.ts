@@ -31,16 +31,20 @@ import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
 import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { parseWorkflowEmail } from './workflowEmail';
-import { getFilingIntakeConfig, intakeFileName } from './filingIntake';
+import path from 'node:path';
+import { planFormImport } from './courtForms';
+import { getFilingIntakeConfig, intakeFileName, buildFilingIntake } from './filingIntake';
 import {
     accountSettingsEnabled, accountSettingsView, credentialsFromSettingsInput,
     encryptMiFileAccount, getMiFileCredentials,
 } from './mifileAccountSettings';
 import { invalidateMifileSession, testMiFileCredentials } from './mifileSession';
 import { pdfPreviewHtml } from './pdfPreview';
+import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
+import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-09-09-admin-login-v22';
+const ADMIN_BUILD_ID = '2026-09-24-scan-intake-v24';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2066,6 +2070,7 @@ const html = String.raw`<!doctype html>
     .draft-panel-toolbar {
       min-height: 58px;
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
@@ -2075,7 +2080,7 @@ const html = String.raw`<!doctype html>
     }
     .draft-document-select {
       min-width: 0;
-      flex: 1 1 auto;
+      flex: 1 0 100%;
     }
     .draft-document-select > span {
       display: block;
@@ -2086,10 +2091,11 @@ const html = String.raw`<!doctype html>
       text-transform: uppercase;
     }
     .draft-document-select select {
-      width: min(100%, 470px);
+      width: 100%;
     }
     .draft-source-actions {
-      flex: 0 0 auto;
+      flex: 1 1 100%;
+      flex-wrap: wrap;
     }
     .draft-source-actions button {
       min-height: 34px;
@@ -2956,8 +2962,9 @@ const html = String.raw`<!doctype html>
     .settings-grid input, .settings-grid select { width: 100%; min-width: 0; }
     .settings-value { overflow-wrap: anywhere; padding: 8px 0; }
     .settings-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 20px; }
-    #miFilePrimaryConfirmationLabel { flex-wrap: nowrap; justify-content: flex-start; }
-    #miFilePrimaryConfirmation { width: 18px; height: 18px; min-height: 18px; min-width: 18px; padding: 0; margin: 0; flex: 0 0 18px; }
+    #miFilePrimaryConfirmationLabel, #libraryConfirmationLabel { flex-wrap: nowrap; justify-content: flex-start; }
+    #miFilePrimaryConfirmation, #libraryConfirmed { width: 18px; height: 18px; min-height: 18px; min-width: 18px; padding: 0; margin: 0; flex: 0 0 18px; }
+    #libraryList td { overflow-wrap: anywhere; }
     #settingsMessage { margin: 16px 0; overflow-wrap: anywhere; }
     @media (max-width: 640px) {
       .settings-layout { padding: 16px; }
@@ -2965,6 +2972,11 @@ const html = String.raw`<!doctype html>
       header.app-header > .controls { min-width: 0; max-width: 100%; }
       .nav-tabs { min-width: 0; max-width: 100%; overflow-x: auto; }
       .nav-tabs button { padding: 0 7px; gap: 5px; font-size: 12px; }
+      #libraryList table, #libraryList tbody { display: block; width: 100%; }
+      #libraryList thead { display: none; }
+      #libraryList tr { display: grid; grid-template-columns: minmax(0, 1fr) 40px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+      #libraryList td { display: block; padding: 4px 8px; border: 0; grid-column: 1; }
+      #libraryList td:last-child { grid-column: 2; grid-row: 1 / 4; padding: 4px 0; }
     }
   </style>
 </head>
@@ -3100,8 +3112,16 @@ const html = String.raw`<!doctype html>
             <h2><i data-lucide="file-pen-line"></i>Case drafts</h2>
             <span id="draftMeta">Loading drafts...</span>
           </div>
+          <button id="newDraftBtn" class="primary" type="button"><i data-lucide="plus"></i>New case</button>
         </div>
         <div class="filter-bar draft-filter-bar">
+          <label class="field">
+            <span class="field-label">Source</span>
+            <select id="draftSourceFilter">
+              <option value="intake">New filing packages</option>
+              <option value="all">All records, including court notices</option>
+            </select>
+          </label>
           <label class="field search-field">
             <span class="field-label">Search</span>
             <i data-lucide="search"></i>
@@ -3192,6 +3212,8 @@ const html = String.raw`<!doctype html>
                 <button id="draftPrimaryBtn" type="button" title="Use the selected document as the primary source"><i data-lucide="star"></i>Primary source</button>
                 <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
                 <button id="draftAddDocumentBtn" type="button" title="Add a PDF to this Draft"><i data-lucide="file-plus-2"></i>Add PDF</button>
+                <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
+                <button id="draftRemoveFormBtn" class="icon-button" type="button" title="Remove library form from Draft" aria-label="Remove library form"><i data-lucide="trash-2"></i></button>
                 <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF while keeping its OneDrive name and link"><i data-lucide="replace"></i>Replace PDF</button>
                 <input id="draftDocumentFileInput" class="hidden" type="file" accept="application/pdf,.pdf">
               </div>
@@ -3232,6 +3254,23 @@ const html = String.raw`<!doctype html>
           <div class="field"><span class="field-label">Accepted senders</span><div id="intakeSenders" class="settings-value"></div></div>
           <div class="field"><span class="field-label">Package</span><div class="settings-value">One case per email · PDF attachments · 25 MB per file</div></div>
         </div>
+      </section>
+      <section class="settings-section">
+        <h2>Form library</h2>
+        <form id="libraryUploadForm">
+          <div class="settings-grid">
+            <label class="field"><span class="field-label">Form</span><select id="libraryRole"><option value="advice">Advice (all courts)</option><option value="local">Local (one court)</option></select></label>
+            <label class="field"><span class="field-label">Exact MiFILE court name</span><input id="libraryCourt" type="text" maxlength="300" disabled></label>
+            <label class="field"><span class="field-label">PDF</span><input id="libraryFile" type="file" accept="application/pdf,.pdf" required></label>
+          </div>
+          <label id="libraryConfirmationLabel" class="settings-actions"><input id="libraryConfirmed" type="checkbox" required>I verified this form and its court assignment</label>
+          <div class="settings-actions"><button id="libraryUploadBtn" class="primary" type="submit"><i data-lucide="upload"></i>Save form</button></div>
+        </form>
+        <p id="libraryMessage" role="status"></p>
+        <div class="settings-actions"><label class="field"><span class="field-label">Import Advice / Local PDFs</span><input id="libraryBatchFiles" type="file" accept="application/pdf,.pdf" multiple></label>
+          <button id="libraryBatchImport" type="button"><i data-lucide="folder-up"></i>Import selected forms</button></div>
+        <div id="libraryImportResults" role="status"></div>
+        <div id="libraryList" style="overflow-x:auto;max-width:100%"></div>
       </section>
       <section class="settings-section">
         <h2>MiFILE account</h2>
@@ -3453,6 +3492,8 @@ const html = String.raw`<!doctype html>
     }[ch]));
     const icon = name => '<i data-lucide="' + escapeHtml(name) + '"></i>';
     const statusPill = value => '<span class="status ' + statusClass(value) + '">' + escapeHtml(statusLabel(value)) + '</span>';
+    const validationPill = value => value === 'failed'
+      ? '<span class="status needs_review">Incomplete</span>' : statusPill(value);
 
     function renderIcons() {
       if (window.lucide && typeof window.lucide.createIcons === 'function') {
@@ -3544,10 +3585,74 @@ const html = String.raw`<!doctype html>
         loadActivity().catch(showActivityError);
       } else if (view === 'settings') {
         loadAccountSettings().catch(error => { document.getElementById('settingsMessage').textContent = error.message; });
+        loadLibraryForms().catch(error => { document.getElementById('libraryMessage').textContent = error.message; });
       }
     }
 
     let accountSettingsBusy = false;
+    async function loadLibraryForms() {
+      const forms = await api('/api/form-library');
+      document.getElementById('libraryList').innerHTML = forms.length ?
+        '<table><thead><tr><th>Form / Court</th><th>PDF / Version</th><th>Status</th><th></th></tr></thead><tbody>' + forms.map(form =>
+          '<tr><td>' + escapeHtml(form.role === 'advice' ? 'Advice / All courts' : 'Local / ' + form.courtName) + '</td><td>' +
+          '<a target="_blank" rel="noreferrer" href="/api/form-library/' + encodeURIComponent(form.id) + '/content">' + escapeHtml(form.filename) + '</a>' +
+          '<div class="muted">' + escapeHtml(new Date(form.createdAt).toLocaleString()) + '</div></td><td>' + (form.active ? 'Active' : 'Inactive') +
+          '</td><td>' + (form.active ? '<button class="icon-button" data-disable-form="' + escapeHtml(form.id) + '" title="Disable for future drafts" aria-label="Disable form">' + icon('archive') + '</button>' : '') + '</td></tr>'
+        ).join('') + '</tbody></table>' : '<p class="muted">No forms added</p>';
+      renderIcons();
+    }
+    document.getElementById('libraryRole').addEventListener('change', () => {
+      const local = document.getElementById('libraryRole').value === 'local';
+      document.getElementById('libraryCourt').disabled = !local;
+      document.getElementById('libraryCourt').required = local;
+    });
+    document.getElementById('libraryUploadForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const file = document.getElementById('libraryFile').files[0];
+      const button = document.getElementById('libraryUploadBtn');
+      const message = document.getElementById('libraryMessage');
+      if (!file || button.disabled) return;
+      if (file.size > 25 * 1024 * 1024) { message.textContent = 'The PDF must be within 25 MB.'; return; }
+      button.disabled = true;
+      try {
+        await api('/api/form-library?role=' + encodeURIComponent(document.getElementById('libraryRole').value) +
+          '&court=' + encodeURIComponent(document.getElementById('libraryCourt').value), {
+            method: 'POST', headers: {'Content-Type':'application/pdf', 'X-File-Name':encodeURIComponent(file.name), 'X-Form-Confirmed':'true'}, body: file,
+          });
+        document.getElementById('libraryFile').value = '';
+        document.getElementById('libraryConfirmed').checked = false;
+        message.textContent = 'Form saved. Existing Draft documents keep their original version.';
+        await loadLibraryForms();
+      } catch (error) { message.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+    document.getElementById('libraryList').addEventListener('click', async event => {
+      const button = event.target.closest('[data-disable-form]');
+      if (!button || !confirm('Disable this form for future Drafts? Existing documents will not be deleted.')) return;
+      button.disabled = true;
+      try { await api('/api/form-library/' + encodeURIComponent(button.dataset.disableForm), {method:'DELETE'}); await loadLibraryForms(); }
+      catch (error) { document.getElementById('libraryMessage').textContent = error.message; button.disabled = false; }
+    });
+    document.getElementById('libraryBatchImport').addEventListener('click', async () => {
+      const button = document.getElementById('libraryBatchImport');
+      const files = Array.from(document.getElementById('libraryBatchFiles').files);
+      if (!files.length || button.disabled) return;
+      if (!confirm('Import these standard forms using their court numbers? Unmatched courts and special packets will be skipped. Existing active versions will be preserved.')) return;
+      button.disabled = true;
+      const root = document.getElementById('libraryImportResults');
+      root.replaceChildren();
+      try {
+        for (const file of files) {
+          const row = document.createElement('p'); root.appendChild(row);
+          row.textContent = file.name + ': importing...';
+          try {
+            const result = await api('/api/form-library/import', {method:'POST',headers:{'Content-Type':'application/pdf','X-File-Name':encodeURIComponent(file.name)},body:file});
+            row.textContent = file.name + ': saved - ' + (result.courtName || 'All courts');
+          } catch (error) { row.textContent = file.name + ': not imported - ' + error.message; }
+        }
+        await loadLibraryForms();
+      } finally { button.disabled = false; }
+    });
     async function loadAccountSettings() {
       const data = await api('/api/settings');
       document.getElementById('intakeMailbox').textContent = data.intake.mailbox || 'Not configured';
@@ -3852,7 +3957,7 @@ const html = String.raw`<!doctype html>
             (item.failedDocumentCount
               ? '<span class="cell-secondary error-text">' + escapeHtml(item.failedDocumentCount) + ' failed</span>'
               : '<span class="cell-secondary">viewable</span>') + '</td>' +
-          '<td>' + statusPill(item.validationStatus) + '</td>' +
+          '<td>' + validationPill(item.validationStatus) + '</td>' +
           '<td>' + statusPill(item.status) + '</td>' +
           '<td><span class="cell-secondary">' + escapeHtml(fmtDate(item.updatedAt)) + '</span></td>' +
         '</tr>').join('') +
@@ -3925,6 +4030,7 @@ const html = String.raw`<!doctype html>
       const task = (async () => {
         const params = new URLSearchParams({
           page: String(state.draftPagination.page),
+          source: document.getElementById('draftSourceFilter').value,
           pageSize: document.getElementById('draftPageSize').value,
         });
         const search = document.getElementById('draftSearch').value.trim();
@@ -4010,7 +4116,7 @@ const html = String.raw`<!doctype html>
       document.getElementById('draftWorkspaceSubject').textContent =
         detail.email.subject || '(no subject)';
       document.getElementById('draftWorkspaceStatuses').innerHTML =
-        statusPill(draft.status) + statusPill(draft.validationStatus) +
+        statusPill(draft.status) + validationPill(draft.validationStatus) +
         statusPill(draft.filingStatus);
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
       renderDraftFields(draft);
@@ -4038,6 +4144,16 @@ const html = String.raw`<!doctype html>
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
       renderIcons();
     }
+
+    document.getElementById('newDraftBtn').addEventListener('click', async () => {
+      const button = document.getElementById('newDraftBtn');
+      button.disabled = true;
+      try {
+        const detail = await api('/api/drafts', {method:'POST'});
+        await openDraft(detail.caseDraft.id);
+      } catch (error) { showDraftError(error); }
+      finally { button.disabled = false; }
+    });
 
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
@@ -4197,14 +4313,17 @@ const html = String.raw`<!doctype html>
       const documents = (state.draftDetail && state.draftDetail.documents) || [];
       const validationRoot = document.getElementById('draftValidationSummary');
 
-      if (issues.length) {
+      if (!draft.filingEligible) {
+        validationRoot.innerHTML = '<div class="draft-validation"><strong>Court notification</strong><p>This record is download history, not a new filing package.</p></div>';
+      } else if (issues.length) {
         const hasErrors = issues.some(issue => issue.severity === 'error');
         validationRoot.innerHTML = '<div class="draft-validation ' +
           (hasErrors ? 'has-errors' : '') + '">' +
+          '<details open><summary>' + issues.length + ' items to review</summary>' +
           issues.map(issue => '<div class="draft-validation-row">' +
             icon(issue.severity === 'error' ? 'circle-x' : 'triangle-alert') +
             '<span>' + escapeHtml(issue.message) + '</span></div>').join('') +
-          '</div>';
+          '</details></div>';
       } else {
         validationRoot.innerHTML = '<div class="draft-validation is-ready">' +
           '<div class="draft-validation-row">' + icon('circle-check') +
@@ -4225,7 +4344,7 @@ const html = String.raw`<!doctype html>
               ? (primaryDocument.currentFilename || primaryDocument.documentType || 'Complaint')
               : 'No primary Complaint selected') + '</strong>' +
             (extraction
-              ? '<span>Extracted ' + escapeHtml(fmtDate(extraction.extractedAt)) +
+              ? '<span>' + (extraction.textSource === 'ocr' ? 'Scan OCR · ' : '') + 'Extracted ' + escapeHtml(fmtDate(extraction.extractedAt)) +
                 ' | ' + escapeHtml((extraction.appliedFields || []).length) +
                 ' field groups applied</span>' +
                 '<span>' + escapeHtml(extraction.formType || 'Unknown Complaint type') +
@@ -4730,8 +4849,11 @@ const html = String.raw`<!doctype html>
       );
       extractButton.disabled = !canExtract;
       addButton.disabled = !canModifyDocuments;
+      window.document.getElementById('draftLibraryBtn').disabled = !canModifyDocuments ||
+        JSON.parse(draft?.normalizedDataJson || '{}').sourceKind !== 'new_filing_intake';
       replaceButton.disabled = !canModifyDocuments ||
-        !activeDocument || !activeDocument.oneDriveUrl;
+        !activeDocument || !activeDocument.oneDriveUrl || Boolean(activeDocument.formTemplate);
+      window.document.getElementById('draftRemoveFormBtn').disabled = !canModifyDocuments || !activeDocument?.formTemplate || activeDocument.status === 'retrying';
       if (activeDocument && activeDocument.oneDriveUrl) {
         const previewKey = activeDocument.id + ':' + (activeDocument.updatedAt || '');
         if (viewer.dataset.previewKey !== previewKey) {
@@ -5335,7 +5457,7 @@ const html = String.raw`<!doctype html>
           '<div class="detail-section-title"><span>' + icon('file-text') + 'Draft</span></div>' +
           '<div class="draft-status-grid">' +
             '<div class="draft-status-item"><span>Draft status</span>' + statusPill(draft.status) + '</div>' +
-            '<div class="draft-status-item"><span>Validation</span>' + statusPill(draft.validationStatus) + '</div>' +
+            '<div class="draft-status-item"><span>Validation</span>' + validationPill(draft.validationStatus) + '</div>' +
             '<div class="draft-status-item"><span>Filing</span>' + statusPill(draft.filingStatus) + '</div>' +
           '</div>' +
           '<div class="kv">' +
@@ -5502,6 +5624,9 @@ const html = String.raw`<!doctype html>
       } else if (doc.sourceUrl && doc.sourceUrl.startsWith('email-attachment://')) {
         links.push('<span class="source-label">' + icon('paperclip') + 'Email attachment</span>');
       }
+      if (doc.formTemplate) links.push('<span class="source-label">' + icon('library') + 'Library: ' + escapeHtml(doc.formTemplate.courtName || 'All courts') + '</span>');
+      if (doc.recognition) links.push('<span class="source-label" title="' + escapeHtml(doc.recognition.message) + '">' + icon('scan-text') +
+        escapeHtml(doc.filingTypeSource === 'manual' ? 'Type confirmed' : 'Type: ' + doc.recognition.source) + '</span>');
       if (!links.length && doc.fileUrl) {
         links.push('<a class="doc-link" href="' + escapeHtml(doc.fileUrl) + '" target="_blank" rel="noreferrer">' + icon('external-link') + 'Legacy file</a>');
       }
@@ -6038,6 +6163,21 @@ const html = String.raw`<!doctype html>
     document.getElementById('draftAddDocumentBtn').addEventListener('click', () => {
       chooseDraftPdf('add');
     });
+    document.getElementById('draftLibraryBtn').addEventListener('click', async () => {
+      try {
+        if (state.draftDirty) await saveDraft(true);
+        state.draftDetail = await api('/api/drafts/' + encodeURIComponent(state.selectedDraftId) + '/standard-forms', { method:'POST' });
+        renderDraftWorkspace();
+      } catch (error) { showDraftError(error); }
+    });
+    document.getElementById('draftRemoveFormBtn').addEventListener('click', async () => {
+      if (!confirm('Remove this library form from the Draft? Its OneDrive copy will not be deleted.')) return;
+      try {
+        if (state.draftDirty) await saveDraft(true);
+        state.draftDetail = await api('/api/drafts/' + encodeURIComponent(state.selectedDraftId) + '/library-documents/' + encodeURIComponent(state.activeDraftDocumentId), {method:'DELETE'});
+        renderDraftWorkspace();
+      } catch (error) { showDraftError(error); }
+    });
     document.getElementById('draftReplaceDocumentBtn').addEventListener('click', () => {
       chooseDraftPdf('replace');
     });
@@ -6069,6 +6209,7 @@ const html = String.raw`<!doctype html>
       draftSearchTimer = setTimeout(resetDraftPageAndLoad, 300);
     });
     document.getElementById('draftStatusFilter').addEventListener('change', resetDraftPageAndLoad);
+    document.getElementById('draftSourceFilter').addEventListener('change', resetDraftPageAndLoad);
     document.getElementById('draftValidationFilter').addEventListener('change', resetDraftPageAndLoad);
     document.getElementById('draftPageSize').addEventListener('change', resetDraftPageAndLoad);
     document.getElementById('draftDateFrom').addEventListener('change', resetDraftPageAndLoad);
@@ -6201,6 +6342,14 @@ export function createAdminServer(
                 sendJavascript(res, fs.readFileSync(require.resolve(`pdfjs-dist/build/${name}`)));
                 return;
             }
+            const pdfAsset = url.pathname.match(/^\/assets\/pdfjs\/(wasm|standard_fonts|cmaps)\/([a-zA-Z0-9_.-]+)$/);
+            if (req.method === 'GET' && pdfAsset) {
+                const filename = path.join(path.dirname(require.resolve('pdfjs-dist/package.json')), pdfAsset[1], pdfAsset[2]);
+                if (!fs.existsSync(filename) || !fs.statSync(filename).isFile()) { sendJson(res, 404, {error:'PDF resource not found'}); return; }
+                res.writeHead(200, { 'Content-Type': filename.endsWith('.wasm') ? 'application/wasm' : filename.endsWith('.js') ? 'text/javascript' : 'application/octet-stream', 'Cache-Control':'private, max-age=86400' });
+                res.end(fs.readFileSync(filename));
+                return;
+            }
             const previewMatch = url.pathname.match(/^\/api\/documents\/([^/]+)\/preview$/);
             if (req.method === 'GET' && previewMatch) {
                 const documentId = decodeURIComponent(previewMatch[1]);
@@ -6224,6 +6373,66 @@ export function createAdminServer(
                     account: { ...account, editable: account.editable && hasAdminCredentials() },
                 });
                 return;
+            }
+            if (req.method === 'GET' && url.pathname === '/api/form-library') {
+                sendJson(res, 200, db.listLibraryForms()); return;
+            }
+            if (req.method === 'POST' && url.pathname === '/api/drafts') {
+                const message = {id:'manual-intake:' + randomUUID(), subject:'New case - manual upload', receivedDateTime:new Date().toISOString()};
+                const parsed = buildFilingIntake(message, []);
+                parsed.intake!.manual = true;
+                parsed.intake!.issues = [];
+                const email = db.registerEmail(message);
+                const draftId = db.createCaseDraft(email.id, parsed);
+                db.markEmailProcessed(email.id);
+                sendJson(res, 201, db.refreshCaseDraftValidation(draftId));
+                return;
+            }
+            if (req.method === 'POST' && url.pathname === '/api/form-library/import') {
+                const content = await readRequestBuffer(req, 25 * 1024 * 1024);
+                try {
+                    const filename = uploadedPdfFilename(req.headers['x-file-name']);
+                    const assignment = planFormImport(filename, db.getKnownCourtNames());
+                    const current = db.listLibraryForms().find(form => form.active && form.role === assignment.role && form.courtName === assignment.courtName);
+                    if (current) {
+                        if (!readFormPdf(db, current).equals(content)) throw new Error('An active form already exists. Review it and use Save form to replace it explicitly.');
+                        sendJson(res, 200, current);
+                    } else sendJson(res, 201, await saveFormPdf(db, {...assignment, filename, content}));
+                } catch (error) { sendJson(res, 422, {error:(error as Error).message}); }
+                return;
+            }
+            if (req.method === 'POST' && url.pathname === '/api/form-library') {
+                const role = url.searchParams.get('role');
+                if (!['advice', 'local'].includes(role || '') || req.headers['x-form-confirmed'] !== 'true') {
+                    sendJson(res, 400, { error: 'Select and confirm the form type and court assignment.' }); return;
+                }
+                const content = await readRequestBuffer(req, 25 * 1024 * 1024);
+                try {
+                    const form = await saveFormPdf(db, { role: role as 'advice' | 'local', courtName: url.searchParams.get('court') || '',
+                        filename: uploadedPdfFilename(req.headers['x-file-name']), content });
+                    sendJson(res, 201, form);
+                } catch (error) { sendJson(res, 422, { error: (error as Error).message }); }
+                return;
+            }
+            const libraryMatch = url.pathname.match(/^\/api\/form-library\/([^/]+)(\/content)?$/);
+            if (libraryMatch) {
+                const form = db.listLibraryForms().find(item => item.id === libraryMatch[1]);
+                if (!form) { sendJson(res, 404, { error: 'Form not found' }); return; }
+                if (req.method === 'GET' && libraryMatch[2]) {
+                    const content = readFormPdf(db, form);
+                    res.writeHead(200, { 'Content-Type':'application/pdf', 'Content-Length':content.length,
+                        'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(form.filename)}`, 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff' });
+                    res.end(content); return;
+                }
+                if (req.method === 'DELETE' && !libraryMatch[2]) { db.disableLibraryForm(form.id); sendJson(res, 200, { ok:true }); return; }
+            }
+            const standardFormsMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/standard-forms$/);
+            if (req.method === 'POST' && standardFormsMatch) {
+                sendJson(res, 200, await applyLibraryForms(db, standardFormsMatch[1])); return;
+            }
+            const removeFormMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/library-documents\/([^/]+)$/);
+            if (req.method === 'DELETE' && removeFormMatch) {
+                sendJson(res, 200, db.removeLibraryDocument(removeFormMatch[1], removeFormMatch[2])); return;
             }
             if (req.method === 'POST' && ['/api/settings/mifile', '/api/settings/mifile/test'].includes(url.pathname)) {
                 const origin = req.headers.origin;
@@ -6328,6 +6537,7 @@ export function createAdminServer(
                     'failed',
                 ]);
                 sendJson(res, 200, db.listDrafts({
+                    source: url.searchParams.get('source') === 'all' ? 'all' : 'intake',
                     page: Number(url.searchParams.get('page') || 1),
                     pageSize: Number(url.searchParams.get('pageSize') || 25),
                     status: allowedStatuses.has(requestedStatus as CaseDraftStatus)
@@ -6654,6 +6864,9 @@ export function createAdminServer(
                 const detail = document.caseDraftId
                     ? db.getDraftDetail(document.caseDraftId)
                     : null;
+                if (detail?.documents.find(item => item.id === documentId)?.formTemplate) {
+                    sendJson(res, 409, { error: 'Remove the library document and add the correct form instead of replacing its pinned version.' }); return;
+                }
                 if (detail?.caseDraft?.filingEligible === false) {
                     sendJson(res, 409, {
                         error: 'Documents from an existing court filing cannot be replaced here',
@@ -6679,10 +6892,14 @@ export function createAdminServer(
                 await inspectFilingPdf(content);
                 const sharedItem = await resolveSharedDriveItem(document.oneDriveUrl);
                 await replaceDriveItemContent(sharedItem.driveId, sharedItem.itemId, content);
-                sendJson(res, 200, db.recordDocumentReplacement(documentId, {
+                const replaced = db.recordDocumentReplacement(documentId, {
                     fileSize: content.length,
                     mimeType: 'application/pdf',
-                }));
+                });
+                if (document.caseDraftId && JSON.parse(replaced.caseDraft?.normalizedDataJson || '{}').sourceKind === 'new_filing_intake') {
+                    db.recordDocumentRecognition(documentId, await recognizeDocumentPdf(content, document.currentFilename || ''));
+                    sendJson(res, 200, db.refreshCaseDraftValidation(document.caseDraftId));
+                } else sendJson(res, 200, replaced);
                 return;
             }
             if (req.method === 'GET' && documentContentMatch) {
@@ -6789,14 +7006,17 @@ export function createAdminServer(
                     status: 'uploaded',
                     metadata: { addedFromDraftEditor: true },
                 });
-                if (isComplaintDocument(null, fileName)) {
+                const isIntake = JSON.parse(detail.caseDraft.normalizedDataJson || '{}').sourceKind === 'new_filing_intake';
+                if (isIntake) db.recordDocumentRecognition(addedDocumentId, await recognizeDocumentPdf(content, originalFilename));
+                const addedType = db.getDraftDetail(caseDraftId)?.documents.find(item => item.id === addedDocumentId)?.documentType;
+                if (isComplaintDocument(addedType, null)) {
                     try {
                         db.applyComplaintExtraction(caseDraftId, addedDocumentId, await extractComplaintPdf(content));
                     } catch (error) {
                         db.recordComplaintExtractionFailure(caseDraftId, addedDocumentId, error);
                     }
                 }
-                sendJson(res, 201, db.refreshCaseDraftValidation(caseDraftId));
+                sendJson(res, 201, isIntake ? await applyLibraryForms(db, caseDraftId) : db.refreshCaseDraftValidation(caseDraftId));
                 return;
             }
 
@@ -6855,7 +7075,8 @@ export function createAdminServer(
                     primary.id,
                     extraction,
                 );
-                const updated = db.refreshCaseDraftValidation(caseDraftId);
+                const updated = JSON.parse(detail.caseDraft.normalizedDataJson || '{}').sourceKind === 'new_filing_intake'
+                    ? await applyLibraryForms(db, caseDraftId) : db.refreshCaseDraftValidation(caseDraftId);
                 sendJson(res, 200, updated);
                 return;
             }
@@ -6875,7 +7096,8 @@ export function createAdminServer(
                         ? parsed.primaryDocumentId
                         : undefined,
                 );
-                sendJson(res, 200, detail);
+                sendJson(res, 200, JSON.parse(detail.caseDraft?.normalizedDataJson || '{}').sourceKind === 'new_filing_intake'
+                    ? await applyLibraryForms(db, decodeURIComponent(draftMatch[1])) : detail);
                 return;
             }
 

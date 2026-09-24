@@ -53,7 +53,7 @@ input.onchange = () => { current = Math.max(1,Math.min(pdf.numPages,Math.floor(N
 zoom.onchange = render;
 let timer;
 window.addEventListener('resize', () => { clearTimeout(timer); timer = setTimeout(render, 100); });
-try { pdf = await pdfjs.getDocument({url:${JSON.stringify(source)},isEvalSupported:false,useSystemFonts:true}).promise; await render(); }
+try { pdf = await pdfjs.getDocument({url:${JSON.stringify(source)},isEvalSupported:false,useSystemFonts:true,wasmUrl:'/assets/pdfjs/wasm/',standardFontDataUrl:'/assets/pdfjs/standard_fonts/',cMapUrl:'/assets/pdfjs/cmaps/',cMapPacked:true}).promise; await render(); }
 catch (error) { message.textContent = 'Unable to load PDF: ' + error.message; }
 </script></body></html>`;
 }

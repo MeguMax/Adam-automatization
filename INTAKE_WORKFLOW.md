@@ -18,7 +18,19 @@ Send a new email with a subject such as:
 NEW LT FILING - Example Property LLC v Morgan Tenant
 ```
 
-Attach individual PDFs: Complaint, Advice, court-specific Local, Summons, Request, and applicable Demand/Notice/Lease/Deed or other supporting documents. Keep each PDF within 25 MB. Word files, ZIP archives, and cloud-link-only packages are not supported as intake documents. The original file names should identify the document roles. Unknown roles are left for review.
+Attach individual PDFs: Complaint, Summons, Request, and applicable Demand/Notice/Lease/Deed or other supporting documents. Include Advice and court-specific Local until the verified forms have been added to Settings > Form library. Keep each PDF within 25 MB. Word files, ZIP archives, and cloud-link-only packages are not supported as intake documents.
+
+Document types are recognized from known titles in the PDF text layer. Filenames are a fallback, not the source of case facts. Filename-only recognition, conflicting titles, combined packages, and unknown files require manual Filing Type confirmation. Scans without a usable text layer are not automatically classified through OCR in this release. Case facts continue to come from the Complaint.
+
+## Reusable forms
+
+In **Settings > Form library**, upload the attorney-approved Advice PDF for all courts and a Local PDF for each exact MiFILE court name. Confirm the document type and court assignment before saving. No legal forms are preinstalled or downloaded from third parties.
+
+The worker adds missing forms after intake. Saving a new-case Draft or extracting its Complaint also checks the library. **Add standard forms** performs the same check manually. Existing Advice/Local attachments are preserved, and repeated checks do not create duplicates. An exact court match is required; a district number alone does not select a Local form.
+
+Each form is copied into that case's OneDrive folder and pinned to its library version. Saving an updated form or disabling it affects future additions only. Existing Drafts and pending retries keep their original version. To replace a pinned form, remove it from the Draft and add the correct one. Changing a Draft's court blocks preparation if its Local form belongs to the previous court.
+
+Upload failures use the normal per-document automatic and manual retries. Inactive form versions remain available for already-reserved documents. Library PDFs are stored next to SQLite in `filing-forms/`, outside the database. On Render this is `/var/data/filing-forms/`. Back up both the database and this directory. Disabled versions are retained; they are not automatically deleted by email cleanup.
 
 By default, accepted senders are `ajd@devlinlawpllc.com` and the `USER_EMAIL` address. Override the list with `FILING_INTAKE_ALLOWED_SENDERS`, a comma-separated list of exact email addresses. The sender list is visible in Settings.
 
@@ -65,3 +77,13 @@ npm.cmd run test:admin-intake
 The browser smoke test uses an isolated SQLite database and mocked OneDrive and MiFILE sign-in services. It checks account saving, credential redaction, cross-origin rejection, uploading a PDF to an initially empty Draft, PDF canvas rendering, and desktop/mobile layout. Screenshots are written to `output/intake-qa`.
 
 Before inviting live client packages, deploy the update, confirm the inbox and accepted senders in Settings, and run one controlled package through the real Microsoft 365 and OneDrive services. Select the exact court, resolve validation issues, and prepare that package in MiFILE. Confirm the resulting bundle in History > Unsubmitted. Local tests do not substitute for this live integration check.
+# September 24: intake recovery and scanned documents
+
+- Drafts defaults to new filing packages. Existing court notifications remain in Queue and in the optional All records view; they are not new cases.
+- New case creates an editable manual package without sending an email. Add PDFs there; manual packages are never automatically queued while the user is still assembling them.
+- Report emails, failure notifications and replies/forwards of our reports are correspondence, not attachment sources. Migration 23 stops their synthetic attachment retries without deleting audit history or OneDrive files.
+- Scanned PDFs use offline English Tesseract OCR in a separate process, serialized with a 120-second deadline, at most 12 pages and 8 million render pixels per page. Models ship in the Docker image through npm; documents are not sent to an OCR service. Original bytes are retained.
+- OCR can populate Complaint parties and addresses. Paragraph 2/10 answers and scan-derived party data require review; absence of an OCR checkbox is never interpreted as No. Poor scans remain editable and do not invalidate successful downloads.
+- PDF.js WASM decoders, fonts and character maps are provided for both server extraction and browser preview, including JBIG2 scans.
+- Settings supports bulk Advice/Local import against unique court names already observed in court notifications. Existing forms are not silently replaced. 21 Local Zoom and 73A Local are held pending client instructions; unresolved court codes need manual assignment.
+- `MIFILE_AUTO_PREPARE_ENABLED=false` disables automatic preparation. Otherwise, completed email intakes with zero current validation issues and no previous filing job can queue **prepare only**. Failed/uncertain jobs are not automatically resubmitted. Court submission and payment remain disabled.

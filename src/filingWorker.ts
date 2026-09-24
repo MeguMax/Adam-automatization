@@ -1,5 +1,6 @@
 import { getWorkflowDatabase } from './database';
 import { MiFileFilingError, MiFileFilingRunner } from './mifileFilingRunner';
+import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 
 function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return Promise.resolve();
@@ -28,6 +29,10 @@ export async function runFilingWorker(options: {
     console.log(`MiFILE filing worker enabled (poll ${pollIntervalMs} ms).`);
 
     while (!options.signal?.aborted) {
+        if (process.env.MIFILE_AUTO_PREPARE_ENABLED !== 'false' && getMiFileRuntimeConfig().ready) {
+            try { db.queueValidatedIntakes(); }
+            catch (error) { console.error('Automatic Unsubmitted preparation could not be queued:', error); }
+        }
         const job = db.claimNextFilingJob();
         if (!job) {
             await wait(pollIntervalMs, options.signal);

@@ -6,6 +6,7 @@ export const INTAKE_SUBJECT_PREFIX = 'NEW LT FILING';
 export const INTAKE_MAX_PDF_BYTES = 25 * 1024 * 1024;
 
 export interface FilingIntakeInfo {
+    manual?: boolean;
     storageKey: string;
     issues: string[];
 }

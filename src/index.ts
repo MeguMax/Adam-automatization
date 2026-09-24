@@ -31,6 +31,8 @@ import {
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
 import { parseWorkflowEmail } from './workflowEmail';
 import { processFilingIntake } from './filingIntakeWorker';
+import { applyLibraryForms, uploadLibraryDocument } from './formLibrary';
+import { recognizeDocumentPdf } from './documentRecognition';
 import { intakeSenderAllowed, isFilingIntakeSubject } from './filingIntake';
 
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS || 10_000);
@@ -413,6 +415,10 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                     comments: storedDocument?.comments ?? null,
                     downloadUrl: sourceUrl,
                 };
+                if (sourceUrl.startsWith('form-library:') && caseDraftId) {
+                    await uploadLibraryDocument(db, caseDraftId, retry.documentId);
+                    continue;
+                }
                 const oneDocumentParsed: ParsedEmailInfo = {
                     ...parsed,
                     isMiFile: parsed.isMiFile,
@@ -456,6 +462,11 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                             retrySource: retry.retrySource,
                         },
                     });
+                    if (caseDraftId && parsed.sourceKind === 'new_filing_intake') {
+                        const recognition = downloadedFile.recognition || await recognizeDocumentPdf(notificationFile.buffer, notificationFile.displayName || notificationFile.fileName);
+                        db.recordDocumentRecognition(retry.documentId, recognition);
+                        downloadedFile.documentType = db.getDraftDetail(caseDraftId)?.documents.find(item => item.id === retry.documentId)?.documentType || downloadedFile.documentType;
+                    }
                     if (
                         caseDraftId &&
                         isComplaintDocument(
@@ -474,6 +485,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
                                 extraction,
                             );
                         } catch (error) {
+                            if (parsed.sourceKind === 'new_filing_intake') db.recordComplaintExtractionFailure(caseDraftId, retry.documentId, error);
                             console.warn(
                                 `Complaint extraction skipped after retry ${retry.documentId}:`,
                                 error instanceof Error ? error.message : String(error),
@@ -506,6 +518,10 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
             }
         }
 
+        if (caseDraftId && reportParsed.sourceKind === 'new_filing_intake') {
+            try { await applyLibraryForms(db, caseDraftId); }
+            catch (error) { console.warn('Standard form synchronization deferred:', error instanceof Error ? error.message : String(error)); }
+        }
         db.refreshEmailAfterDocumentRetries(emailId, caseDraftId);
         const validatedDraft = caseDraftId
             ? db.refreshCaseDraftValidation(caseDraftId)
