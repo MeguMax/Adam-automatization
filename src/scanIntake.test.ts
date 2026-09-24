@@ -12,6 +12,15 @@ import { isProcessingReportSubject } from './processingReport';
 import { districtCode, planFormImport, resolveCourt } from './courtForms';
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
+import { recognizeDocumentText } from './documentRecognition';
+
+test('Advice prose mentioning summons is not a second document title', () => {
+    const advice = recognizeDocumentText(['Advice of Rights and Information (Landlord-Tenant)\nYou can file a motion before the date listed on the\nsummons, or ask the court in person at the first court hearing.'], '');
+    assert.equal(advice.role, 'advice');
+    assert.equal(advice.source, 'content');
+    assert.equal(recognizeDocumentText(['Summons, Landlord-Tenant/Land Contract'], '').role, 'summons');
+    assert.equal(recognizeDocumentText(['Advice of Rights and Information (Landlord-Tenant)', 'Summons, Landlord-Tenant/Land Contract'], '').source, 'conflict');
+});
 
 function scannedFixture(): Buffer {
     const canvas = createCanvas(1224, 1584);

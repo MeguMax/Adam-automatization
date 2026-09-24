@@ -33,7 +33,7 @@ export function recognizeDocumentText(pages: string[], filename: string): Docume
     const roles = new Set<RecognizedRole>();
     const patterns: Array<[RecognizedRole, RegExp]> = [
         ['complaint', /^(?:complaint|complaint[, ]+(?:for )?(?:possession|nonpayment|termination|health hazard).*)$/i],
-        ['summons', /^summons(?:\s*[,(-].*)?$/i],
+        ['summons', /^summons(?:\s*[,(-]\s*landlord[-\s]tenant(?:\s*\/\s*land contract)?\s*\)?)?$/i],
         ['request', /^request for court mailing and record(?:\s*\(.*)?$/i],
         ['advice', /^advice of rights(?: and information)?(?:\s*\(.*)?$/i],
         ['local', /^local rental (?:and|&) housing (?:information|assistance information)(?:\s*\(.*)?$/i],
