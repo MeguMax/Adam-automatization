@@ -12,9 +12,8 @@ import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClien
 import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
+import { authenticateMifilePage } from './mifileSession';
 
-const MIFILE_LOGIN_URL =
-    'https://mifile.courts.michigan.gov/login?returnurl=%2Ffile';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_UPLOAD_TIMEOUT_MS = 180_000;
 const MAX_MIFILE_FILE_BYTES = 25 * 1024 * 1024;
@@ -236,15 +235,16 @@ export class MiFileFilingRunner {
             );
             return result;
         } catch (error) {
-            if (lastCheckpoint === 'login') {
-                throw new MiFileFilingError(
-                    'MiFILE sign-in failed or timed out. Check the account and any verification requirements.',
-                    'LOGIN_FAILED', 'login',
-                );
-            }
             if (page) {
                 failureScreenshot = path.join(jobDirectory, `failed-${safePathToken(lastCheckpoint)}.png`);
                 await page.screenshot({ path: failureScreenshot, fullPage: true }).catch(() => {});
+            }
+            if (lastCheckpoint === 'login') {
+                throw new MiFileFilingError(
+                    error instanceof Error ? error.message :
+                        'MiFILE sign-in failed or timed out. Check the account and any verification requirements.',
+                    'LOGIN_FAILED', 'login', failureScreenshot,
+                );
             }
             if (error instanceof MiFileFilingError) {
                 throw new MiFileFilingError(
@@ -308,17 +308,11 @@ export class MiFileFilingRunner {
     }
 
     private async login(page: Page, credentials: MiFileCredentials): Promise<void> {
-        await page.goto(MIFILE_LOGIN_URL, {
+        await authenticateMifilePage(page, credentials);
+        await page.goto('https://mifile.courts.michigan.gov/file', {
             waitUntil: 'domcontentloaded',
             timeout: this.timeoutMs,
         });
-        await page.locator('#Email').fill(credentials.username);
-        await page.locator('#Password').fill(credentials.password);
-        await page.locator('button.login-button').click({ noWaitAfter: true });
-        await page.waitForURL(url => !url.pathname.toLowerCase().includes('/login'), {
-            timeout: this.timeoutMs,
-        });
-        await page.waitForTimeout(1_000);
         const notificationOk = await firstVisible(
             page.getByRole('button', { name: 'OK', exact: true }),
         );

@@ -76,7 +76,10 @@ async function closeLoginModalIfAny(page: Page): Promise<void> {
     await page.waitForTimeout(500);
 }
 
-async function loginToMifile(page: Page, credentials = getMiFileCredentials()): Promise<void> {
+export async function authenticateMifilePage(
+    page: Page,
+    credentials = getMiFileCredentials(),
+): Promise<void> {
     if (!credentials.username || !credentials.password) {
         throw new Error('MIFILE_USER / MIFILE_PASSWORD not set in env');
     }
@@ -114,7 +117,7 @@ async function createMifileCookieHeader(credentials: MiFileCredentials): Promise
     const br = await getBrowser();
     const page = await br.newPage();
     try {
-        await loginToMifile(page, credentials);
+        await authenticateMifilePage(page, credentials);
         const cookies = await page.context().cookies('https://mifile.courts.michigan.gov');
         const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
         if (!cookieHeader) throw new Error('MiFILE login returned an empty cookie set');
@@ -158,7 +161,7 @@ export async function testMiFileCredentials(credentials: MiFileCredentials): Pro
     });
     try {
         const page = await testBrowser.newPage();
-        await loginToMifile(page, credentials);
+        await authenticateMifilePage(page, credentials);
     } catch {
         throw new Error('MiFILE sign-in could not be verified. Check the credentials, service availability, or additional verification requirements.');
     } finally {
