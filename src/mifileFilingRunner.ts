@@ -309,6 +309,9 @@ export class MiFileFilingRunner {
 
     private async login(page: Page, credentials: MiFileCredentials): Promise<void> {
         await authenticateMifilePage(page, credentials);
+        // The identity cookie can arrive just before MiFILE finishes its own
+        // redirect to /cases. Let that navigation settle before opening /file.
+        await page.waitForTimeout(1_500);
         await page.goto('https://mifile.courts.michigan.gov/file', {
             waitUntil: 'domcontentloaded',
             timeout: this.timeoutMs,
@@ -355,18 +358,22 @@ export class MiFileFilingRunner {
         await page.locator('#filer-input-empty').click();
         const configuredFiler = 'Devlin, Adam';
         const filer = await firstVisible(page.getByText(configuredFiler, { exact: true }));
-        if (!filer) {
+        const filerOption = filer || await firstVisible(
+            page.locator('#filer-listbox [role="option"]').filter({ hasText: configuredFiler }),
+        );
+        if (!filerOption) {
             throw new MiFileFilingError(
                 `MiFILE filer is unavailable: ${configuredFiler}`,
                 'FILER_NOT_AVAILABLE',
                 'select_filing',
             );
         }
-        await filer.click();
+        await filerOption.click();
         await page.locator('#searchField').fill('Landlord');
         await page.getByText(payload.caseType, { exact: true }).click();
         await page.locator('#nextButton').click();
         await page.locator('#formFrame').waitFor({ state: 'visible' });
+        await page.waitForTimeout(1_500);
         await this.log('info', 'select_filing', 'Selected court, filer, and LT case type.', {
             courtName: payload.courtName,
             caseType: payload.caseType,
@@ -435,7 +442,19 @@ export class MiFileFilingRunner {
             );
         }
 
-        await frame.getByRole('button', { name: 'Save Case Initiation Form' }).click();
+        const saveForm = await firstVisible(
+            frame.getByRole('button', { name: 'Save Case Initiation Form', exact: true }).or(
+                frame.getByRole('button', { name: 'Save', exact: true }),
+            ),
+        );
+        if (!saveForm) {
+            throw new MiFileFilingError(
+                'MiFILE case-initiation Save button was not found.',
+                'CASE_FORM_SAVE_NOT_FOUND',
+                'case_form',
+            );
+        }
+        await saveForm.click();
         await page.locator('#fileUpload').waitFor({
             state: 'attached',
             timeout: this.uploadTimeoutMs,
