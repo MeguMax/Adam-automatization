@@ -32,7 +32,7 @@ import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { parseWorkflowEmail } from './workflowEmail';
 import path from 'node:path';
-import { planFormImport } from './courtForms';
+import { planFormImports } from './courtForms';
 import { getFilingIntakeConfig, intakeFileName, buildFilingIntake } from './filingIntake';
 import {
     accountSettingsEnabled, accountSettingsView, credentialsFromSettingsInput,
@@ -44,7 +44,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-09-24-scan-intake-v24';
+const ADMIN_BUILD_ID = '2026-09-27-multi-local-v25';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -6392,12 +6392,18 @@ export function createAdminServer(
                 const content = await readRequestBuffer(req, 25 * 1024 * 1024);
                 try {
                     const filename = uploadedPdfFilename(req.headers['x-file-name']);
-                    const assignment = planFormImport(filename, db.getKnownCourtNames());
-                    const current = db.listLibraryForms().find(form => form.active && form.role === assignment.role && form.courtName === assignment.courtName);
-                    if (current) {
-                        if (!readFormPdf(db, current).equals(content)) throw new Error('An active form already exists. Review it and use Save form to replace it explicitly.');
-                        sendJson(res, 200, current);
-                    } else sendJson(res, 201, await saveFormPdf(db, {...assignment, filename, content}));
+                    const assignments = planFormImports(filename, db.getKnownCourtNames());
+                    const currentForms = assignments.map(assignment => db.listLibraryForms().find(form => form.active &&
+                        form.role === assignment.role && form.courtName === assignment.courtName && form.slotKey === assignment.slotKey));
+                    for (const current of currentForms) if (current && !readFormPdf(db, current).equals(content)) {
+                        throw new Error('An active form already exists. Review it and use Save form to replace it explicitly.');
+                    }
+                    const forms = [];
+                    for (let index = 0; index < assignments.length; index++) forms.push(currentForms[index] ||
+                        await saveFormPdf(db, {...assignments[index], filename, content}));
+                    sendJson(res, currentForms.every(Boolean) ? 200 : 201, {
+                        ...forms[0], courtName: forms.map(form => form.courtName || 'All courts').join('; '),
+                    });
                 } catch (error) { sendJson(res, 422, {error:(error as Error).message}); }
                 return;
             }

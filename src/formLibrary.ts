@@ -12,13 +12,13 @@ function formPath(db: WorkflowDatabase, sha: string): string {
     return path.join(path.dirname(db.getPath()), 'filing-forms', sha + '.pdf');
 }
 
-export async function saveFormPdf(db: WorkflowDatabase, input: { role: FormRole; courtName: string; filename: string; content: Buffer }) {
+export async function saveFormPdf(db: WorkflowDatabase, input: { role: FormRole; courtName: string; filename: string; content: Buffer; slotKey?: string; allowMixedTitles?: boolean }) {
     if (!['advice', 'local'].includes(input.role)) throw new Error('Choose Advice or Local');
     if (input.role === 'local' && !input.courtName.trim()) throw new Error('Enter the exact MiFILE court name');
     if (!input.content.length || input.content.length > INTAKE_MAX_PDF_BYTES) throw new Error('The PDF must be within 25 MB');
     const pages = await inspectFilingPdf(input.content);
     const recognition = recognizeDocumentText(pages, '');
-    if (recognition.source === 'conflict' || (recognition.source === 'content' && recognition.role !== input.role)) {
+    if ((!input.allowMixedTitles && recognition.source === 'conflict') || (recognition.source === 'content' && recognition.role !== input.role)) {
         throw new Error('The PDF title does not match the selected form type');
     }
     const sha256 = createHash('sha256').update(input.content).digest('hex');
@@ -26,7 +26,7 @@ export async function saveFormPdf(db: WorkflowDatabase, input: { role: FormRole;
     fs.mkdirSync(path.dirname(filename), { recursive: true });
     // Immutable content-addressed files keep pending Drafts pinned to their original version.
     if (!fs.existsSync(filename)) fs.writeFileSync(filename, input.content, { flag: 'wx' });
-    return db.saveLibraryForm({ role: input.role, courtName: input.courtName,
+    return db.saveLibraryForm({ role: input.role, courtName: input.courtName, slotKey: input.slotKey || 'primary',
         filename: path.basename(input.filename).slice(0, 250) || `${input.role}.pdf`, sha256, fileSize: input.content.length });
 }
 

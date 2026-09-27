@@ -9,7 +9,7 @@ import { recognizeScannedPdf } from './pdfOcr';
 import { parseScannedComplaint } from './complaintExtractor';
 import { inspectFilingPdf } from './pdfValidation';
 import { isProcessingReportSubject } from './processingReport';
-import { districtCode, planFormImport, resolveCourt } from './courtForms';
+import { districtCode, planFormImport, planFormImports, resolveCourt } from './courtForms';
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { recognizeDocumentText } from './documentRecognition';
@@ -79,15 +79,29 @@ test('processing report correspondence cannot be mistaken for source filings', (
     assert.equal(isProcessingReportSubject('NEW LT FILING - Example'), false);
 });
 
-test('court matching requires a unique observed court and skips unresolved special packets', () => {
+test('court matching requires a unique observed court and plans approved special packets', () => {
     const court = 'MI Wayne County - Lincoln Park - 25th District Court';
+    const court21 = 'MI Wayne County - Garden City - 21st District Court';
+    const court73 = 'MI Sanilac County - Sandusky - 73A District Court';
     assert.equal(districtCode(court), '25');
     assert.equal(districtCode('MI Example - 52nd District Court - 1st Division'), '52-1');
     assert.equal(resolveCourt('25', [court]), court);
     assert.equal(resolveCourt('25', [court, 'MI Another - 25th District Court']), null);
     assert.equal(planFormImport('25 Local.pdf', [court]).courtName, court);
-    assert.throws(() => planFormImport('73A Local.pdf', []), /Awaiting/);
-    assert.throws(() => planFormImport('21 Local Zoom.pdf', []), /Awaiting/);
+    assert.deepEqual(planFormImport('21 Local Zoom.pdf', [court21]), {
+        role:'local', courtName:court21, slotKey:'zoom-instructions', allowMixedTitles:false,
+    });
+    assert.deepEqual(planFormImport('73A Local.pdf', [court73]), {
+        role:'local', courtName:court73, slotKey:'primary', allowMixedTitles:true,
+    });
+    assert.equal(planFormImport('21 Local Zoom.pdf', []).courtName, court21);
+    assert.equal(planFormImport('41A1 Local.pdf', []).courtName,
+        'MI Macomb County - Sterling Heights - 41A-1 District Court');
+    assert.deepEqual(planFormImports('72 Local.pdf', []).map(plan => plan.courtName), [
+        'MI Saint Clair County - Marine City - 72-1 District Court',
+        'MI Saint Clair County - Port Huron - 72-2 District Court',
+    ]);
+    assert.throws(() => planFormImport('72 Local.pdf', []), /2 MiFILE courts/);
 });
 
 test('migration stops phantom report retries without deleting source history or real failed downloads', () => {

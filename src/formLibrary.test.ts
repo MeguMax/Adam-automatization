@@ -96,6 +96,27 @@ test('automatic forms are copied once; attached forms are preserved and court ch
     } finally { f.close(); }
 });
 
+test('approved courts can add multiple distinct Local components without a duplicate-package error', async () => {
+    const f = fixture();
+    try {
+        const court = 'MI Example County - 21st District Court';
+        await saveFormPdf(f.db, { role:'local', courtName:court, slotKey:'primary', filename:'21 Local.pdf',
+            content:testPdfFixture(DOCUMENT_LABELS.local) });
+        await saveFormPdf(f.db, { role:'local', courtName:court, slotKey:'zoom-instructions', filename:'21 Local Zoom.pdf',
+            content:testPdfFixture('Virtual courtroom instructions') });
+        const id = f.createDraft(court);
+        await applyLibraryForms(f.db, id, f.dependencies);
+        await applyLibraryForms(f.db, id, f.dependencies);
+        const detail = f.db.getDraftDetail(id)!;
+        const locals = detail.documents.filter(document => document.packageRole === 'local');
+        assert.equal(locals.length, 2);
+        assert.equal(f.uploads.length, 2);
+        assert.deepEqual(new Set(locals.map(document => document.formTemplate?.slotKey)),
+            new Set(['primary', 'zoom-instructions']));
+        assert.ok(!detail.caseDraft?.validationIssues.some(issue => issue.message.includes('exactly one')));
+    } finally { f.close(); }
+});
+
 test('a failed form uses existing retries and retains its pinned version even after the library changes', async () => {
     const f = fixture();
     try {

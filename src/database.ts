@@ -388,7 +388,7 @@ export interface EmailPurgeResult extends EmailDeleteResult {
 
 export interface DocumentRecordView {
     recognition?: DocumentRecognition | null;
-    formTemplate?: { id: string; role: FormRole; courtKey: string; courtName: string } | null;
+    formTemplate?: { id: string; role: FormRole; courtKey: string; courtName: string; slotKey?: string } | null;
     id: string;
     originalFilename: string | null;
     currentFilename: string | null;
@@ -1475,7 +1475,10 @@ function validateDraftDocuments(
             });
             continue;
         }
-        if (matching.length > 1) {
+        const approvedLocalSet = role === 'local' && matching.length > 1 && matching.every(document =>
+            document.formTemplate?.role === 'local') &&
+            new Set(matching.map(document => document.formTemplate?.id)).size === matching.length;
+        if (matching.length > 1 && !approvedLocalSet) {
             issues.push({
                 field: `package.${role}`,
                 severity: 'error',
@@ -2378,6 +2381,15 @@ const migrations: Migration[] = [
                 AND json_extract(normalized_data_json, '$.sourceKind') = 'new_filing_intake'`).run(timestamp);
         },
     },
+    {
+        version: 24,
+        name: 'multiple_court_local_forms',
+        up: db => db.exec(`
+            ALTER TABLE filing_forms ADD COLUMN slot_key TEXT NOT NULL DEFAULT 'primary';
+            DROP INDEX idx_active_form;
+            CREATE UNIQUE INDEX idx_active_form_slot ON filing_forms(role, court_key, slot_key) WHERE active = 1;
+        `),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2424,7 +2436,7 @@ export class WorkflowDatabase {
 
     listLibraryForms(): LibraryForm[] {
         return this.db.prepare(`SELECT id, role, court_name AS courtName, court_key AS courtKey,
-            filename, sha256, file_size AS fileSize, active, created_at AS createdAt
+            slot_key AS slotKey, filename, sha256, file_size AS fileSize, active, created_at AS createdAt
             FROM filing_forms ORDER BY active DESC, role, court_name, created_at DESC`).all() as unknown as LibraryForm[];
     }
 
@@ -2434,14 +2446,18 @@ export class WorkflowDatabase {
         if (input.role === 'local' && (!name || name.length > 300)) throw new Error('Select the exact court for the Local form');
         if (!/^[a-f0-9]{64}$/.test(input.sha256)) throw new Error('Invalid PDF fingerprint');
         const key = courtKey(name);
-        const current = this.listLibraryForms().find(form => form.active && form.role === input.role && form.courtKey === key);
+        const slotKey = input.slotKey.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-|-$/g, '');
+        if (!slotKey || slotKey.length > 80) throw new Error('Invalid form component');
+        const current = this.listLibraryForms().find(form => form.active && form.role === input.role &&
+            form.courtKey === key && form.slotKey === slotKey);
         if (current?.sha256 === input.sha256) return current;
         const id = randomUUID();
         this.runInTransaction(() => {
-            this.db.prepare('UPDATE filing_forms SET active = 0 WHERE role = ? AND court_key = ?').run(input.role, key);
-            this.db.prepare(`INSERT INTO filing_forms (id, role, court_name, court_key, filename, sha256, file_size, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, input.role, name, key, input.filename, input.sha256, input.fileSize, nowIso());
-            this.insertAuditLog('filing_form', id, 'library_form_saved', { role: input.role, courtName: name });
+            this.db.prepare('UPDATE filing_forms SET active = 0 WHERE role = ? AND court_key = ? AND slot_key = ?')
+                .run(input.role, key, slotKey);
+            this.db.prepare(`INSERT INTO filing_forms (id, role, court_name, court_key, slot_key, filename, sha256, file_size, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, input.role, name, key, slotKey, input.filename, input.sha256, input.fileSize, nowIso());
+            this.insertAuditLog('filing_form', id, 'library_form_saved', { role: input.role, courtName: name, slotKey });
         });
         return this.listLibraryForms().find(form => form.id === id)!;
     }
@@ -2465,13 +2481,16 @@ export class WorkflowDatabase {
     reserveLibraryDocument(draftId: string, form: LibraryForm): string | null {
         const detail = this.assertEditableIntake(draftId);
         const data = JSON.parse(detail.caseDraft!.normalizedDataJson || '{}');
-        if (detail.documents.some(doc => doc.packageRole === form.role)) return null;
+        if (form.role === 'advice' && detail.documents.some(doc => doc.packageRole === 'advice')) return null;
+        if (form.role === 'local' && detail.documents.some(doc => doc.packageRole === 'local' && !doc.formTemplate)) return null;
+        if (detail.documents.some(doc => doc.formTemplate?.id === form.id)) return null;
         const active = this.listLibraryForms().find(item => item.id === form.id && item.active);
         if (!active || (form.role === 'local' && courtKey(data.courtName || '') !== form.courtKey)) return null;
         return this.addDocument({ emailId: detail.email.id, caseDraftId: draftId,
             originalFilename: form.filename, documentType: DOCUMENT_LABELS[form.role],
             sourceUrl: `form-library:${form.id}`, uploadSource: 'form_library', status: 'retrying',
-            lastRetryAt: nowIso(), metadata: { formTemplate: { id: form.id, role: form.role, courtKey: form.courtKey, courtName: form.courtName } } });
+            lastRetryAt: nowIso(), metadata: { formTemplate: { id: form.id, role: form.role, courtKey: form.courtKey,
+                courtName: form.courtName, slotKey: form.slotKey } } });
     }
 
     recordDocumentRecognition(documentId: string, recognition: DocumentRecognition): void {

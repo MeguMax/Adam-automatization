@@ -4,6 +4,7 @@ export interface LibraryForm {
     role: FormRole;
     courtName: string;
     courtKey: string;
+    slotKey: string;
     filename: string;
     sha256: string;
     fileSize: number;
