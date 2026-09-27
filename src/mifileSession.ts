@@ -29,6 +29,12 @@ const MIFILE_COOKIE_CACHE_MS = boundedEnvironmentInteger(
     30_000,
     60 * 60 * 1000,
 );
+const MIFILE_LOGIN_ATTEMPTS = boundedEnvironmentInteger(
+    process.env.MIFILE_LOGIN_ATTEMPTS,
+    2,
+    1,
+    3,
+);
 
 async function getBrowser(): Promise<Browser> {
     if (!browser || !browser.isConnected()) {
@@ -109,30 +115,29 @@ export async function authenticateMifilePage(
         throw new Error('MIFILE_USER / MIFILE_PASSWORD not set in env');
     }
 
-    try {
-        await page.goto(
-            'https://mifile.courts.michigan.gov/login?returnurl=%2Fcases',
-            {
-                waitUntil: 'load',
-                timeout: 60000, // было дефолтные 30000
-            }
-        );
-    } catch (err) {
-        console.error('MiFILE login page.goto timeout or error:', err);
-        throw err;
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= MIFILE_LOGIN_ATTEMPTS; attempt += 1) {
+        if (attempt > 1) await page.waitForTimeout(5_000);
+        try {
+            await page.goto(
+                'https://mifile.courts.michigan.gov/login?returnurl=%2Fcases',
+                {
+                    waitUntil: 'load',
+                    timeout: 60_000,
+                },
+            );
+            await dismissMifileModalIfAny(page);
+            await page.fill('input#Email', credentials.username);
+            await page.fill('input#Password', credentials.password);
+            await page.locator('button.flatButton.login-button').click({ force: true });
+            await waitForAuthenticatedCookies(page);
+            return;
+        } catch (error) {
+            lastError = error;
+        }
     }
-
-    await dismissMifileModalIfAny(page);
-
-    try {
-        await page.fill('input#Email', credentials.username);
-        await page.fill('input#Password', credentials.password);
-        const loginButton = page.locator('button.flatButton.login-button');
-        await loginButton.click({ force: true });
-        await waitForAuthenticatedCookies(page);
-    } catch {
-        throw new Error('MiFILE sign-in failed or timed out. Check the account and any verification requirements.');
-    }
+    console.error('MiFILE sign-in exhausted automatic attempts:', lastError);
+    throw new Error('MiFILE sign-in failed or timed out. Check the account and any verification requirements.');
 }
 
 /**

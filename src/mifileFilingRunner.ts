@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { chromium, Frame, Locator, Page } from 'playwright';
 import {
+    DraftAttorney,
     DraftParty,
     FilingDocumentPayload,
     FilingJobView,
@@ -343,6 +344,8 @@ export class MiFileFilingRunner {
         const courtName = courtDisplayName(payload.courtName);
         const courtInput = page.locator('#court_select_dropdown');
         await courtInput.fill(courtName);
+        await page.waitForTimeout(300);
+        await dismissMifileModalIfAny(page);
         const courtOption = await firstVisible(
             page.locator('li.inner-list-item').filter({ hasText: courtName }),
         );
@@ -398,14 +401,14 @@ export class MiFileFilingRunner {
         }
 
         if (payload.filingData.relatedCivilAction === 'none') {
-            await frame.locator('#relatedCivilActions_0').check();
+            await frame.locator('#relatedCivilActions_0').check({ force: true });
         } else if (payload.filingData.relatedCivilAction === 'previously_filed') {
-            await frame.locator('#relatedCivilActions_1').check();
+            await frame.locator('#relatedCivilActions_1').check({ force: true });
             const relatedCourt = payload.filingData.relatedCaseCourt || '';
             if (/^this court$/i.test(relatedCourt)) {
-                await frame.locator('#relatedCivilActions_CourtOption_0').check();
+                await frame.locator('#relatedCivilActions_CourtOption_0').check({ force: true });
             } else {
-                await frame.locator('#relatedCivilActions_CourtOption_1').check();
+                await frame.locator('#relatedCivilActions_CourtOption_1').check({ force: true });
                 await frame.locator('#relatedCivilActions_Court').fill(relatedCourt);
             }
             await frame.locator('#relatedCivilActions_CaseNumber').fill(
@@ -418,7 +421,7 @@ export class MiFileFilingRunner {
                 payload.filingData.relatedCasePending
                     ? '#relatedCivilActions_State_0'
                     : '#relatedCivilActions_State_1',
-            ).check();
+            ).check({ force: true });
         } else {
             throw new MiFileFilingError(
                 'Related civil action must be confirmed before preparing the filing.',
@@ -433,7 +436,7 @@ export class MiFileFilingRunner {
                 : '0',
         );
         if (payload.filingData.mailingRequested) {
-            await frame.locator('#requestSecondMail').check();
+            await frame.locator('#requestSecondMail').check({ force: true });
         } else {
             throw new MiFileFilingError(
                 'Court service by mail is required for this workflow.',
@@ -454,6 +457,20 @@ export class MiFileFilingRunner {
                 'case_form',
             );
         }
+        const attorneyIndex = payload.filingData.defendants.length + 1;
+        const attorneyFirstName = frame.locator(`#psn${attorneyIndex}FirstName`);
+        if (!(await attorneyFirstName.count())) {
+            // MiFILE renders the represented-party attorney section only after
+            // the base form is saved once. That first save intentionally leaves
+            // the form open so the attorney fields can be completed.
+            await saveForm.click();
+            await attorneyFirstName.waitFor({ state: 'attached', timeout: this.timeoutMs });
+        }
+        await this.fillAttorney(
+            frame,
+            attorneyIndex,
+            payload.filingData.attorney,
+        );
         await saveForm.click();
         await page.locator('#fileUpload').waitFor({
             state: 'attached',
@@ -469,6 +486,47 @@ export class MiFileFilingRunner {
         await this.log('info', 'case_form', 'MiFILE accepted the case-initiation fields.');
     }
 
+    private async fillAttorney(
+        frame: Frame,
+        index: number,
+        attorney: DraftAttorney,
+    ): Promise<void> {
+        const nameTokens = String(attorney.name || '').trim().split(/\s+/).filter(Boolean);
+        if (nameTokens.length < 2) {
+            throw new MiFileFilingError(
+                'The filing attorney needs separate first and last names.',
+                'ATTORNEY_NAME_INCOMPLETE',
+                'case_form',
+            );
+        }
+        const prefix = `psn${index}`;
+        const attorneyPrefix = `aty${index}`;
+        const registeredEmail = await frame.locator('#attorneyEmail').inputValue().catch(() => '');
+        const email = attorney.email?.trim() || registeredEmail.trim();
+        if (!email) {
+            throw new MiFileFilingError(
+                'The filing attorney email is required by MiFILE.',
+                'ATTORNEY_EMAIL_MISSING',
+                'case_form',
+            );
+        }
+        await frame.locator(`#${prefix}FirstName`).fill(nameTokens.slice(0, -1).join(' '));
+        await frame.locator(`#${prefix}MiddleName`).fill('');
+        await frame.locator(`#${prefix}FamilyName`).fill(nameTokens[nameTokens.length - 1]);
+        await frame.locator(`#${prefix}Suffix`).fill('');
+        await frame.locator(`#${attorneyPrefix}BarNumber`).fill(attorney.barNumber || 'P72877');
+        await frame.selectOption(`#${attorneyPrefix}Jurisdiction`, { label: 'Michigan' });
+        await frame.selectOption(`#${prefix}Country`, 'US');
+        await frame.locator(`#${prefix}Address`).fill(attorney.address1 || '');
+        await frame.locator(`#${prefix}Address2`).fill(attorney.address2 || '');
+        await frame.locator(`#${prefix}City`).fill(attorney.city || '');
+        await frame.selectOption(`#${prefix}State`, { label: stateLabel(attorney.state) });
+        await frame.locator(`#${prefix}Zip`).fill(attorney.postalCode || '');
+        await frame.locator(`#${prefix}Email`).fill(email);
+        const phone = frame.locator(`#${prefix}Phone`);
+        if (await phone.count()) await phone.fill(attorney.phone || '');
+    }
+
     private async fillParty(
         frame: Frame,
         index: number,
@@ -477,7 +535,7 @@ export class MiFileFilingRunner {
     ): Promise<void> {
         const prefix = `psn${index}`;
         if (party.partyType === 'entity') {
-            await frame.locator(`#${prefix}IsPerson_1`).check();
+            await frame.locator(`#${prefix}IsPerson_1`).check({ force: true });
             const entityName = party.entityName || party.displayName;
             if (!entityName) {
                 throw new MiFileFilingError(
@@ -488,7 +546,7 @@ export class MiFileFilingRunner {
             }
             await frame.locator(`#${prefix}EntityName`).fill(entityName);
         } else {
-            await frame.locator(`#${prefix}IsPerson_0`).check();
+            await frame.locator(`#${prefix}IsPerson_0`).check({ force: true });
             const names = partyPersonNames(party);
             await frame.locator(`#${prefix}FirstName`).fill(names.firstName);
             await frame.locator(`#${prefix}MiddleName`).fill(party.middleName || '');
@@ -506,7 +564,7 @@ export class MiFileFilingRunner {
         const email = frame.locator(`#${prefix}Email`);
         if (await email.count() && party.email) await email.fill(party.email);
         if (isPlaintiff) {
-            await frame.locator('#pty0SelfRepresented_0').check();
+            await frame.locator('#pty0SelfRepresented_0').check({ force: true });
         }
     }
 
@@ -546,10 +604,9 @@ export class MiFileFilingRunner {
             const typeInput = row.locator('input[id^="selectFilingTypeInput_"]');
             await typeInput.fill(item.document.filingType);
             const exactType = await firstVisible(
-                page.locator('ul.dropdown-menu:visible').getByText(
-                    item.document.filingType,
-                    { exact: true },
-                ),
+                page.locator('ul.dropdown-menu:visible li[role="option"]').filter({
+                    hasText: item.document.filingType,
+                }),
             );
             if (exactType) {
                 await exactType.click();
