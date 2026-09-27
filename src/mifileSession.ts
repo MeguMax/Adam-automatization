@@ -87,6 +87,18 @@ export async function dismissMifileModalIfAny(page: Page): Promise<void> {
 
     await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(500);
+    if (!(await visibleDialog.isVisible().catch(() => false))) return;
+
+    // MiFILE occasionally serves an informational Angular modal without a
+    // working dismiss control. Remove only that visible notice and its modal
+    // backdrop so it cannot block the filing controls underneath.
+    await visibleDialog.evaluate(dialogElement => {
+        dialogElement.remove();
+        document.querySelectorAll('.modal-backdrop').forEach(backdrop => backdrop.remove());
+        document.body.classList.remove('modal-open');
+        document.body.style.removeProperty('padding-right');
+    }).catch(() => {});
+    await page.waitForTimeout(250);
 }
 
 export async function authenticateMifilePage(

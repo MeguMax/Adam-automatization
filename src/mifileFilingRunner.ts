@@ -335,6 +335,8 @@ export class MiFileFilingRunner {
                 timeout: this.timeoutMs,
             });
         }
+        await page.waitForTimeout(1_000);
+        await dismissMifileModalIfAny(page);
         const courtName = courtDisplayName(payload.courtName);
         const courtInput = page.locator('#court_select_dropdown');
         await courtInput.fill(courtName);
