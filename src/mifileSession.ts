@@ -59,20 +59,33 @@ async function waitForAuthenticatedCookies(page: Page): Promise<void> {
     );
 }
 
-async function closeLoginModalIfAny(page: Page): Promise<void> {
+export async function dismissMifileModalIfAny(page: Page): Promise<void> {
     const dialog = page.locator('div[role="dialog"], div[uib-modal-window]');
-    if (!(await dialog.count())) return;
+    const count = await dialog.count();
+    if (!count) return;
 
-    const buttons = dialog.locator(
-        'button:has-text("OK"), button:has-text("Close"), button.close'
+    let visibleDialog = null;
+    for (let index = 0; index < count; index += 1) {
+        const candidate = dialog.nth(index);
+        if (await candidate.isVisible().catch(() => false)) {
+            visibleDialog = candidate;
+            break;
+        }
+    }
+    if (!visibleDialog) return;
+
+    const buttons = visibleDialog.locator(
+        'button:has-text("OK"), button:has-text("Close"), button.close, ' +
+        'button[aria-label="Close"], [data-dismiss="modal"], ' +
+        '[ng-click*="$dismiss"], [ng-click*="$close"]'
     );
     if (await buttons.count()) {
         await buttons.first().click({ force: true }).catch(() => {});
         await page.waitForTimeout(500);
-        return;
+        if (!(await visibleDialog.isVisible().catch(() => false))) return;
     }
 
-    await dialog.first().click({ force: true }).catch(() => {});
+    await page.keyboard.press('Escape').catch(() => {});
     await page.waitForTimeout(500);
 }
 
@@ -97,7 +110,7 @@ export async function authenticateMifilePage(
         throw err;
     }
 
-    await closeLoginModalIfAny(page);
+    await dismissMifileModalIfAny(page);
 
     try {
         await page.fill('input#Email', credentials.username);

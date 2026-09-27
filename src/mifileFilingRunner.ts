@@ -12,7 +12,7 @@ import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClien
 import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
-import { authenticateMifilePage } from './mifileSession';
+import { authenticateMifilePage, dismissMifileModalIfAny } from './mifileSession';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_UPLOAD_TIMEOUT_MS = 180_000;
@@ -313,6 +313,7 @@ export class MiFileFilingRunner {
             waitUntil: 'domcontentloaded',
             timeout: this.timeoutMs,
         });
+        await dismissMifileModalIfAny(page);
         const notificationOk = await firstVisible(
             page.getByRole('button', { name: 'OK', exact: true }),
         );
