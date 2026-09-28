@@ -358,20 +358,49 @@ export class MiFileFilingRunner {
         }
         await courtOption.click();
         await page.selectOption('#actionSelect', { label: 'Initiate a new case' });
-        await page.locator('#filer-input-empty').click();
         const configuredFiler = 'Devlin, Adam';
-        const filer = await firstVisible(page.getByText(configuredFiler, { exact: true }));
-        const filerOption = filer || await firstVisible(
-            page.locator('#filer-listbox [role="option"]').filter({ hasText: configuredFiler }),
-        );
-        if (!filerOption) {
+        const selectedFiler = page.locator('#filer-input-selected');
+        const selectedFilerText = await selectedFiler.inputValue().catch(() => '');
+        if (!selectedFilerText.toLowerCase().includes(configuredFiler.toLowerCase())) {
+            const filerInput = page.locator('#filer-input-empty');
+            await filerInput.waitFor({ state: 'visible', timeout: this.timeoutMs });
+            await filerInput.click();
+            const filerOptions = page.locator('#filer-listbox [role="option"]');
+            await filerOptions.first().waitFor({ state: 'visible', timeout: this.timeoutMs })
+                .catch(async () => {
+                    // The filer list is populated asynchronously and can occasionally
+                    // close before the account connections arrive. Reopening it gives
+                    // MiFILE another chance without restarting the entire filing.
+                    await filerInput.click();
+                    await filerOptions.first().waitFor({
+                        state: 'visible',
+                        timeout: this.timeoutMs,
+                    });
+                });
+            const filerOption = await firstVisible(
+                filerOptions.filter({ hasText: configuredFiler }),
+            );
+            if (!filerOption) {
+                const availableFilers = (await filerOptions.allTextContents())
+                    .map(value => value.trim())
+                    .filter(Boolean);
+                throw new MiFileFilingError(
+                    `MiFILE filer is unavailable: ${configuredFiler}. ` +
+                    `Available filers: ${availableFilers.join(', ') || 'none'}.`,
+                    'FILER_NOT_AVAILABLE',
+                    'select_filing',
+                );
+            }
+            await filerOption.click();
+        }
+        const confirmedFiler = await selectedFiler.inputValue().catch(() => '');
+        if (!confirmedFiler.toLowerCase().includes(configuredFiler.toLowerCase())) {
             throw new MiFileFilingError(
-                `MiFILE filer is unavailable: ${configuredFiler}`,
+                `MiFILE did not select the required filer: ${configuredFiler}.`,
                 'FILER_NOT_AVAILABLE',
                 'select_filing',
             );
         }
-        await filerOption.click();
         await page.locator('#searchField').fill('Landlord');
         await page.getByText(payload.caseType, { exact: true }).click();
         await page.locator('#nextButton').click();
@@ -572,21 +601,59 @@ export class MiFileFilingRunner {
         page: Page,
         documents: MaterializedDocument[],
     ): Promise<void> {
-        const uploadedRows = new Map<string, string>();
-        for (const item of documents) {
-            const priorCount = await page.locator('tbody[id^="filing-"] input[name^="documentName_"]').count();
-            await page.locator('#fileUpload').setInputFiles(item.localPath);
-            await page.waitForFunction(
-                count => document.querySelectorAll(
-                    'tbody[id^="filing-"] input[name^="documentName_"]',
-                ).length > count,
-                priorCount,
-                { timeout: this.uploadTimeoutMs },
+        if (!documents.length) {
+            throw new MiFileFilingError(
+                'The filing package does not contain any PDF documents.',
+                'NO_FILING_DOCUMENTS',
+                'document_upload',
             );
-            const rows = page.locator('tbody[id^="filing-"]').filter({
-                has: page.locator('input[name^="documentName_"]'),
-            });
-            const row = rows.last();
+        }
+        const uploadedRows = new Map<string, string>();
+        const rows = page.locator('tbody[id^="filing-"]').filter({
+            has: page.locator('input[name^="documentName_"]'),
+        });
+        const existingRowIds = new Set(
+            (await rows.evaluateAll(elements => elements.map(element => element.id))).filter(Boolean),
+        );
+        await this.log('info', 'document_upload', 'Uploading the complete PDF package to MiFILE.', {
+            documentCount: documents.length,
+        });
+        await page.locator('#fileUpload').setInputFiles(
+            documents.map(item => item.localPath),
+        );
+        await page.waitForFunction(
+            ({ priorCount, expectedCount }) => document.querySelectorAll(
+                'tbody[id^="filing-"] input[name^="documentName_"]',
+            ).length >= priorCount + expectedCount,
+            { priorCount: existingRowIds.size, expectedCount: documents.length },
+            { timeout: this.uploadTimeoutMs },
+        ).catch(async () => {
+            const actualCount = await rows.count();
+            throw new MiFileFilingError(
+                `MiFILE created ${Math.max(actualCount - existingRowIds.size, 0)} of ` +
+                `${documents.length} expected document rows.`,
+                'UPLOAD_ROWS_INCOMPLETE',
+                'document_upload',
+            );
+        });
+
+        const newRows: Locator[] = [];
+        for (let index = 0; index < await rows.count(); index += 1) {
+            const candidate = rows.nth(index);
+            const rowId = await candidate.getAttribute('id');
+            if (rowId && !existingRowIds.has(rowId)) newRows.push(candidate);
+        }
+        if (newRows.length !== documents.length) {
+            throw new MiFileFilingError(
+                `MiFILE created ${newRows.length} of ${documents.length} expected document rows.`,
+                'UPLOAD_ROWS_INCOMPLETE',
+                'document_upload',
+            );
+        }
+
+        for (let index = 0; index < documents.length; index += 1) {
+            const item = documents[index];
+            const row = newRows[index];
             await row.locator('.glyphicon-ok').waitFor({
                 state: 'visible',
                 timeout: this.uploadTimeoutMs,
@@ -618,6 +685,8 @@ export class MiFileFilingRunner {
                 documentId: item.document.id,
                 filename: item.document.filename,
                 filingType: item.document.filingType,
+                documentNumber: index + 1,
+                documentCount: documents.length,
             });
         }
 
