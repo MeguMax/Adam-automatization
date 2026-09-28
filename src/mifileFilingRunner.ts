@@ -670,6 +670,11 @@ export class MiFileFilingRunner {
             await row.locator('input[name^="documentName_"]').fill(item.document.filingName);
             const typeInput = row.locator('input[id^="selectFilingTypeInput_"]');
             await typeInput.fill(item.document.filingType);
+            // Some courts display their protected-PII informational notice only
+            // after the first filing-type dropdown opens. It is an acknowledgement
+            // dialog, not a Yes/No case answer, and otherwise covers the option.
+            await dismissMifileModalIfAny(page);
+            await typeInput.fill(item.document.filingType);
             const exactType = await firstVisible(
                 page.locator('ul.dropdown-menu:visible li[role="option"]').filter({
                     hasText: item.document.filingType,
