@@ -45,6 +45,35 @@ async function main() {
     const draftId = db.createCaseDraft(email.id, buildFilingIntake(message, []));
     db.markEmailProcessed(email.id);
     db.refreshCaseDraftValidation(draftId);
+    const notificationMessage = {
+        id: 'filed-notification',
+        subject: 'MiFILE - Document Filed 26-00001-LT, EXAMPLE OWNER V TENANT',
+        receivedDateTime: '2026-09-08T10:00:00Z',
+        from: { emailAddress: { address: 'info@truefiling.com' } },
+    };
+    const notificationEmail = db.registerEmail(notificationMessage);
+    const notificationParsed = buildFilingIntake(notificationMessage, []);
+    Object.assign(notificationParsed, {
+        courtName: 'MI Example County - 25th District Court',
+        caseTitle: 'EXAMPLE OWNER V TENANT',
+        plaintiff: 'EXAMPLE OWNER',
+        defendant: 'TENANT',
+    });
+    const notificationDraftId = db.createCaseDraft(notificationEmail.id, notificationParsed);
+    db.addDocument({
+        emailId: notificationEmail.id,
+        caseDraftId: notificationDraftId,
+        originalFilename: 'Filed Complaint.pdf',
+        currentFilename: 'Filed Complaint.pdf',
+        oneDriveUrl: 'https://onedrive.example/Filed%20Complaint.pdf',
+        mimeType: 'application/pdf',
+        fileSize: 1024,
+        documentType: 'Complaint for Possession Only',
+        uploadSource: 'processing_report',
+        status: 'uploaded',
+    });
+    db.markEmailProcessed(notificationEmail.id);
+    db.refreshCaseDraftValidation(notificationDraftId);
     const { createAdminServer } = require('./adminServer') as typeof import('./adminServer');
     const server = createAdminServer(0, { handleSignals: false, closeDatabaseOnShutdown: false });
     await once(server, 'listening');
@@ -195,6 +224,28 @@ async function main() {
         await page.locator('#draftWorkspaceView').waitFor({state:'visible'});
         assert.equal(await page.locator('#draftApproveBtn').innerText(), 'Confirm package');
         assert.equal(await page.locator('#draftPrepareBtn').innerText(), 'Send to MiFILE');
+        await page.locator('#closeDraftBtn').click();
+        await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();
+        await page.locator('#draftManualCopyBtn').waitFor({ state: 'visible' });
+        page.once('dialog', dialog => dialog.accept());
+        const copied = page.waitForResponse(response =>
+            response.url().endsWith(`/api/drafts/${notificationDraftId}/manual-copy`) &&
+            response.status() === 201);
+        await page.locator('#draftManualCopyBtn').click();
+        const copiedPayload = await (await copied).json();
+        assert.equal(copiedPayload.caseDraft.manualPackage, true);
+        assert.equal(copiedPayload.manualCopy.sourceDraftId, notificationDraftId);
+        assert.equal(copiedPayload.manualCopy.copiedDocuments, 1);
+        assert.equal(copiedPayload.caseDraft.editableData.caseNumber, null);
+        assert.equal(copiedPayload.caseDraft.editableData.courtName,
+            'MI Example County - 25th District Court');
+        assert.equal(copiedPayload.documents.some((document: { oneDriveUrl: string | null }) =>
+            document.oneDriveUrl === 'https://onedrive.example/Filed%20Complaint.pdf'), true);
+        assert.equal(db.getDraftDetail(notificationDraftId)?.caseDraft?.filingEligible, false);
+        await page.waitForFunction(() =>
+            document.getElementById('draftApproveBtn')?.textContent === 'Confirm package');
+        assert.equal(await page.locator('#draftApproveBtn').innerText(), 'Confirm package');
+        assert.equal(await page.locator('#draftManualCopyBtn').isHidden(), true);
         assert.deepEqual(errors, []);
         await page.locator('#signOutBtn').click();
         await page.waitForURL(url + '/login');

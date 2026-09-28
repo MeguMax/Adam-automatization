@@ -5,6 +5,7 @@ import { randomUUID } from 'crypto';
 import { createAdminAuth, hasAdminCredentials } from './adminAuth';
 import {
     CaseDraftStatus,
+    EmailDetail,
     EmailProcessingStatus,
     getWorkflowDatabase,
     ProcessingReportInput,
@@ -44,7 +45,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-09-28-manual-filing-package-v33';
+const ADMIN_BUILD_ID = '2026-09-28-notification-manual-package-v34';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -71,6 +72,70 @@ const syncStatus: SyncStatus = {
     lastSyncedEmails: 0,
     lastMiFileDrafts: 0,
 };
+
+function manualFilingData(source?: EmailDetail | null): Record<string, unknown> {
+    const sourceFiling = source?.caseDraft?.filingData;
+    const sourceFields = source?.caseDraft?.editableData;
+    const plaintiffName = sourceFields?.plaintiff || null;
+    const defendantName = sourceFields?.defendant || null;
+    return {
+        courtDistrict: sourceFiling?.courtDistrict || null,
+        action: 'Initiate a new case',
+        caseType: 'LT - Landlord-Tenant Summary Proceedings',
+        relatedCivilAction: 'unknown',
+        relatedCaseCourt: null,
+        relatedCaseDocketNumber: null,
+        relatedCaseJudge: null,
+        relatedCasePending: null,
+        moneyJudgmentRequested: null,
+        claimAmount: null,
+        mailingRequested: true,
+        includeAllOtherOccupants: false,
+        plaintiff: sourceFiling?.plaintiff || {
+            partyType: 'entity',
+            entityName: plaintiffName,
+            displayName: plaintiffName,
+        },
+        defendants: sourceFiling?.defendants?.length
+            ? sourceFiling.defendants
+            : defendantName
+                ? [{ partyType: 'person', displayName: defendantName }]
+                : [],
+        attorney: {
+            name: process.env.FILING_ATTORNEY_NAME || 'Adam J Devlin',
+            barNumber: process.env.FILING_ATTORNEY_BAR_NUMBER || 'P72877',
+            address1: process.env.FILING_ATTORNEY_ADDRESS || '30850 Telegraph Rd',
+            address2: process.env.FILING_ATTORNEY_ADDRESS_2 || 'Suite 250',
+            city: process.env.FILING_ATTORNEY_CITY || 'Bingham Farms',
+            state: process.env.FILING_ATTORNEY_STATE || 'MI',
+            postalCode: process.env.FILING_ATTORNEY_ZIP || '48025',
+            phone: process.env.FILING_ATTORNEY_PHONE || '2487036201',
+            email: process.env.FILING_ATTORNEY_EMAIL || 'ajd@devlinlawpllc.com',
+        },
+    };
+}
+
+function buildManualDraft(message: any, source?: EmailDetail | null): any {
+    const parsed = buildFilingIntake(message, []);
+    parsed.intake!.manual = true;
+    parsed.intake!.issues = [];
+    const sourceFields = source?.caseDraft?.editableData;
+    Object.assign(parsed, {
+        courtName: sourceFields?.courtName || null,
+        caseTitle: sourceFields?.caseTitle || null,
+        plaintiff: sourceFields?.plaintiff || null,
+        defendant: sourceFields?.defendant || null,
+        filerName: process.env.FILING_ATTORNEY_NAME || 'Adam J Devlin',
+        submitterName: process.env.FILING_ATTORNEY_NAME || 'Adam J Devlin',
+        filingData: manualFilingData(source),
+        manualPackageSource: source?.caseDraft ? {
+            caseDraftId: source.caseDraft.id,
+            emailId: source.email.id,
+            subject: source.email.subject,
+        } : null,
+    });
+    return parsed;
+}
 
 function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
     const body = JSON.stringify(payload);
@@ -3191,6 +3256,7 @@ const html = String.raw`<!doctype html>
           </div>
           <div id="draftWorkspaceStatuses" class="draft-workspace-statuses"></div>
           <div class="draft-workspace-actions">
+            <button id="draftManualCopyBtn" class="hidden" type="button" title="Create a separate manual filing package from this notification"><i data-lucide="copy-plus"></i>Use as manual package</button>
             <button id="draftRejectBtn" class="danger" type="button"><i data-lucide="x"></i>Reject</button>
             <button id="draftApproveBtn" type="button"><i data-lucide="check-check"></i>Approve</button>
             <button id="draftPrepareBtn" type="button"><i data-lucide="upload-cloud"></i>Prepare in MiFILE</button>
@@ -4122,6 +4188,8 @@ const html = String.raw`<!doctype html>
         (draft.manualPackage ? 'Confirm package' : 'Approve');
       document.getElementById('draftPrepareBtn').innerHTML = icon('upload-cloud') +
         (draft.manualPackage ? 'Send to MiFILE' : 'Prepare in MiFILE');
+      const manualCopyButton = document.getElementById('draftManualCopyBtn');
+      manualCopyButton.classList.toggle('hidden', draft.filingEligible !== false);
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
       renderDraftFields(draft);
       renderDraftFilingJobs();
@@ -4137,6 +4205,7 @@ const html = String.raw`<!doctype html>
       document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea')
         .forEach(control => { control.disabled = draftLocked; });
       document.getElementById('draftRejectBtn').disabled = draftLocked;
+      manualCopyButton.disabled = draftLocked;
       document.getElementById('draftApproveBtn').disabled =
         draftLocked ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
@@ -4158,6 +4227,25 @@ const html = String.raw`<!doctype html>
       } catch (error) { showDraftError(error); }
       finally { button.disabled = false; }
     });
+
+    async function createManualCopy() {
+      const detail = state.draftDetail;
+      if (!detail || !detail.caseDraft) return;
+      if (!window.confirm(
+        'This notification may describe documents already filed with the court. Create a separate manual package from its available OneDrive PDFs? Nothing will be submitted; the package can only be saved to MiFILE Unsubmitted after review.',
+      )) return;
+      const button = document.getElementById('draftManualCopyBtn');
+      setButtonBusy(button, true, 'Creating');
+      try {
+        const created = await api('/api/drafts/' +
+          encodeURIComponent(detail.caseDraft.id) + '/manual-copy', { method:'POST' });
+        state.draftDirty = false;
+        await openDraft(created.caseDraft.id);
+        showToast('Manual filing package created. Review its fields and documents.');
+      } finally {
+        setButtonBusy(button, false);
+      }
+    }
 
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
@@ -4318,7 +4406,7 @@ const html = String.raw`<!doctype html>
       const validationRoot = document.getElementById('draftValidationSummary');
 
       if (!draft.filingEligible) {
-        validationRoot.innerHTML = '<div class="draft-validation"><strong>Court notification</strong><p>This record is download history, not a new filing package.</p></div>';
+        validationRoot.innerHTML = '<div class="draft-validation"><strong>Court notification</strong><p>This record is download history, not a new filing package. Use <strong>Use as manual package</strong> to create a separate editable package from its available OneDrive PDFs.</p></div>';
       } else if (issues.length) {
         const hasErrors = issues.some(issue => issue.severity === 'error');
         validationRoot.innerHTML = '<div class="draft-validation ' +
@@ -6162,6 +6250,9 @@ const html = String.raw`<!doctype html>
     document.getElementById('draftApproveBtn').addEventListener('click', () => {
       reviewDraft('approve').catch(showDraftError);
     });
+    document.getElementById('draftManualCopyBtn').addEventListener('click', () => {
+      createManualCopy().catch(showDraftError);
+    });
     document.getElementById('draftPrepareBtn').addEventListener('click', () => {
       queueDraftFiling(false).catch(showDraftError);
     });
@@ -6404,36 +6495,106 @@ export function createAdminServer(
             }
             if (req.method === 'POST' && url.pathname === '/api/drafts') {
                 const message = {id:'manual-intake:' + randomUUID(), subject:'New case - manual upload', receivedDateTime:new Date().toISOString()};
-                const parsed = buildFilingIntake(message, []);
-                parsed.intake!.manual = true;
-                parsed.intake!.issues = [];
-                Object.assign(parsed, {
-                    filingData: {
-                        action: 'Initiate a new case',
-                        caseType: 'LT - Landlord-Tenant Summary Proceedings',
-                        relatedCivilAction: 'unknown',
-                        moneyJudgmentRequested: null,
-                        mailingRequested: true,
-                        includeAllOtherOccupants: false,
-                        plaintiff: { partyType: 'entity' },
-                        defendants: [],
-                        attorney: {
-                            name: process.env.FILING_ATTORNEY_NAME || 'Adam J Devlin',
-                            barNumber: process.env.FILING_ATTORNEY_BAR_NUMBER || 'P72877',
-                            address1: process.env.FILING_ATTORNEY_ADDRESS || '30850 Telegraph Rd',
-                            address2: process.env.FILING_ATTORNEY_ADDRESS_2 || 'Suite 250',
-                            city: process.env.FILING_ATTORNEY_CITY || 'Bingham Farms',
-                            state: process.env.FILING_ATTORNEY_STATE || 'MI',
-                            postalCode: process.env.FILING_ATTORNEY_ZIP || '48025',
-                            phone: process.env.FILING_ATTORNEY_PHONE || '2487036201',
-                            email: process.env.FILING_ATTORNEY_EMAIL || 'ajd@devlinlawpllc.com',
-                        },
-                    },
-                });
+                const parsed = buildManualDraft(message);
                 const email = db.registerEmail(message);
                 const draftId = db.createCaseDraft(email.id, parsed);
                 db.markEmailProcessed(email.id);
                 sendJson(res, 201, db.refreshCaseDraftValidation(draftId));
+                return;
+            }
+
+            const manualCopyMatch = url.pathname.match(
+                /^\/api\/drafts\/([^/]+)\/manual-copy$/,
+            );
+            if (req.method === 'POST' && manualCopyMatch) {
+                const sourceDraftId = decodeURIComponent(manualCopyMatch[1]);
+                const source = db.getDraftDetail(sourceDraftId);
+                if (!source?.caseDraft) {
+                    sendJson(res, 404, { error: 'Source Draft not found' });
+                    return;
+                }
+                if (source.caseDraft.filingEligible) {
+                    sendJson(res, 409, {
+                        error: 'This Draft is already a filing package and does not need conversion.',
+                    });
+                    return;
+                }
+
+                const message = {
+                    id: `manual-copy:${source.email.externalMessageId}:${randomUUID()}`,
+                    subject: `Manual filing package - ${
+                        source.caseDraft.editableData.caseTitle || 'court notification'
+                    }`,
+                    receivedDateTime: new Date().toISOString(),
+                    from: { emailAddress: {
+                        address: process.env.USER_EMAIL ||
+                            process.env.FILING_ATTORNEY_EMAIL ||
+                            'manual-intake@local',
+                    } },
+                };
+                const email = db.registerEmail(message);
+                const draftId = db.createCaseDraft(
+                    email.id,
+                    buildManualDraft(message, source),
+                );
+                db.markEmailProcessed(email.id);
+
+                const copiedDocuments: Array<{ sourceId: string; targetId: string }> = [];
+                for (const document of source.documents.filter(item => item.oneDriveUrl)) {
+                    const targetId = db.addDocument({
+                        emailId: email.id,
+                        caseDraftId: draftId,
+                        originalFilename: document.originalFilename,
+                        currentFilename: document.currentFilename,
+                        fileUrl: document.fileUrl,
+                        sourceUrl: document.sourceUrl,
+                        oneDriveUrl: document.oneDriveUrl,
+                        storagePath: document.storagePath,
+                        mimeType: document.mimeType || 'application/pdf',
+                        fileSize: document.fileSize,
+                        documentType: document.documentType,
+                        uploadSource: 'manual_copy_from_notification',
+                        status: 'uploaded',
+                        metadata: {
+                            recognition: document.recognition || null,
+                            formTemplate: document.formTemplate || null,
+                            manualCopySourceDraftId: sourceDraftId,
+                            manualCopySourceDocumentId: document.id,
+                        },
+                    });
+                    copiedDocuments.push({ sourceId: document.id, targetId });
+                }
+
+                const copiedDetail = db.getDraftDetail(draftId);
+                if (!copiedDetail?.caseDraft) {
+                    throw new Error('Manual package was not created');
+                }
+                const targetBySourceId = new Map(copiedDocuments.map(item => [item.sourceId, item.targetId]));
+                db.updateCaseDraft(
+                    draftId,
+                    {},
+                    `Created from court notification ${source.email.subject || source.email.externalMessageId}. Review all fields before MiFILE preparation.`,
+                    copiedDetail.caseDraft.filingData,
+                    source.documents
+                        .filter(document => targetBySourceId.has(document.id))
+                        .map(document => ({
+                            id: targetBySourceId.get(document.id)!,
+                            filingName: document.filingName || document.currentFilename || document.originalFilename,
+                            filingType: document.filingType,
+                            filingRelation: document.filingRelation === 'unknown'
+                                ? 'separate'
+                                : document.filingRelation,
+                            requiredForFiling: document.packageRole !== 'fee',
+                        })),
+                );
+                const result = await applyLibraryForms(db, draftId);
+                sendJson(res, 201, {
+                    ...result,
+                    manualCopy: {
+                        sourceDraftId,
+                        copiedDocuments: copiedDocuments.length,
+                    },
+                });
                 return;
             }
             if (req.method === 'POST' && url.pathname === '/api/form-library/import') {
