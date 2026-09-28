@@ -244,3 +244,85 @@ test('automatic preparation only queues complete new intakes once and never skip
         assert.equal(job?.triggerSource, 'validated_intake');
     } finally { f.close(); }
 });
+
+test('manual Drafts can prepare a reviewed arbitrary PDF package without a Complaint', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-filing-'));
+    const db = new WorkflowDatabase(path.join(directory, 'test.sqlite'));
+    try {
+        const manualMessage = {
+            id: 'manual-intake-test',
+            internetMessageId: '<manual-intake-test@example.com>',
+            subject: 'New case - manual upload',
+            receivedDateTime: '2026-09-28T12:00:00Z',
+        };
+        const email = db.registerEmail(manualMessage);
+        const parsed = buildFilingIntake(manualMessage, []);
+        parsed.intake!.manual = true;
+        parsed.intake!.issues = [];
+        const draftId = db.createCaseDraft(email.id, parsed);
+        const documentId = db.addDocument({
+            emailId: email.id,
+            caseDraftId: draftId,
+            originalFilename: 'Reviewed supporting document.pdf',
+            currentFilename: 'Reviewed-supporting-document.pdf',
+            oneDriveUrl: 'https://onedrive.example/reviewed-document',
+            documentType: 'Unclassified document',
+            mimeType: 'application/pdf',
+            uploadSource: 'admin_draft_upload',
+            status: 'uploaded',
+        });
+        const filingData = {
+            ...db.getDraftDetail(draftId)!.caseDraft!.filingData,
+            relatedCivilAction: 'none' as const,
+            moneyJudgmentRequested: false,
+            claimAmount: '0.00',
+            plaintiff: {
+                id: 'plaintiff-1', partyType: 'entity' as const,
+                displayName: 'Example Property LLC', entityName: 'Example Property LLC',
+                firstName: null, middleName: null, lastName: null, suffix: null,
+                address1: '200 Main Street', address2: null, city: 'Lincoln Park',
+                state: 'MI', postalCode: '48146', phone: null, email: null,
+            },
+            defendants: [{
+                id: 'defendant-1', partyType: 'person' as const,
+                displayName: 'Taylor Tenant', entityName: null, firstName: 'Taylor',
+                middleName: null, lastName: 'Tenant', suffix: null,
+                address1: '100 Main Street', address2: null, city: 'Lincoln Park',
+                state: 'MI', postalCode: '48146', phone: null, email: null,
+            }],
+            attorney: {
+                name: 'Adam J Devlin', barNumber: 'P72877',
+                address1: '30850 Telegraph Rd', address2: 'Suite 250',
+                city: 'Bingham Farms', state: 'MI', postalCode: '48025',
+                phone: '2487036201', email: 'ajd@devlinlawpllc.com',
+            },
+        };
+        const ready = db.updateCaseDraft(
+            draftId,
+            { courtName: '25th District Court' },
+            undefined,
+            filingData,
+            [{
+                id: documentId,
+                filingName: 'Reviewed supporting document',
+                filingType: 'Other',
+                filingRelation: 'separate',
+                requiredForFiling: true,
+            }],
+        );
+        assert.equal(ready.caseDraft?.manualPackage, true);
+        assert.ok(!ready.caseDraft?.validationIssues.some(issue =>
+            /Complaint|standard nonpayment package/.test(issue.message)));
+        assert.ok(!ready.caseDraft?.validationIssues.some(issue => issue.severity === 'error'),
+            JSON.stringify(ready.caseDraft?.validationIssues));
+        db.reviewCaseDraft(draftId, 'approve');
+        const job = db.queueFilingJob(draftId);
+        assert.equal(job.payload?.documents.length, 1);
+        assert.equal(job.payload?.documents[0].filingType, 'Other');
+        assert.equal(job.payload?.documents[0].isPrimary, false);
+        assert.equal(db.queueValidatedIntakes(), 0, 'manual packages require an explicit click');
+    } finally {
+        db.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});

@@ -186,9 +186,15 @@ async function main() {
         await page.locator('#newDraftBtn').click();
         const manual = await (await created).json();
         assert.equal(JSON.parse(manual.caseDraft.normalizedDataJson).intake.manual, true);
+        assert.equal(manual.caseDraft.manualPackage, true);
+        assert.equal(manual.caseDraft.filingData.attorney.barNumber, 'P72877');
+        assert.ok(!manual.caseDraft.validationIssues.some((issue: { message: string }) =>
+            /standard nonpayment package|No Complaint document/.test(issue.message)));
         assert.equal(manual.caseDraft.status, 'needs_review');
         assert.equal(db.queueValidatedIntakes(), 0);
         await page.locator('#draftWorkspaceView').waitFor({state:'visible'});
+        assert.equal(await page.locator('#draftApproveBtn').innerText(), 'Confirm package');
+        assert.equal(await page.locator('#draftPrepareBtn').innerText(), 'Send to MiFILE');
         assert.deepEqual(errors, []);
         await page.locator('#signOutBtn').click();
         await page.waitForURL(url + '/login');

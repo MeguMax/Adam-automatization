@@ -568,6 +568,7 @@ export interface EmailDetail {
             extractedAt: string;
             appliedFields: string[];
         }) | null;
+        manualPackage: boolean;
         validationIssues: DraftValidationIssue[];
         filingEligible: boolean;
         filingEligibilityIssues: DraftValidationIssue[];
@@ -1451,6 +1452,75 @@ function validateNewCaseSource(
         severity: 'error',
         message: 'This email records an existing court filing and cannot be submitted as a new case.',
     }];
+}
+
+function isManualFilingPackage(data: unknown): boolean {
+    const root = data && typeof data === 'object' && !Array.isArray(data)
+        ? data as Record<string, unknown>
+        : {};
+    const intake = root.intake && typeof root.intake === 'object' &&
+        !Array.isArray(root.intake)
+        ? root.intake as Record<string, unknown>
+        : {};
+    return root.sourceKind === 'new_filing_intake' && intake.manual === true;
+}
+
+function validateManualDraftDocuments(
+    documents: DocumentRecordView[],
+): DraftValidationIssue[] {
+    const included = documents.filter(document =>
+        document.requiredForFiling && document.packageRole !== 'fee');
+    const issues: DraftValidationIssue[] = [];
+    if (!included.length) {
+        issues.push({
+            field: 'package.documents',
+            severity: 'error',
+            message: 'Add and include at least one PDF for the manual MiFILE package.',
+        });
+        return issues;
+    }
+
+    const hasComplaint = included.some(document => document.packageRole === 'complaint');
+    for (const document of included) {
+        const label = document.currentFilename || document.originalFilename ||
+            document.documentType || 'Document';
+        if (!document.oneDriveUrl || !['uploaded', 'downloaded', 'replaced'].includes(document.status)) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${label} is not ready in OneDrive.`,
+            });
+            continue;
+        }
+        if (!document.filingName?.trim()) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `Enter the MiFILE document name for ${label}.`,
+            });
+        }
+        if (!document.filingType?.trim()) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `Select or enter the MiFILE Filing Type for ${label}.`,
+            });
+        }
+        if (document.filingRelation === 'unknown') {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `Choose Separate filing or Connect to Complaint for ${label}.`,
+            });
+        } else if (document.filingRelation === 'connected_to_complaint' && !hasComplaint) {
+            issues.push({
+                field: `document.${document.id}`,
+                severity: 'error',
+                message: `${label} cannot be connected because no Complaint is included.`,
+            });
+        }
+    }
+    return issues;
 }
 
 function validateDraftDocuments(
@@ -4800,17 +4870,22 @@ export class WorkflowDatabase {
             if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
             return left.createdAt.localeCompare(right.createdAt);
         });
+        const manualPackage = isManualFilingPackage(normalizedDraftData);
         const validationIssues = caseDraft && !validateNewCaseSource(normalizedDraftData, email.subject, email.sender).length
             ? [
                 ...validateDraftData(normalizedDraftData),
                 ...this.intakeValidationIssues(normalizedDraftData),
-                ...validatePrimaryComplaint(
-                    caseDraft.primary_document_id,
-                    documentViews,
-                    complaintExtraction,
-                    normalizedFilingData,
-                ),
-                ...validateDraftDocuments(documentViews, normalizedFilingData),
+                ...(manualPackage
+                    ? validateManualDraftDocuments(documentViews)
+                    : [
+                        ...validatePrimaryComplaint(
+                            caseDraft.primary_document_id,
+                            documentViews,
+                            complaintExtraction,
+                            normalizedFilingData,
+                        ),
+                        ...validateDraftDocuments(documentViews, normalizedFilingData),
+                    ]),
                 ...documentViews.filter(document => document.requiredForFiling && document.formTemplate?.role === 'local' &&
                     document.formTemplate.courtKey !== courtKey(normalizedDraftData?.courtName || '')).map(document => ({
                         field: `document.${document.id}`, severity: 'error' as const,
@@ -4863,6 +4938,7 @@ export class WorkflowDatabase {
                         normalizedDraftData,
                     ),
                     complaintExtraction,
+                    manualPackage,
                     validationIssues,
                     filingEligible: filingEligibilityIssues.length === 0,
                     filingEligibilityIssues,
@@ -5471,6 +5547,7 @@ export class WorkflowDatabase {
             ? 'needs_review'
             : existing.status;
         const timestamp = nowIso();
+        const manualPackage = isManualFilingPackage(next);
 
         const updatedDocumentIds: string[] = [];
         this.runInTransaction(() => {
@@ -5537,7 +5614,7 @@ export class WorkflowDatabase {
                     (existingDocument as any).current_filename ||
                         (existingDocument as any).original_filename,
                 );
-                const coreDocument = [
+                const coreDocument = !manualPackage && [
                     'complaint',
                     'advice',
                     'local',

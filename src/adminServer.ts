@@ -44,7 +44,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-09-28-mifile-multiupload-v32';
+const ADMIN_BUILD_ID = '2026-09-28-manual-filing-package-v33';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3211,11 +3211,11 @@ const html = String.raw`<!doctype html>
               <div class="draft-source-actions">
                 <button id="draftPrimaryBtn" type="button" title="Use the selected document as the primary source"><i data-lucide="star"></i>Primary source</button>
                 <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
-                <button id="draftAddDocumentBtn" type="button" title="Add a PDF to this Draft"><i data-lucide="file-plus-2"></i>Add PDF</button>
+                <button id="draftAddDocumentBtn" type="button" title="Add one or more PDFs to this Draft"><i data-lucide="file-plus-2"></i>Add PDFs</button>
                 <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
                 <button id="draftRemoveFormBtn" class="icon-button" type="button" title="Remove library form from Draft" aria-label="Remove library form"><i data-lucide="trash-2"></i></button>
                 <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF while keeping its OneDrive name and link"><i data-lucide="replace"></i>Replace PDF</button>
-                <input id="draftDocumentFileInput" class="hidden" type="file" accept="application/pdf,.pdf">
+                <input id="draftDocumentFileInput" class="hidden" type="file" accept="application/pdf,.pdf" multiple>
               </div>
               <div class="draft-document-links">
                 <a id="draftOneDriveLink" class="button-link" target="_blank" rel="noopener"><i data-lucide="cloud"></i>OneDrive</a>
@@ -4118,6 +4118,10 @@ const html = String.raw`<!doctype html>
       document.getElementById('draftWorkspaceStatuses').innerHTML =
         statusPill(draft.status) + validationPill(draft.validationStatus) +
         statusPill(draft.filingStatus);
+      document.getElementById('draftApproveBtn').innerHTML = icon('check-check') +
+        (draft.manualPackage ? 'Confirm package' : 'Approve');
+      document.getElementById('draftPrepareBtn').innerHTML = icon('upload-cloud') +
+        (draft.manualPackage ? 'Send to MiFILE' : 'Prepare in MiFILE');
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
       renderDraftFields(draft);
       renderDraftFilingJobs();
@@ -4327,12 +4331,23 @@ const html = String.raw`<!doctype html>
       } else {
         validationRoot.innerHTML = '<div class="draft-validation is-ready">' +
           '<div class="draft-validation-row">' + icon('circle-check') +
-          '<span>Standard first-hearing nonpayment package passed validation.</span></div></div>';
+          '<span>' + escapeHtml(draft.manualPackage
+            ? 'Manual package is complete and ready for confirmation.'
+            : 'Standard first-hearing nonpayment package passed validation.') +
+          '</span></div></div>';
       }
 
       const primaryDocument = documents.find(document => document.isPrimary) || null;
       const extraction = draft.complaintExtraction || null;
-      const extractionSummary =
+      const extractionSummary = draft.manualPackage
+        ? '<section class="draft-field-section"><div class="draft-section-heading">' +
+            '<h3>Manual filing package</h3><span class="field-source manual">Manual</span>' +
+          '</div><div class="draft-source-summary">' +
+            '<strong>Upload and classify the PDFs to include</strong>' +
+            '<span>A Complaint can still be selected to extract fields, but it is not required. ' +
+            'Advice and the court-specific Local form are added from the form library after the court is selected.</span>' +
+          '</div></section>'
+        :
         '<section class="draft-field-section">' +
           '<div class="draft-section-heading"><h3>Primary data source</h3>' +
             (primaryDocument && primaryDocument.documentRole === 'primary_source'
@@ -4689,8 +4704,10 @@ const html = String.raw`<!doctype html>
 
     function renderDraftDocumentMapping(document, index, issueByField) {
       const issue = issueByField.get('document.' + document.id);
-      const coreDocument = ['complaint', 'advice', 'local', 'request', 'summons']
-        .includes(document.packageRole);
+      const manualPackage = Boolean(state.draftDetail && state.draftDetail.caseDraft &&
+        state.draftDetail.caseDraft.manualPackage);
+      const coreDocument = !manualPackage &&
+        ['complaint', 'advice', 'local', 'request', 'summons'].includes(document.packageRole);
       return '<div class="draft-document-mapping" data-draft-document-id="' +
         escapeHtml(document.id) + '">' +
         '<label class="draft-field">' +
@@ -5041,6 +5058,7 @@ const html = String.raw`<!doctype html>
       state.draftFileAction = action;
       const input = document.getElementById('draftDocumentFileInput');
       input.value = '';
+      input.multiple = action === 'add';
       input.click();
     }
 
@@ -5077,7 +5095,7 @@ const html = String.raw`<!doctype html>
         });
         if (action === 'add') {
           const added = (state.draftDetail.documents || []).find(document =>
-            document.currentFilename === file.name);
+            !(detail.documents || []).some(existing => existing.id === document.id));
           if (added) state.activeDraftDocumentId = added.id;
         }
         state.draftDirty = false;
@@ -6181,8 +6199,15 @@ const html = String.raw`<!doctype html>
     document.getElementById('draftReplaceDocumentBtn').addEventListener('click', () => {
       chooseDraftPdf('replace');
     });
-    document.getElementById('draftDocumentFileInput').addEventListener('change', event => {
-      uploadDraftPdf(event.target.files && event.target.files[0]).catch(showDraftError);
+    document.getElementById('draftDocumentFileInput').addEventListener('change', async event => {
+      const files = Array.from(event.target.files || []);
+      const action = state.draftFileAction;
+      try {
+        for (const file of (action === 'replace' ? files.slice(0, 1) : files)) {
+          state.draftFileAction = action;
+          await uploadDraftPdf(file);
+        }
+      } catch (error) { showDraftError(error); }
     });
     document.querySelectorAll('[data-draft-mobile-mode]').forEach(button => {
       button.addEventListener('click', () => setDraftMobileMode(button.dataset.draftMobileMode));
@@ -6382,6 +6407,29 @@ export function createAdminServer(
                 const parsed = buildFilingIntake(message, []);
                 parsed.intake!.manual = true;
                 parsed.intake!.issues = [];
+                Object.assign(parsed, {
+                    filingData: {
+                        action: 'Initiate a new case',
+                        caseType: 'LT - Landlord-Tenant Summary Proceedings',
+                        relatedCivilAction: 'unknown',
+                        moneyJudgmentRequested: null,
+                        mailingRequested: true,
+                        includeAllOtherOccupants: false,
+                        plaintiff: { partyType: 'entity' },
+                        defendants: [],
+                        attorney: {
+                            name: process.env.FILING_ATTORNEY_NAME || 'Adam J Devlin',
+                            barNumber: process.env.FILING_ATTORNEY_BAR_NUMBER || 'P72877',
+                            address1: process.env.FILING_ATTORNEY_ADDRESS || '30850 Telegraph Rd',
+                            address2: process.env.FILING_ATTORNEY_ADDRESS_2 || 'Suite 250',
+                            city: process.env.FILING_ATTORNEY_CITY || 'Bingham Farms',
+                            state: process.env.FILING_ATTORNEY_STATE || 'MI',
+                            postalCode: process.env.FILING_ATTORNEY_ZIP || '48025',
+                            phone: process.env.FILING_ATTORNEY_PHONE || '2487036201',
+                            email: process.env.FILING_ATTORNEY_EMAIL || 'ajd@devlinlawpllc.com',
+                        },
+                    },
+                });
                 const email = db.registerEmail(message);
                 const draftId = db.createCaseDraft(email.id, parsed);
                 db.markEmailProcessed(email.id);
