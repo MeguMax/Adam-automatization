@@ -226,26 +226,11 @@ async function main() {
         assert.equal(await page.locator('#draftPrepareBtn').innerText(), 'Send to MiFILE');
         await page.locator('#closeDraftBtn').click();
         await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();
-        await page.locator('#draftManualCopyBtn').waitFor({ state: 'visible' });
-        page.once('dialog', dialog => dialog.accept());
-        const copied = page.waitForResponse(response =>
-            response.url().endsWith(`/api/drafts/${notificationDraftId}/manual-copy`) &&
-            response.status() === 201);
-        await page.locator('#draftManualCopyBtn').click();
-        const copiedPayload = await (await copied).json();
-        assert.equal(copiedPayload.caseDraft.manualPackage, true);
-        assert.equal(copiedPayload.manualCopy.sourceDraftId, notificationDraftId);
-        assert.equal(copiedPayload.manualCopy.copiedDocuments, 1);
-        assert.equal(copiedPayload.caseDraft.editableData.caseNumber, null);
-        assert.equal(copiedPayload.caseDraft.editableData.courtName,
-            'MI Example County - 25th District Court');
-        assert.equal(copiedPayload.documents.some((document: { oneDriveUrl: string | null }) =>
-            document.oneDriveUrl === 'https://onedrive.example/Filed%20Complaint.pdf'), true);
-        assert.equal(db.getDraftDetail(notificationDraftId)?.caseDraft?.filingEligible, false);
-        await page.waitForFunction(() =>
-            document.getElementById('draftApproveBtn')?.textContent === 'Confirm package');
-        assert.equal(await page.locator('#draftApproveBtn').innerText(), 'Confirm package');
         assert.equal(await page.locator('#draftManualCopyBtn').isHidden(), true);
+        const blockedCopy = await context.request.post(
+            `${url}/api/drafts/${notificationDraftId}/manual-copy`, { headers: { Origin: url } });
+        assert.equal(blockedCopy.status(), 409);
+        assert.equal(db.getDraftDetail(notificationDraftId)?.caseDraft?.filingEligible, false);
         assert.deepEqual(errors, []);
         await page.locator('#signOutBtn').click();
         await page.waitForURL(url + '/login');

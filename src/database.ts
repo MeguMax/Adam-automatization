@@ -1393,11 +1393,11 @@ function validatePrimaryComplaint(
                 message: 'Re-extract this Complaint to read paragraphs 2 and 10 with the current rules.',
             });
         }
-        if (extraction.formType !== 'NONPAYMENT OF RENT') {
+        if (!['NONPAYMENT OF RENT', 'TERMINATION OF TENANCY'].includes(extraction.formType || '')) {
             issues.push({
                 field: 'complaintExtraction.formType',
                 severity: 'error',
-                message: 'Automatic filing is currently limited to first-hearing nonpayment Complaints.',
+                message: 'The Complaint must be a recognized landlord-tenant nonpayment or termination form.',
             });
         }
         for (const warning of extraction.warnings) {
@@ -1437,6 +1437,7 @@ function validateNewCaseSource(
     const normalizedSender = String(sender || '').toLowerCase();
     const isFiledNotification =
         root.isMiFile === true ||
+        Boolean(root.manualPackageSource) ||
         Boolean(editableDraftValue(root.bundleNumber)) ||
         Boolean(editableDraftValue(root.filedAt)) ||
         /mifile\s*-\s*document filed|filing (?:accepted|submitted)|processed:/.test(
@@ -1541,7 +1542,7 @@ function validateDraftDocuments(
             issues.push({
                 field: `package.${role}`,
                 severity: 'error',
-                message: `The standard nonpayment package is missing ${label}.`,
+                message: `The standard landlord-tenant package is missing ${label}.`,
             });
             continue;
         }
@@ -1552,14 +1553,14 @@ function validateDraftDocuments(
             issues.push({
                 field: `package.${role}`,
                 severity: 'error',
-                message: `The standard nonpayment package contains ${matching.length} ${label} documents; exactly one is required.`,
+                message: `The standard landlord-tenant package contains ${matching.length} ${label} documents; exactly one is required.`,
             });
         }
         if (matching.some(document => !document.requiredForFiling)) {
             issues.push({
                 field: `package.${role}`,
                 severity: 'error',
-                message: `${label} cannot be excluded from the standard nonpayment package.`,
+                message: `${label} cannot be excluded from the standard landlord-tenant package.`,
             });
         }
     }

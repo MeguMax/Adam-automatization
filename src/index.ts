@@ -29,7 +29,7 @@ import {
     isEmailAttachmentSource,
 } from './emailAttachmentSource';
 import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
-import { parseWorkflowEmail } from './workflowEmail';
+import { isCourtNotificationMessage, parseWorkflowEmail } from './workflowEmail';
 import { processFilingIntake } from './filingIntakeWorker';
 import { applyLibraryForms, uploadLibraryDocument } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
@@ -385,6 +385,14 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
         const recoveredFiles: NotificationFile[] = [];
         const reportParsed = retryParsedEmail(retries[0]);
         let sourceMessage = retrySourceMessage(retries[0]);
+        if (reportParsed.isMiFile && !isCourtNotificationMessage(sourceMessage)) {
+            const reason = 'Court document processing accepts original notifications from @truefiling.com only.';
+            for (const retry of retries) db.completeDocumentRetryNotDownloadable({
+                documentId: retry.documentId, reason, downloadAttempts: 0,
+            });
+            db.markEmailIgnored(emailId, reason);
+            continue;
+        }
         let recoveredMessagePromise: Promise<any> | null = null;
         const attachmentResolver = createEmailAttachmentResolver(async () => {
             recoveredMessagePromise ??= recoverOutlookMessage(db, retries[0]);

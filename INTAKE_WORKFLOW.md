@@ -2,7 +2,7 @@
 
 ## Current workflow
 
-One authorized email creates one new Draft and one OneDrive folder. The worker processes attached PDFs, extracts fields from the Complaint, and validates the package. The supported scope remains first-hearing nonpayment LT cases.
+One authorized email creates one new Draft and one OneDrive folder. The worker processes attached PDFs, extracts fields from the Complaint, and validates the package. Nonpayment and termination LT Complaints use the same filing workflow; paragraph 10 determines possession-only versus possession and supplemental money judgment.
 
 The Draft editor displays the PDF with page navigation and zoom beside the editable fields. On mobile, switch between Document and Fields. Missing data, unreadable files, ambiguous document roles, and incomplete packages require review.
 
@@ -34,7 +34,11 @@ Upload failures use the normal per-document automatic and manual retries. Inacti
 
 By default, accepted senders are `ajd@devlinlawpllc.com` and the `USER_EMAIL` address. Override the list with `FILING_INTAKE_ALLOWED_SENDERS`, a comma-separated list of exact email addresses. The sender list is visible in Settings.
 
-Replies and forwards with `Re:` or `FW:` subjects do not create another intake. Existing MiFILE notifications retain their existing processing path, including when a notification body appears under an intake subject. Reprocessing the same recorded email resumes missing documents; sending the package as a completely new email creates a separate Draft.
+Replies and forwards with `Re:` or `FW:` subjects do not create another intake. Original court notifications are processed only from exact `@truefiling.com` addresses. Client replies quoting a court notification are ignored, including delayed retries previously queued from those replies. `Document Sent` reads the case number and title from the actual email Subject header. Reprocessing the same recorded email resumes missing documents; sending the package as a completely new email creates a separate Draft.
+
+Court notifications are download history and cannot create a new case package, including through the former manual-copy API. Notification reports do not announce filing readiness. To prepare a new case, the user must send an authorized intake or create a new manual Draft with original case documents.
+
+Adam supplies Complaint, Summons, Request and at least one supporting document. The library adds Advice and the selected court's Local form, giving a minimum standard package of six documents. Missing library forms require correction. Automatic Other/Connected selection still needs Adam's court list; until then uncertain relationships require review.
 
 ## Storage and recovery
 

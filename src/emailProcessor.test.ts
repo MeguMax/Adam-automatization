@@ -59,3 +59,43 @@ test('Graph subject searches remove URL and query syntax characters', async () =
         'YOUR R D TEST 1',
     );
 });
+
+const DOCUMENT_SENT_BODY = `<p>The following document was electronically sent on behalf of the 52-2 DISTRICT COURT by MiFILE.</p>
+<p>Document Name:<br>52-2 DC105 CLARKSTON APTS, LLC V ASHLEY COOLEY (2)</p>
+<p>Document Type:<br>PROPOSED JUDGMENT/ORDER</p>
+<a href="https://eservices.truecertify.com/?loc=MID52.2-SB2K89-A73AD90C&amp;key=YWX">Download</a>`;
+
+test('Document Sent reads case number and parties from the actual Subject header', async () => {
+    const { parseWorkflowEmail } = await import('./workflowEmail');
+    const parsed = await parseWorkflowEmail({
+        subject: 'MiFILE - Document Sent 26-04033-LT, CLARKSTON APTS, LLC V COOLEY',
+        from: { emailAddress: { address: 'truefilingadmin@truefiling.com' } },
+        body: { content: DOCUMENT_SENT_BODY },
+    });
+    assert.equal(parsed?.caseNumber, '26-04033-LT');
+    assert.equal(parsed?.caseTitle, 'CLARKSTON APTS, LLC V COOLEY');
+    assert.equal(parsed?.courtName, '52-2 DISTRICT COURT');
+    assert.equal(parsed?.filedDocuments[0].documentName,
+        '52-2 DC105 CLARKSTON APTS, LLC V ASHLEY COOLEY (2)');
+});
+
+test('client replies and lookalike domains cannot reprocess quoted court documents', async () => {
+    const { parseWorkflowEmail } = await import('./workflowEmail');
+    for (const [sender, subject] of [
+        ['client@example.com', 'RE: MiFILE - Document Sent 26-04033-LT, OWNER V TENANT'],
+        ['truefilingadmin@truefiling.com.attacker.example', 'MiFILE - Document Sent 26-04033-LT, OWNER V TENANT'],
+        ['truefilingadmin@truefiling.com', 'RE: MiFILE - Document Sent 26-04033-LT, OWNER V TENANT'],
+    ]) {
+        assert.equal(await parseWorkflowEmail({ subject,
+            from: { emailAddress: { address: sender } }, body: { content: DOCUMENT_SENT_BODY } }), null);
+    }
+});
+
+test('court download reports never announce automatic filing readiness', async () => {
+    const { parseEmailBody } = await import('./emailProcessor');
+    const { buildSuccessBody } = await import('./buildSuccessBody');
+    const body = buildSuccessBody({ msg: {}, parsed: parseEmailBody(DOCUMENT_SENT_BODY), files: [],
+        draftValidation: { status: 'parsed', issues: [] } });
+    assert.ok(!body.includes('READY'));
+    assert.ok(!body.includes('Filing Draft'));
+});

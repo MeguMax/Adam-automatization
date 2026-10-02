@@ -344,7 +344,7 @@ export async function downloadCourtEmailAttachment(
     throw new Error('Microsoft Graph returned an unsupported attachment payload');
 }
 
-export function parseEmailBody(bodyHtml: string): ParsedEmailInfo {
+export function parseEmailBody(bodyHtml: string, subject = ''): ParsedEmailInfo {
     const text = htmlToText(bodyHtml);
 
     // Type B: single‑document (“Your document was successfully filed…”)
@@ -360,7 +360,7 @@ export function parseEmailBody(bodyHtml: string): ParsedEmailInfo {
     }
 
     // Type C: “Document Sent …” от TrueFiling (нет суда/кейса, только один документ)
-    const cLike = parseDocumentSentStyle(text, bodyHtml);
+    const cLike = parseDocumentSentStyle(text, bodyHtml, subject);
     if (cLike) {
         return { ...cLike, isMiFile: true };
     }
@@ -537,6 +537,7 @@ function trueCertifyDownloadUrl(html: string, text: string): string | null {
 function parseDocumentSentStyle(
     text: string,
     html: string,
+    subject: string,
 ): Omit<ParsedEmailInfo, 'isMiFile'> | null {
     // 1) Главный маркер Type C — ссылка на TrueCertify
     const downloadUrl = trueCertifyDownloadUrl(html, text);
@@ -568,7 +569,8 @@ function parseDocumentSentStyle(
     let caseNumber: string | null = null;
     let caseTitle: string | null = null;
 
-    const docSentMatch = text.match(/MiFILE\s*-\s*Document Sent\s+([^\n,]+),\s*(.+)\s*$/mi);
+    const subjectPattern = /MiFILE\s*-\s*Document Sent\s+([^\r\n,]+),\s*([^\r\n]+)/i;
+    const docSentMatch = subject.match(subjectPattern) || text.match(subjectPattern);
     if (docSentMatch) {
         caseNumber = docSentMatch[1]?.trim() || null;
         caseTitle = docSentMatch[2]?.trim() || null;

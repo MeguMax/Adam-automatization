@@ -152,7 +152,7 @@ function personNameParts(value: string): Partial<ComplaintPartyExtraction> {
 }
 
 function isLikelyComplaint(text: string): boolean {
-    return /COMPLAINT[\s\S]{0,80}(?:NONPAYMENT OF RENT|Landlord-Tenant)/i.test(text) &&
+    return /COMPLAINT[\s\S]{0,80}(?:NONPAYMENT OF RENT|TERMINATION OF TENANCY|Landlord-Tenant)/i.test(text) &&
         /SUPPLEMENTAL COMPLAINT/i.test(text);
 }
 

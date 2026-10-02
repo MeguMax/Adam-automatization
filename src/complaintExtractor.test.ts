@@ -37,6 +37,13 @@ test('recognizes Complaint documents without treating every filing as primary', 
     assert.equal(isComplaintDocument('Summons, Landlord-Tenant', 'Summons.pdf'), false);
 });
 
+test('termination Complaints use the same LT fields without an unsupported-form blocker', () => {
+    const result = parseComplaintText(POSSESSION_ONLY_TEXT.replace('NONPAYMENT OF RENT', 'TERMINATION OF TENANCY'));
+    assert.equal(result.formType, 'TERMINATION OF TENANCY');
+    assert.ok(!result.warnings.some(warning => warning.code === 'unsupported_form'));
+    assert.equal(result.data.plaintiff?.entityName, 'Example Property Management');
+});
+
 test('extracts high-confidence filing fields from a Michigan Complaint', () => {
     const result = parseComplaintText(POSSESSION_ONLY_TEXT, {
         documentType: 'Complaint for Possession Only',

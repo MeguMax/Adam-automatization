@@ -43,15 +43,15 @@ export function buildSuccessBody(args: {
         )
         .join('\n');
 
-    const validation = draftValidation
+    const validation = draftValidation && parsed.sourceKind === 'new_filing_intake'
         ? `\n\nFiling Draft:\n` +
           `Status: ${draftValidation.status}\n` +
-          `Automatic submission: ${draftValidation.issues.length ? 'BLOCKED - correction or review required' : 'READY'}\n` +
+          `MiFILE preparation: ${draftValidation.issues.length ? 'BLOCKED - correction or review required' : 'READY - Unsubmitted only'}\n` +
           (draftValidation.issues.length
               ? draftValidation.issues
                   .map(issue => `- ${issue.severity.toUpperCase()}: ${issue.message}`)
                   .join('\n')
-              : '- Standard first-hearing nonpayment package passed validation.')
+              : '- Landlord-tenant package passed validation. Court submission is disabled.')
         : '';
 
     return header + docs + validation;
