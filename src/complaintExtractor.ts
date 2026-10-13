@@ -46,13 +46,15 @@ export interface ComplaintExtractionWarning {
         | 'multiple_defendants_review'
         | 'related_action_review'
         | 'claim_amount_review'
+        | 'caption_review'
         | 'scan_review';
     message: string;
 }
 
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
-    extractorVersion: 1 | 2;
+    extractorVersion: 1 | 2 | 3;
+    extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
     textHash: string;
@@ -65,6 +67,8 @@ interface TextItemLike {
     str?: unknown;
     transform?: unknown;
     hasEOL?: unknown;
+    width?: number;
+    height?: number;
 }
 
 export interface ComplaintPositionedValue {
@@ -95,7 +99,7 @@ function normalizeLine(value: unknown): string {
 }
 
 function normalizedLines(text: string | string[]): string[] {
-    const values = Array.isArray(text) ? text : text.split(/\r?\n/);
+    const values = Array.isArray(text) ? text : text.split(/\r\n|\r|\n/);
     return values.map(normalizeLine).filter(Boolean);
 }
 
@@ -152,8 +156,108 @@ function personNameParts(value: string): Partial<ComplaintPartyExtraction> {
 }
 
 function isLikelyComplaint(text: string): boolean {
-    return /COMPLAINT[\s\S]{0,80}(?:NONPAYMENT OF RENT|TERMINATION OF TENANCY|Landlord-Tenant)/i.test(text) &&
+    return /COMPLAINT[\s\S]{0,80}(?:NONPAYMENT OF RENT|TERMINATION OF TENANCY|RECOVER POSSESSION OF PROPERTY|Landlord-Tenant)/i.test(text) &&
         /SUPPLEMENTAL COMPLAINT/i.test(text);
+}
+
+function complaintFormType(text: string): string | null {
+    return text.match(/COMPLAINT[,\s]+(NONPAYMENT OF RENT|TERMINATION OF TENANCY)/i)?.[1]?.toUpperCase()
+        ?? (/COMPLAINT\s+TO\s+RECOVER POSSESSION OF PROPERTY/i.test(text) ? 'RECOVER POSSESSION OF PROPERTY' : null);
+}
+
+function partyFromLines(lines: string[]): ComplaintPartyExtraction | undefined {
+    if (!lines[0] || !/[a-z]{2}/i.test(lines[0])) return;
+    const name = cleanName(lines[0]);
+    const cityIndex = lines.findIndex(line => Boolean(parseCityStateZip(line).state));
+    const addressLines = cityIndex > 0 ? lines.slice(1, cityIndex).filter(line => !/^(?:devlin law|.*P\d{5})/i.test(line)) : [];
+    return {
+        displayName: name, ...personNameParts(name),
+        ...(cityIndex > 0 ? { address1: addressLines.join(' '), ...parseCityStateZip(lines[cityIndex]) } : {}),
+        phone: lines.map(normalizedPhone).find(Boolean),
+    };
+}
+
+function applyDefendants(result: ComplaintExtractionResult, party: ComplaintPartyExtraction, confidence: ComplaintFieldConfidence): void {
+    result.data.includeAllOtherOccupants = /all other occupants/i.test(party.displayName);
+    const name = cleanName(party.displayName.replace(/(?:,?\s+and\s+)?all other occupants/ig, ''));
+    const names = name.split(/\s+(?:and|&)\s+|\s*,\s*/).map(cleanName).filter(Boolean);
+    const canSplit = names.length > 1 && names.every(value => Boolean(personNameParts(value).lastName));
+    result.data.defendants = (canSplit ? names : [name]).map(displayName => ({
+        ...party, displayName, ...personNameParts(displayName),
+    }));
+    result.fieldConfidence.defendants = confidence;
+    result.fieldConfidence.includeAllOtherOccupants = confidence;
+    if (!canSplit && names.length > 1) result.warnings.push({
+        code: 'multiple_defendants_review', message: 'Confirm how the Defendant names should be split into parties.',
+    });
+}
+
+export interface ComplaintFormWidget {
+    fieldName?: string;
+    fieldValue?: unknown;
+    fieldType?: string;
+    checkBox?: boolean;
+}
+
+/** Read the typed values rather than OCRing an AcroForm's appearance streams. */
+export function parseComplaintFormFields(text: string, widgets: ComplaintFormWidget[], pageCount = 1): ComplaintExtractionResult | null {
+    const prefix = /\bDC\s*102c\b/i.test(text) ? 'dc102c' : /\bDC\s*102a\b/i.test(text) ? 'dc102a' : null;
+    if (!prefix || !isLikelyComplaint(text)) return null;
+    const fields = new Map(widgets.map(widget => [widget.fieldName?.toLowerCase(), widget]));
+    const field = (number: number) => fields.get(`${prefix}_${String(number).padStart(2, '0')}`);
+    const value = (number: number) => typeof field(number)?.fieldValue === 'string' ? String(field(number)!.fieldValue) : '';
+    if (!value(5).trim() && !value(7).trim()) return null;
+    const checked = (number: number): boolean | undefined => {
+        const widget = field(number);
+        if (widget?.fieldType !== 'Btn' || widget.checkBox !== true || typeof widget.fieldValue !== 'string' || !widget.fieldValue) return;
+        return widget.fieldValue !== 'Off';
+    };
+    const result: ComplaintExtractionResult = {
+        extractorVersion: 3, extractionMethod: 'form_fields', textSource: 'pdf',
+        formType: complaintFormType(text), pageCount,
+        textHash: createHash('sha256').update(text + JSON.stringify(widgets)).digest('hex'),
+        data: { mailingRequested: true }, fieldConfidence: { mailingRequested: 'high' }, warnings: [],
+    };
+    const plaintiff = partyFromLines(normalizedLines(value(5)));
+    if (plaintiff) { result.data.plaintiff = { ...plaintiff, entityName: plaintiff.displayName }; result.fieldConfidence.plaintiff = 'high'; }
+    const defendantLines = normalizedLines(value(7));
+    const defendant = partyFromLines(defendantLines);
+    if (defendant) applyDefendants(result, defendant, 'high');
+    const cityIndex = defendantLines.findIndex(line => Boolean(parseCityStateZip(line).state));
+    if (cityIndex >= 0 && defendantLines.slice(cityIndex + 1).some(line => !normalizedPhone(line))) result.warnings.push({
+        code: 'caption_review', message: 'The Defendant caption contains additional notice recipients or instructions. Review the parties before preparation.',
+    });
+    const attorneyLines = normalizedLines(value(6));
+    const bar = attorneyLines[0]?.match(/\(?\bP\d{5,8}\b\)?/i);
+    const attorney = partyFromLines([attorneyLines[0]?.replace(/\(?\bP\d{5,8}\b\)?/i, '').trim() || '', ...attorneyLines.slice(1)]);
+    if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() }; result.fieldConfidence.attorney = 'high'; }
+    const district = value(1).trim().match(/^(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)?$/i);
+    if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = 'high'; }
+    if (value(2).trim()) { result.data.caseNumber = value(2).trim(); result.fieldConfidence.caseNumber = 'high'; }
+    const none = checked(8), previous = checked(9);
+    if (none !== undefined && previous !== undefined && none !== previous) {
+        result.data.relatedCivilAction = none ? 'none' : 'previously_filed';
+        result.fieldConfidence.relatedCivilAction = 'high';
+        if (previous) {
+            result.data.relatedCaseCourt = value(10).trim() || undefined;
+            const docket = value(11).match(/\b[A-Z0-9]+(?:-[A-Z0-9]+){1,4}\b/i);
+            result.data.relatedCaseDocketNumber = docket?.[0];
+            result.data.relatedCaseJudge = value(11).replace(docket?.[0] || '', '').trim() || undefined;
+            const pending = checked(12), resolved = checked(13);
+            if (pending !== undefined && resolved !== undefined && pending !== resolved) result.data.relatedCasePending = pending;
+        }
+    } else result.warnings.push({ code: 'related_action_review', message: 'Paragraph 2 is missing or ambiguous. Confirm the related civil action answer.' });
+    const money = checked(prefix === 'dc102c' ? 39 : 32);
+    if (money !== undefined) {
+        result.data.moneyJudgmentRequested = money;
+        result.fieldConfidence.moneyJudgmentRequested = 'high';
+        result.data.claimAmount = money ? normalizedMoney(value(prefix === 'dc102c' ? 40 : 37)) : '0.00';
+        if (result.data.claimAmount) result.fieldConfidence.claimAmount = 'high';
+    }
+    if (money === undefined || (money && !result.data.claimAmount)) result.warnings.push({ code: 'claim_amount_review', message: 'Confirm paragraph 10 and its total claim amount. No amount has been guessed from the rent rate.' });
+    if (!plaintiff) result.warnings.push({ code: 'missing_plaintiff', message: 'Enter the Plaintiff from the Complaint.' });
+    if (!defendant) result.warnings.push({ code: 'missing_defendant', message: 'Enter the Defendant names and address from the Complaint.' });
+    return result;
 }
 
 function caseNumberFromLines(lines: string[]): string | undefined {
@@ -209,9 +313,9 @@ function textInBox(
 
 function normalizedMoney(value: string | undefined): string | undefined {
     if (!value) return undefined;
-    const match = value.replace(/[$,\s]/g, '').match(/^\d+(?:\.\d+)?$/);
-    if (!match) return undefined;
-    const amount = Number(match[0]);
+    const normalized = value.trim();
+    if (!/^\$?\s*(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2}0*)?$/.test(normalized)) return undefined;
+    const amount = Number(normalized.replace(/[$,\s]/g, ''));
     if (!Number.isFinite(amount) || amount < 0) return undefined;
     return amount.toFixed(2);
 }
@@ -368,8 +472,7 @@ export function parseComplaintText(
     const warnings: ComplaintExtractionWarning[] = [];
     const data: ComplaintExtractionData = {};
     const fieldConfidence: Record<string, ComplaintFieldConfidence> = {};
-    const formType = joined.match(/COMPLAINT,?\s+(NONPAYMENT OF RENT|TERMINATION OF TENANCY)/i)?.[1]
-        ?.toUpperCase() ?? null;
+    const formType = complaintFormType(joined);
 
     if (!isLikelyComplaint(joined)) {
         warnings.push({
@@ -527,10 +630,22 @@ export async function extractComplaintPdf(
         const document = await loadingTask.promise;
         const lines: string[] = [];
         const positionedValues: ComplaintPositionedValue[] = [];
+        const widgets: ComplaintFormWidget[] = [];
+        const layoutPages: OcrPage[] = [];
         for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
             const page = await document.getPage(pageNumber);
+            widgets.push(...await page.getAnnotations());
             const content = await page.getTextContent();
             const textItems = content.items as TextItemLike[];
+            const viewport = page.getViewport({ scale: 1 });
+            const layoutWords: OcrLine[] = textItems.flatMap(item => {
+                if (typeof item.str !== 'string' || !item.str.trim() || !Array.isArray(item.transform)) return [];
+                const [x, y] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
+                return [{ text: item.str.trim(), confidence: 100, pageNumber,
+                    x: x * 612 / viewport.width, y: (y - (item.height || 0)) * 792 / viewport.height,
+                    width: (item.width || 0) * 612 / viewport.width, height: (item.height || 0) * 792 / viewport.height }];
+            });
+            layoutPages.push({ text: layoutWords.map(word => word.text).join('\n'), confidence: 100, lines: layoutWords, words: layoutWords });
             let filledMarkerIndex = -1;
             for (let index = textItems.length - 1; index >= 0; index--) {
                 if (normalizeLine(textItems[index]?.str) === 'K') {
@@ -575,7 +690,11 @@ export async function extractComplaintPdf(
                 if (rawItem.hasEOL === true) flush();
             }
             flush();
+            page.cleanup();
         }
+
+        const formResult = parseComplaintFormFields(lines.join('\n'), widgets, document.numPages);
+        if (formResult) return formResult;
 
         const result = parseComplaintText(lines, {
             pageCount: document.numPages,
@@ -583,8 +702,8 @@ export async function extractComplaintPdf(
             positionedValues,
         });
         if (result.warnings.some(warning => warning.code === 'missing_filled_section')) {
-            // Flattened PDFs and scans have no reliable PDF fill-order marker.
-            // OCR reads their visible fields instead; never infer unchecked boxes from missing text.
+            const layout = parseLayoutComplaint(layoutPages, document.numPages, 'pdf');
+            if (layout.data.plaintiff && layout.data.defendants?.length) return layout;
             return parseScannedComplaint(await recognizeScannedPdf(buffer), document.numPages);
         }
         return { ...result, textSource: 'pdf' };
@@ -594,9 +713,15 @@ export async function extractComplaintPdf(
 }
 
 export function parseScannedComplaint(pages: OcrPage[], pageCount = pages.length): ComplaintExtractionResult {
+    return parseLayoutComplaint(pages, pageCount, 'ocr');
+}
+
+function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf' | 'ocr'): ComplaintExtractionResult {
     const text = pages.map(page => page.text).join('\n');
     const result = parseComplaintText(text, { pageCount });
-    result.textSource = 'ocr';
+    result.textSource = source;
+    result.extractorVersion = 3;
+    result.extractionMethod = source === 'ocr' ? 'ocr' : 'positioned_text';
     result.data = {};
     result.fieldConfidence = {};
     result.warnings = result.warnings.filter(warning => !['missing_filled_section', 'missing_plaintiff', 'missing_defendant'].includes(warning.code));
@@ -608,45 +733,56 @@ export function parseScannedComplaint(pages: OcrPage[], pageCount = pages.length
             const row = rows.find(row => Math.abs(row[0].y - word.y) < 5);
             if (row) row.push(word); else rows.push([word]);
         }
-        return rows.map(row => ({ y: row[0].y, text: row.sort((a, b) => a.x - b.x).map(word => word.text).join(' ') }));
+        return rows.map(row => ({ y: row[0].y, confidence: Math.min(...row.map(word => word.confidence)),
+            text: row.sort((a, b) => a.x - b.x).map(word => word.text).join(' ') }));
     };
     const left = groupLines(words.filter(word => word.x < 300));
     const right = groupLines(words.filter(word => word.x >= 300));
-    const plaintiffLabel = left.find(line => /plaintiff.{0,6}name/i.test(line.text));
-    const defendantLabel = right.find(line => /defendant.{0,6}name/i.test(line.text));
-    const attorneyLabel = left.find(line => /plaintiff.{0,6}attorney/i.test(line.text));
-    const statesLabel = left.find(line => /the plaintiff states/i.test(line.text));
+    const plaintiffLabel = left.find(line => /plaintiff.{0,8}name/i.test(line.text));
+    const defendantLabel = right.find(line => /defendant.{0,8}name/i.test(line.text));
+    const attorneyLabel = left.find(line => /plaintiff.{0,8}attorney/i.test(line.text));
+    const statesLabel = [...left, ...right].find(line => /the plaintiff states/i.test(line.text));
     function party(rows: Array<{y: number; text: string}>, start?: number, end?: number): ComplaintPartyExtraction | undefined {
         if (start === undefined || end === undefined) return;
         const values = rows.filter(line => line.y > start + 6 && line.y < end - 2).map(line => line.text.trim());
         const name = values[0];
         if (!name || !/[a-z]{2}/i.test(name) || /name,? address|telephone|plaintiff|defendant|attorney/i.test(name)) return;
-        const cityIndex = values.findIndex(value => Boolean(parseCityStateZip(value).state));
-        return { displayName: cleanName(name), ...personNameParts(name),
-            ...(cityIndex > 0 ? { address1: values.slice(1, cityIndex).join(' '), ...parseCityStateZip(values[cityIndex]) } : {}),
-            phone: values.map(normalizedPhone).find(Boolean) };
+        return partyFromLines(values);
     }
     const plaintiff = party(left, plaintiffLabel?.y, attorneyLabel?.y);
     if (plaintiff) {
         result.data.plaintiff = { ...plaintiff, entityName: plaintiff.displayName };
-        result.fieldConfidence.plaintiff = 'medium';
+        result.fieldConfidence.plaintiff = source === 'pdf' ? 'high' : 'medium';
     }
     const defendant = party(right, defendantLabel?.y, statesLabel?.y);
     if (defendant) {
-        result.data.includeAllOtherOccupants = /all other occupants/i.test(defendant.displayName);
-        defendant.displayName = cleanName(defendant.displayName.replace(/(?:,?\s+and\s+)?all other occupants/ig, ''));
-        Object.assign(defendant, personNameParts(defendant.displayName));
-        result.data.defendants = [defendant];
-        result.fieldConfidence.defendants = 'medium';
+        applyDefendants(result, defendant, source === 'pdf' ? 'high' : 'medium');
     }
-    const district = text.match(/\b(\d{1,3}[AB]?)(?:st|nd|rd|th)?\s+(?:judicial\s+)?district\b/i);
-    if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = 'medium'; }
+    const header = groupLines(words.filter(word => word.y < (plaintiffLabel?.y || 180))).map(line => line.text).join('\n');
+    const district = header.match(/\b(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)?\s+(?:judicial\s+)?district\b/i);
+    if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = source === 'pdf' ? 'high' : 'medium'; }
+    if (attorneyLabel) {
+        const end = [...left, ...right].filter(line => line.y > attorneyLabel.y && /^2\.|^there is no other pending/i.test(line.text)).sort((a,b)=>a.y-b.y)[0]?.y || attorneyLabel.y + 120;
+        const rows = left.filter(line => line.y > attorneyLabel.y + 6 && line.y < end - 2).map(line => line.text);
+        const bar = rows[0]?.match(/\(?\bP\d{5,8}\b\)?/i);
+        const attorney = partyFromLines([rows[0]?.replace(/\(?\bP\d{5,8}\b\)?/i, '').trim() || '', ...rows.slice(1)]);
+        if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() }; result.fieldConfidence.attorney = source === 'pdf' ? 'high' : 'medium'; }
+    }
     result.data.mailingRequested = true;
     delete result.data.moneyJudgmentRequested;
     delete result.data.claimAmount;
     delete result.data.relatedCivilAction;
-    result.warnings.push({ code: 'claim_amount_review', message: 'Confirm paragraph 10 and the claim amount against the scanned Complaint. OCR does not assume that an unread checkbox is unchecked.' });
-    result.warnings.push({ code: 'scan_review', message: 'Fields were read from a scan. Check the parties and addresses against the PDF before approving this package.' });
+    result.warnings.push({ code: 'claim_amount_review', message: 'Confirm paragraph 10 and the total claim amount. Missing checkbox text is not treated as an unchecked box.' });
+    if (source === 'ocr') {
+        result.warnings.push({ code: 'scan_review', message: 'Fields were read from a scan. Check the parties and addresses against the PDF before approving this package.' });
+        for (const [key, start, end, rows] of [
+            ['plaintiff', plaintiffLabel?.y, attorneyLabel?.y, left],
+            ['defendants', defendantLabel?.y, statesLabel?.y, right],
+        ] as const) {
+            if (start === undefined || end === undefined) continue;
+            if (rows.some(line => line.y > start + 6 && line.y < end - 2 && line.confidence < 80)) result.fieldConfidence[key] = 'low';
+        }
+    }
     if (!result.data.plaintiff) result.warnings.push({ code: 'missing_plaintiff', message: 'Enter the Plaintiff from the scanned Complaint.' });
     if (!result.data.defendants?.length) result.warnings.push({ code: 'missing_defendant', message: 'Enter the Defendant names and address from the scanned Complaint.' });
     return result;

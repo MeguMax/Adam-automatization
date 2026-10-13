@@ -3,7 +3,11 @@ import test from 'node:test';
 import {
     isComplaintDocument,
     parseComplaintText,
+    parseComplaintFormFields,
+    extractComplaintPdf,
+    ComplaintFormWidget,
 } from './complaintExtractor';
+import { testComplaintFormFixture } from './testPdfFixture';
 
 const POSSESSION_ONLY_TEXT = `
 DC 102a (11/23) COMPLAINT, NONPAYMENT OF RENT, Landlord-Tenant
@@ -105,4 +109,70 @@ test('reads paragraph 2, paragraph 10, and the claim amount from positioned PDF 
     assert.equal(result.fieldConfidence.moneyJudgmentRequested, 'high');
     assert.ok(!result.warnings.some(warning => warning.code === 'related_action_review'));
     assert.ok(!result.warnings.some(warning => warning.code === 'claim_amount_review'));
+});
+
+function formWidgets(overrides: Record<number, string> = {}, prefix = 'dc102a'): ComplaintFormWidget[] {
+    const values: Record<number, string> = {
+        1: '42-2', 2: '', 5: 'Example Property, LLC',
+        6: 'Alex Attorney P70000\r200 Legal Avenue\rExample City, MI 48001\r248 555 0199',
+        7: 'Taylor Tenant, Jordan Resident, and all other occupants\r300 Rental Street Apt 4\rExample City, MI 48002',
+        8: 'On', 9: 'Off', 32: 'On', 34: '900', 37: '1,991.50',
+        ...overrides,
+    };
+    return Object.entries(values).map(([number, fieldValue]) => ({
+        fieldName: `${prefix}_${number.padStart(2, '0')}`, fieldValue,
+        fieldType: [8,9,32,39].includes(Number(number)) ? 'Btn' : 'Tx',
+        checkBox: [8,9,32,39].includes(Number(number)),
+    }));
+}
+
+const FORM_TITLE = 'DC 102a (11/23) COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT';
+
+test('AcroForm values preserve spelling, multiline addresses, multiple Defendants, and exact claim amounts', () => {
+    const result = parseComplaintFormFields(FORM_TITLE, formWidgets())!;
+    assert.equal(result.extractionMethod, 'form_fields');
+    assert.equal(result.textSource, 'pdf');
+    assert.equal(result.data.courtDistrict, '42-2');
+    assert.equal(result.data.plaintiff?.entityName, 'Example Property, LLC');
+    assert.deepEqual(result.data.defendants?.map(p => p.displayName), ['Taylor Tenant','Jordan Resident']);
+    assert.ok(result.data.defendants?.every(p => p.address1 === '300 Rental Street Apt 4' && p.postalCode === '48002'));
+    assert.equal(result.data.includeAllOtherOccupants, true);
+    assert.equal(result.data.relatedCivilAction, 'none');
+    assert.equal(result.data.moneyJudgmentRequested, true);
+    assert.equal(result.data.claimAmount, '1991.50');
+    assert.equal(result.data.attorney?.barNumber, 'P70000');
+    assert.equal(result.warnings.length, 0);
+});
+
+test('AcroForm missing values and ambiguous boxes do not default to possession only or use monthly rent as the claim', () => {
+    const missing = parseComplaintFormFields(FORM_TITLE, formWidgets({8:'Off',9:'Off',37:''}))!;
+    assert.equal(missing.data.relatedCivilAction, undefined);
+    assert.equal(missing.data.claimAmount, undefined);
+    assert.ok(missing.warnings.some(w=>w.code==='claim_amount_review'));
+    assert.equal(parseComplaintFormFields(FORM_TITLE, formWidgets({32:''}))!.data.moneyJudgmentRequested, undefined);
+    assert.equal(parseComplaintFormFields(FORM_TITLE, formWidgets({37:'1,99.50'}))!.data.claimAmount, undefined);
+    const unchecked = parseComplaintFormFields(FORM_TITLE, formWidgets({32:'Off'}))!;
+    assert.equal(unchecked.data.claimAmount, '0.00');
+    assert.equal(unchecked.data.moneyJudgmentRequested, false);
+    assert.equal(parseComplaintFormFields(FORM_TITLE, formWidgets({5:'',7:''})), null, 'empty overlay widgets must not override visible flattened text');
+});
+
+test('DC102c recovery Complaint is supported and extra caption notice recipients still require review', () => {
+    const result = parseComplaintFormFields('DC 102c COMPLAINT TO RECOVER POSSESSION OF PROPERTY\nSUPPLEMENTAL COMPLAINT',
+        formWidgets({39:'Off',7:'Taylor Tenant, Jordan Resident, and all other occupants\r300 Rental Street\rExample City, MI 48002\rNotice per MCL 600.3238(6):\rExample Association'}, 'dc102c'))!;
+    assert.equal(result.formType, 'RECOVER POSSESSION OF PROPERTY');
+    assert.equal(result.data.moneyJudgmentRequested, false);
+    assert.equal(result.data.claimAmount, '0.00');
+    assert.equal(result.data.defendants?.length, 2);
+    assert.ok(result.warnings.some(w=>w.code==='caption_review'));
+});
+
+test('real interactive PDF extracts Widget values even when page text contains only the blank template', async () => {
+    const result = await extractComplaintPdf(testComplaintFormFixture());
+    assert.equal(result.extractionMethod, 'form_fields');
+    assert.equal(result.data.plaintiff?.displayName, 'Example Property LLC');
+    assert.equal(result.data.defendants?.[0].displayName, 'Morgan Tenant');
+    assert.equal(result.data.defendants?.[0].postalCode, '48146');
+    assert.equal(result.data.claimAmount, '1991.50');
+    assert.equal(result.warnings.length, 0);
 });

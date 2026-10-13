@@ -22,6 +22,15 @@ test('Advice prose mentioning summons is not a second document title', () => {
     assert.equal(recognizeDocumentText(['Advice of Rights and Information (Landlord-Tenant)', 'Summons, Landlord-Tenant/Land Contract'], '').source, 'conflict');
 });
 
+test('actual Request title, DC102c layout, and letterhead Demand titles are recognized without filenames', () => {
+    assert.equal(recognizeDocumentText(['REQUEST FOR COURT MAILING AND\nRECORD OF MAILING BY COURT\n(Landlord-Tenant)'], '').source, 'content');
+    assert.equal(recognizeDocumentText(['JUDICIAL DISTRICT COMPLAINT TO\nRECOVER POSSESSION OF PROPERTY'], '').role, 'complaint');
+    assert.equal(recognizeDocumentText(['STATE OF MICHIGAN DEMAND FOR POSSESSION\nNONPAYMENT OF RENT'], '').role, 'ancillary');
+    const complaint=recognizeDocumentText(['COMPLAINT\nNONPAYMENT OF RENT\nAttached to this complaint is a copy of the demand for possession'], '');
+    assert.equal(complaint.role,'complaint');
+    assert.equal(complaint.source,'content');
+});
+
 function scannedFixture(): Buffer {
     const canvas = createCanvas(1224, 1584);
     const ctx = canvas.getContext('2d');
@@ -71,6 +80,25 @@ test('real raster-only PDF is read offline; OCR parties become editable without 
     assert.equal(result.data.claimAmount, undefined);
     assert.equal(result.textSource, 'ocr');
     assert.ok(result.warnings.some(w => w.code === 'scan_review'));
+});
+
+test('OCR page selection rejects malformed requests before spawning a worker', async () => {
+    for (const pages of [[],[0],[1,1],[1.5]]) await assert.rejects(recognizeScannedPdf(scannedFixture(),pages), /positive integers/);
+});
+
+test('OCR handles the two-column caption when The plaintiff states is on the right and flags low-confidence names', () => {
+    const items = [
+        ['Plaintiff name, address',40,110,95], ['Example Property LLC',40,135,95],
+        ["Plaintiff's attorney, bar no.",40,205,95],
+        ['Defendant name, address',326,110,95], ['Morgan Tenant',326,135,55],
+        ['200 Rental Avenue',326,155,95], ['Lincoln Park, MI 48146',326,175,95],
+        ['The plaintiff states:',326,205,95], ['25th District Court',40,70,95],
+    ].map(([text,x,y,confidence])=>({text:String(text),x:Number(x),y:Number(y),confidence:Number(confidence),width:180,height:10,pageNumber:1}));
+    const result=parseScannedComplaint([{text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT\n'+items.map(i=>i.text).join('\n'),confidence:95,lines:items,words:items}]);
+    assert.equal(result.data.defendants?.[0].postalCode,'48146');
+    assert.equal(result.fieldConfidence.defendants,'low');
+    assert.equal(result.data.moneyJudgmentRequested,undefined);
+    assert.ok(result.warnings.some(w=>w.code==='scan_review'));
 });
 
 test('processing report correspondence cannot be mistaken for source filings', () => {

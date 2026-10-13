@@ -2,7 +2,7 @@
 
 ## Current workflow
 
-One authorized email creates one new Draft and one OneDrive folder. The worker processes attached PDFs, extracts fields from the Complaint, and validates the package. Nonpayment and termination LT Complaints use the same filing workflow; paragraph 10 determines possession-only versus possession and supplemental money judgment.
+One authorized email creates one new Draft and one OneDrive folder. The worker processes attached PDFs, extracts fields from the Complaint, and validates the package. Nonpayment, termination, and DC 102c recovery-of-possession Complaints use the same filing workflow; paragraph 10 determines possession-only versus possession and supplemental money judgment.
 
 The Draft editor displays the PDF with page navigation and zoom beside the editable fields. On mobile, switch between Document and Fields. Missing data, unreadable files, ambiguous document roles, and incomplete packages require review.
 
@@ -21,6 +21,14 @@ NEW LT FILING - Example Property LLC v Morgan Tenant
 Attach individual PDFs: Complaint, Summons, Request, and applicable Demand/Notice/Lease/Deed or other supporting documents. Include Advice and court-specific Local until the verified forms have been added to Settings > Form library. Keep each PDF within 25 MB. Word files, ZIP archives, and cloud-link-only packages are not supported as intake documents.
 
 Document types are recognized from known titles in the PDF text layer or offline OCR when the text layer is insufficient. Filenames are a fallback, not the source of case facts. Filename-only recognition, low-confidence OCR, conflicting titles, combined packages, and unknown files require manual Filing Type confirmation. OCR can suggest Complaint parties and addresses, but scan-derived fields and paragraph 2/10 answers require review. Case facts continue to come from the Complaint.
+
+Complaint extraction first reads populated DC 102a/DC 102c PDF form fields, including their actual checkbox values. Empty overlay fields do not override visible flattened text. If populated form fields are unavailable, the extractor reads the caption's text coordinates before using OCR. Drafts identify these sources as **PDF form fields**, **PDF text layout**, or **Scan OCR**. Clearly separated full Defendant names are entered as separate parties sharing the caption address. Additional caption notice recipients require review instead of being silently included as Defendants.
+
+OCR renders up to approximately 300 DPI within the existing 8-million-pixel limit, normalizes contrast, corrects small skew, retries low-quality page segmentation, and re-reads identifiable party blocks separately. It runs offline and keeps the original PDF unchanged. Word confidence is checked within party regions, not just averaged across the page. Scan-derived values still require confirmation. Unread checkbox states remain unknown, and total claim amounts are not substituted with a monthly rent rate. Re-extraction clears unverified old automatic checkbox/amount answers while preserving explicit manual corrections.
+
+An address absent from the Complaint must be entered manually. The extractor does not silently use the attorney's address as the Plaintiff's address. Missing Request documents and uncertain court-specific Other/Connected relationships remain visible review issues. **Extract fields** updates existing editable Drafts to the current extraction rules; deploying the update does not automatically reprocess or queue historical cases.
+
+Live Draft refresh checks the selected record and edit revision again after each background response. Responses started before a field edit do not replace unsaved input, including while navigating between Drafts.
 
 ## Reusable forms
 

@@ -26,18 +26,18 @@ function filenameRole(filename: string): RecognizedRole {
     for (const role of ['complaint', 'summons', 'request', 'advice', 'local'] as const) {
         if (new RegExp(`\\b${role}\\b`).test(value)) return role;
     }
-    return /\b(demand|notice|lease|deed|ancillary|other|connected)\b/.test(value) ? 'ancillary' : 'unknown';
+    return /\b(demand|notice|lease|deed|affidavit|ancillary|other|connected)\b/.test(value) ? 'ancillary' : 'unknown';
 }
 
 export function recognizeDocumentText(pages: string[], filename: string): DocumentRecognition {
     const roles = new Set<RecognizedRole>();
     const patterns: Array<[RecognizedRole, RegExp]> = [
-        ['complaint', /^(?:complaint|complaint[, ]+(?:for )?(?:possession|nonpayment|termination|health hazard).*)$/i],
+        ['complaint', /^(?:complaint|complaint[, ]+(?:for )?(?:possession|nonpayment|termination|health hazard).*|(?:judicial district\s+)?complaint to(?: recover possession of property)?|recover possession of property)$/i],
         ['summons', /^summons(?:\s*[,(-]\s*landlord[-\s]tenant(?:\s*\/\s*land contract)?\s*\)?)?$/i],
-        ['request', /^request for court mailing and record(?:\s*\(.*)?$/i],
+        ['request', /^request for court mailing(?: and (?:record|record of mailing by court))?(?:\s*\(.*)?$/i],
         ['advice', /^advice of rights(?: and information)?(?:\s*\(.*)?$/i],
         ['local', /^local rental (?:and|&) housing (?:information|assistance information)(?:\s*\(.*)?$/i],
-        ['ancillary', /^(?:demand for possession.*|notice to quit.*|residential lease(?: agreement)?|lease agreement|warranty deed|quitclaim deed)$/i],
+        ['ancillary', /^(?:state of michigan\s+)?(?:demand for possession(?:\s+nonpayment of rent)?|notice to quit(?: to recover possession of property)?|warranty deed|quit\s*claim deed|affidavit(?: of [a-z ]+)?|residential lease(?: agreement)?|lease agreement)$/i],
     ];
     for (const page of pages) {
         const lines = page.split(/\r?\n/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 24);

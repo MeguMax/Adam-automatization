@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
 import { chromium } from 'playwright';
-import { testPdfFixture } from './testPdfFixture';
+import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
 
 async function main() {
     const originalCwd = process.cwd();
@@ -185,7 +185,28 @@ async function main() {
         assert.ok(linkBox && viewerBox && linkBox.y + linkBox.height <= viewerBox.y + 1);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), true);
         await page.setViewportSize({ width: 1440, height: 1000 });
+        let releaseRefresh!: () => void;
+        let refreshRequested!: () => void;
+        const refreshGate = new Promise<void>(resolve => { releaseRefresh = resolve; });
+        const requested = new Promise<void>(resolve => { refreshRequested = resolve; });
+        let pauseRefresh = true;
+        const draftRoute = url + '/api/drafts/' + draftId;
+        await context.route(draftRoute, async route => {
+            if (pauseRefresh && route.request().method() === 'GET') {
+                pauseRefresh = false;
+                refreshRequested();
+                await refreshGate;
+            }
+            await route.continue();
+        });
+        const delayedRefresh = page.evaluate(() => (window as any).refreshDraftFilingState());
+        await requested;
         await page.locator('[data-draft-field="courtName"]').fill('MI Example County - 25th District Court');
+        releaseRefresh();
+        await delayedRefresh;
+        await context.unroute(draftRoute);
+        assert.equal(await page.locator('[data-draft-field="courtName"]').inputValue(),'MI Example County - 25th District Court');
+        assert.equal(await page.locator('#draftSaveBtn').isEnabled(),true,'A stale refresh must not discard an edit started in flight');
         await page.locator('#draftSaveBtn').click();
         await page.waitForFunction(() => document.getElementById('draftDocumentSelect')?.textContent?.includes('Local'));
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 2);
@@ -202,6 +223,31 @@ async function main() {
         await removed;
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 1);
         assert.equal(storedFiles.size, 2, 'Removing a library document must not delete its OneDrive copy');
+        await page.locator('#draftAddDocumentBtn').click();
+        await page.locator('#draftDocumentFileInput').setInputFiles({ name:'Complaint.pdf',mimeType:'application/pdf',buffer:testComplaintFormFixture() });
+        await page.waitForFunction(() => document.querySelector('.draft-source-summary')?.textContent?.includes('PDF form fields'));
+        const extracted=db.getDraftDetail(draftId)!.caseDraft!;
+        assert.equal(extracted.complaintExtraction?.extractorVersion,3);
+        assert.equal(extracted.filingData.defendants[0].postalCode,'48146');
+        assert.equal(extracted.filingData.claimAmount,'1991.50');
+        assert.ok(!extracted.validationIssues.some(issue=>issue.field==='complaintExtraction'));
+        assert.ok(!extracted.validationIssues.some(issue=>issue.message.startsWith('No PDF attachments were received.')));
+        await page.frameLocator('#draftPdfViewer iframe').locator('canvas').waitFor({state:'visible'});
+        await page.frameLocator('#draftPdfViewer iframe').locator('#message').waitFor({state:'hidden'});
+        await page.screenshot({path:path.join(screenshots,'complaint-fields-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),true);
+        assert.equal(await page.locator('.draft-source-actions button').evaluateAll(buttons => buttons.every(button => {
+            const rect=button.getBoundingClientRect();
+            return rect.left>=0 && rect.right<=window.innerWidth && button.clientWidth>=button.scrollWidth;
+        })),true,'Every mobile document action must fit its panel');
+        const complaintPreview=page.frames().find(frame=>frame.url().includes('/preview'))!;
+        await complaintPreview.waitForFunction(() => {
+            const canvas=document.querySelector('canvas');
+            return canvas && canvas.getBoundingClientRect().width<=document.documentElement.clientWidth;
+        });
+        await page.screenshot({path:path.join(screenshots,'complaint-fields-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#settingsTab').click();
         const localForm = db.listLibraryForms().find(form => form.role === 'local')!;
         page.once('dialog', dialog => dialog.accept());
@@ -237,7 +283,7 @@ async function main() {
         assert.equal((await context.request.get(`${url}/api/settings`)).status(), 401);
         await page.goto(url);
         await page.locator('#loginForm').waitFor();
-        console.log('Admin smoke passed: login/logout, settings, form library upload/preview, content recognition, automatic court form, idempotency, PDF preview, desktop/mobile layouts.');
+        console.log('Admin smoke passed: login/logout, settings, form library upload/preview, content recognition, automatic court form, idempotency, PDF preview, AcroForm Complaint fields, desktop/mobile layouts.');
         console.log(`Screenshots: ${screenshots}`);
     } finally {
         await browser.close();

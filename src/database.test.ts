@@ -920,6 +920,35 @@ test('Complaint extraction becomes authoritative while preserving later manual f
     }
 });
 
+test('a new unread checkbox extraction clears stale automatic answers but preserves explicit manual corrections', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'extraction-stale-'));
+    const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));
+    try {
+        const email=db.registerEmail({id:'stale-extraction',subject:'NEW LT FILING - Example'});
+        const draft=db.createCaseDraft(email.id,{isMiFile:false,sourceKind:'new_filing_intake',courtName:null,caseNumber:null,caseTitle:null,plaintiff:null,defendant:null,bundleNumber:null,filerName:null,filedAt:null,filedDocuments:[],fileTypeByAttachmentId:{}});
+        const before=db.getDraftDetail(draft)!.caseDraft!;
+        const saved=db.updateCaseDraft(draft,{courtName:'MI Example - 25th District Court'},undefined,{...before.filingData,moneyJudgmentRequested:null,claimAmount:''});
+        assert.equal(saved.caseDraft?.filingData.moneyJudgmentRequested,null,'Saving another field must not turn an unknown checkbox into No');
+        assert.equal(saved.caseDraft?.filingData.claimAmount,null);
+        const doc=db.addDocument({emailId:email.id,caseDraftId:draft,currentFilename:'Complaint.pdf',oneDriveUrl:'https://onedrive.example/complaint',documentType:'Complaint',status:'uploaded',uploadSource:'test'});
+        const extraction = {extractorVersion:3 as const,formType:'NONPAYMENT OF RENT',pageCount:1,textHash:'old',data:{relatedCivilAction:'none' as const,moneyJudgmentRequested:true,claimAmount:'1991.50'},fieldConfidence:{},warnings:[]};
+        db.applyComplaintExtraction(draft,doc,extraction);
+        const uncertain=db.applyComplaintExtraction(draft,doc,{...extraction,textHash:'new',data:{},warnings:[{code:'claim_amount_review',message:'Confirm paragraph 10.'}]});
+        assert.equal(uncertain.caseDraft?.complaintExtraction?.extractorVersion,3);
+        assert.equal(uncertain.caseDraft?.filingData.relatedCivilAction,'unknown');
+        assert.equal(uncertain.caseDraft?.filingData.moneyJudgmentRequested,null);
+        assert.equal(uncertain.caseDraft?.filingData.claimAmount,null);
+        const amountOnly=db.updateCaseDraft(draft,{},undefined,{...uncertain.caseDraft?.filingData,moneyJudgmentRequested:null,claimAmount:'1500.00'});
+        assert.equal(amountOnly.caseDraft?.filingData.moneyJudgmentRequested,null,'An amount alone must not answer paragraph 10');
+        assert.ok(uncertain.caseDraft?.validationIssues.some(issue=>issue.field==='filingData.moneyJudgmentRequested'));
+        db.updateCaseDraft(draft,{},undefined,{...uncertain.caseDraft?.filingData,relatedCivilAction:'none',moneyJudgmentRequested:true,claimAmount:'1500.00'});
+        const manual=db.applyComplaintExtraction(draft,doc,{...extraction,textHash:'again',data:{}});
+        assert.equal(manual.caseDraft?.filingData.relatedCivilAction,'none');
+        assert.equal(manual.caseDraft?.filingData.moneyJudgmentRequested,true);
+        assert.equal(manual.caseDraft?.filingData.claimAmount,'1500.00');
+    } finally {db.close();fs.rmSync(tempDir,{recursive:true,force:true});}
+});
+
 test('complete first-hearing nonpayment packages become ready with Complaint-driven filing rules', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-standard-package-'));
     const db = new WorkflowDatabase(path.join(tempDir, 'workflow.sqlite'));

@@ -10,11 +10,21 @@ export interface OcrLine {
     height: number;
     pageNumber: number;
 }
-export interface OcrPage { text: string; confidence: number; lines: OcrLine[]; words: OcrLine[] }
+export interface OcrPage {
+    text: string;
+    confidence: number;
+    lines: OcrLine[];
+    words: OcrLine[];
+    rotationRadians?: number;
+    recognitionPasses?: number;
+}
 let queue: Promise<unknown> = Promise.resolve();
 
 /** One isolated OCR process at a time; a bad PDF must not take down the web server. */
 export function recognizeScannedPdf(buffer: Buffer, pageNumbers?: number[]): Promise<OcrPage[]> {
+    if (pageNumbers && (!pageNumbers.length || pageNumbers.some(page => !Number.isInteger(page) || page < 1) || new Set(pageNumbers).size !== pageNumbers.length)) {
+        return Promise.reject(new Error('OCR page numbers must be unique positive integers.'));
+    }
     const run = () => new Promise<OcrPage[]>((resolve, reject) => {
         const child = fork(path.join(__dirname, 'pdfOcrChild.js'), [], {
             stdio: ['ignore', 'ignore', 'pipe', 'ipc'], ...{ windowsHide: true },

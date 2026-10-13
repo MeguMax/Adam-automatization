@@ -889,7 +889,9 @@ function draftFilingData(data: unknown): DraftFilingData {
         : null;
     const moneyJudgmentRequested = typeof source.moneyJudgmentRequested === 'boolean'
         ? source.moneyJudgmentRequested
-        : source.claimAmount !== undefined && source.claimAmount !== null
+        : !Object.prototype.hasOwnProperty.call(source, 'moneyJudgmentRequested') &&
+            source.claimAmount !== undefined && source.claimAmount !== null &&
+            String(source.claimAmount).trim() !== ''
             ? Number(String(source.claimAmount).replace(/[$,\s]/g, '')) > 0
             : null;
     const claimAmount = moneyJudgmentRequested === false
@@ -979,7 +981,7 @@ function complaintExtractionFromDraft(data: unknown): StoredComplaintExtraction 
     if (
         typeof source.documentId !== 'string' ||
         typeof source.extractedAt !== 'string' ||
-        (source.extractorVersion !== 1 && source.extractorVersion !== 2) ||
+        (source.extractorVersion !== 1 && source.extractorVersion !== 2 && source.extractorVersion !== 3) ||
         !source.data ||
         typeof source.data !== 'object'
     ) {
@@ -1393,11 +1395,11 @@ function validatePrimaryComplaint(
                 message: 'Re-extract this Complaint to read paragraphs 2 and 10 with the current rules.',
             });
         }
-        if (!['NONPAYMENT OF RENT', 'TERMINATION OF TENANCY'].includes(extraction.formType || '')) {
+        if (!['NONPAYMENT OF RENT', 'TERMINATION OF TENANCY', 'RECOVER POSSESSION OF PROPERTY'].includes(extraction.formType || '')) {
             issues.push({
                 field: 'complaintExtraction.formType',
                 severity: 'error',
-                message: 'The Complaint must be a recognized landlord-tenant nonpayment or termination form.',
+                message: 'The Complaint must be a recognized landlord-tenant nonpayment, termination, or recovery-of-possession form.',
             });
         }
         for (const warning of extraction.warnings) {
@@ -4875,7 +4877,7 @@ export class WorkflowDatabase {
         const validationIssues = caseDraft && !validateNewCaseSource(normalizedDraftData, email.subject, email.sender).length
             ? [
                 ...validateDraftData(normalizedDraftData),
-                ...this.intakeValidationIssues(normalizedDraftData),
+                ...this.intakeValidationIssues(normalizedDraftData, documentViews),
                 ...(manualPackage
                     ? validateManualDraftDocuments(documentViews)
                     : [
@@ -5882,6 +5884,17 @@ export class WorkflowDatabase {
         const filing = draftFilingData(next);
         const manualFields = inferredManualFilingFields(extractedData, next);
         const appliedFields: string[] = [];
+        // Re-extraction must not preserve an old guessed checkbox/amount as if
+        // the new scan had verified it. Explicit manual edits remain protected.
+        if (extraction.data.relatedCivilAction === undefined && !manualFields.has('relatedCivilAction')) {
+            filing.relatedCivilAction = 'unknown';
+        }
+        if (extraction.data.moneyJudgmentRequested === undefined && !manualFields.has('moneyJudgmentRequested')) {
+            filing.moneyJudgmentRequested = null;
+        }
+        if (extraction.data.claimAmount === undefined && !manualFields.has('claimAmount')) {
+            filing.claimAmount = null;
+        }
         const apply = <K extends DraftFilingDataKey>(key: K, value: DraftFilingData[K]) => {
             if (manualFields.has(key) || value === undefined || value === null) return;
             filing[key] = value;
@@ -6092,11 +6105,14 @@ export class WorkflowDatabase {
         return this.getDraftDetail(caseDraftId) ?? detail;
     }
 
-    private intakeValidationIssues(data: unknown): DraftValidationIssue[] {
+    private intakeValidationIssues(data: unknown, documents: DocumentRecordView[]): DraftValidationIssue[] {
         const root = data as Record<string, any> | null;
         const issues: DraftValidationIssue[] = [];
         if (root?.sourceKind === 'new_filing_intake' && Array.isArray(root.intake?.issues)) {
             for (const message of root.intake.issues) {
+                if (String(message).startsWith('No PDF attachments were received.') && documents.some(document =>
+                    !document.formTemplate && document.requiredForFiling && document.oneDriveUrl &&
+                    ['uploaded', 'downloaded', 'replaced'].includes(document.status))) continue;
                 issues.push({ field: 'intake', severity: 'warning', message: String(message) });
             }
         }

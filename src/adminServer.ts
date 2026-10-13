@@ -45,7 +45,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-02-client-filing-rules-v35';
+const ADMIN_BUILD_ID = '2026-10-13-complaint-fields-ocr-v36';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2705,7 +2705,9 @@ const html = String.raw`<!doctype html>
       .draft-panel-toolbar {
         align-items: stretch;
         flex-direction: column;
+        flex-wrap: nowrap;
       }
+      .draft-document-select { flex: 0 0 auto; min-width: 0; width: 100%; }
       .draft-document-select select {
         width: 100%;
       }
@@ -2713,10 +2715,14 @@ const html = String.raw`<!doctype html>
         width: 100%;
       }
       .draft-source-actions {
+        flex: 0 0 auto;
         width: 100%;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       .draft-source-actions button {
-        flex: 1 1 0;
+        min-width: 0;
+        white-space: normal;
       }
       .draft-document-links .button-link {
         flex: 1 1 0;
@@ -3471,6 +3477,7 @@ const html = String.raw`<!doctype html>
       activeDraftDocumentId: null,
       draftFileAction: null,
       draftDirty: false,
+      draftEditRevision: 0,
       draftMobileMode: 'document',
       editingMappingId: null,
       view: 'queue',
@@ -4330,14 +4337,18 @@ const html = String.raw`<!doctype html>
 
     async function refreshDraftFilingState() {
       if (!state.selectedDraftId || !state.draftDetail || state.draftDirty) return;
+      const draftId = state.selectedDraftId;
+      const revision = state.draftEditRevision;
       const jobs = await api('/api/filing-jobs?caseDraftId=' +
-        encodeURIComponent(state.selectedDraftId));
+        encodeURIComponent(draftId));
+      if (state.selectedDraftId !== draftId || state.draftDirty || state.draftEditRevision !== revision) return;
       const previous = state.draftFilingJobs[0];
       const latest = jobs[0];
       state.draftFilingJobs = jobs;
       if (!previous || !latest || previous.updatedAt !== latest.updatedAt) {
-        state.draftDetail = await api('/api/drafts/' +
-          encodeURIComponent(state.selectedDraftId));
+        const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
+        if (state.selectedDraftId !== draftId || state.draftDirty || state.draftEditRevision !== revision) return;
+        state.draftDetail = detail;
         renderDraftWorkspace();
       } else {
         renderDraftFilingJobs();
@@ -4429,7 +4440,7 @@ const html = String.raw`<!doctype html>
               ? (primaryDocument.currentFilename || primaryDocument.documentType || 'Complaint')
               : 'No primary Complaint selected') + '</strong>' +
             (extraction
-              ? '<span>' + (extraction.textSource === 'ocr' ? 'Scan OCR · ' : '') + 'Extracted ' + escapeHtml(fmtDate(extraction.extractedAt)) +
+              ? '<span>' + (extraction.extractionMethod === 'form_fields' ? 'PDF form fields · ' : extraction.textSource === 'ocr' ? 'Scan OCR · ' : extraction.extractionMethod === 'positioned_text' ? 'PDF text layout · ' : '') + 'Extracted ' + escapeHtml(fmtDate(extraction.extractedAt)) +
                 ' | ' + escapeHtml((extraction.appliedFields || []).length) +
                 ' field groups applied</span>' +
                 '<span>' + escapeHtml(extraction.formType || 'Unknown Complaint type') +
@@ -4971,6 +4982,7 @@ const html = String.raw`<!doctype html>
     }
 
     function setDraftDirty(dirty) {
+      if (dirty) state.draftEditRevision++;
       state.draftDirty = !!dirty;
       document.getElementById('draftUnsavedBadge').classList.toggle('hidden', !dirty);
       const draft = state.draftDetail && state.draftDetail.caseDraft;
@@ -5945,9 +5957,13 @@ const html = String.raw`<!doctype html>
         if (state.view === 'activity') await loadActivity(true);
         if (state.view === 'drafts') {
           if (state.selectedDraftId && !state.draftDirty) {
-            state.draftDetail = await api('/api/drafts/' +
-              encodeURIComponent(state.selectedDraftId));
-            renderDraftWorkspace();
+            const draftId = state.selectedDraftId;
+            const revision = state.draftEditRevision;
+            const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
+            if (state.selectedDraftId === draftId && !state.draftDirty && state.draftEditRevision === revision) {
+              state.draftDetail = detail;
+              renderDraftWorkspace();
+            }
           } else if (!state.selectedDraftId) {
             await loadDrafts(true);
           }
