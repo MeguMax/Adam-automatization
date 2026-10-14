@@ -165,6 +165,35 @@ export class MiFileFilingRunner {
                 'starting',
             );
         }
+        const filing = job.payload.filingData;
+        if (!filing || !['none', 'previously_filed'].includes(filing.relatedCivilAction) ||
+            typeof filing.moneyJudgmentRequested !== 'boolean') {
+            throw new MiFileFilingError(
+                'Confirm Complaint paragraphs 2 and 10 before preparing the package.',
+                'CASE_ANSWERS_UNCONFIRMED', 'starting',
+            );
+        }
+        if (filing.relatedCivilAction === 'previously_filed' &&
+            (!filing.relatedCaseCourt || !filing.relatedCaseDocketNumber || typeof filing.relatedCasePending !== 'boolean')) {
+            throw new MiFileFilingError(
+                'Complete the prior civil action court, docket number and status before preparing the package.',
+                'RELATED_ACTION_UNCONFIRMED', 'starting',
+            );
+        }
+        if (filing.moneyJudgmentRequested && (!filing.claimAmount ||
+            !Number.isFinite(Number(filing.claimAmount)) || Number(filing.claimAmount) <= 0)) {
+            throw new MiFileFilingError(
+                'Enter the positive total claim amount from paragraph 10 before preparing the package.',
+                'CLAIM_AMOUNT_UNCONFIRMED', 'starting',
+            );
+        }
+        if (!job.payload.documents.length || job.payload.documents.some(document =>
+            !['separate', 'connected_to_complaint'].includes(document.filingRelation))) {
+            throw new MiFileFilingError(
+                'Include the filing PDFs and choose Other or Connected for every supporting document.',
+                'DOCUMENT_RELATION_UNCONFIRMED', 'starting',
+            );
+        }
         const runtimeConfig = getMiFileRuntimeConfig();
         const credentials = getMiFileCredentials();
         if (!runtimeConfig.ready) {
@@ -185,19 +214,21 @@ export class MiFileFilingRunner {
         const documentDirectory = path.join(jobDirectory, 'documents');
         fs.mkdirSync(documentDirectory, { recursive: true });
         let page: Page | null = null;
+        let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
         let lastCheckpoint = 'starting';
         let failureScreenshot: string | null = null;
 
-        await this.log('info', 'materialize_documents', 'Downloading filing PDFs from OneDrive.');
-        const documents = await this.materializeDocuments(job.payload, documentDirectory);
-        const browser = await chromium.launch({
-            headless: envFlag(
-                process.env.MIFILE_FILING_HEADLESS ?? process.env.TRUECERTIFY_HEADLESS,
-                true,
-            ),
-            args: ['--no-sandbox', '--disable-dev-shm-usage'],
-        });
         try {
+            lastCheckpoint = 'materialize_documents';
+            await this.log('info', lastCheckpoint, 'Downloading filing PDFs from OneDrive.');
+            const documents = await this.materializeDocuments(job.payload, documentDirectory);
+            browser = await chromium.launch({
+                headless: envFlag(
+                    process.env.MIFILE_FILING_HEADLESS ?? process.env.TRUECERTIFY_HEADLESS,
+                    true,
+                ),
+                args: ['--no-sandbox', '--disable-dev-shm-usage'],
+            });
             page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
             page.setDefaultTimeout(this.timeoutMs);
             lastCheckpoint = 'login';
@@ -262,9 +293,12 @@ export class MiFileFilingRunner {
                 failureScreenshot,
             );
         } finally {
-            await browser.close();
-            if (!envFlag(process.env.MIFILE_KEEP_FILING_TEMP, false)) {
-                fs.rmSync(documentDirectory, { recursive: true, force: true });
+            try {
+                await browser?.close();
+            } finally {
+                if (!envFlag(process.env.MIFILE_KEEP_FILING_TEMP, false)) {
+                    fs.rmSync(documentDirectory, { recursive: true, force: true });
+                }
             }
         }
     }
@@ -675,16 +709,19 @@ export class MiFileFilingRunner {
             // dialog, not a Yes/No case answer, and otherwise covers the option.
             await dismissMifileModalIfAny(page);
             await typeInput.fill(item.document.filingType);
-            const exactType = await firstVisible(
-                page.locator('ul.dropdown-menu:visible li[role="option"]').filter({
-                    hasText: item.document.filingType,
-                }),
-            );
-            if (exactType) {
+            const escapedType = item.document.filingType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const exactType = page.locator('ul.dropdown-menu:visible li[role="option"]').filter({
+                hasText: new RegExp(`^\\s*${escapedType}\\s*$`),
+            }).first();
+            try {
+                await exactType.waitFor({ state: 'visible', timeout: this.timeoutMs });
                 await exactType.click();
-            } else {
-                await typeInput.press('ArrowDown');
-                await typeInput.press('Enter');
+            } catch {
+                throw new MiFileFilingError(
+                    `MiFILE does not offer the exact Filing Type "${item.document.filingType}" for ${item.document.filename}. Review the document type for this court.`,
+                    'FILING_TYPE_NOT_AVAILABLE',
+                    'document_upload',
+                );
             }
             await this.log('info', 'document_upload', 'Document uploaded and classified.', {
                 documentId: item.document.id,
@@ -698,15 +735,24 @@ export class MiFileFilingRunner {
         for (const item of documents.filter(candidate =>
             candidate.document.filingRelation === 'connected_to_complaint')) {
             const rowId = uploadedRows.get(item.document.id);
-            if (!rowId) continue;
-            const connect = page.locator(`#${rowId}-connect-filing`);
-            if (await connect.isVisible().catch(() => false)) {
-                await connect.click();
-                await page.waitForTimeout(300);
-                await this.log('info', 'document_upload', 'Connected ancillary filing to Complaint.', {
-                    documentId: item.document.id,
-                });
+            if (!rowId) {
+                throw new MiFileFilingError(
+                    `MiFILE has no uploaded row for connected document ${item.document.filename}.`,
+                    'CONNECTED_FILING_UNAVAILABLE', 'document_upload',
+                );
             }
+            const connect = page.locator(`#${rowId}-connect-filing`);
+            if (!await connect.isVisible().catch(() => false)) {
+                throw new MiFileFilingError(
+                    `MiFILE cannot connect ${item.document.filename} to the Complaint. Review this court's Other/Connected rule before retrying.`,
+                    'CONNECTED_FILING_UNAVAILABLE', 'document_upload',
+                );
+            }
+            await connect.click();
+            await page.waitForTimeout(300);
+            await this.log('info', 'document_upload', 'Connected ancillary filing to Complaint.', {
+                documentId: item.document.id,
+            });
         }
     }
 

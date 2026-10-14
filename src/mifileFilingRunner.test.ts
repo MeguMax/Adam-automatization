@@ -1,0 +1,211 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test, { after, before } from 'node:test';
+import { chromium, Browser, Page } from 'playwright';
+import type { FilingDocumentPayload, FilingJobView } from './database';
+import { testPdfFixture } from './testPdfFixture';
+
+const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mifile-runner-qa-'));
+let browser: Browser;
+let MiFileFilingRunner: typeof import('./mifileFilingRunner').MiFileFilingRunner;
+
+before(async () => {
+    Object.assign(process.env, {
+        TENANT_ID:'11111111-1111-1111-1111-111111111111',CLIENT_ID:'qa-client',CLIENT_SECRET:'qa-secret',
+        USER_EMAIL:'qa@example.com',ONEDRIVE_ROOT_SHARE_URL:'https://onedrive.example/root',
+        WORKFLOW_DB_PATH: path.join(directory, 'workflow.sqlite'),
+        MIFILE_FILING_DEBUG_DIR: directory, MIFILE_KEEP_FILING_TEMP: 'false',
+        MIFILE_USER: 'qa@example.com', MIFILE_PASSWORD: 'qa-only',
+        MIFILE_ACCOUNT_ENVIRONMENT: 'test', MIFILE_EXPECTED_ACCOUNT_EMAIL: 'qa@example.com',
+    });
+    MiFileFilingRunner = require('./mifileFilingRunner').MiFileFilingRunner;
+    browser = await chromium.launch({ headless: true });
+});
+
+after(async () => {
+    await browser?.close();
+    require('./database').getWorkflowDatabase().close();
+    fs.rmSync(directory, { recursive: true, force: true });
+});
+
+function filingDocument(index: number, connected = false): FilingDocumentPayload {
+    return {
+        id: 'doc-' + index, filename: `Document-${index}.pdf`, filingName: `Document ${index}`,
+        filingType: index === 0 ? 'Complaint for Possession Only' : 'Other',
+        filingRelation: connected ? 'connected_to_complaint' : 'separate',
+        packageRole: index === 0 ? 'complaint' : 'ancillary',
+        oneDriveUrl: `https://onedrive.example/doc-${index}`, mimeType: 'application/pdf',
+        fileSize: 200, isPrimary: index === 0,
+    };
+}
+
+async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean } = {}): Promise<Page> {
+    const page = await browser.newPage();
+    await page.route('**/*', route => route.abort());
+    await page.setContent(`<input id="fileUpload" type="file" multiple><table id="files"></table>
+        <button onclick="window.saved = true">Save Progress</button>
+        <button onclick="window.submitted = true">Submit</button>
+        <script>
+        fileUpload.onchange = () => Array.from(fileUpload.files).forEach((file,index) => {
+            const row = document.createElement('tbody'); row.id = 'filing-' + index;
+            row.innerHTML = '<tr><td><span class="glyphicon-ok">Uploaded</span>' +
+                '<input name="documentName_' + index + '">' +
+                '<input id="selectFilingTypeInput_' + index + '">' +
+                '<ul class="dropdown-menu" style="display:none"><li role="option">Complaint for Possession Only (Different type)</li>' +
+                ${JSON.stringify(options.missingType ? '' : '<li role="option">Complaint for Possession Only</li>')} +
+                '<li role="option">Other</li></ul>' +
+                (${Boolean(options.missingConnect)} ? '' : '<button type="button" id="filing-' + index + '-connect-filing">Connect</button>') +
+                '</td></tr>';
+            row.querySelectorAll('[role="option"]').forEach(option => option.onclick = () => {
+                row.dataset.selectedType = option.textContent;
+                row.querySelector('input[id^="selectFilingTypeInput_"]').value = option.textContent;
+            });
+            row.querySelector('input[id^="selectFilingTypeInput_"]').oninput = () => {
+                document.querySelectorAll('.dropdown-menu').forEach(menu => menu.style.display = 'none');
+                row.querySelector('.dropdown-menu').style.display = 'block';
+            };
+            const connect = row.querySelector('button');
+            if (connect) connect.onclick = () => row.dataset.connected = 'true';
+            files.append(row);
+        });
+        </script>`);
+    return page;
+}
+
+function materialized(count: number, connected = false) {
+    return Array.from({ length: count }, (_, index) => {
+        const document = filingDocument(index, connected && index === 1);
+        const localPath = path.join(directory, document.filename);
+        fs.writeFileSync(localPath, testPdfFixture());
+        return { document, localPath };
+    });
+}
+
+test('MiFILE uploader assigns all PDFs using exact Filing Types and connects the ancillary document', async () => {
+    const page = await uploadPage();
+    try {
+        const runner = new MiFileFilingRunner();
+        await (runner as any).uploadDocuments(page, materialized(6, true));
+        assert.equal(await page.locator('tbody').count(), 6);
+        assert.equal(await page.locator('#filing-0').getAttribute('data-selected-type'), 'Complaint for Possession Only');
+        assert.equal(await page.locator('#filing-1').getAttribute('data-connected'), 'true');
+        assert.equal(await page.locator('#filing-5 input[name^="documentName_"]').inputValue(), 'Document 5');
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('similar Filing Type labels must not be accepted in place of the requested type', async () => {
+    const page = await uploadPage({ missingType: true });
+    try {
+        const runner = new MiFileFilingRunner();
+        (runner as any).timeoutMs = 300;
+        await assert.rejects((runner as any).uploadDocuments(page, materialized(1)), (error: any) =>
+            error.code === 'FILING_TYPE_NOT_AVAILABLE' && error.checkpoint === 'document_upload');
+        assert.equal(await page.locator('#filing-0').getAttribute('data-selected-type'), null);
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('missing Connected control must fail before saving instead of silently creating a separate filing', async () => {
+    const page = await uploadPage({ missingConnect: true });
+    try {
+        await assert.rejects((new MiFileFilingRunner() as any).uploadDocuments(page, materialized(2, true)),
+            (error: any) => error.code === 'CONNECTED_FILING_UNAVAILABLE');
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('partial OneDrive materialization is cleaned up and reports its actual checkpoint', async () => {
+    const drive = require('./oneDriveClient');
+    const resolve = drive.resolveSharedDriveItem;
+    const download = drive.downloadDriveItemBuffer;
+    drive.resolveSharedDriveItem = async (url: string) => ({ driveId: 'qa', itemId: url });
+    let calls = 0;
+    drive.downloadDriveItemBuffer = async () => {
+        if (++calls === 2) throw new Error('Simulated OneDrive disconnect');
+        return testPdfFixture();
+    };
+    try {
+        const job = { id: 'partial-materialization', mode: 'prepare',
+            payload: { filingData: {relatedCivilAction:'none',moneyJudgmentRequested:false},
+                documents: [filingDocument(0), filingDocument(1)] } } as FilingJobView;
+        await assert.rejects(new MiFileFilingRunner().prepare(job), (error: any) =>
+            error.checkpoint === 'materialize_documents' && /OneDrive disconnect/.test(error.message));
+        assert.equal(fs.existsSync(path.join(directory, job.id, 'documents')), false);
+    } finally {
+        drive.resolveSharedDriveItem = resolve;
+        drive.downloadDriveItemBuffer = download;
+    }
+});
+
+test('old queued snapshots with unknown answers or document relations are stopped before remote access', async () => {
+    const runner = new MiFileFilingRunner();
+    await assert.rejects(runner.prepare({mode:'submit'} as FilingJobView),
+        (error:any)=>error.code==='UNSUPPORTED_JOB_MODE');
+    const payload = {filingData:{relatedCivilAction:'none',moneyJudgmentRequested:false},documents:[filingDocument(0)]};
+    for (const [invalid, code] of [
+        [{...payload,filingData:{...payload.filingData,moneyJudgmentRequested:null}},'CASE_ANSWERS_UNCONFIRMED'],
+        [{...payload,filingData:{...payload.filingData,relatedCivilAction:'unknown'}},'CASE_ANSWERS_UNCONFIRMED'],
+        [{...payload,documents:[{...filingDocument(0),filingRelation:'unknown'}]},'DOCUMENT_RELATION_UNCONFIRMED'],
+        [{...payload,filingData:{...payload.filingData,moneyJudgmentRequested:true,claimAmount:'0'}},'CLAIM_AMOUNT_UNCONFIRMED'],
+    ] as const) {
+        await assert.rejects(runner.prepare({mode:'prepare',payload:invalid} as FilingJobView),
+            (error:any)=>error.code===code && error.checkpoint==='starting');
+    }
+});
+
+test('an uncertain save requires reconciliation while the worker continues with the next package', async () => {
+    const {getWorkflowDatabase}=require('./database') as typeof import('./database');
+    const {buildFilingIntake}=require('./filingIntake') as typeof import('./filingIntake');
+    const {MiFileFilingError}=require('./mifileFilingRunner') as typeof import('./mifileFilingRunner');
+    const {runFilingWorker}=require('./filingWorker') as typeof import('./filingWorker');
+    const db=getWorkflowDatabase();
+    const jobs=[0,1].map(index=>{
+        const message={id:'worker-recovery-'+index,subject:'NEW LT FILING - QA '+index,
+            from:{emailAddress:{address:'qa@example.com'}}};
+        const parsed=buildFilingIntake(message,[]);
+        parsed.intake!.manual=true;
+        const email=db.registerEmail(message);
+        const draft=db.createCaseDraft(email.id,parsed);
+        db.addDocument({emailId:email.id,caseDraftId:draft,currentFilename:'Other.pdf',documentType:'Other',
+            oneDriveUrl:'https://onedrive.example/other',status:'uploaded',uploadSource:'test'});
+        const party={displayName:'Example Owner LLC',entityName:'Example Owner LLC',partyType:'entity',
+            address1:'100 Main Street',city:'Lincoln Park',state:'MI',postalCode:'48146'};
+        db.updateCaseDraft(draft,{courtName:'25th District Court',caseTitle:'Example Owner v Tenant',
+            plaintiff:'Example Owner LLC',defendant:'Morgan Tenant'},undefined,{
+            caseType:'LT - Landlord-Tenant Summary Proceedings',action:'Initiate a new case',
+            relatedCivilAction:'none',moneyJudgmentRequested:false,claimAmount:'0.00',mailingRequested:true,
+            plaintiff:party,defendants:[{...party,partyType:'person',entityName:null,displayName:'Morgan Tenant',firstName:'Morgan',lastName:'Tenant'}],
+        });
+        db.reviewCaseDraft(draft,'approve');
+        return db.queueFilingJob(draft);
+    });
+    const previous=MiFileFilingRunner.prototype.prepare;
+    const previousAuto=process.env.MIFILE_AUTO_PREPARE_ENABLED;
+    process.env.MIFILE_AUTO_PREPARE_ENABLED='false';
+    const controller=new AbortController();
+    const processed:string[]=[];
+    MiFileFilingRunner.prototype.prepare=async job=>{
+        processed.push(job.id);
+        if(job.id===jobs[0].id) throw new MiFileFilingError('Simulated response lost after Save Progress','MIFILE_AUTOMATION_FAILED','save_progress');
+        controller.abort();
+        return {checkpoint:'saved_unsubmitted',externalBundleId:'qa-bundle',temporaryCaseNumber:'TEMP-QA',
+            uploadedDocuments:1,mifileVersion:null,screenshotPath:null,url:'https://mifile.example/qa'};
+    };
+    try{
+        await runFilingWorker({signal:controller.signal,pollIntervalMs:1000});
+        assert.deepEqual(processed,jobs.map(job=>job.id));
+        assert.equal(db.getFilingJob(jobs[0].id)!.status,'reconciliation_required');
+        assert.equal(db.getFilingJob(jobs[0].id)!.errorCode,'UNSUBMITTED_OUTCOME_UNKNOWN');
+        assert.equal(db.getFilingJob(jobs[1].id)!.status,'prepared');
+        assert.throws(()=>db.queueFilingJob(jobs[0].caseDraftId),/Approve the Draft/);
+        assert.equal(db.listFilingJobs(jobs[0].caseDraftId).length,1);
+    }finally{
+        controller.abort();
+        MiFileFilingRunner.prototype.prepare=previous;
+        if(previousAuto===undefined) delete process.env.MIFILE_AUTO_PREPARE_ENABLED;
+        else process.env.MIFILE_AUTO_PREPARE_ENABLED=previousAuto;
+    }
+});

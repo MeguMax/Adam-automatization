@@ -45,7 +45,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-13-complaint-fields-ocr-v36';
+const ADMIN_BUILD_ID = '2026-10-15-draft-review-v37';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -1780,7 +1780,7 @@ const html = String.raw`<!doctype html>
     }
     .toast {
       display: grid;
-      grid-template-columns: 18px minmax(0, 1fr);
+      grid-template-columns: 18px minmax(0, 1fr) 22px;
       gap: 9px;
       padding: 11px 12px;
       border: 1px solid var(--line-strong);
@@ -1799,6 +1799,7 @@ const html = String.raw`<!doctype html>
     .toast.error svg {
       color: var(--bad);
     }
+    .toast button { padding: 2px; border: 0; background: transparent; min-height: 22px; }
     .activity-section > summary {
       cursor: pointer;
       list-style: none;
@@ -2308,6 +2309,21 @@ const html = String.raw`<!doctype html>
       margin-top: 1px;
       flex: 0 0 auto;
     }
+    .draft-review-heading { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+    .draft-review-heading strong { font-size: 13px; }
+    .draft-review-group { display: grid; gap: 8px; margin-top: 8px; }
+    .draft-review-items { display: grid; gap: 8px; max-height: 220px; overflow-y: auto; padding: 2px; }
+    .draft-review-group > strong { font-size: 11px; }
+    .draft-review-group .draft-validation-row { align-items: center; }
+    .draft-review-group .draft-validation-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .draft-review-group button { flex: 0 0 auto; padding: 4px; }
+    .draft-review-heading button { font-size: 11px; white-space: normal; }
+    .draft-field-source { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 10px; color: var(--muted); }
+    .draft-field-source button { padding: 2px; min-height: 22px; }
+    .draft-review-target { outline: 2px solid var(--accent); outline-offset: 3px; }
+    #draftDocumentState { flex: 1 0 100%; min-width: 0; }
+    #draftDocumentState:empty { display: none; }
+    [data-draft-section], .draft-document-mapping, .draft-field { scroll-margin-block: 14px; }
     .draft-filing-job-panel {
       margin-bottom: 14px;
       padding: 11px;
@@ -2438,11 +2454,11 @@ const html = String.raw`<!doctype html>
     .field-source.empty {
       color: var(--bad);
     }
-    .draft-field.has-error input {
+    .draft-field.has-error input, .draft-field.has-error select {
       border-color: #db8881;
       background: #fffafa;
     }
-    .draft-field.has-warning input {
+    .draft-field.has-warning input, .draft-field.has-warning select {
       border-color: #dfc17e;
       background: #fffdf8;
     }
@@ -2456,6 +2472,7 @@ const html = String.raw`<!doctype html>
     .draft-field.has-error .draft-field-message {
       color: var(--bad);
     }
+    .draft-document-mapping > .draft-field-message { grid-column: 1 / -1; }
     .draft-field select,
     .draft-field input[type="number"] {
       width: 100%;
@@ -3293,6 +3310,7 @@ const html = String.raw`<!doctype html>
                 <a id="draftOneDriveLink" class="button-link" target="_blank" rel="noopener"><i data-lucide="cloud"></i>OneDrive</a>
                 <a id="draftSourceLink" class="button-link" target="_blank" rel="noopener"><i data-lucide="download"></i>MiFILE</a>
               </div>
+              <div id="draftDocumentState"></div>
             </div>
             <div id="draftPdfViewer" class="draft-pdf-viewer"></div>
           </section>
@@ -3492,19 +3510,19 @@ const html = String.raw`<!doctype html>
     const STATUS_LABELS = {
       partial_failure: 'Partial failure',
       validation_failed: 'Validation failed',
-      ready_to_file: 'Ready to file',
+      ready_to_file: 'Ready to prepare',
       needs_review: 'Needs review',
       needs_short_name: 'Needs short name',
       needs_application: 'Needs application',
       not_downloadable: 'Not downloadable',
       retry_queued: 'Retry queued',
-      filing_in_progress: 'Filing in progress',
+      filing_in_progress: 'Preparing in MiFILE',
       filing_reconciliation: 'Reconciliation required',
       reconciliation_required: 'Reconciliation required',
       filing_prepared: 'Prepared in MiFILE',
       prepared: 'Prepared',
       filed_successfully: 'Filed successfully',
-      filing_failed: 'Filing failed',
+      filing_failed: 'Preparation failed',
       not_started: 'Not started',
       legacy_processed: 'Legacy processed',
     };
@@ -3580,11 +3598,14 @@ const html = String.raw`<!doctype html>
 
     function showToast(message, tone) {
       const root = document.getElementById('toastRegion');
+      if (tone !== 'error') root.querySelectorAll('.toast:not(.error)').forEach(item => item.remove());
       const toast = document.createElement('div');
       toast.className = 'toast' + (tone === 'error' ? ' error' : '');
       toast.innerHTML = icon(tone === 'error' ? 'circle-alert' : 'circle-check') +
-        '<div>' + escapeHtml(message) + '</div>';
+        '<div>' + escapeHtml(message) + '</div><button type="button" title="Dismiss notification" aria-label="Dismiss notification">' + icon('x') + '</button>';
       root.appendChild(toast);
+      while (root.children.length > 2) root.firstElementChild.remove();
+      toast.querySelector('button').addEventListener('click', () => toast.remove());
       renderIcons();
       setTimeout(() => toast.remove(), 4200);
     }
@@ -4184,7 +4205,7 @@ const html = String.raw`<!doctype html>
       if (!detail || !draft) return;
       const data = draft.editableData || {};
       const caseNumber = data.caseNumber || data.newCaseNumber ||
-        data.temporaryCaseNumber || 'Unassigned draft';
+        data.temporaryCaseNumber || data.caseTitle || 'Unassigned draft';
       document.getElementById('draftWorkspaceCase').textContent = caseNumber;
       document.getElementById('draftWorkspaceSubject').textContent =
         detail.email.subject || '(no subject)';
@@ -4192,9 +4213,9 @@ const html = String.raw`<!doctype html>
         statusPill(draft.status) + validationPill(draft.validationStatus) +
         statusPill(draft.filingStatus);
       document.getElementById('draftApproveBtn').innerHTML = icon('check-check') +
-        (draft.manualPackage ? 'Confirm package' : 'Approve');
+        'Confirm package';
       document.getElementById('draftPrepareBtn').innerHTML = icon('upload-cloud') +
-        (draft.manualPackage ? 'Send to MiFILE' : 'Prepare in MiFILE');
+        'Prepare in MiFILE';
       const manualCopyButton = document.getElementById('draftManualCopyBtn');
       manualCopyButton.classList.add('hidden');
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
@@ -4209,20 +4230,28 @@ const html = String.raw`<!doctype html>
         'filing_prepared',
         'filed_successfully',
       ].includes(draft.status);
-      document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea')
-        .forEach(control => { control.disabled = draftLocked; });
+      if (draftLocked) {
+        document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source])')
+          .forEach(control => { control.disabled = true; });
+      }
+      document.getElementById('draftReviewerNotes').disabled = draftLocked;
       document.getElementById('draftRejectBtn').disabled = draftLocked;
       manualCopyButton.disabled = draftLocked;
       document.getElementById('draftApproveBtn').disabled =
         draftLocked ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
-      document.getElementById('draftPrepareBtn').disabled =
-        draftLocked ||
+      updateDraftPreparationButton();
+      renderIcons();
+    }
+
+    function updateDraftPreparationButton() {
+      const draft = state.draftDetail && state.draftDetail.caseDraft;
+      document.getElementById('draftPrepareBtn').disabled = !draft ||
+        draft.filingStatus === 'queued' ||
         !['ready_to_file', 'filing_failed'].includes(draft.status) ||
         !state.mifileConfig || !state.mifileConfig.ready ||
         draft.filingEligible === false ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
-      renderIcons();
     }
 
     document.getElementById('newDraftBtn').addEventListener('click', async () => {
@@ -4386,6 +4415,7 @@ const html = String.raw`<!doctype html>
         showToast('MiFILE preparation queued. Progress will update here.');
       } finally {
         setButtonBusy(button, false);
+        updateDraftPreparationButton();
       }
     }
 
@@ -4402,13 +4432,28 @@ const html = String.raw`<!doctype html>
         validationRoot.innerHTML = '<div class="draft-validation"><strong>Court notification</strong><p>This is court activity and download history. To prepare a new case, create a new Draft and upload its original documents.</p></div>';
       } else if (issues.length) {
         const hasErrors = issues.some(issue => issue.severity === 'error');
+        const errorCount = issues.filter(issue => issue.severity === 'error').length;
         validationRoot.innerHTML = '<div class="draft-validation ' +
           (hasErrors ? 'has-errors' : '') + '">' +
-          '<details open><summary>' + issues.length + ' items to review</summary>' +
-          issues.map(issue => '<div class="draft-validation-row">' +
-            icon(issue.severity === 'error' ? 'circle-x' : 'triangle-alert') +
-            '<span>' + escapeHtml(issue.message) + '</span></div>').join('') +
-          '</details></div>';
+          '<div class="draft-review-heading"><strong>' +
+            (hasErrors ? 'Package needs correction' : 'Review before confirming') +
+          '</strong><button type="button" data-review-next>' + icon('arrow-down-to-line') +
+            'First item</button></div>' +
+          ['error', 'warning'].map(severity => {
+            const matching = issues.map((issue, index) => ({ issue, index }))
+              .filter(item => item.issue.severity === severity);
+            if (!matching.length) return '';
+            return '<div class="draft-review-group"><strong>' + matching.length +
+              (severity === 'error' ? ' required correction' : ' review note') +
+              (matching.length === 1 ? '' : 's') + '</strong><div class="draft-review-items">' +
+              matching.map(item => '<div class="draft-validation-row">' +
+                icon(severity === 'error' ? 'circle-alert' : 'triangle-alert') +
+                '<span>' + escapeHtml(item.issue.message) + '</span>' +
+                '<button type="button" class="icon-button" data-review-issue="' + item.index +
+                '" title="Review this item" aria-label="Review: ' + escapeHtml(item.issue.message) + '">' +
+                  icon('arrow-right') + '</button></div>').join('') + '</div></div>';
+          }).join('') +
+          (errorCount ? '' : '<span>Required checks passed. Review the notes before confirming the package.</span>') + '</div>';
       } else {
         validationRoot.innerHTML = '<div class="draft-validation is-ready">' +
           '<div class="draft-validation-row">' + icon('circle-check') +
@@ -4421,7 +4466,7 @@ const html = String.raw`<!doctype html>
       const primaryDocument = documents.find(document => document.isPrimary) || null;
       const extraction = draft.complaintExtraction || null;
       const extractionSummary = draft.manualPackage
-        ? '<section class="draft-field-section"><div class="draft-section-heading">' +
+        ? '<section class="draft-field-section" data-draft-section="source"><div class="draft-section-heading">' +
             '<h3>Manual filing package</h3><span class="field-source manual">Manual</span>' +
           '</div><div class="draft-source-summary">' +
             '<strong>Upload and classify the PDFs to include</strong>' +
@@ -4429,7 +4474,7 @@ const html = String.raw`<!doctype html>
             'Advice and the court-specific Local form are added from the form library after the court is selected.</span>' +
           '</div></section>'
         :
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="source">' +
           '<div class="draft-section-heading"><h3>Primary data source</h3>' +
             (primaryDocument && primaryDocument.documentRole === 'primary_source'
               ? '<span class="field-source complaint">Complaint</span>'
@@ -4468,14 +4513,13 @@ const html = String.raw`<!doctype html>
                   escapeHtml(DRAFT_SOURCE_LABELS[source] || source) + '</span></span>' +
               '<input type="text" data-draft-field="' + escapeHtml(field.key) + '" value="' +
                 escapeHtml(data[field.key] || '') + '">' +
-              (issue ? '<span class="draft-field-message">' + escapeHtml(issue.message) + '</span>' : '') +
             '</label>';
           }).join('') +
           '</div></section>'
       ).join('');
 
       const filingSetup =
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="setup">' +
           '<div class="draft-section-heading"><h3>MiFILE setup</h3></div>' +
           '<div class="draft-field-grid">' +
             renderDraftInput('District number', 'data-filing-field="courtDistrict"',
@@ -4488,7 +4532,7 @@ const html = String.raw`<!doctype html>
         '</section>';
 
       const caseDetails =
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="details">' +
           '<div class="draft-section-heading"><h3>Case details</h3></div>' +
           '<div class="draft-field-grid">' +
             renderDraftSelect(
@@ -4573,14 +4617,14 @@ const html = String.raw`<!doctype html>
         '</section>';
 
       const plaintiff =
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="plaintiff">' +
           '<div class="draft-section-heading"><h3>Plaintiff</h3></div>' +
           renderDraftParty('plaintiff', 0, filing.plaintiff || {}, 'Plaintiff', false) +
         '</section>';
 
       const defendants = Array.isArray(filing.defendants) ? filing.defendants : [];
       const defendantSection =
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="defendants">' +
           '<div class="draft-section-heading"><h3>Defendants</h3>' +
             '<button type="button" data-add-defendant>' + icon('plus') +
               'Add Defendant</button></div>' +
@@ -4597,7 +4641,7 @@ const html = String.raw`<!doctype html>
         '</section>';
 
       const attorney =
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="attorney">' +
           '<div class="draft-section-heading"><h3>Attorney / filer</h3></div>' +
           '<div class="draft-field-grid">' +
             renderDraftInput('Name', 'data-attorney-field="name"',
@@ -4622,7 +4666,7 @@ const html = String.raw`<!doctype html>
         '</section>';
 
       const documentMappings =
-        '<section class="draft-field-section">' +
+        '<section class="draft-field-section" data-draft-section="documents">' +
           '<div class="draft-section-heading"><h3>MiFILE document types</h3></div>' +
           (documents.length
             ? documents.map((document, index) =>
@@ -4639,6 +4683,13 @@ const html = String.raw`<!doctype html>
       document.getElementById('draftFieldGroups').innerHTML =
         extractionSummary + legacyGroups + filingSetup + caseDetails + plaintiff + defendantSection +
         attorney + documentMappings;
+      decorateDraftReviewFields(draft);
+      validationRoot.querySelectorAll('[data-review-issue]').forEach(button => {
+        button.addEventListener('click', () => focusDraftIssue(issues[Number(button.dataset.reviewIssue)]));
+      });
+      const nextIssue = validationRoot.querySelector('[data-review-next]');
+      if (nextIssue) nextIssue.addEventListener('click', () =>
+        focusDraftIssue(issues.find(issue => issue.severity === 'error') || issues[0]));
 
       document.querySelectorAll(
         '#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea',
@@ -4701,6 +4752,107 @@ const html = String.raw`<!doctype html>
         });
       });
       renderIcons();
+    }
+
+    function draftIssueTarget(issue) {
+      const field = issue.field;
+      const root = document.getElementById('draftFieldGroups');
+      const exact = Array.from(root.querySelectorAll('[data-review-field]'))
+        .find(input => input.dataset.reviewField === field);
+      if (exact) return exact;
+      if (field.startsWith('document.')) {
+        return Array.from(root.querySelectorAll('[data-draft-document-id]'))
+          .find(row => row.dataset.draftDocumentId === field.slice(9));
+      }
+      if (field.startsWith('filingData.plaintiff') || field === 'plaintiff') {
+        return root.querySelector('[data-party-role="plaintiff"]');
+      }
+      if (field.startsWith('filingData.defendants.') && field.split('.').length === 3) {
+        return root.querySelector('[data-party-role="defendant"][data-party-index="' + Number(field.split('.')[2]) + '"]');
+      }
+      let section = 'source';
+      if (field.startsWith('package.') || field === 'intake') section = 'documents';
+      if (field.startsWith('filingData.defendants') || field === 'defendant') section = 'defendants';
+      if (field.startsWith('complaintExtraction.related') || field.startsWith('complaintExtraction.claim')) section = 'details';
+      if (field.startsWith('complaintExtraction.missing_plaintiff')) section = 'plaintiff';
+      if (field.startsWith('complaintExtraction.missing_defendant') || field.startsWith('complaintExtraction.multiple_defendants')) section = 'defendants';
+      if (field.startsWith('filingData.attorney')) section = 'attorney';
+      return root.querySelector('[data-draft-section="' + section + '"]');
+    }
+
+    function focusDraftIssue(issue) {
+      if (!issue) return;
+      const target = draftIssueTarget(issue);
+      if (!target) return;
+      const row = target.closest('[data-draft-document-id]');
+      if (row) {
+        state.activeDraftDocumentId = row.dataset.draftDocumentId;
+        renderDraftDocuments(state.draftDetail.documents || []);
+      }
+      setDraftMobileMode('fields');
+      document.querySelectorAll('.draft-review-target').forEach(element => element.classList.remove('draft-review-target'));
+      const wrapper = target.closest('.draft-field') || target;
+      wrapper.classList.add('draft-review-target');
+      const control = target.matches('input, select, textarea') ? target :
+        Array.from(target.querySelectorAll('input:not(:disabled), select:not(:disabled), button:not(:disabled)'))
+          .find(input => !input.value || input.value === 'unknown') ||
+        target.querySelector('input:not(:disabled), select:not(:disabled), button:not(:disabled)');
+      wrapper.scrollIntoView({ block: 'center', behavior: 'instant' });
+      if (control) control.focus({ preventScroll: true });
+      else { wrapper.tabIndex = -1; wrapper.focus({ preventScroll: true }); }
+    }
+
+    function showDraftComplaintSource() {
+      const primary = (state.draftDetail.documents || []).find(document => document.isPrimary);
+      if (!primary) return;
+      state.activeDraftDocumentId = primary.id;
+      renderDraftDocuments(state.draftDetail.documents);
+      setDraftMobileMode('document');
+    }
+
+    function decorateDraftReviewFields(draft) {
+      const root = document.getElementById('draftFieldGroups');
+      const extraction = draft.complaintExtraction;
+      root.querySelectorAll('input, select').forEach(input => {
+        const party = input.closest('[data-party-role]');
+        let key = input.dataset.filingField;
+        let field = key ? 'filingData.' + key : input.dataset.draftField;
+        if (input.dataset.partyField && party) {
+          key = party.dataset.partyRole === 'plaintiff' ? 'plaintiff' : 'defendants';
+          field = 'filingData.' + key + (key === 'defendants' ? '.' + party.dataset.partyIndex : '') + '.' + input.dataset.partyField;
+        }
+        if (input.dataset.attorneyField) { key = 'attorney'; field = 'filingData.attorney.' + input.dataset.attorneyField; }
+        if (!field) return;
+        input.dataset.reviewField = field;
+        if (!key) return;
+        const source = (draft.filingFieldSources || {})[key] || 'empty';
+        const confidence = extraction && extraction.fieldConfidence && extraction.fieldConfidence[key];
+        const sourceLabel = source === 'complaint' && extraction
+          ? extraction.extractionMethod === 'form_fields' ? 'PDF fields'
+            : extraction.textSource === 'ocr' ? 'Scan OCR' : 'PDF text'
+          : DRAFT_SOURCE_LABELS[source] || source;
+        const label = input.closest('.draft-field');
+        const empty = input.type !== 'checkbox' && !input.value;
+        label.insertAdjacentHTML('beforeend', '<span class="draft-field-source">' +
+          escapeHtml(empty ? 'Missing' : sourceLabel) +
+          (!empty && source === 'complaint' && confidence && confidence !== 'high'
+            ? ' · ' + escapeHtml(confidence === 'low' ? 'Check value' : 'Review value') : '') +
+          (!empty && source === 'complaint' && draft.primaryDocumentId
+            ? '<button type="button" class="icon-button" data-complaint-source title="Open source Complaint" aria-label="Open source Complaint">' + icon('file-search') + '</button>' : '') + '</span>');
+      });
+      (draft.validationIssues || []).forEach((issue, index) => {
+        const target = draftIssueTarget(issue);
+        if (!target) return;
+        const wrapper = target.closest('.draft-field') || target;
+        wrapper.classList.add('has-' + issue.severity);
+        const messageId = 'draft-field-issue-' + index;
+        if (target.matches('input, select')) {
+          if (issue.severity === 'error') target.setAttribute('aria-invalid', 'true');
+          target.setAttribute('aria-describedby', [target.getAttribute('aria-describedby'), messageId].filter(Boolean).join(' '));
+        }
+        wrapper.insertAdjacentHTML('beforeend', '<span class="draft-field-message" id="' + messageId + '">' + escapeHtml(issue.message) + '</span>');
+      });
+      root.querySelectorAll('[data-complaint-source]').forEach(button => button.addEventListener('click', showDraftComplaintSource));
     }
 
     function renderDraftInput(label, attributes, value, wide, type, listId) {
@@ -4816,9 +4968,6 @@ const html = String.raw`<!doctype html>
           '<span class="draft-field-label"><span>Filing Type</span></span>' +
           '<input type="text" list="mifileFilingTypes" data-document-field="filingType" value="' +
             escapeHtml(document.filingType || '') + '">' +
-          (issue
-            ? '<span class="draft-field-message">' + escapeHtml(issue.message) + '</span>'
-            : '') +
         '</label>' +
         '<label class="draft-field filing-relation-field ' +
           (issue ? 'has-' + escapeHtml(issue.severity) : '') + '">' +
@@ -4859,7 +5008,7 @@ const html = String.raw`<!doctype html>
         return;
       }
       if (selectedDocument.documentRole !== 'primary_source') {
-        toast('Only a Complaint can be used as the primary data source.', 'error');
+        showToast('Only a Complaint can be used as the primary data source.', 'error');
         return;
       }
       if (draft.primaryDocumentId === documentId) return;
@@ -4952,6 +5101,23 @@ const html = String.raw`<!doctype html>
       replaceButton.disabled = !canModifyDocuments ||
         !activeDocument || !activeDocument.oneDriveUrl || Boolean(activeDocument.formTemplate);
       window.document.getElementById('draftRemoveFormBtn').disabled = !canModifyDocuments || !activeDocument?.formTemplate || activeDocument.status === 'retrying';
+      const documentState = window.document.getElementById('draftDocumentState');
+      const needsDownload = activeDocument && !['uploaded', 'downloaded', 'replaced'].includes(activeDocument.status);
+      documentState.innerHTML = needsDownload
+        ? '<div class="draft-document-status">' + statusPill(activeDocument.status) +
+          (canModifyDocuments ? renderDocumentRetryAction(activeDocument) : '') + '</div>' +
+          (activeDocument.errorMessage ? '<div class="draft-filing-job-error">' + escapeHtml(activeDocument.errorMessage) + '</div>' : '') +
+          renderDocumentRetryInfo(activeDocument, state.draftDetail.retryPolicy) +
+          renderDocumentFailureLog(activeDocument)
+        : '';
+      documentState.querySelectorAll('[data-retry-document]').forEach(button => {
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          try { await retryDraftDocument(button.dataset.retryDocument); }
+          catch (error) { showDraftError(error); }
+          finally { button.disabled = false; }
+        });
+      });
       if (activeDocument && activeDocument.oneDriveUrl) {
         const previewKey = activeDocument.id + ':' + (activeDocument.updatedAt || '');
         if (viewer.dataset.previewKey !== previewKey) {
@@ -4973,12 +5139,30 @@ const html = String.raw`<!doctype html>
     }
 
     function updateDraftDocumentLink(link, href) {
+      if (href && !/^https?:\/\//i.test(href)) href = null;
       link.classList.toggle('is-disabled', !href);
       if (href) {
         link.href = href;
       } else {
         link.removeAttribute('href');
       }
+    }
+
+    async function retryDraftDocument(documentId) {
+      if (state.draftDirty) await saveDraft(true);
+      const draftId = state.selectedDraftId;
+      const revision = state.draftEditRevision;
+      await api('/api/documents/' + encodeURIComponent(documentId) + '/retry', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'Queued from Draft Editor' }),
+      });
+      const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
+      if (state.selectedDraftId === draftId && !state.draftDirty && state.draftEditRevision === revision) {
+        state.draftDetail = detail;
+        renderDraftWorkspace();
+      }
+      await loadDrafts(true);
+      showToast('Document retry queued.');
     }
 
     function setDraftDirty(dirty) {
@@ -6738,13 +6922,19 @@ export function createAdminServer(
                     });
                     return;
                 }
-                const job = db.queueFilingJob(
-                    decodeURIComponent(queueFilingMatch[1]),
-                    'prepare',
-                    parsed.retry === true ? 'admin_retry' : 'admin',
-                    'admin',
-                );
-                sendJson(res, 202, job);
+                try {
+                    const job = db.queueFilingJob(
+                        decodeURIComponent(queueFilingMatch[1]),
+                        'prepare',
+                        parsed.retry === true ? 'admin_retry' : 'admin',
+                        'admin',
+                    );
+                    sendJson(res, 202, job);
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    if (!/active MiFILE job|Approve the Draft|Filing is blocked:/.test(message)) throw error;
+                    sendJson(res, 409, { error: message });
+                }
                 return;
             }
 

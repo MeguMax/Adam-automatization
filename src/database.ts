@@ -1145,35 +1145,31 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
     if (!filing.caseType) {
         issues.push({
             field: 'filingData.caseType',
-            severity: 'warning',
+            severity: 'error',
             message: 'Select the MiFILE case type.',
         });
     }
     if (filing.relatedCivilAction === 'unknown') {
         issues.push({
             field: 'filingData.relatedCivilAction',
-            severity: 'warning',
+            severity: 'error',
             message: 'Paragraph 2 could not be read; confirm whether a related civil action exists.',
         });
     }
     if (filing.relatedCivilAction === 'previously_filed') {
-        const missingRelatedFields = [
-            !filing.relatedCaseCourt ? 'court' : null,
-            !filing.relatedCaseDocketNumber ? 'docket number' : null,
-            filing.relatedCasePending === null ? 'status' : null,
-        ].filter((value): value is string => Boolean(value));
-        if (missingRelatedFields.length) {
-            issues.push({
-                field: 'filingData.relatedCivilAction',
-                severity: 'warning',
-                message: `Complete the prior civil action ${missingRelatedFields.join(', ')} from paragraph 2.`,
-            });
+        for (const [key, label] of [
+            ['relatedCaseCourt', 'court'], ['relatedCaseDocketNumber', 'docket number'],
+            ['relatedCasePending', 'status'],
+        ] as const) {
+            if (filing[key] !== null && filing[key] !== '') continue;
+            issues.push({ field: `filingData.${key}`, severity: 'error',
+                message: `Complete the prior civil action ${label} from paragraph 2.` });
         }
     }
     if (filing.moneyJudgmentRequested === null) {
         issues.push({
             field: 'filingData.moneyJudgmentRequested',
-            severity: 'warning',
+            severity: 'error',
             message: 'Paragraph 10 could not be read; confirm whether a money judgment is requested.',
         });
     } else if (
@@ -1200,17 +1196,12 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
             message: 'Complete the Plaintiff party information.',
         });
     }
-    const missingPlaintiffAddress = [
-        !filing.plaintiff.address1 ? 'street address' : null,
-        !filing.plaintiff.city ? 'city' : null,
-        !filing.plaintiff.state ? 'state' : null,
-        !filing.plaintiff.postalCode ? 'ZIP code' : null,
-    ].filter((value): value is string => Boolean(value));
-    if (missingPlaintiffAddress.length) {
-        issues.push({
-            field: 'filingData.plaintiff',
-            severity: 'error',
-            message: `Complete Plaintiff ${missingPlaintiffAddress.join(', ')} from the Complaint.`,
+    const addressFields = [['address1', 'street address'], ['city', 'city'],
+        ['state', 'state'], ['postalCode', 'ZIP code']] as const;
+    for (const [key, label] of addressFields) {
+        if (!filing.plaintiff[key]) issues.push({
+            field: `filingData.plaintiff.${key}`, severity: 'error',
+            message: `Complete Plaintiff ${label} from the Complaint.`,
         });
     }
     if (!filing.defendants.length) {
@@ -1228,17 +1219,10 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
                 message: `Complete the name for Defendant ${index + 1}.`,
             });
         }
-        const missingAddress = [
-            !party.address1 ? 'street address' : null,
-            !party.city ? 'city' : null,
-            !party.state ? 'state' : null,
-            !party.postalCode ? 'ZIP code' : null,
-        ].filter((value): value is string => Boolean(value));
-        if (missingAddress.length) {
-            issues.push({
-                field: `filingData.defendants.${index}`,
-                severity: 'error',
-                message: `Complete Defendant ${index + 1} ${missingAddress.join(', ')} from the Complaint.`,
+        for (const [key, label] of addressFields) {
+            if (!party[key]) issues.push({
+                field: `filingData.defendants.${index}.${key}`, severity: 'error',
+                message: `Complete Defendant ${index + 1} ${label} from the Complaint.`,
             });
         }
     });
@@ -1648,7 +1632,7 @@ function validateDraftDocuments(
         ) {
             issues.push({
                 field: `document.${document.id}`,
-                severity: 'warning',
+                severity: 'error',
                 message: `Choose whether ${document.currentFilename || document.documentType || 'the ancillary document'} is filed as Other or connected to the Complaint.`,
             });
         }
@@ -4836,8 +4820,9 @@ export class WorkflowDatabase {
                     : suggestedFilingType
                         ? 'suggested'
                         : null,
-                filingRelation:
-                    row.filing_relation === 'separate' ||
+                filingRelation: row.filing_relation === 'unknown' && row.filing_relation_source === 'manual'
+                    ? 'unknown'
+                    : row.filing_relation === 'separate' ||
                     row.filing_relation === 'connected_to_complaint'
                         ? row.filing_relation
                         : suggestedRelation,

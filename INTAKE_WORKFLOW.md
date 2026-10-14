@@ -30,6 +30,20 @@ An address absent from the Complaint must be entered manually. The extractor doe
 
 Live Draft refresh checks the selected record and edit revision again after each background response. Responses started before a field edit do not replace unsaved input, including while navigating between Drafts.
 
+## Correcting and confirming a Draft
+
+The review panel separates **required corrections** from **review notes**. Each arrow opens the affected field or document mapping; **First item** jumps to the first required correction. Missing Plaintiff and Defendant address components are reported individually. Correct the highlighted values and save to refresh validation. Notes from OCR or an unusual caption remain visible for the attorney's review rather than being silently dismissed.
+
+Filing fields identify their saved source: PDF fields, PDF text, Scan OCR, Manual, or a default. Party and attorney provenance is tracked by field group. The document icon beside a Complaint-derived group opens the primary Complaint; it does not claim to locate the exact word or checkbox on a particular page. Empty values remain marked Missing.
+
+**Confirm package** cannot waive required MiFILE answers: paragraph 2, paragraph 10, a positive supplemental claim amount, prior-action details when applicable, and an explicit Other/Connected choice must be completed. Choosing Review required for a document preserves that unknown state, including when its Filing Type is Other. Informational review notes can be acknowledged through normal package confirmation. Both automated and manual packages use **Prepare in MiFILE**, never a final-submit action.
+
+The preparation button stays disabled after queueing, during preparation, while reconciliation is required, and after preparation. A repeated queue request returns a conflict without adding a second job. Core document constraints and the required mailing checkbox remain read-only; source PDFs remain viewable while the Draft is locked.
+
+Selecting an unavailable document shows its download status, error, retry timing and recorded failure log directly above the PDF preview. The retry arrow queues the existing document retry without creating a second document. Unsaved Draft corrections are saved before queueing it. Internal email-attachment source identifiers are not presented as browser download links.
+
+The MiFILE uploader requires an exact Filing Type option and stops if a requested Connected control is unavailable. It no longer selects a potentially different first option or silently skips a connection. Old queued payloads are checked again for unknown required answers and relationships before any external access. Temporary PDFs are removed even if OneDrive materialization fails partway through the package.
+
 ## Reusable forms
 
 In **Settings > Form library**, upload the attorney-approved Advice PDF for all courts and a Local PDF for each exact MiFILE court name. Confirm the document type and court assignment before saving. No legal forms are preinstalled or downloaded from third parties.
@@ -86,7 +100,7 @@ npm.cmd test
 npm.cmd run test:admin-intake
 ```
 
-The browser smoke test uses an isolated SQLite database and mocked OneDrive and MiFILE sign-in services. It checks account saving, credential redaction, cross-origin rejection, uploading a PDF to an initially empty Draft, PDF canvas rendering, and desktop/mobile layout. Screenshots are written to `output/intake-qa`.
+The browser smoke test uses an isolated SQLite database and mocked OneDrive and MiFILE sign-in services. It checks account saving, credential redaction, cross-origin rejection, uploading a PDF to an initially empty Draft, PDF canvas rendering, and desktop/mobile layout. It also corrects missing fields, completes a six-document package, confirms it, queues one preparation job, and simulates a restart at Save Progress followed by reconciliation. The MiFILE uploader tests use a local browser fixture to check all six uploads, exact Filing Type selection, missing Connected controls, and refusal to save or submit on those failures. These tests do not create a real MiFILE bundle. Screenshots are written to `output/intake-qa`.
 
 Before inviting live client packages, deploy the update, confirm the inbox and accepted senders in Settings, and run one controlled package through the real Microsoft 365 and OneDrive services. Select the exact court, resolve validation issues, and prepare that package in MiFILE. Confirm the resulting bundle in History > Unsubmitted. Local tests do not substitute for this live integration check.
 # September 24: intake recovery and scanned documents

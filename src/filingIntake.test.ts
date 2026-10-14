@@ -67,6 +67,39 @@ test('intake uses an explicit subject and authorized sender; replies and court n
     assert.equal(intakeSenderAllowed(message, { FILING_INTAKE_ALLOWED_SENDERS: 'somebody@example.com' }), false);
 });
 
+test('required Complaint answers and Other/Connected choices cannot be waived by confirming a package', () => {
+    const f = fixture([]);
+    try {
+        const ids = ['Complaint', 'Advice', 'Local', 'Summons', 'Request', 'Demand'].map(role => f.db.addDocument({
+            emailId:f.email.id,caseDraftId:f.draftId,currentFilename:role+'.pdf',documentType:role,
+            oneDriveUrl:'https://onedrive.example/'+role,mimeType:'application/pdf',uploadSource:'test',status:'uploaded',
+        }));
+        f.db.applyComplaintExtraction(f.draftId,ids[0],extraction);
+        f.db.updateCaseDraft(f.draftId,{courtName:'25th District Court'},undefined,undefined,
+            [{id:ids[5],filingRelation:'separate',filingType:'Other'}]);
+        const initial=f.db.refreshCaseDraftValidation(f.draftId).caseDraft!;
+        assert.deepEqual(initial.validationIssues,[]);
+        const cases = [
+            {patch:{relatedCivilAction:'unknown'},field:'filingData.relatedCivilAction'},
+            {patch:{moneyJudgmentRequested:null},field:'filingData.moneyJudgmentRequested'},
+            {patch:{moneyJudgmentRequested:true,claimAmount:null},field:'filingData.claimAmount'},
+            {patch:{relatedCivilAction:'previously_filed',relatedCaseCourt:null,relatedCaseDocketNumber:null,relatedCasePending:null},field:'filingData.relatedCaseCourt'},
+            {patch:{plaintiff:{...initial.filingData.plaintiff,address1:null}},field:'filingData.plaintiff.address1'},
+        ];
+        for(const {patch,field} of cases){
+            const updated=f.db.updateCaseDraft(f.draftId,{},undefined,{...initial.filingData,...patch});
+            assert.ok(updated.caseDraft!.validationIssues.some(issue=>issue.field===field && issue.severity==='error'),field);
+            assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/Cannot approve draft/);
+            assert.throws(()=>f.db.buildFilingPayload(f.draftId),/Filing is blocked/);
+            assert.equal(f.db.queueValidatedIntakes(),0);
+        }
+        const relationship=f.db.updateCaseDraft(f.draftId,{},undefined,initial.filingData,
+            [{id:ids[5],filingRelation:'unknown',filingType:'Other'}]);
+        assert.ok(relationship.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+ids[5] && issue.severity==='error'));
+        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/Choose whether/);
+    }finally{f.close();}
+});
+
 test('attachment identity distinguishes duplicate names and keeps encoded punctuation intact', () => {
     const parsed = buildFilingIntake(message, [attachment('Complaint ?1.pdf', 'a/+=1'), attachment('Complaint ?1.pdf', 'b/+=2')]);
     assert.equal(parsed.isMiFile, false);
