@@ -2616,6 +2616,7 @@ export class WorkflowDatabase {
         const detail = this.getDraftDetail(id);
         const draft = detail?.caseDraft;
         if (!draft || JSON.parse(draft.normalizedDataJson || '{}').sourceKind !== 'new_filing_intake') throw new Error('Only new filing intake Drafts can use library forms');
+        if (!draft.filingEligible) throw new Error('Court notifications cannot change new-case documents or library forms.');
         if (draft.filingStatus === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived', 'rejected'].includes(draft.status)) {
             throw new Error('This Draft is locked for document changes');
         }

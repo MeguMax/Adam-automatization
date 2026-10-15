@@ -189,6 +189,12 @@ test('locked Drafts and court notifications cannot change or remove their docume
         const doc=f.db.addDocument({emailId:email.id,caseDraftId:draft,currentFilename:'Filed.pdf',status:'uploaded',uploadSource:'email',oneDriveUrl:'https://onedrive.example/filed'});
         assert.throws(()=>f.db.beginDocumentReplacement(doc),/Only new filing/);
         assert.throws(()=>f.db.removeDraftDocument(draft,doc),/Only new filing/);
+        const copiedEmail=f.db.registerEmail({id:'legacy-copied-notification',subject:message.subject});
+        const copiedDraft=f.db.createCaseDraft(copiedEmail.id,{...buildFilingIntake(message,[]),isMiFile:true});
+        const copiedDoc=f.db.addDocument({emailId:copiedEmail.id,caseDraftId:copiedDraft,currentFilename:'Legacy Copy.pdf',
+            status:'uploaded',uploadSource:'email',oneDriveUrl:'https://onedrive.example/legacy-copy'});
+        assert.throws(()=>f.db.beginDocumentReplacement(copiedDoc),/Court notifications/);
+        assert.throws(()=>f.db.removeDraftDocument(copiedDraft,copiedDoc),/Court notifications/);
     }finally{f.close();}
 });
 
