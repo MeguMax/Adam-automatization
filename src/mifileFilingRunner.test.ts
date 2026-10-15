@@ -41,7 +41,7 @@ function filingDocument(index: number, connected = false): FilingDocumentPayload
     };
 }
 
-async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean } = {}): Promise<Page> {
+async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean; feeLabels?: boolean } = {}): Promise<Page> {
     const page = await browser.newPage();
     await page.route('**/*', route => route.abort());
     await page.setContent(`<input id="fileUpload" type="file" multiple><table id="files"></table>
@@ -54,8 +54,8 @@ async function uploadPage(options: { missingType?: boolean; missingConnect?: boo
                 '<input name="documentName_' + index + '">' +
                 '<input id="selectFilingTypeInput_' + index + '">' +
                 '<ul class="dropdown-menu" style="display:none"><li role="option">Complaint for Possession Only (Different type)</li>' +
-                ${JSON.stringify(options.missingType ? '' : '<li role="option">Complaint for Possession Only</li>')} +
-                '<li role="option">Other</li></ul>' +
+                ${JSON.stringify(options.missingType ? '' : '<li role="option">Complaint for Possession Only' + (options.feeLabels ? ' - $45.00' : '') + '</li>')} +
+                ${JSON.stringify('<li role="option">Other' + (options.feeLabels ? ' - $0.00' : '') + '</li></ul>')} +
                 (${Boolean(options.missingConnect)} ? '' : '<button type="button" id="filing-' + index + '-connect-filing">Connect</button>') +
                 '</td></tr>';
             row.querySelectorAll('[role="option"]').forEach(option => option.onclick = () => {
@@ -108,6 +108,16 @@ test('similar Filing Type labels must not be accepted in place of the requested 
     } finally { await page.close(); }
 });
 
+test('live MiFILE fee suffixes preserve exact Filing Type matching for every PDF', async () => {
+    const page = await uploadPage({feeLabels: true});
+    try {
+        await (new MiFileFilingRunner() as any).uploadDocuments(page, materialized(6));
+        assert.equal(await page.locator('#filing-0').getAttribute('data-selected-type'), 'Complaint for Possession Only - $45.00');
+        assert.equal(await page.locator('#filing-5').getAttribute('data-selected-type'), 'Other - $0.00');
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
 test('missing Connected control must fail before saving instead of silently creating a separate filing', async () => {
     const page = await uploadPage({ missingConnect: true });
     try {
@@ -156,13 +166,14 @@ test('old queued snapshots with unknown answers or document relations are stoppe
     }
 });
 
-test('an uncertain save requires reconciliation while the worker continues with the next package', async () => {
+test('partial case forms, uploads and uncertain saves require reconciliation without blocking later packages', async () => {
     const {getWorkflowDatabase}=require('./database') as typeof import('./database');
     const {buildFilingIntake}=require('./filingIntake') as typeof import('./filingIntake');
     const {MiFileFilingError}=require('./mifileFilingRunner') as typeof import('./mifileFilingRunner');
     const {runFilingWorker}=require('./filingWorker') as typeof import('./filingWorker');
     const db=getWorkflowDatabase();
-    const jobs=[0,1].map(index=>{
+    const checkpoints=['case_form','document_upload','save_progress','saved_unsubmitted'];
+    const jobs=[0,1,2,3,4].map(index=>{
         const message={id:'worker-recovery-'+index,subject:'NEW LT FILING - QA '+index,
             from:{emailAddress:{address:'qa@example.com'}}};
         const parsed=buildFilingIntake(message,[]);
@@ -189,7 +200,8 @@ test('an uncertain save requires reconciliation while the worker continues with 
     const processed:string[]=[];
     MiFileFilingRunner.prototype.prepare=async job=>{
         processed.push(job.id);
-        if(job.id===jobs[0].id) throw new MiFileFilingError('Simulated response lost after Save Progress','MIFILE_AUTOMATION_FAILED','save_progress');
+        const index=jobs.findIndex(item=>item.id===job.id);
+        if(index<checkpoints.length) throw new MiFileFilingError('Simulated partial Unsubmitted bundle','MIFILE_AUTOMATION_FAILED',checkpoints[index]);
         controller.abort();
         return {checkpoint:'saved_unsubmitted',externalBundleId:'qa-bundle',temporaryCaseNumber:'TEMP-QA',
             uploadedDocuments:1,mifileVersion:null,screenshotPath:null,url:'https://mifile.example/qa'};
@@ -197,11 +209,13 @@ test('an uncertain save requires reconciliation while the worker continues with 
     try{
         await runFilingWorker({signal:controller.signal,pollIntervalMs:1000});
         assert.deepEqual(processed,jobs.map(job=>job.id));
-        assert.equal(db.getFilingJob(jobs[0].id)!.status,'reconciliation_required');
-        assert.equal(db.getFilingJob(jobs[0].id)!.errorCode,'UNSUBMITTED_OUTCOME_UNKNOWN');
-        assert.equal(db.getFilingJob(jobs[1].id)!.status,'prepared');
-        assert.throws(()=>db.queueFilingJob(jobs[0].caseDraftId),/Approve the Draft/);
-        assert.equal(db.listFilingJobs(jobs[0].caseDraftId).length,1);
+        for(const job of jobs.slice(0,-1)) {
+            assert.equal(db.getFilingJob(job.id)!.status,'reconciliation_required');
+            assert.equal(db.getFilingJob(job.id)!.errorCode,'UNSUBMITTED_OUTCOME_UNKNOWN');
+            assert.throws(()=>db.queueFilingJob(job.caseDraftId),/Approve the Draft/);
+            assert.equal(db.listFilingJobs(job.caseDraftId).length,1);
+        }
+        assert.equal(db.getFilingJob(jobs[4].id)!.status,'prepared');
     }finally{
         controller.abort();
         MiFileFilingRunner.prototype.prepare=previous;

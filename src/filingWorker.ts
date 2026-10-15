@@ -70,7 +70,8 @@ export async function runFilingWorker(options: {
                     'MIFILE_AUTOMATION_FAILED',
                     'unknown',
                 );
-            const outcomeUnknown = ['save_progress', 'saved_unsubmitted'].includes(
+            // Saving the initiation form already creates an Unsubmitted bundle.
+            const outcomeUnknown = ['case_form', 'document_upload', 'save_progress', 'saved_unsubmitted'].includes(
                 filingError.checkpoint,
             );
             const errorCode = outcomeUnknown
@@ -83,7 +84,7 @@ export async function runFilingWorker(options: {
                 level: outcomeUnknown ? 'warning' : 'error',
                 checkpoint: outcomeUnknown ? 'reconciliation_required' : filingError.checkpoint,
                 message: errorMessage,
-                details: { code: errorCode },
+                details: { code: errorCode, originalCode: filingError.code, failedCheckpoint: filingError.checkpoint },
             });
             db.completeFilingJob({
                 filingJobId: job.id,

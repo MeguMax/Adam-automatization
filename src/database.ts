@@ -2473,6 +2473,28 @@ const migrations: Migration[] = [
             notes TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
         ); CREATE UNIQUE INDEX idx_active_court_filing_rule ON court_filing_rules(court_key) WHERE active = 1;`),
     },
+    {
+        version: 26,
+        name: 'reconcile_partial_mifile_case_bundles',
+        up: db => {
+            const timestamp = nowIso();
+            db.prepare(`UPDATE filing_jobs SET status = 'reconciliation_required',
+                error_code = 'UNSUBMITTED_OUTCOME_UNKNOWN',
+                error_message = COALESCE(error_message || ' ', '') ||
+                    'MiFILE may already contain a partial bundle. Check History > Unsubmitted before retrying.',
+                updated_at = ?
+                WHERE status = 'failed' AND checkpoint IN ('case_form', 'document_upload')
+                AND NOT EXISTS (SELECT 1 FROM filing_jobs newer
+                    WHERE newer.case_draft_id = filing_jobs.case_draft_id
+                    AND newer.attempt_number > filing_jobs.attempt_number)`).run(timestamp);
+            db.prepare(`UPDATE case_drafts SET status = 'filing_reconciliation',
+                filing_status = 'reconciliation_required', updated_at = ?
+                WHERE status = 'filing_failed' AND EXISTS (SELECT 1 FROM filing_jobs j
+                    WHERE j.case_draft_id = case_drafts.id AND j.status = 'reconciliation_required'
+                    AND NOT EXISTS (SELECT 1 FROM filing_jobs newer
+                        WHERE newer.case_draft_id = j.case_draft_id AND newer.attempt_number > j.attempt_number))`).run(timestamp);
+        },
+    },
 ];
 
 export class WorkflowDatabase {
@@ -5322,7 +5344,7 @@ export class WorkflowDatabase {
         const timestamp = nowIso();
         this.runInTransaction(() => {
             for (const row of rows) {
-                const outcomeUnknown = ['save_progress', 'saved_unsubmitted'].includes(
+                const outcomeUnknown = ['case_form', 'document_upload', 'save_progress', 'saved_unsubmitted'].includes(
                     row.checkpoint || '',
                 );
                 const jobStatus: FilingJobStatus = outcomeUnknown
@@ -5338,7 +5360,7 @@ export class WorkflowDatabase {
                     ? 'UNSUBMITTED_OUTCOME_UNKNOWN'
                     : 'PROCESS_INTERRUPTED';
                 const errorMessage = outcomeUnknown
-                    ? 'The service restarted while MiFILE was saving. Check History > Unsubmitted before taking another action.'
+                    ? 'The service restarted after MiFILE preparation may have created a partial bundle. Check History > Unsubmitted before taking another action.'
                     : 'The service restarted during MiFILE preparation.';
                 const parsed = this.safeJson(row.execution_log);
                 const log = Array.isArray(parsed) ? parsed.slice(-999) : [];

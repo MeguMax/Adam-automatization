@@ -3,6 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
@@ -38,6 +39,46 @@ function fixture() {
     db.markEmailProcessed(email.id);
     return {db,parsed,email,draftId,complaint,ancillary,add,close(){db.close();fs.rmSync(directory,{recursive:true,force:true});}};
 }
+
+test('legacy failures after creating a case form require reconciliation on migration',()=>{
+    const f=fixture();
+    const filename=f.db.getPath();
+    let reopened:WorkflowDatabase|undefined;
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingRelation:'separate',filingType:'Other'}]);
+        f.db.reviewCaseDraft(f.draftId,'approve');
+        const job=f.db.queueFilingJob(f.draftId);
+        f.db.claimNextFilingJob();
+        f.db.completeFilingJob({filingJobId:job.id,status:'failed',checkpoint:'document_upload',errorCode:'FILING_TYPE_NOT_AVAILABLE',errorMessage:'Missing exact label'});
+        f.db.close();
+        const raw=new DatabaseSync(filename);
+        raw.prepare('DELETE FROM schema_migrations WHERE version = 26').run();
+        raw.close();
+        reopened=new WorkflowDatabase(filename);
+        assert.equal(reopened.getFilingJob(job.id)!.status,'reconciliation_required');
+        assert.match(reopened.getFilingJob(job.id)!.errorMessage!,/Missing exact label.*partial bundle/);
+        assert.equal(reopened.getDraftDetail(f.draftId)!.caseDraft!.status,'filing_reconciliation');
+        assert.throws(()=>reopened!.queueFilingJob(f.draftId),/Approve the Draft/);
+        assert.equal(reopened.listFilingJobs(f.draftId).length,1);
+    } finally {
+        reopened?.close();
+        fs.rmSync(path.dirname(filename),{recursive:true,force:true});
+    }
+});
+
+test('a restart after saving the case form blocks another preparation until reconciliation',()=>{
+    const f=fixture();
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingRelation:'separate',filingType:'Other'}]);
+        f.db.reviewCaseDraft(f.draftId,'approve');
+        const job=f.db.queueFilingJob(f.draftId);
+        f.db.claimNextFilingJob();
+        f.db.appendFilingJobLog(job.id,{level:'info',checkpoint:'case_form',message:'Case form saved.'});
+        assert.equal(f.db.recoverInterruptedFilingJobs(),1);
+        assert.equal(f.db.getFilingJob(job.id)!.status,'reconciliation_required');
+        assert.throws(()=>f.db.queueFilingJob(f.draftId),/Approve the Draft/);
+    }finally{f.close();}
+});
 
 test('removing a duplicate PDF preserves OneDrive, cancels retries and does not resurrect it on email reprocessing',async()=>{
     const f=fixture();

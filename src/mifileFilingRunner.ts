@@ -236,6 +236,7 @@ export class MiFileFilingRunner {
             lastCheckpoint = 'select_filing';
             await this.openNewLtCase(page, job.payload);
             lastCheckpoint = 'case_form';
+            await this.log('info', lastCheckpoint, 'Completing the MiFILE case-initiation fields.');
             await this.completeCaseForm(page, job.payload);
             lastCheckpoint = 'document_upload';
             await this.uploadDocuments(page, documents);
@@ -711,7 +712,8 @@ export class MiFileFilingRunner {
             await typeInput.fill(item.document.filingType);
             const escapedType = item.document.filingType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const exactType = page.locator('ul.dropdown-menu:visible li[role="option"]').filter({
-                hasText: new RegExp(`^\\s*${escapedType}\\s*$`),
+                // MiFILE appends the court's filing fee to its otherwise exact label.
+                hasText: new RegExp(`^\\s*${escapedType}(?:\\s+-\\s+\\$[\\d,]+\\.\\d{2})?\\s*$`),
             }).first();
             try {
                 await exactType.waitFor({ state: 'visible', timeout: this.timeoutMs });

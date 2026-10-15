@@ -1095,8 +1095,8 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
         assert.equal(claimed?.status, 'running');
         db.appendFilingJobLog(queued.id, {
             level: 'info',
-            checkpoint: 'case_form',
-            message: 'Case form completed in test.',
+            checkpoint: 'select_filing',
+            message: 'Case form has not been saved in test.',
         });
         assert.equal(db.recoverInterruptedFilingJobs(), 1);
         assert.equal(db.getFilingJob(queued.id)?.errorCode, 'PROCESS_INTERRUPTED');

@@ -42,7 +42,9 @@ The preparation button stays disabled after queueing, during preparation, while 
 
 Selecting an unavailable document shows its download status, error, retry timing and recorded failure log directly above the PDF preview. The retry arrow queues the existing document retry without creating a second document. Unsaved Draft corrections are saved before queueing it. Internal email-attachment source identifiers are not presented as browser download links.
 
-The MiFILE uploader requires an exact Filing Type option and stops if a requested Connected control is unavailable. It no longer selects a potentially different first option or silently skips a connection. Old queued payloads are checked again for unknown required answers and relationships before any external access. Temporary PDFs are removed even if OneDrive materialization fails partway through the package.
+The MiFILE uploader requires an exact Filing Type option, allowing only MiFILE's displayed fee suffix (for example, ` - $45.00`), and stops if a requested Connected control is unavailable. It never selects a potentially different first option or silently skips a connection. Old queued payloads are checked again for unknown required answers and relationships before any external access. Temporary PDFs are removed even if OneDrive materialization fails partway through the package.
+
+MiFILE can create an Unsubmitted bundle as soon as the case-initiation form is saved, before any source PDF is saved. A failure or restart during case-form completion, PDF upload, or Save Progress therefore requires reconciliation; it must not queue a fresh package blindly. Migration 26 also protects the latest historical failures at those earlier stages. Check the actual bundle contents, not just its existence, before marking it prepared. A partial bundle must be completed in MiFILE or removed by the account owner before a fresh preparation attempt.
 
 ### Removing and Replacing PDFs
 
