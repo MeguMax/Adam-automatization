@@ -27,7 +27,7 @@ export async function processFilingIntake(
         const document = current.documents.find(item => item.sourceUrl === source.downloadUrl) ||
             (nameMatches.length === 1 ? nameMatches[0] : undefined);
         // A removed source document stays removed on reprocessing.
-        if (!document || document.oneDriveUrl || document.status === 'uploaded') continue;
+        if (!document || !document.sourceUrl || document.oneDriveUrl || document.status === 'uploaded') continue;
         try {
             const stableSource = { ...source, downloadUrl: document.sourceUrl || source.downloadUrl };
             const result = await dependencies.download({ ...parsed, filedDocuments: [stableSource] });

@@ -45,7 +45,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-15-draft-review-v37';
+const ADMIN_BUILD_ID = '2026-10-15-draft-repair-court-rules-v38';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2323,6 +2323,15 @@ const html = String.raw`<!doctype html>
     .draft-review-target { outline: 2px solid var(--accent); outline-offset: 3px; }
     #draftDocumentState { flex: 1 0 100%; min-width: 0; }
     #draftDocumentState:empty { display: none; }
+    .court-rules-section { grid-column: 1 / -1; }
+    .court-rule-row { display: grid; grid-template-columns: minmax(210px, 1.2fr) minmax(175px, 1fr) minmax(180px, 1.4fr) auto; gap: 12px; align-items: end; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    .court-rule-row input, .court-rule-row select { min-width: 0; width: 100%; }
+    .court-rule-name { font-size: 12px; overflow-wrap: anywhere; }
+    .court-rule-name span { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; }
+    .court-rule-actions { display: flex; gap: 6px; }
+    .court-rule-confirmation { display: inline-flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 360px; font-size: 12px; }
+    #courtRuleConfirmed { width: 16px; height: 16px; min-height: 16px; margin: 0; flex: 0 0 16px; }
+    @media (max-width: 820px) { .court-rule-row { grid-template-columns: minmax(0, 1fr); } }
     [data-draft-section], .draft-document-mapping, .draft-field { scroll-margin-block: 14px; }
     .draft-filing-job-panel {
       margin-bottom: 14px;
@@ -3302,8 +3311,9 @@ const html = String.raw`<!doctype html>
                 <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
                 <button id="draftAddDocumentBtn" type="button" title="Add one or more PDFs to this Draft"><i data-lucide="file-plus-2"></i>Add PDFs</button>
                 <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
-                <button id="draftRemoveFormBtn" class="icon-button" type="button" title="Remove library form from Draft" aria-label="Remove library form"><i data-lucide="trash-2"></i></button>
-                <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF while keeping its OneDrive name and link"><i data-lucide="replace"></i>Replace PDF</button>
+                <button id="draftCourtRuleBtn" type="button" title="Apply the current rule to documents without a manual submission choice"><i data-lucide="list-checks"></i>Apply court rule</button>
+                <button id="draftRemoveFormBtn" class="icon-button danger" type="button" title="Remove PDF from Draft only" aria-label="Remove PDF from Draft"><i data-lucide="trash-2"></i></button>
+                <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF or upload a corrected file"><i data-lucide="replace"></i>Replace PDF</button>
                 <input id="draftDocumentFileInput" class="hidden" type="file" accept="application/pdf,.pdf" multiple>
               </div>
               <div class="draft-document-links">
@@ -3381,6 +3391,21 @@ const html = String.raw`<!doctype html>
         </form>
         <div id="settingsMessage" role="status" aria-live="polite"></div>
       </section>
+      <section class="settings-section court-rules-section">
+        <h2>Court filing rules</h2>
+        <form id="courtRuleForm">
+          <div class="settings-grid">
+            <label class="field"><span class="field-label">Exact MiFILE court</span><input id="courtRuleCourt" list="courtRuleCourts" required maxlength="300"></label>
+            <label class="field"><span class="field-label">Supporting documents</span><select id="courtRuleRelation"><option value="manual_review">Manual review</option><option value="separate">Other - separate filing</option><option value="connected_to_complaint">Connected to Complaint</option></select></label>
+            <label class="field"><span class="field-label">Exceptions / notes</span><input id="courtRuleNotes" maxlength="2000"></label>
+          </div>
+          <div class="settings-actions"><label class="court-rule-confirmation"><input id="courtRuleConfirmed" type="checkbox" required><span>Rule confirmed for all supporting PDFs in this court</span></label>
+            <button type="submit" id="courtRuleSave" class="primary"><i data-lucide="plus"></i>Add rule</button></div>
+        </form>
+        <datalist id="courtRuleCourts"></datalist>
+        <div id="courtRuleMessage" role="status" aria-live="polite"></div>
+        <div id="courtRuleList"></div>
+      </section>
     </section>
     <section id="mappingsPane" class="full-span hidden">
       <div class="summary" id="mappingSummary"></div>
@@ -3443,6 +3468,7 @@ const html = String.raw`<!doctype html>
               <option value="case_draft">Draft case</option>
               <option value="plaintiff_mapping">Plaintiff mapping</option>
               <option value="filing_job">Filing job</option>
+              <option value="court_rule">Court rule</option>
             </select>
           </label>
           <label class="field">
@@ -3680,10 +3706,62 @@ const html = String.raw`<!doctype html>
       } else if (view === 'settings') {
         loadAccountSettings().catch(error => { document.getElementById('settingsMessage').textContent = error.message; });
         loadLibraryForms().catch(error => { document.getElementById('libraryMessage').textContent = error.message; });
+        loadCourtRules().catch(error => { document.getElementById('courtRuleMessage').textContent = error.message; });
       }
     }
 
     let accountSettingsBusy = false;
+    function courtRuleOptions(selected) {
+      return [['manual_review','Manual review'],['separate','Other - separate filing'],['connected_to_complaint','Connected to Complaint']]
+        .map(([value,label]) => '<option value="' + value + '"' + (value === selected ? ' selected' : '') + '>' + label + '</option>').join('');
+    }
+    async function loadCourtRules() {
+      const result = await api('/api/court-rules');
+      document.getElementById('courtRuleCourts').innerHTML = result.courts.map(court => '<option value="' + escapeHtml(court) + '"></option>').join('');
+      const root = document.getElementById('courtRuleList');
+      root.innerHTML = result.rules.length ? result.rules.map(rule =>
+        '<div class="court-rule-row" data-court-rule="' + escapeHtml(rule.id) + '">' +
+          '<div class="court-rule-name"><strong>' + escapeHtml(rule.courtName) + '</strong><span>' + escapeHtml(fmtDate(rule.createdAt)) + '</span></div>' +
+          '<label class="field"><span class="field-label">Supporting documents</span><select data-rule-relation>' + courtRuleOptions(rule.relation) + '</select></label>' +
+          '<label class="field"><span class="field-label">Exceptions / notes</span><input data-rule-notes maxlength="2000" value="' + escapeHtml(rule.notes) + '"></label>' +
+          '<div class="court-rule-actions"><button type="button" class="icon-button" data-save-rule title="Save court rule" aria-label="Save court rule">' + icon('save') + '</button>' +
+          '<button type="button" class="icon-button danger" data-disable-rule title="Disable court rule" aria-label="Disable court rule">' + icon('archive') + '</button></div></div>'
+      ).join('') : '<p class="muted">No court filing rules configured.</p>';
+      root.querySelectorAll('[data-court-rule]').forEach(row => {
+        const rule = result.rules.find(item => item.id === row.dataset.courtRule);
+        row.querySelector('[data-save-rule]').addEventListener('click', async event => {
+          if (!confirm('Confirm this rule for all supporting PDFs in ' + rule.courtName + '? Existing Drafts keep their pinned version until reviewed.')) return;
+          event.currentTarget.disabled = true;
+          try {
+            await api('/api/court-rules', {method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({courtName:rule.courtName,relation:row.querySelector('[data-rule-relation]').value,
+                notes:row.querySelector('[data-rule-notes]').value,confirmed:true,expectedId:rule.id})});
+            await loadCourtRules();
+            document.getElementById('courtRuleMessage').textContent = 'New rule version saved. Existing manual document choices are unchanged.';
+          } catch(error) { document.getElementById('courtRuleMessage').textContent=error.message; }
+          finally { if(row.isConnected) row.querySelector('[data-save-rule]').disabled=false; }
+        });
+        row.querySelector('[data-disable-rule]').addEventListener('click', async () => {
+          if (!confirm('Disable this rule? Drafts using it will need review before preparation.')) return;
+          try { await api('/api/court-rules/' + encodeURIComponent(rule.id),{method:'DELETE'}); await loadCourtRules(); }
+          catch(error) { document.getElementById('courtRuleMessage').textContent=error.message; }
+        });
+      });
+      renderIcons();
+    }
+    document.getElementById('courtRuleForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button=document.getElementById('courtRuleSave'); button.disabled=true;
+      try {
+        await api('/api/court-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+          courtName:document.getElementById('courtRuleCourt').value,relation:document.getElementById('courtRuleRelation').value,
+          notes:document.getElementById('courtRuleNotes').value,confirmed:document.getElementById('courtRuleConfirmed').checked,expectedId:null})});
+        document.getElementById('courtRuleForm').reset();
+        await loadCourtRules();
+        document.getElementById('courtRuleMessage').textContent='Court rule saved.';
+      } catch(error) { document.getElementById('courtRuleMessage').textContent=error.message; }
+      finally { button.disabled=false; }
+    });
     async function loadLibraryForms() {
       const forms = await api('/api/form-library');
       document.getElementById('libraryList').innerHTML = forms.length ?
@@ -4224,7 +4302,7 @@ const html = String.raw`<!doctype html>
       renderDraftDocuments(detail.documents || []);
       setDraftDirty(false);
       setDraftMobileMode(state.draftMobileMode);
-      const draftLocked = draft.filingStatus === 'queued' || [
+      const draftLocked = state.draftMutationBusy || draft.filingStatus === 'queued' || [
         'filing_in_progress',
         'filing_reconciliation',
         'filing_prepared',
@@ -4235,6 +4313,7 @@ const html = String.raw`<!doctype html>
           .forEach(control => { control.disabled = true; });
       }
       document.getElementById('draftReviewerNotes').disabled = draftLocked;
+      document.getElementById('closeDraftBtn').disabled = Boolean(state.draftMutationBusy);
       document.getElementById('draftRejectBtn').disabled = draftLocked;
       manualCopyButton.disabled = draftLocked;
       document.getElementById('draftApproveBtn').disabled =
@@ -4247,9 +4326,11 @@ const html = String.raw`<!doctype html>
     function updateDraftPreparationButton() {
       const draft = state.draftDetail && state.draftDetail.caseDraft;
       document.getElementById('draftPrepareBtn').disabled = !draft ||
+        state.draftMutationBusy ||
         draft.filingStatus === 'queued' ||
         !['ready_to_file', 'filing_failed'].includes(draft.status) ||
         !state.mifileConfig || !state.mifileConfig.ready ||
+        (JSON.parse(draft.normalizedDataJson || '{}').manualDocumentEdits && !draft.reviewedAt) ||
         draft.filingEligible === false ||
         (draft.validationIssues || []).some(issue => issue.severity === 'error');
     }
@@ -4294,7 +4375,7 @@ const html = String.raw`<!doctype html>
           '<div class="draft-filing-job-meta">' + escapeHtml(
             eligibilityIssues.length
               ? eligibilityIssues[0].message
-              : 'Approve this Draft, then prepare an unsubmitted MiFILE bundle.',
+              : 'Confirm the package before MiFILE preparation.',
           ) + '</div>' +
         '</div>';
         return;
@@ -4365,7 +4446,7 @@ const html = String.raw`<!doctype html>
     }
 
     async function refreshDraftFilingState() {
-      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty) return;
+      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty || state.draftMutationBusy) return;
       const draftId = state.selectedDraftId;
       const revision = state.draftEditRevision;
       const jobs = await api('/api/filing-jobs?caseDraftId=' +
@@ -4700,6 +4781,9 @@ const html = String.raw`<!doctype html>
       const moneyJudgment = document.querySelector(
         '[data-filing-field="moneyJudgmentRequested"]',
       );
+      document.querySelectorAll('[data-document-field="filingRelation"]').forEach(input => {
+        input.addEventListener('change', () => { input.dataset.reviewed = 'true'; });
+      });
       const claimAmount = document.querySelector('[data-filing-field="claimAmount"]');
       const syncClaimAmount = () => {
         if (!moneyJudgment || !claimAmount) return;
@@ -4981,6 +5065,8 @@ const html = String.raw`<!doctype html>
             '<option value="connected_to_complaint"' +
               (document.filingRelation === 'connected_to_complaint' ? ' selected' : '') + '>Connect to Complaint</option>' +
           '</select>' +
+          (document.filingRelationSource === 'court_rule' ? '<span class="draft-field-source">Court rule' +
+            (document.courtRule?.notes ? ': ' + escapeHtml(document.courtRule.notes) : '') + '</span>' : '') +
         '</label>' +
         (document.documentRole === 'primary_source'
           ? '<button type="button" class="draft-primary-toggle icon-button ' +
@@ -5072,7 +5158,7 @@ const html = String.raw`<!doctype html>
       );
       const draft = state.draftDetail && state.draftDetail.caseDraft;
       const canModifyDocuments = Boolean(
-        draft && draft.filingEligible !== false && draft.filingStatus !== 'queued' &&
+        draft && !state.draftMutationBusy && state.draftDetail.email.processingStatus !== 'processing' && draft.filingEligible !== false && draft.filingStatus !== 'queued' &&
         !['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
           .includes(draft.status),
       );
@@ -5081,7 +5167,7 @@ const html = String.raw`<!doctype html>
       primaryButton.innerHTML = icon('star') +
         (activeDocument && activeDocument.isPrimary
           ? 'Primary source'
-          : canBePrimary ? 'Use as primary' : 'Complaint required');
+          : canBePrimary ? 'Use as primary' : 'Not a Complaint');
       primaryButton.title = canBePrimary
         ? (activeDocument && activeDocument.isPrimary
           ? 'Primary data source'
@@ -5098,9 +5184,10 @@ const html = String.raw`<!doctype html>
       addButton.disabled = !canModifyDocuments;
       window.document.getElementById('draftLibraryBtn').disabled = !canModifyDocuments ||
         JSON.parse(draft?.normalizedDataJson || '{}').sourceKind !== 'new_filing_intake';
+      window.document.getElementById('draftCourtRuleBtn').disabled = !canModifyDocuments || !draft?.editableData?.courtName;
       replaceButton.disabled = !canModifyDocuments ||
-        !activeDocument || !activeDocument.oneDriveUrl || Boolean(activeDocument.formTemplate);
-      window.document.getElementById('draftRemoveFormBtn').disabled = !canModifyDocuments || !activeDocument?.formTemplate || activeDocument.status === 'retrying';
+        !activeDocument || activeDocument.status === 'retrying' || Boolean(activeDocument.formTemplate);
+      window.document.getElementById('draftRemoveFormBtn').disabled = !canModifyDocuments || !activeDocument || activeDocument.status === 'retrying';
       const documentState = window.document.getElementById('draftDocumentState');
       const needsDownload = activeDocument && !['uploaded', 'downloaded', 'replaced'].includes(activeDocument.status);
       documentState.innerHTML = needsDownload
@@ -5243,6 +5330,7 @@ const html = String.raw`<!doctype html>
             filingName: filingName ? filingName.value : '',
             filingType: filingType ? filingType.value : '',
             filingRelation: filingRelation ? filingRelation.value : 'unknown',
+            filingRelationReviewed: Boolean(filingRelation && filingRelation.dataset.reviewed === 'true'),
             requiredForFiling: required ? required.checked : true,
           };
         },
@@ -5340,18 +5428,20 @@ const html = String.raw`<!doctype html>
       }
       if (state.draftDirty) await saveDraft(true);
       if (action === 'replace' && !window.confirm(
-        'Replace the selected OneDrive PDF? Its current filename and link will be preserved.',
+        'Replace the selected PDF with this file? Existing OneDrive names and links are preserved. Complaint data will need to be extracted again.',
       )) return;
 
       const button = document.getElementById(
         action === 'replace' ? 'draftReplaceDocumentBtn' : 'draftAddDocumentBtn',
       );
+      state.draftMutationBusy = true;
+      renderDraftWorkspace();
       setButtonBusy(button, true, action === 'replace' ? 'Replacing' : 'Adding');
       try {
         const endpoint = action === 'replace'
           ? '/api/documents/' + encodeURIComponent(state.activeDraftDocumentId) + '/content'
           : '/api/drafts/' + encodeURIComponent(detail.caseDraft.id) + '/documents';
-        state.draftDetail = await api(endpoint, {
+        const updated = await api(endpoint, {
           method: action === 'replace' ? 'PUT' : 'POST',
           headers: {
             'Content-Type': 'application/pdf',
@@ -5359,6 +5449,8 @@ const html = String.raw`<!doctype html>
           },
           body: file,
         });
+        if (state.selectedDraftId !== detail.caseDraft.id) return;
+        state.draftDetail = updated;
         if (action === 'add') {
           const added = (state.draftDetail.documents || []).find(document =>
             !(detail.documents || []).some(existing => existing.id === document.id));
@@ -5372,7 +5464,13 @@ const html = String.raw`<!doctype html>
           : 'PDF added. Set its Filing Type and submission relation.');
       } finally {
         state.draftFileAction = null;
+        if (state.selectedDraftId === detail.caseDraft.id) {
+          try { state.draftDetail = await api('/api/drafts/' + encodeURIComponent(detail.caseDraft.id)); }
+          catch { /* Keep the last response if a refresh is temporarily unavailable. */ }
+        }
+        state.draftMutationBusy = false;
         setButtonBusy(button, false);
+        if (state.selectedDraftId) renderDraftWorkspace();
       }
     }
 
@@ -6458,13 +6556,26 @@ const html = String.raw`<!doctype html>
         renderDraftWorkspace();
       } catch (error) { showDraftError(error); }
     });
-    document.getElementById('draftRemoveFormBtn').addEventListener('click', async () => {
-      if (!confirm('Remove this library form from the Draft? Its OneDrive copy will not be deleted.')) return;
+    document.getElementById('draftCourtRuleBtn').addEventListener('click', async () => {
       try {
         if (state.draftDirty) await saveDraft(true);
-        state.draftDetail = await api('/api/drafts/' + encodeURIComponent(state.selectedDraftId) + '/library-documents/' + encodeURIComponent(state.activeDraftDocumentId), {method:'DELETE'});
+        state.draftDetail=await api('/api/drafts/'+encodeURIComponent(state.selectedDraftId)+'/court-rule',{method:'POST'});
+        renderDraftWorkspace(); showToast('Court rule applied. Manual submission choices were preserved.');
+      } catch(error) { showDraftError(error); }
+    });
+    document.getElementById('draftRemoveFormBtn').addEventListener('click', async () => {
+      if (!confirm('Remove this PDF from the Draft? Its OneDrive copy will not be deleted. A required document must be added again before preparation.')) return;
+      const draftId=state.selectedDraftId;
+      const documentId=state.activeDraftDocumentId;
+      try {
+        if (state.draftDirty) await saveDraft(true);
+        state.draftMutationBusy=true;
         renderDraftWorkspace();
+        const updated=await api('/api/drafts/' + encodeURIComponent(draftId) + '/documents/' + encodeURIComponent(documentId), {method:'DELETE'});
+        if(state.selectedDraftId===draftId) state.draftDetail=updated;
+        await loadDrafts(true);
       } catch (error) { showDraftError(error); }
+      finally{state.draftMutationBusy=false;if(state.selectedDraftId) renderDraftWorkspace();}
     });
     document.getElementById('draftReplaceDocumentBtn').addEventListener('click', () => {
       chooseDraftPdf('replace');
@@ -6671,6 +6782,27 @@ export function createAdminServer(
             }
             if (req.method === 'GET' && url.pathname === '/api/form-library') {
                 sendJson(res, 200, db.listLibraryForms()); return;
+            }
+            if (req.method === 'GET' && url.pathname === '/api/court-rules') {
+                sendJson(res,200,{rules:db.listCourtFilingRules(),courts:db.getKnownCourtNames()}); return;
+            }
+            if (req.method === 'POST' && url.pathname === '/api/court-rules') {
+                try {
+                    const input=JSON.parse(await readRequestBody(req));
+                    if (input.expectedId !== null && typeof input.expectedId !== 'string') throw new Error('Reload the court rule list before saving.');
+                    sendJson(res,201,db.saveCourtFilingRule(input));
+                } catch(error) { sendJson(res,422,{error:(error as Error).message}); }
+                return;
+            }
+            const courtRuleMatch=url.pathname.match(/^\/api\/court-rules\/([^/]+)$/);
+            if(req.method==='DELETE' && courtRuleMatch){
+                try { db.disableCourtFilingRule(decodeURIComponent(courtRuleMatch[1])); sendJson(res,200,{ok:true}); }
+                catch(error){sendJson(res,409,{error:(error as Error).message});} return;
+            }
+            const applyCourtRuleMatch=url.pathname.match(/^\/api\/drafts\/([^/]+)\/court-rule$/);
+            if(req.method==='POST' && applyCourtRuleMatch){
+                try{sendJson(res,200,db.applyCourtFilingRule(decodeURIComponent(applyCourtRuleMatch[1]),true));}
+                catch(error){sendJson(res,409,{error:(error as Error).message});} return;
             }
             if (req.method === 'POST' && url.pathname === '/api/drafts') {
                 const message = {id:'manual-intake:' + randomUUID(), subject:'New case - manual upload', receivedDateTime:new Date().toISOString()};
@@ -7168,30 +7300,11 @@ export function createAdminServer(
             );
             if (req.method === 'PUT' && documentContentMatch) {
                 const documentId = decodeURIComponent(documentContentMatch[1]);
-                const document = db.getDocumentAccess(documentId);
-                if (!document) {
-                    sendJson(res, 404, { error: 'Document not found' });
-                    return;
-                }
-                const detail = document.caseDraftId
-                    ? db.getDraftDetail(document.caseDraftId)
-                    : null;
-                if (detail?.documents.find(item => item.id === documentId)?.formTemplate) {
+                let context;
+                try { context = db.getDraftDocumentEditContext(documentId); }
+                catch (error) { sendJson(res, 409, { error: (error as Error).message }); return; }
+                if (context.document.formTemplate) {
                     sendJson(res, 409, { error: 'Remove the library document and add the correct form instead of replacing its pinned version.' }); return;
-                }
-                if (detail?.caseDraft?.filingEligible === false) {
-                    sendJson(res, 409, {
-                        error: 'Documents from an existing court filing cannot be replaced here',
-                    });
-                    return;
-                }
-                if (detail?.caseDraft && (detail.caseDraft.filingStatus === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully'].includes(
-                    detail.caseDraft.status,
-                ))) {
-                    sendJson(res, 409, {
-                        error: 'Documents cannot be replaced while this Draft is being filed or has already been prepared',
-                    });
-                    return;
                 }
                 const content = await readRequestBuffer(req, 25 * 1024 * 1024);
                 const validation = validatePdfBuffer(content);
@@ -7202,16 +7315,31 @@ export function createAdminServer(
                     return;
                 }
                 await inspectFilingPdf(content);
-                const sharedItem = await resolveSharedDriveItem(document.oneDriveUrl);
-                await replaceDriveItemContent(sharedItem.driveId, sharedItem.itemId, content);
-                const replaced = db.recordDocumentReplacement(documentId, {
-                    fileSize: content.length,
-                    mimeType: 'application/pdf',
-                });
-                if (document.caseDraftId && JSON.parse(replaced.caseDraft?.normalizedDataJson || '{}').sourceKind === 'new_filing_intake') {
-                    db.recordDocumentRecognition(documentId, await recognizeDocumentPdf(content, document.currentFilename || ''));
-                    sendJson(res, 200, db.refreshCaseDraftValidation(document.caseDraftId));
-                } else sendJson(res, 200, replaced);
+                const replacement = db.beginDocumentReplacement(documentId);
+                try {
+                    const document = replacement.document;
+                    const draftId = replacement.detail.caseDraft!.id;
+                    let uploaded;
+                    if (document.oneDriveUrl) {
+                        const sharedItem = await resolveSharedDriveItem(document.oneDriveUrl);
+                        await replaceDriveItemContent(sharedItem.driveId, sharedItem.itemId, content);
+                    } else {
+                        const data = JSON.parse(replacement.detail.caseDraft!.normalizedDataJson || '{}');
+                        const folder = await ensureIntakeFolder(data.intake.storageKey);
+                        const filename = intakeFileName(document.currentFilename || document.originalFilename ||
+                            uploadedPdfFilename(req.headers['x-file-name']), documentId);
+                        const file = await uploadFileBufferToFolder(folder.driveId, folder.itemId, filename, content);
+                        uploaded = { oneDriveUrl: await createFileLink(file.driveId, file.itemId), currentFilename: file.fileName,
+                            storagePath: `New filings/${data.intake.storageKey}/${file.fileName}` };
+                    }
+                    db.recordDocumentReplacement(documentId, {fileSize:content.length,mimeType:'application/pdf',token:replacement.token,...uploaded});
+                    db.recordDocumentRecognition(documentId, await recognizeDocumentPdf(content, uploadedPdfFilename(req.headers['x-file-name'])));
+                    db.refreshEmailAfterDocumentRetries(replacement.detail.email.id, draftId);
+                    sendJson(res, 200, await applyLibraryForms(db,draftId));
+                } catch (error) {
+                    db.failDocumentReplacement(documentId, replacement.token, error);
+                    sendJson(res, 502, {error:'PDF replacement could not be completed. Check the document error and replace the PDF again.'});
+                }
                 return;
             }
             if (req.method === 'GET' && documentContentMatch) {
@@ -7250,6 +7378,12 @@ export function createAdminServer(
             const addDraftDocumentMatch = url.pathname.match(
                 /^\/api\/drafts\/([^/]+)\/documents$/,
             );
+            const removeDraftDocumentMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/documents\/([^/]+)$/);
+            if (req.method === 'DELETE' && removeDraftDocumentMatch) {
+                try { sendJson(res, 200, db.removeDraftDocument(decodeURIComponent(removeDraftDocumentMatch[1]), decodeURIComponent(removeDraftDocumentMatch[2]))); }
+                catch (error) { sendJson(res, 409, {error:(error as Error).message}); }
+                return;
+            }
             if (req.method === 'POST' && addDraftDocumentMatch) {
                 const caseDraftId = decodeURIComponent(addDraftDocumentMatch[1]);
                 const detail = db.getDraftDetail(caseDraftId);
@@ -7286,38 +7420,32 @@ export function createAdminServer(
                     return;
                 }
                 await inspectFilingPdf(content);
-                const anchorItem = intake?.storageKey
-                    ? await ensureIntakeFolder(intake.storageKey).then(folder => ({
-                        driveId: folder.driveId, parentItemId: folder.itemId,
-                    }))
-                    : await resolveSharedDriveItem(anchor!.oneDriveUrl!);
-                if (!anchorItem.parentItemId) {
-                    sendJson(res, 409, { error: 'The OneDrive case folder could not be resolved' });
-                    return;
+                let currentIntake;
+                try { currentIntake = db.assertEditableIntake(caseDraftId); }
+                catch (error) { sendJson(res, 409, {error:(error as Error).message}); return; }
+                if (currentIntake.email.processingStatus === 'processing') {
+                    sendJson(res, 409, {error:'Wait for the incoming package to finish processing.'}); return;
                 }
                 const originalFilename = uploadedPdfFilename(req.headers['x-file-name']);
-                const fileName = intakeFileName(originalFilename, randomUUID());
-                const uploaded = await uploadFileBufferToFolder(
-                    anchorItem.driveId,
-                    anchorItem.parentItemId,
-                    fileName,
-                    content,
-                );
-                const oneDriveUrl = await createFileLink(uploaded.driveId, uploaded.itemId);
                 const addedDocumentId = db.addDocument({
-                    emailId: detail.email.id,
-                    caseDraftId,
-                    originalFilename,
-                    currentFilename: fileName,
-                    fileUrl: oneDriveUrl,
-                    oneDriveUrl,
-                    mimeType: 'application/pdf',
-                    fileSize: content.length,
-                    documentType: originalFilename.replace(/\.pdf$/i, ''),
-                    uploadSource: 'admin_draft_upload',
-                    status: 'uploaded',
-                    metadata: { addedFromDraftEditor: true },
+                    emailId:detail.email.id,caseDraftId,originalFilename,documentType:originalFilename.replace(/\.pdf$/i,''),
+                    uploadSource:'admin_draft_upload',status:'failed',metadata:{addedFromDraftEditor:true},
                 });
+                const reservation = db.beginDocumentReplacement(addedDocumentId);
+                try {
+                    const anchorItem = intake?.storageKey
+                        ? await ensureIntakeFolder(intake.storageKey).then(folder => ({driveId:folder.driveId,parentItemId:folder.itemId}))
+                        : await resolveSharedDriveItem(anchor!.oneDriveUrl!);
+                    if (!anchorItem.parentItemId) throw new Error('The OneDrive case folder could not be resolved');
+                    const fileName = intakeFileName(originalFilename, addedDocumentId);
+                    const uploaded = await uploadFileBufferToFolder(anchorItem.driveId,anchorItem.parentItemId,fileName,content);
+                    const oneDriveUrl = await createFileLink(uploaded.driveId,uploaded.itemId);
+                    db.recordDocumentReplacement(addedDocumentId,{fileSize:content.length,token:reservation.token,
+                        oneDriveUrl,currentFilename:uploaded.fileName,storagePath:`New filings/${intake?.storageKey || ''}/${uploaded.fileName}`});
+                } catch(error) {
+                    db.failDocumentReplacement(addedDocumentId,reservation.token,error);
+                    sendJson(res,502,{error:'The PDF upload failed. Its Draft record is retained; use Replace PDF to retry without adding a duplicate.'}); return;
+                }
                 const isIntake = JSON.parse(detail.caseDraft.normalizedDataJson || '{}').sourceKind === 'new_filing_intake';
                 if (isIntake) db.recordDocumentRecognition(addedDocumentId, await recognizeDocumentPdf(content, originalFilename));
                 const addedType = db.getDraftDetail(caseDraftId)?.documents.find(item => item.id === addedDocumentId)?.documentType;

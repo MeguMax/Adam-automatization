@@ -44,6 +44,22 @@ Selecting an unavailable document shows its download status, error, retry timing
 
 The MiFILE uploader requires an exact Filing Type option and stops if a requested Connected control is unavailable. It no longer selects a potentially different first option or silently skips a connection. Old queued payloads are checked again for unknown required answers and relationships before any external access. Temporary PDFs are removed even if OneDrive materialization fails partway through the package.
 
+### Removing and Replacing PDFs
+
+The trash icon removes the selected PDF from the Draft only. Its OneDrive copy is retained. Original email documents are archived in SQLite rather than recreated on the next inbox sync, and removed documents cannot be retried. Required-package checks still apply: removing a required PDF leaves a correction item until a suitable document is added. Library forms retain their separate version controls.
+
+**Replace PDF** also works for a failed document that has never reached OneDrive. Existing uploaded PDFs keep their filename and link while their contents are replaced. A first-time replacement upload uses the existing Draft document ID to keep its storage filename stable across retries. Failed uploads retain one repairable Draft record rather than requiring another Add PDFs action.
+
+During replacement the document is reserved, preparation is blocked, and its original attachment retry is retired. An interrupted or failed replacement requires another local replacement; neither the delayed retry worker nor email reprocessing restores the old attachment over the correction. Replacing or removing the primary Complaint clears its automatic fields and extraction result. Explicit manual corrections are preserved. Run **Extract fields** after replacing the Complaint, then review the result.
+
+Manual document additions, removals and replacements disable automatic preparation for that Draft. After correcting the package, use **Confirm package** and **Prepare in MiFILE**. Unchanged incoming packages can still use the existing automatic Unsubmitted preparation path. Queued, running, reconciliation-required, prepared and court-notification records cannot be modified through these document controls.
+
+### Court Filing Rules
+
+**Settings > Court filing rules** stores a confirmed rule for an exact court: **Other - separate filing**, **Connected to Complaint**, or **Manual review**. The known court list comes from saved cases and approved Local forms. No court rules are preloaded or inferred from court numbers. A rule is confirmed for all supporting PDFs; courts with document-specific exceptions should remain on Manual review until a more specific policy is supplied. Notes are displayed with the document's rule-derived submission choice.
+
+The worker applies a configured rule after intake and standard-form completion. Manual document choices are preserved. Each rule change creates a new version. Existing Draft documents keep their pinned version and require review if that version changes or is disabled. **Apply court rule** explicitly updates non-manual choices to the current rule. Changing the Draft's court clears an automatic choice from the previous court; a missing rule leaves the relationship unknown instead of assuming Other. Queued job payloads remain immutable snapshots, and prepared bundles are not changed.
+
 ## Reusable forms
 
 In **Settings > Form library**, upload the attorney-approved Advice PDF for all courts and a Local PDF for each exact MiFILE court name. Confirm the document type and court assignment before saving. No legal forms are preinstalled or downloaded from third parties.

@@ -21,11 +21,11 @@ export function testPdfFixture(text = 'Test filing document'): Buffer {
     return Buffer.from(content);
 }
 
-export function testComplaintFormFixture(): Buffer {
+export function testComplaintFormFixture(overrides: Record<number, string> = {}): Buffer {
     const values: Record<number, string> = { 1:'25th',5:'Example Property LLC',
         6:'Alex Attorney P70000\r100 Legal Avenue\rLincoln Park, MI 48146\r248 555 0199',
         7:'Morgan Tenant, and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146',
-        8:'On',9:'Off',32:'On',37:'1991.5' };
+        8:'On',9:'Off',32:'On',37:'1991.5', ...overrides };
     const fields = Object.entries(values);
     const refs = fields.map((_,index)=>`${index+7} 0 R`).join(' ');
     const stream = 'BT /F1 10 Tf 40 740 Td (DC 102a COMPLAINT, NONPAYMENT OF RENT) Tj 0 -14 Td (SUPPLEMENTAL COMPLAINT) Tj ET';

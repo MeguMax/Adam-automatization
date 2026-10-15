@@ -25,14 +25,17 @@ async function main() {
     const db = getWorkflowDatabase();
     const storedFiles = new Map<string, Buffer>();
     const drive = require('./oneDriveClient');
+    let rejectUpload = false;
     drive.ensureIntakeFolder = async () => ({ driveId: 'fixture-drive', itemId: 'fixture-folder' });
     drive.uploadFileBufferToFolder = async (_driveId: string, _folder: string, name: string, buffer: Buffer) => {
+        if(rejectUpload) throw new Error('Simulated OneDrive upload failure');
         storedFiles.set(name, buffer);
         return { driveId: 'fixture-drive', itemId: name, fileName: name };
     };
     drive.createFileLink = async (_driveId: string, itemId: string) => `https://onedrive.example/${encodeURIComponent(itemId)}`;
     drive.resolveSharedDriveItem = async (url: string) => ({ driveId: 'fixture-drive', itemId: decodeURIComponent(url.split('/').pop()!), parentItemId: 'fixture-folder', fileName: 'Advice.pdf' });
     drive.downloadDriveItemBuffer = async (_driveId: string, itemId: string) => storedFiles.get(itemId);
+    drive.replaceDriveItemContent = async (_driveId:string,itemId:string,buffer:Buffer) => { storedFiles.set(itemId,buffer); };
     const session = require('./mifileSession');
     let signInTests = 0;
     session.testMiFileCredentials = async (credentials: { password: string }) => {
@@ -45,6 +48,11 @@ async function main() {
     const draftId = db.createCaseDraft(email.id, buildFilingIntake(message, []));
     db.markEmailProcessed(email.id);
     db.refreshCaseDraftValidation(draftId);
+    const ruleCourt='MI Example County - 29th District Court';
+    const ruleMessage={id:'court-rule-example',subject:'NEW LT FILING - Court rules example'};
+    const ruleEmail=db.registerEmail(ruleMessage);
+    db.createCaseDraft(ruleEmail.id,{...buildFilingIntake(ruleMessage,[]),courtName:ruleCourt});
+    db.markEmailProcessed(ruleEmail.id);
     const notificationMessage = {
         id: 'filed-notification',
         subject: 'MiFILE - Document Filed 26-00001-LT, EXAMPLE OWNER V TENANT',
@@ -108,6 +116,30 @@ async function main() {
         await page.setViewportSize({ width: 1440, height: 1000 });
         await page.locator('#settingsTab').click();
         await page.waitForFunction(() => document.getElementById('intakeMailbox')?.textContent === 'intake@example.com');
+        await page.locator('#courtRuleCourt').fill(ruleCourt);
+        await page.locator('#courtRuleRelation').selectOption('connected_to_complaint');
+        await page.locator('#courtRuleNotes').fill('Attorney-confirmed example rule');
+        await page.locator('#courtRuleConfirmed').check();
+        await page.locator('#courtRuleSave').click();
+        await page.waitForFunction(() => document.getElementById('courtRuleMessage')?.textContent==='Court rule saved.');
+        const firstRule=db.listCourtFilingRules()[0];
+        assert.equal(firstRule.relation,'connected_to_complaint');
+        const ruleRow=page.locator('[data-court-rule="'+firstRule.id+'"]');
+        await ruleRow.locator('[data-rule-relation]').selectOption('separate');
+        page.once('dialog',dialog=>dialog.accept());
+        await ruleRow.locator('[data-save-rule]').click();
+        await page.waitForFunction(() => document.getElementById('courtRuleMessage')?.textContent?.includes('New rule version saved'));
+        assert.equal(db.listCourtFilingRules(true).length,2);
+        assert.equal(db.listCourtFilingRules()[0].relation,'separate');
+        await page.locator('.court-rules-section').screenshot({path:path.join(screenshots,'court-rules-desktop.png')});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.locator('.court-rules-section').screenshot({path:path.join(screenshots,'court-rules-mobile.png')});
+        await page.setViewportSize({width:1440,height:1000});
+        const currentRule=db.listCourtFilingRules()[0];
+        page.once('dialog',dialog=>dialog.accept());
+        await page.locator('[data-court-rule="'+currentRule.id+'"] [data-disable-rule]').click();
+        await page.waitForFunction(()=>document.getElementById('courtRuleList')?.textContent?.includes('No court filing rules configured'));
         await page.locator('#libraryFile').setInputFiles({ name: 'Standard Advice.pdf', mimeType: 'application/pdf', buffer: testPdfFixture('Advice of Rights and Information') });
         await page.locator('#libraryConfirmed').check();
         await page.locator('#libraryUploadBtn').click();
@@ -218,7 +250,7 @@ async function main() {
         await applied;
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 2);
         page.once('dialog', dialog => dialog.accept());
-        const removed = page.waitForResponse(response => response.url().includes('/library-documents/') && response.status() === 200);
+        const removed = page.waitForResponse(response => response.url().includes('/documents/') && response.request().method() === 'DELETE' && response.status() === 200);
         await page.locator('#draftRemoveFormBtn').click();
         await removed;
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 1);
@@ -328,6 +360,9 @@ async function main() {
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.status,'filing_prepared');
         assert.equal(db.listFilingJobs(draftId).length,1);
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
+        const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;
+        assert.equal((await context.request.put(`${url}/api/documents/${lockedDocument.id}/content`,{headers:{Origin:url},data:testComplaintFormFixture()})).status(),409);
+        assert.equal((await context.request.delete(`${url}/api/drafts/${draftId}/documents/${lockedDocument.id}`,{headers:{Origin:url}})).status(),409);
         await page.locator('#settingsTab').click();
         const localForm = db.listLibraryForms().find(form => form.role === 'local')!;
         page.once('dialog', dialog => dialog.accept());
@@ -367,6 +402,48 @@ async function main() {
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),true);
         await page.screenshot({path:path.join(screenshots,'draft-document-retry-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
+        page.once('dialog',dialog=>dialog.accept());
+        await page.locator('#draftReplaceDocumentBtn').click();
+        const repair=page.waitForResponse(response=>response.url().endsWith('/content') && response.request().method()==='PUT');
+        await page.locator('#draftDocumentFileInput').setInputFiles({name:'Corrected Other.pdf',mimeType:'application/pdf',buffer:testPdfFixture('DEMAND FOR POSSESSION NONPAYMENT OF RENT')});
+        assert.equal((await repair).status(),200);
+        await page.waitForFunction(() => document.getElementById('closeDraftBtn')?.hasAttribute('disabled') === false);
+        const repaired=db.getDraftDetail(manual.caseDraft.id)!.documents[0];
+        assert.equal(repaired.id,failedDocument);assert.equal(repaired.status,'replaced');assert.ok(repaired.oneDriveUrl);
+        assert.equal(repaired.sourceUrl,null);assert.equal(repaired.nextRetryAt,null);
+        for(const name of ['Morgan Tenant','Taylor Resident']){
+            const replaced=page.waitForResponse(response=>response.url().endsWith('/content') && response.request().method()==='PUT');
+            await page.locator('#draftReplaceDocumentBtn').click();
+            page.once('dialog',dialog=>dialog.accept());
+            await page.locator('#draftDocumentFileInput').setInputFiles({name:'Complaint.pdf',mimeType:'application/pdf',
+                buffer:testComplaintFormFixture({7:name+', and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146'})});
+            assert.equal((await replaced).status(),200);
+            await page.waitForFunction(()=>document.getElementById('closeDraftBtn')?.hasAttribute('disabled')===false);
+            assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction,null);
+            const extractedResponse=page.waitForResponse(response=>response.url().endsWith('/extract-complaint') && response.status()===200);
+            await page.locator('#draftExtractBtn').click();await extractedResponse;
+            await page.waitForFunction(()=>!document.getElementById('draftExtractBtn')?.classList.contains('loading'));
+            assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.filingData.defendants[0].displayName,name);
+        }
+        await page.screenshot({path:path.join(screenshots,'draft-complaint-replacement.png'),fullPage:true});
+        const oneDriveCount=storedFiles.size;
+        page.once('dialog',dialog=>dialog.accept());
+        const removeOriginal=page.waitForResponse(response=>response.request().method()==='DELETE' && response.url().includes('/documents/'+failedDocument));
+        await page.locator('#draftRemoveFormBtn').click();
+        assert.equal((await removeOriginal).status(),200);
+        await page.waitForFunction(id=>!document.querySelector('#draftDocumentSelect option[value="'+id+'"]'),failedDocument);
+        assert.equal(storedFiles.size,oneDriveCount);
+        const remaining=db.getDraftDetail(manual.caseDraft.id)!.documents.length;
+        rejectUpload=true;
+        await page.locator('#draftAddDocumentBtn').click();
+        const failedUpload=page.waitForResponse(response=>response.url().endsWith('/documents') && response.request().method()==='POST');
+        await page.locator('#draftDocumentFileInput').setInputFiles({name:'New Other.pdf',mimeType:'application/pdf',buffer:testPdfFixture('DEMAND FOR POSSESSION NONPAYMENT OF RENT')});
+        assert.equal((await failedUpload).status(),502);
+        await page.waitForFunction(() => document.getElementById('closeDraftBtn')?.hasAttribute('disabled') === false);
+        assert.equal(db.getDraftDetail(manual.caseDraft.id)!.documents.length,remaining+1);
+        assert.equal(db.getDraftDetail(manual.caseDraft.id)!.documents.find(doc=>doc.originalFilename==='New Other.pdf')!.status,'failed');
+        rejectUpload=false;
+        await page.screenshot({path:path.join(screenshots,'draft-upload-recovery.png'),fullPage:true});
         await page.locator('#closeDraftBtn').click();
         await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();
         assert.equal(await page.locator('#draftManualCopyBtn').isHidden(), true);

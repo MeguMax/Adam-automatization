@@ -81,5 +81,5 @@ export async function applyLibraryForms(db: WorkflowDatabase, draftId: string, d
         }
     }
     db.refreshEmailAfterDocumentRetries(detail.email.id, draftId);
-    return db.refreshCaseDraftValidation(draftId);
+    return db.applyCourtFilingRule(draftId);
 }

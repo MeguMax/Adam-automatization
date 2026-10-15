@@ -6,7 +6,7 @@ import type { ParsedEmailInfo } from './emailProcessor';
 import { DOCUMENT_LABELS, documentLabel, DocumentRecognition } from './documentRecognition';
 import { LibraryForm, FormRole, courtKey } from './formLibraryTypes';
 import { isProcessingReportSubject } from './processingReport';
-import { resolveCourt } from './courtForms';
+import { resolveCourt, districtCode } from './courtForms';
 import {
     ComplaintExtractionResult,
     isComplaintDocument,
@@ -303,6 +303,15 @@ export type FilingPackageRole =
     | 'fee'
     | 'unknown';
 export type DraftFilingRelation = 'separate' | 'connected_to_complaint' | 'unknown';
+export interface CourtFilingRule {
+    id: string;
+    courtName: string;
+    courtKey: string;
+    relation: 'separate' | 'connected_to_complaint' | 'manual_review';
+    notes: string;
+    active: number;
+    createdAt: string;
+}
 
 export type DraftPartyType = 'person' | 'entity';
 export type RelatedCivilAction = 'none' | 'previously_filed' | 'unknown';
@@ -362,6 +371,7 @@ export interface DraftDocumentFilingUpdate {
     filingRelation?: unknown;
     filingSequence?: unknown;
     requiredForFiling?: unknown;
+    filingRelationReviewed?: boolean;
 }
 
 export interface DraftDocumentAccess {
@@ -403,7 +413,8 @@ export interface DocumentRecordView {
     filingType: string | null;
     filingTypeSource: 'suggested' | 'complaint' | 'manual' | null;
     filingRelation: DraftFilingRelation;
-    filingRelationSource: 'suggested' | 'manual' | null;
+    filingRelationSource: 'suggested' | 'manual' | 'court_rule' | null;
+    courtRule?: { id: string; courtKey: string; relation: string; notes?: string; courtName?: string } | null;
     filingSequence: number | null;
     suggestedFilingSequence: number | null;
     requiredForFiling: boolean;
@@ -1005,7 +1016,9 @@ function inferredManualFilingFields(
     normalizedData: unknown,
 ): Set<DraftFilingDataKey> {
     const stored = storedManualFilingFields(normalizedData);
-    if (stored.size || complaintExtractionFromDraft(normalizedData)) return stored;
+    if (stored.size || complaintExtractionFromDraft(normalizedData) ||
+        (normalizedData && typeof normalizedData === 'object' &&
+            Array.isArray((normalizedData as Record<string, unknown>).manualFilingFields))) return stored;
 
     const extracted = draftFilingData(extractedData);
     const normalized = draftFilingData(normalizedData);
@@ -1120,6 +1133,10 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
             severity: 'error',
             message: 'Select the MiFILE court before preparing this filing.',
         });
+    }
+    if (values.courtName && filing.courtDistrict && /district court/i.test(values.courtName) &&
+        districtCode(values.courtName) !== districtCode(`${filing.courtDistrict} District Court`)) {
+        issues.push({field:'courtName',severity:'error',message:'The selected court does not match the Complaint district. Review the court and district number before preparation.'});
     }
     if (!values.caseTitle) {
         issues.push({
@@ -2447,6 +2464,15 @@ const migrations: Migration[] = [
             CREATE UNIQUE INDEX idx_active_form_slot ON filing_forms(role, court_key, slot_key) WHERE active = 1;
         `),
     },
+    {
+        version: 25,
+        name: 'court_ancillary_filing_rules',
+        up: db => db.exec(`CREATE TABLE court_filing_rules (
+            id TEXT PRIMARY KEY, court_name TEXT NOT NULL, court_key TEXT NOT NULL,
+            relation TEXT NOT NULL CHECK(relation IN ('separate', 'connected_to_complaint', 'manual_review')),
+            notes TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        ); CREATE UNIQUE INDEX idx_active_court_filing_rule ON court_filing_rules(court_key) WHERE active = 1;`),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2469,7 +2495,8 @@ export class WorkflowDatabase {
     getKnownCourtNames(): string[] {
         const rows = this.db.prepare(`SELECT DISTINCT json_extract(normalized_data_json, '$.courtName') AS name
             FROM case_drafts WHERE json_extract(normalized_data_json, '$.courtName') LIKE 'MI % District Court%'
-            UNION SELECT court_name FROM filing_forms WHERE role = 'local' AND active = 1`).all() as Array<{name:string}>;
+            UNION SELECT court_name FROM filing_forms WHERE role = 'local' AND active = 1
+            UNION SELECT court_name FROM court_filing_rules WHERE active = 1`).all() as Array<{name:string}>;
         return rows.map(row => row.name).filter(Boolean).sort();
     }
 
@@ -2478,6 +2505,7 @@ export class WorkflowDatabase {
             WHERE json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'
               AND c.status = 'ready_to_file' AND c.validation_status = 'passed' AND c.filing_status = 'not_started'
               AND COALESCE(json_extract(c.normalized_data_json, '$.intake.manual'), 0) = 0
+              AND COALESCE(json_extract(c.normalized_data_json, '$.manualDocumentEdits'), 0) = 0
               AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status = 'processed')
               AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = c.id)
             ORDER BY c.created_at LIMIT ?`).all(limit) as Array<{id:string}>;
@@ -2489,6 +2517,65 @@ export class WorkflowDatabase {
             queued++;
         }
         return queued;
+    }
+
+    listCourtFilingRules(includeInactive = false): CourtFilingRule[] {
+        return this.db.prepare(`SELECT id, court_name AS courtName, court_key AS courtKey, relation, notes, active, created_at AS createdAt
+            FROM court_filing_rules ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY court_name, created_at DESC`).all() as unknown as CourtFilingRule[];
+    }
+
+    saveCourtFilingRule(input: { courtName: string; relation: string; notes?: string; confirmed: boolean; expectedId?: string | null }): CourtFilingRule {
+        const courtName = this.getKnownCourtNames().find(name => courtKey(name) === courtKey(String(input.courtName || '')));
+        if (!courtName) throw new Error('Select the exact court from the known court list. Add its approved Local form first if it is missing.');
+        if (input.confirmed !== true) throw new Error('Confirm the court rule before saving it');
+        if (!['separate', 'connected_to_complaint', 'manual_review'].includes(input.relation)) throw new Error('Choose Other, Connected or Manual review');
+        const notes = String(input.notes || '').trim();
+        if (notes.length > 2000) throw new Error('Court rule notes must be 2000 characters or fewer');
+        const existing = this.listCourtFilingRules().find(rule => rule.courtKey === courtKey(courtName));
+        if (input.expectedId !== undefined && input.expectedId !== (existing?.id || null)) {
+            throw new Error('This court rule changed. Reload the rules before saving another version.');
+        }
+        if (existing?.relation === input.relation && existing.notes === notes) return existing;
+        const id = randomUUID();
+        this.runInTransaction(() => {
+            this.db.prepare('UPDATE court_filing_rules SET active = 0 WHERE court_key = ?').run(courtKey(courtName));
+            this.db.prepare(`INSERT INTO court_filing_rules (id,court_name,court_key,relation,notes,created_at)
+                VALUES (?,?,?,?,?,?)`).run(id,courtName,courtKey(courtName),input.relation,notes,nowIso());
+            this.insertAuditLog('court_rule',id,'court_filing_rule_saved',{courtName,relation:input.relation,previousVersion:existing?.id || null});
+        });
+        return this.listCourtFilingRules().find(rule => rule.id === id)!;
+    }
+
+    disableCourtFilingRule(id: string): void {
+        const rule = this.listCourtFilingRules().find(item => item.id === id);
+        if (!rule) throw new Error('Active court rule not found');
+        this.db.prepare('UPDATE court_filing_rules SET active = 0 WHERE id = ?').run(id);
+        this.insertAuditLog('court_rule',id,'court_filing_rule_disabled',{courtName:rule.courtName});
+    }
+
+    applyCourtFilingRule(draftId: string, replacePinned = false): EmailDetail {
+        const detail = this.assertEditableIntake(draftId);
+        const key = courtKey(detail.caseDraft!.editableData.courtName || '');
+        const rule = this.listCourtFilingRules().find(item => item.courtKey === key);
+        let changed = false;
+        this.runInTransaction(() => {
+            for (const document of detail.documents) {
+                if (document.packageRole !== 'ancillary' || document.filingRelationSource === 'manual') continue;
+                if (document.courtRule?.courtKey === key && (!replacePinned || document.courtRule.id === rule?.id)) continue;
+                if (!rule && !document.courtRule) continue;
+                const row = this.db.prepare('SELECT metadata_json FROM document_records WHERE id = ?').get(document.id) as {metadata_json:string|null};
+                const metadata = this.safeJson(row.metadata_json) || {};
+                const relation = rule && rule.relation !== 'manual_review' ? rule.relation : 'unknown';
+                if (rule) metadata.courtRule = {id:rule.id,courtKey:key,courtName:rule.courtName,relation:rule.relation,notes:rule.notes};
+                else delete metadata.courtRule;
+                this.db.prepare(`UPDATE document_records SET filing_relation = ?, filing_relation_source = ?, metadata_json = ?, updated_at = ? WHERE id = ?`)
+                    .run(relation,rule ? 'court_rule' : 'suggested',toJson(metadata),nowIso(),document.id);
+                this.insertAuditLog('document_record',document.id,'court_filing_rule_applied',{ruleId:rule?.id || null,courtName:detail.caseDraft!.editableData.courtName,relation});
+                changed = true;
+            }
+            if (changed) this.db.prepare('UPDATE case_drafts SET reviewed_at = NULL, updated_at = ? WHERE id = ?').run(nowIso(),draftId);
+        });
+        return this.refreshCaseDraftValidation(draftId);
     }
 
     listLibraryForms(): LibraryForm[] {
@@ -2558,7 +2645,8 @@ export class WorkflowDatabase {
         const label = DOCUMENT_LABELS[recognition.role];
         const metadata = { ...this.safeJson(row.metadata_json), recognition };
         this.db.prepare(`UPDATE document_records SET document_type = ?, filing_type = ?, filing_type_source = 'suggested',
-            filing_relation = ?, metadata_json = ?, updated_at = ? WHERE id = ?`).run(label,
+            filing_relation = CASE WHEN filing_relation_source IN ('court_rule','manual') THEN filing_relation ELSE ? END,
+            metadata_json = ?, updated_at = ? WHERE id = ?`).run(label,
             suggestMiFileFilingType(label, null), suggestedFilingRelation(label, null), toJson(metadata), nowIso(), documentId);
         if (recognition.role !== 'complaint') {
             this.db.prepare('UPDATE case_drafts SET primary_document_id = NULL WHERE id = ? AND primary_document_id = ?')
@@ -2578,6 +2666,102 @@ export class WorkflowDatabase {
         });
         this.refreshEmailAfterDocumentRetries(detail.email.id, draftId);
         return this.refreshCaseDraftValidation(draftId);
+    }
+
+    getDraftDocumentEditContext(documentId: string): { detail: EmailDetail; document: DocumentRecordView } {
+        const row = this.db.prepare('SELECT case_draft_id FROM document_records WHERE id = ? AND is_active = 1')
+            .get(documentId) as { case_draft_id: string } | undefined;
+        if (!row?.case_draft_id) throw new Error('Draft document not found');
+        const detail = this.assertEditableIntake(row.case_draft_id);
+        const document = detail.documents.find(item => item.id === documentId)!;
+        if (document.status === 'retrying' || detail.email.processingStatus === 'processing') {
+            throw new Error('Wait for the current document processing to finish before changing this PDF');
+        }
+        return { detail, document };
+    }
+
+    removeDraftDocument(draftId: string, documentId: string): EmailDetail {
+        const { detail, document } = this.getDraftDocumentEditContext(documentId);
+        if (detail.caseDraft!.id !== draftId) throw new Error('Document does not belong to this Draft');
+        if (document.formTemplate) {
+            this.removeLibraryDocument(draftId, documentId);
+            this.db.prepare(`UPDATE case_drafts SET normalized_data_json = json_set(normalized_data_json, '$.manualDocumentEdits', json('true')),
+                reviewed_at = NULL WHERE id = ?`).run(draftId);
+            return this.getDraftDetail(draftId)!;
+        }
+        this.runInTransaction(() => {
+            if (document.isPrimary) this.invalidateComplaintData(draftId);
+            this.db.prepare(`UPDATE document_records SET is_active = 0, status = 'archived',
+                required_for_filing = 0, next_retry_at = NULL, updated_at = ? WHERE id = ?`).run(nowIso(), documentId);
+            this.db.prepare(`UPDATE case_drafts SET primary_document_id = CASE WHEN primary_document_id = ? THEN NULL ELSE primary_document_id END,
+                normalized_data_json = json_set(normalized_data_json, '$.manualDocumentEdits', json('true')),
+                status = 'needs_review', reviewed_at = NULL, updated_at = ? WHERE id = ?`).run(documentId, nowIso(), draftId);
+            this.insertAuditLog('case_draft', draftId, 'draft_document_removed', {
+                documentId, filename: document.currentFilename || document.originalFilename,
+                oneDriveFilePreserved: document.oneDriveUrl, originalSource: document.sourceUrl,
+            });
+        });
+        this.refreshEmailAfterDocumentRetries(detail.email.id, draftId);
+        return this.refreshCaseDraftValidation(draftId);
+    }
+
+    beginDocumentReplacement(documentId: string) {
+        const context = this.getDraftDocumentEditContext(documentId);
+        if (context.document.formTemplate) throw new Error('Remove the library document and add the correct form instead of replacing its pinned version.');
+        const token = randomUUID();
+        const timestamp = nowIso();
+        this.runInTransaction(() => {
+            const row = this.db.prepare('SELECT metadata_json FROM document_records WHERE id = ?').get(documentId) as { metadata_json: string | null };
+            const metadata = this.safeJson(row.metadata_json) || {};
+            // A replacement must never be overwritten later by a retry of the original attachment.
+            metadata.replacement = { token, startedAt: timestamp, originalSource: context.document.sourceUrl || metadata.replacement?.originalSource || null };
+            this.db.prepare(`UPDATE document_records SET status = 'retrying', source_url = NULL,
+                next_retry_at = NULL, last_retry_at = ?, error_message = NULL, metadata_json = ?, updated_at = ? WHERE id = ?`)
+                .run(timestamp, toJson(metadata), timestamp, documentId);
+            if (context.document.isPrimary) this.invalidateComplaintData(context.detail.caseDraft!.id);
+            this.db.prepare(`UPDATE case_drafts SET status = 'needs_review', validation_status = 'failed',
+                normalized_data_json = json_set(normalized_data_json, '$.manualDocumentEdits', json('true')),
+                reviewed_at = NULL, updated_at = ? WHERE id = ?`).run(timestamp, context.detail.caseDraft!.id);
+            this.insertAuditLog('document_record', documentId, 'draft_replacement_started', { token });
+        });
+        return { ...context, token };
+    }
+
+    failDocumentReplacement(documentId: string, token: string, error: unknown): void {
+        const row = this.db.prepare('SELECT metadata_json, case_draft_id FROM document_records WHERE id = ? AND is_active = 1')
+            .get(documentId) as { metadata_json: string | null; case_draft_id: string } | undefined;
+        if (!row || this.safeJson(row.metadata_json)?.replacement?.token !== token) return;
+        this.db.prepare(`UPDATE document_records SET status = 'failed', next_retry_at = NULL,
+            error_message = ?, updated_at = ? WHERE id = ?`).run(
+                `PDF replacement failed: ${normalizeError(error)}. Replace the PDF again; the original attachment will not be retried.`, nowIso(), documentId);
+        this.insertAuditLog('document_record', documentId, 'draft_replacement_failed', { error: normalizeError(error) });
+        const email = this.getDraftDetail(row.case_draft_id)!.email;
+        this.refreshEmailAfterDocumentRetries(email.id, row.case_draft_id);
+        this.refreshCaseDraftValidation(row.case_draft_id);
+    }
+
+    private invalidateComplaintData(draftId: string): void {
+        const row = this.db.prepare('SELECT extracted_data_json, normalized_data_json FROM case_drafts WHERE id = ?')
+            .get(draftId) as { extracted_data_json: string | null; normalized_data_json: string | null };
+        const extracted = this.safeJson(row.extracted_data_json) || {};
+        const normalized = this.safeJson(row.normalized_data_json) || {};
+        const extraction = complaintExtractionFromDraft(normalized);
+        const manual = inferredManualFilingFields(extracted, normalized);
+        const filing = draftFilingData(normalized);
+        const originalFiling = draftFilingData(extracted);
+        for (const key of DRAFT_FILING_DATA_KEYS) {
+            if (!manual.has(key) && extraction?.appliedFields.includes(key)) (filing as any)[key] = originalFiling[key];
+        }
+        const sources = draftFieldSources(extracted, normalized);
+        const originalFields = draftEditableData(extracted);
+        if (!extracted.caseTitle && normalized.caseTitle === `${normalized.plaintiff} V ${normalized.defendant}`) normalized.caseTitle = null;
+        for (const field of EDITABLE_DRAFT_FIELDS) if (sources[field] === 'complaint') normalized[field] = originalFields[field];
+        normalized.filingData = filing;
+        normalized.manualFilingFields = Array.from(manual);
+        delete normalized.complaintExtraction;
+        delete normalized.complaintExtractionError;
+        this.db.prepare('UPDATE case_drafts SET normalized_data_json = ?, reviewed_at = NULL WHERE id = ?')
+            .run(toJson(normalized), draftId);
     }
 
     getRuntimeSetting(key: string): string | null {
@@ -3029,8 +3213,10 @@ export class WorkflowDatabase {
             .prepare(`
                 UPDATE document_records
                 SET status = 'failed',
-                    error_message = 'Retry worker stopped before the document finished; retry rescheduled',
-                    next_retry_at = ?,
+                    error_message = CASE WHEN json_extract(metadata_json, '$.replacement.token') IS NOT NULL
+                        THEN 'PDF replacement was interrupted. Replace the PDF again; no original attachment retry was scheduled.'
+                        ELSE 'Retry worker stopped before the document finished; retry rescheduled' END,
+                    next_retry_at = CASE WHEN json_extract(metadata_json, '$.replacement.token') IS NOT NULL THEN NULL ELSE ? END,
                     updated_at = ?
                 WHERE status = 'retrying'
                   AND last_retry_at IS NOT NULL
@@ -3046,8 +3232,10 @@ export class WorkflowDatabase {
             .prepare(`
                 UPDATE document_records
                 SET status = 'failed',
-                    error_message = 'Worker restarted before the document finished; retry rescheduled',
-                    next_retry_at = ?,
+                    error_message = CASE WHEN json_extract(metadata_json, '$.replacement.token') IS NOT NULL
+                        THEN 'PDF replacement was interrupted. Replace the PDF again; no original attachment retry was scheduled.'
+                        ELSE 'Worker restarted before the document finished; retry rescheduled' END,
+                    next_retry_at = CASE WHEN json_extract(metadata_json, '$.replacement.token') IS NOT NULL THEN NULL ELSE ? END,
                     updated_at = ?
                 WHERE status = 'retrying'
             `)
@@ -3388,12 +3576,11 @@ export class WorkflowDatabase {
                     SUM(CASE WHEN status = 'uploaded' OR one_drive_url IS NOT NULL THEN 1 ELSE 0 END) AS uploaded_count,
                     SUM(CASE WHEN status = 'not_downloadable' THEN 1 ELSE 0 END) AS not_downloadable_count,
                     SUM(CASE
-                        WHEN source_url IS NOT NULL
-                         AND status IN ('pending', 'failed', 'retry_queued', 'retrying')
+                        WHEN status IN ('pending', 'failed', 'retry_queued', 'retrying')
                         THEN 1 ELSE 0
                     END) AS outstanding_count
                 FROM document_records
-                WHERE email_id = ?
+                WHERE email_id = ? AND is_active = 1
             `)
             .get(emailId) as {
                 uploaded_count: number | null;
@@ -3431,6 +3618,9 @@ export class WorkflowDatabase {
             if (caseDraftId) {
                 this.setCaseDraftStatus(caseDraftId, 'needs_review', 'warnings', 'not_started');
             }
+        } else if (caseDraftId && this.safeJson(this.getDraftDetail(caseDraftId)?.caseDraft?.normalizedDataJson || null)?.sourceKind === 'new_filing_intake') {
+            this.markEmailProcessed(emailId);
+            this.refreshCaseDraftValidation(caseDraftId);
         }
     }
 
@@ -4820,15 +5010,16 @@ export class WorkflowDatabase {
                     : suggestedFilingType
                         ? 'suggested'
                         : null,
-                filingRelation: row.filing_relation === 'unknown' && row.filing_relation_source === 'manual'
+                filingRelation: row.filing_relation === 'unknown' && ['manual','court_rule'].includes(row.filing_relation_source)
                     ? 'unknown'
                     : row.filing_relation === 'separate' ||
                     row.filing_relation === 'connected_to_complaint'
                         ? row.filing_relation
                         : suggestedRelation,
                 filingRelationSource: row.filing_relation
-                    ? (row.filing_relation_source === 'manual' ? 'manual' : 'suggested')
+                    ? (row.filing_relation_source === 'manual' ? 'manual' : row.filing_relation_source === 'court_rule' ? 'court_rule' : 'suggested')
                     : 'suggested',
+                courtRule: this.safeJson(row.metadata_json)?.courtRule || null,
                 filingSequence: row.filing_sequence === null
                     ? suggestedSequence
                     : Number(row.filing_sequence),
@@ -4859,6 +5050,7 @@ export class WorkflowDatabase {
             return left.createdAt.localeCompare(right.createdAt);
         });
         const manualPackage = isManualFilingPackage(normalizedDraftData);
+        const activeRuleIds = new Set(this.listCourtFilingRules().map(rule => rule.id));
         const validationIssues = caseDraft && !validateNewCaseSource(normalizedDraftData, email.subject, email.sender).length
             ? [
                 ...validateDraftData(normalizedDraftData),
@@ -4878,6 +5070,12 @@ export class WorkflowDatabase {
                     document.formTemplate.courtKey !== courtKey(normalizedDraftData?.courtName || '')).map(document => ({
                         field: `document.${document.id}`, severity: 'error' as const,
                         message: 'The library Local form belongs to another court. Remove it and add the form for the selected court.',
+                    })),
+                ...documentViews.filter(document => document.requiredForFiling && document.filingRelationSource === 'court_rule' &&
+                    document.courtRule && (document.courtRule.courtKey !== courtKey(normalizedDraftData?.courtName || '') ||
+                    !activeRuleIds.has(document.courtRule!.id))).map(document => ({
+                        field:`document.${document.id}`,severity:'error' as const,
+                        message:'The court rule used for this document changed or was disabled. Apply the current court rule or confirm this document\'s submission choice.',
                     })),
             ]
             : [];
@@ -5040,6 +5238,9 @@ export class WorkflowDatabase {
         const allowedStatuses = new Set(['ready_to_file', 'filing_failed']);
         if (!allowedStatuses.has(detail.caseDraft.status)) {
             throw new Error('Approve the Draft before preparing it in MiFILE');
+        }
+        if (this.safeJson(detail.caseDraft.normalizedDataJson)?.manualDocumentEdits && !detail.caseDraft.reviewedAt) {
+            throw new Error('Approve the Draft after reviewing the changed documents before preparing it in MiFILE');
         }
         const active = this.db
             .prepare(`
@@ -5547,6 +5748,7 @@ export class WorkflowDatabase {
                         reviewer_notes = ?,
                         status = ?,
                         validation_status = ?,
+                        reviewed_at = CASE WHEN ? THEN NULL ELSE reviewed_at END,
                         updated_at = ?
                     WHERE id = ?
                 `)
@@ -5556,6 +5758,7 @@ export class WorkflowDatabase {
                     notes,
                     status,
                     validationStatus,
+                    changed ? 1 : 0,
                     timestamp,
                     caseDraftId,
                 );
@@ -5565,7 +5768,7 @@ export class WorkflowDatabase {
                 if (!documentId) throw new Error('Every document mapping requires an id');
                 const existingDocument = this.db
                     .prepare(`
-                        SELECT id, document_type, current_filename, original_filename
+                        SELECT id, document_type, current_filename, original_filename, filing_relation, filing_relation_source
                         FROM document_records
                         WHERE id = ?
                           AND case_draft_id = ?
@@ -5620,6 +5823,9 @@ export class WorkflowDatabase {
                     : packageRole === 'fee'
                         ? false
                         : mapping.requiredForFiling !== false;
+                const relationSource = (existingDocument as any).filing_relation_source === 'court_rule' &&
+                    mapping.filingRelationReviewed !== true && (existingDocument as any).filing_relation === filingRelation
+                    ? 'court_rule' : 'manual';
 
                 this.db
                     .prepare(`
@@ -5641,7 +5847,7 @@ export class WorkflowDatabase {
                         filingType,
                         filingType ? 'manual' : null,
                         filingRelation,
-                        'manual',
+                        relationSource,
                         requiredForFiling ? 1 : 0,
                         timestamp,
                         documentId,
@@ -5742,11 +5948,12 @@ export class WorkflowDatabase {
 
     recordDocumentReplacement(
         documentId: string,
-        input: { fileSize: number; mimeType?: string | null },
+        input: { fileSize: number; mimeType?: string | null; token?: string;
+            oneDriveUrl?: string; currentFilename?: string; storagePath?: string },
     ): EmailDetail {
         const row = this.db.prepare(`
             SELECT d.case_draft_id, d.email_id, c.primary_document_id,
-                   c.extracted_data_json, c.normalized_data_json
+                   c.extracted_data_json, c.normalized_data_json, d.metadata_json
             FROM document_records d
             LEFT JOIN case_drafts c ON c.id = d.case_draft_id
             WHERE d.id = ? AND d.is_active = 1
@@ -5757,33 +5964,40 @@ export class WorkflowDatabase {
                 primary_document_id: string | null;
                 extracted_data_json: string | null;
                 normalized_data_json: string | null;
+                metadata_json: string | null;
             }
             | undefined;
         if (!row) throw new Error('Document not found');
+        if (row.case_draft_id) this.assertEditableIntake(row.case_draft_id);
+        const metadata = this.safeJson(row.metadata_json) || {};
+        if (input.token && metadata.replacement?.token !== input.token) throw new Error('The PDF replacement is no longer current');
+        if (metadata.replacement) metadata.lastReplacement = metadata.replacement;
+        delete metadata.replacement;
+        delete metadata.recognition;
+        delete metadata.courtRule;
         const timestamp = nowIso();
         this.runInTransaction(() => {
             this.db.prepare(`
                 UPDATE document_records
                 SET status = 'replaced', file_size = ?, mime_type = ?,
-                    filing_type_source = 'suggested',
+                    filing_type_source = 'suggested', filing_type = NULL,
+                    filing_relation = 'unknown', filing_relation_source = 'suggested',
+                    one_drive_url = COALESCE(?, one_drive_url), file_url = COALESCE(?, file_url),
+                    current_filename = COALESCE(?, current_filename), storage_path = COALESCE(?, storage_path),
+                    source_url = NULL, next_retry_at = NULL, metadata_json = ?,
                     error_message = NULL, updated_at = ?
                 WHERE id = ?
-            `).run(input.fileSize, input.mimeType || 'application/pdf', timestamp, documentId);
+            `).run(input.fileSize, input.mimeType || 'application/pdf', input.oneDriveUrl || null, input.oneDriveUrl || null,
+                input.currentFilename || null, input.storagePath || null, toJson(metadata), timestamp, documentId);
             if (row.case_draft_id) {
                 if (row.primary_document_id === documentId) {
-                    const extracted = this.safeJson(row.extracted_data_json) || {};
-                    const normalized = this.safeJson(row.normalized_data_json) || {};
-                    delete extracted.complaintExtraction;
-                    delete normalized.complaintExtraction;
+                    this.invalidateComplaintData(row.case_draft_id);
                     this.db.prepare(`
                         UPDATE case_drafts
-                        SET extracted_data_json = ?, normalized_data_json = ?,
-                            status = 'needs_review', validation_status = 'warnings',
+                        SET status = 'needs_review', validation_status = 'warnings',
                             filing_status = 'not_started', updated_at = ?
                         WHERE id = ?
                     `).run(
-                        toJson(extracted),
-                        toJson(normalized),
                         timestamp,
                         row.case_draft_id,
                     );
@@ -6185,6 +6399,7 @@ export class WorkflowDatabase {
             if (Array.isArray(oldNormalizedObject.manualFilingFields)) {
                 nextNormalized.manualFilingFields = oldNormalizedObject.manualFilingFields;
             }
+            if (oldNormalizedObject.manualDocumentEdits === true) nextNormalized.manualDocumentEdits = true;
             if (oldNormalizedObject.complaintExtractionError) {
                 nextNormalized.complaintExtractionError = oldNormalizedObject.complaintExtractionError;
             }
@@ -6866,14 +7081,15 @@ export class WorkflowDatabase {
         const existing = this.db
             .prepare(`
                 SELECT
+                    SUM(CASE WHEN is_active = 0 THEN 1 ELSE 0 END) AS removed_count,
                     SUM(CASE WHEN status IN ('pending', 'not_downloadable') AND upload_source = 'parsed_email' THEN 1 ELSE 0 END) AS pending_count,
                     SUM(CASE WHEN status IN ('uploaded', 'failed', 'not_downloadable') OR one_drive_url IS NOT NULL THEN 1 ELSE 0 END) AS result_count
                 FROM document_records
                 WHERE case_draft_id = ?
             `)
-            .get(caseDraftId) as { pending_count: number | null; result_count: number | null };
+            .get(caseDraftId) as { pending_count: number | null; result_count: number | null; removed_count: number | null };
 
-        if (Number(existing.result_count ?? 0) > 0) {
+        if (Number(existing.result_count ?? 0) > 0 || Number(existing.removed_count ?? 0) > 0) {
             return;
         }
 
