@@ -94,6 +94,11 @@ async function main() {
         return route.abort();
     });
     const page = await context.newPage();
+    const clickDocumentTool = async (id: string) => {
+        const menu=page.locator('#draftDocumentTools');
+        if (!await menu.evaluate(element=>(element as HTMLDetailsElement).open)) await menu.locator('summary').click();
+        await page.locator('#'+id).click();
+    };
     const errors: string[] = [];
     page.on('pageerror', error => errors.push(error.message));
     try {
@@ -231,6 +236,7 @@ async function main() {
             }
             await route.continue();
         });
+        await page.locator('#draftDataTab').click();
         const delayedRefresh = page.evaluate(() => (window as any).refreshDraftFilingState());
         await requested;
         await page.locator('[data-draft-field="courtName"]').fill('MI Example County - 25th District Court');
@@ -246,12 +252,12 @@ async function main() {
         await page.locator('#draftDocumentSelect').selectOption(local.id);
         assert.equal(await page.locator('#draftReplaceDocumentBtn').isDisabled(), true);
         const applied = page.waitForResponse(response => response.url().endsWith('/standard-forms') && response.status() === 200);
-        await page.locator('#draftLibraryBtn').click();
+        await clickDocumentTool('draftLibraryBtn');
         await applied;
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 2);
         page.once('dialog', dialog => dialog.accept());
         const removed = page.waitForResponse(response => response.url().includes('/documents/') && response.request().method() === 'DELETE' && response.status() === 200);
-        await page.locator('#draftRemoveFormBtn').click();
+        await clickDocumentTool('draftRemoveFormBtn');
         await removed;
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 1);
         assert.equal(storedFiles.size, 2, 'Removing a library document must not delete its OneDrive copy');
@@ -267,6 +273,7 @@ async function main() {
         assert.ok(!extracted.validationIssues.some(issue=>issue.message.startsWith('No PDF attachments were received.')));
         const addressIssue = extracted.validationIssues.findIndex(issue => issue.field === 'filingData.plaintiff.address1');
         assert.ok(addressIssue >= 0, 'Missing Plaintiff street address must point to that exact field');
+        await page.locator('#draftReviewTab').click();
         await page.locator('[data-review-issue="' + addressIssue + '"]').click();
         const plaintiffAddress = page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
         assert.equal(await plaintiffAddress.evaluate(element => element === document.activeElement), true);
@@ -276,8 +283,28 @@ async function main() {
         await page.locator('[data-party-role="plaintiff"] [data-party-field="city"]').fill('Lincoln Park');
         await page.locator('[data-party-role="plaintiff"] [data-party-field="state"]').fill('MI');
         await page.locator('[data-party-role="plaintiff"] [data-party-field="postalCode"]').fill('48146');
+        const partyExtras=page.locator('[data-disclosure="plaintiff-0"]');
+        await partyExtras.locator('summary').click();
+        await partyExtras.locator('[data-party-field="phone"]').fill('2485550101');
+        assert.equal(await page.locator('[data-party-role="plaintiff"] [data-party-field="firstName"]').isHidden(),true);
+        let releaseSave!:()=>void;
+        let saveRequested!:()=>void;
+        const saveGate=new Promise<void>(resolve=>{releaseSave=resolve;});
+        const saving=new Promise<void>(resolve=>{saveRequested=resolve;});
+        await context.route(draftRoute,async route=>{
+            if(route.request().method()==='PATCH'){saveRequested();await saveGate;}
+            await route.continue();
+        });
         await page.locator('#draftSaveBtn').click();
+        await saving;
+        assert.equal(await plaintiffAddress.isDisabled(),true,'Inputs are locked while their snapshot is being saved');
+        assert.equal(await page.locator('#closeDraftBtn').isDisabled(),true);
+        releaseSave();
         await page.waitForFunction(() => !document.querySelector('[data-review-field="filingData.plaintiff.address1"]')?.hasAttribute('aria-invalid'));
+        await context.unroute(draftRoute);
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.filingData.plaintiff!.phone,'2485550101');
+        assert.equal(await partyExtras.evaluate(element=>(element as HTMLDetailsElement).open),true);
+        assert.equal(await page.locator('#draftDataTab').getAttribute('aria-selected'),'true');
         assert.match(await plaintiffAddress.locator('..').innerText(), /Manual/);
         await page.locator('[data-complaint-source]').first().click();
         assert.equal(await page.locator('#draftDocumentSelect').inputValue(), extracted.primaryDocumentId);
@@ -286,10 +313,12 @@ async function main() {
         await page.screenshot({path:path.join(screenshots,'complaint-fields-desktop.png'),fullPage:true});
         await page.setViewportSize({width:390,height:844});
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),true);
+        await page.locator('#draftDocumentTools summary').click();
         assert.equal(await page.locator('.draft-source-actions button').evaluateAll(buttons => buttons.every(button => {
             const rect=button.getBoundingClientRect();
             return rect.left>=0 && rect.right<=window.innerWidth && button.clientWidth>=button.scrollWidth;
         })),true,'Every mobile document action must fit its panel');
+        await page.locator('#draftDocumentTools summary').click();
         const complaintPreview=page.frames().find(frame=>frame.url().includes('/preview'))!;
         await complaintPreview.waitForFunction(() => {
             const canvas=document.querySelector('canvas');
@@ -317,6 +346,11 @@ async function main() {
         assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue =>
             issue.field === 'document.' + ancillary.id && issue.severity === 'error'));
         assert.equal(await page.locator('#draftApproveBtn').isDisabled(), true);
+        await page.locator('#draftDocumentsTab').click();
+        await page.locator('[data-disclosure="document-' + ancillary.id + '"] summary').click();
+        await page.evaluate(()=>(window as any).renderDraftWorkspace());
+        assert.equal(await page.locator('#draftDocumentsTab').getAttribute('aria-selected'),'true');
+        assert.equal(await page.locator('[data-disclosure="document-' + ancillary.id + '"]').evaluate(element=>(element as HTMLDetailsElement).open),true);
         const ancillaryRow = page.locator('[data-draft-document-id="' + ancillary.id + '"]');
         await ancillaryRow.locator('[data-document-field="filingRelation"]').selectOption('separate');
         // Explicit review also covers filename-only recognition in a small synthetic fixture.
@@ -326,16 +360,36 @@ async function main() {
         const complete = db.getDraftDetail(draftId)!;
         assert.equal(complete.documents.length, 6);
         assert.deepEqual(complete.caseDraft!.validationIssues, []);
-        await page.locator('#draftApproveBtn').click();
-        await page.waitForFunction(() => document.getElementById('draftPrepareBtn')?.hasAttribute('disabled') === false);
-        page.once('dialog', dialog => dialog.accept());
+        await page.locator('#draftReviewTab').click();
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.reviewedAt,null);
+        assert.equal(await page.locator('#draftReviewTab').getAttribute('aria-selected'),'true');
+        await page.frameLocator('#draftPdfViewer iframe').locator('canvas').waitFor({state:'visible'});
+        await page.frameLocator('#draftPdfViewer iframe').locator('#message').waitFor({state:'hidden'});
+        await page.screenshot({path:path.join(screenshots,'draft-guided-review-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        await page.locator('[data-draft-mobile-mode="fields"]').click();
+        await page.screenshot({path:path.join(screenshots,'draft-guided-review-mobile.png'),fullPage:true});
+        assert.equal(await page.locator('#queueTab').isVisible(),true,'Main navigation remains available in the mobile editor');
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        assert.equal(await page.locator('#draftPrepareBtn').evaluate(element=>element.getBoundingClientRect().bottom<=innerHeight),true,'The primary action stays inside the mobile viewport');
+        await page.setViewportSize({width:1440,height:1000});
+        // Cancel is side-effect free; a second click approves and queues together.
         await page.locator('#draftPrepareBtn').click();
+        await page.locator('#draftConfirmDialog').waitFor({state:'visible'});
+        assert.match(await page.locator('#draftConfirmMessage').innerText(),/No payment or court submission/);
+        await page.locator('#draftConfirmDialog [value="cancel"]').click();
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.reviewedAt,null);
+        assert.equal(db.listFilingJobs(draftId).length,0);
+        await page.locator('#draftPrepareBtn').click();
+        await page.locator('#draftConfirmAccept').click();
         await page.waitForFunction(() => document.getElementById('draftFilingJobPanel')?.textContent?.includes('Queued'));
         await page.waitForFunction(() => !document.getElementById('draftPrepareBtn')?.classList.contains('loading'));
         const job = db.listFilingJobs(draftId)[0];
         assert.equal(job.payload!.documents.length,6,'Preparation must contain the full package, not just its Complaint');
         assert.equal(job.mode,'prepare');
-        assert.equal(await page.locator('#draftPrepareBtn').isDisabled(),true);
+        assert.equal(await page.locator('#draftPrepareBtn').innerText(),'View progress');
+        await page.locator('#draftPrepareBtn').click();
+        assert.equal(db.listFilingJobs(draftId).length,1);
         assert.equal((await context.request.post(`${url}/api/drafts/${draftId}/filing-jobs`,{headers:{Origin:url},data:{mode:'prepare'}})).status(),409);
         assert.equal(db.listFilingJobs(draftId).length,1);
         await page.evaluate(() => {
@@ -353,12 +407,13 @@ async function main() {
         assert.equal(db.recoverInterruptedFilingJobs(),1);
         await page.evaluate(() => (window as any).refreshDraftFilingState());
         await page.locator('[data-reconcile-filing-job="found"]').waitFor();
-        assert.equal(await page.locator('#draftPrepareBtn').isDisabled(),true);
-        page.once('dialog',dialog=>dialog.accept());
+        assert.equal(await page.locator('#draftPrepareBtn').innerText(),'Check result');
         await page.locator('[data-reconcile-filing-job="found"]').click();
+        await page.locator('#draftConfirmAccept').click();
         await page.waitForFunction(() => document.getElementById('draftFilingJobPanel')?.textContent?.includes('Prepared'));
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.status,'filing_prepared');
         assert.equal(db.listFilingJobs(draftId).length,1);
+        await page.locator('#draftReviewTab').click();
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;
         assert.equal((await context.request.put(`${url}/api/documents/${lockedDocument.id}/content`,{headers:{Origin:url},data:testComplaintFormFixture()})).status(),409);
@@ -383,8 +438,8 @@ async function main() {
         assert.equal(manual.caseDraft.status, 'needs_review');
         assert.equal(db.queueValidatedIntakes(), 0);
         await page.locator('#draftWorkspaceView').waitFor({state:'visible'});
-        assert.equal(await page.locator('#draftApproveBtn').innerText(), 'Confirm package');
-        assert.equal(await page.locator('#draftPrepareBtn').innerText(), 'Prepare in MiFILE');
+        assert.equal((await page.locator('#draftApproveBtn').textContent())?.trim(), 'Confirm package');
+        assert.equal(await page.locator('#draftPrepareBtn').innerText(), 'Review corrections');
         const failedDocument = db.addDocument({emailId:manual.email.id,caseDraftId:manual.caseDraft.id,
             currentFilename:'Unavailable Other.pdf',documentType:'Other',status:'failed',
             sourceUrl:'email-attachment://qa/Unavailable.pdf',uploadSource:'test',errorMessage:'Simulated PDF download timeout'});
@@ -403,7 +458,7 @@ async function main() {
         await page.screenshot({path:path.join(screenshots,'draft-document-retry-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
         page.once('dialog',dialog=>dialog.accept());
-        await page.locator('#draftReplaceDocumentBtn').click();
+        await clickDocumentTool('draftReplaceDocumentBtn');
         const repair=page.waitForResponse(response=>response.url().endsWith('/content') && response.request().method()==='PUT');
         await page.locator('#draftDocumentFileInput').setInputFiles({name:'Corrected Other.pdf',mimeType:'application/pdf',buffer:testPdfFixture('DEMAND FOR POSSESSION NONPAYMENT OF RENT')});
         assert.equal((await repair).status(),200);
@@ -413,7 +468,7 @@ async function main() {
         assert.equal(repaired.sourceUrl,null);assert.equal(repaired.nextRetryAt,null);
         for(const name of ['Morgan Tenant','Taylor Resident']){
             const replaced=page.waitForResponse(response=>response.url().endsWith('/content') && response.request().method()==='PUT');
-            await page.locator('#draftReplaceDocumentBtn').click();
+            await clickDocumentTool('draftReplaceDocumentBtn');
             page.once('dialog',dialog=>dialog.accept());
             await page.locator('#draftDocumentFileInput').setInputFiles({name:'Complaint.pdf',mimeType:'application/pdf',
                 buffer:testComplaintFormFixture({7:name+', and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146'})});
@@ -421,7 +476,7 @@ async function main() {
             await page.waitForFunction(()=>document.getElementById('closeDraftBtn')?.hasAttribute('disabled')===false);
             assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction,null);
             const extractedResponse=page.waitForResponse(response=>response.url().endsWith('/extract-complaint') && response.status()===200);
-            await page.locator('#draftExtractBtn').click();await extractedResponse;
+            await clickDocumentTool('draftExtractBtn');await extractedResponse;
             await page.waitForFunction(()=>!document.getElementById('draftExtractBtn')?.classList.contains('loading'));
             assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.filingData.defendants[0].displayName,name);
         }
@@ -429,7 +484,7 @@ async function main() {
         const oneDriveCount=storedFiles.size;
         page.once('dialog',dialog=>dialog.accept());
         const removeOriginal=page.waitForResponse(response=>response.request().method()==='DELETE' && response.url().includes('/documents/'+failedDocument));
-        await page.locator('#draftRemoveFormBtn').click();
+        await clickDocumentTool('draftRemoveFormBtn');
         assert.equal((await removeOriginal).status(),200);
         await page.waitForFunction(id=>!document.querySelector('#draftDocumentSelect option[value="'+id+'"]'),failedDocument);
         assert.equal(storedFiles.size,oneDriveCount);

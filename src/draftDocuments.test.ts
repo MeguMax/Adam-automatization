@@ -40,6 +40,44 @@ function fixture() {
     return {db,parsed,email,draftId,complaint,ancillary,add,close(){db.close();fs.rmSync(directory,{recursive:true,force:true});}};
 }
 
+test('one confirmation reviews and queues a complete package, rejects duplicates and stale snapshots',()=>{
+    const f=fixture();
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingRelation:'separate',filingType:'Other'}]);
+        const before=f.db.getDraftDetail(f.draftId)!.caseDraft!;
+        assert.equal(before.reviewedAt,null);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true,'stale-version'),/Draft changed/);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
+        const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true,before.updatedAt);
+        assert.equal(job.mode,'prepare');
+        assert.equal(job.payload!.documents.length,6);
+        assert.ok(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Resolve or complete/);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,1);
+    } finally { f.close(); }
+});
+
+test('combined confirmation cannot approve an incomplete package or enable final submission',()=>{
+    const f=fixture();
+    try {
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve/);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'submit' as any,'admin','admin',true),/Final court submission is disabled/);
+    } finally { f.close(); }
+});
+
+test('combined confirmation rolls back review if payload creation fails',()=>{
+    const f=fixture();
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingRelation:'separate',filingType:'Other'}]);
+        f.db.buildFilingPayload=()=>{throw new Error('Simulated snapshot failure');};
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/snapshot failure/);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { f.close(); }
+});
+
 test('legacy failures after creating a case form require reconciliation on migration',()=>{
     const f=fixture();
     const filename=f.db.getPath();

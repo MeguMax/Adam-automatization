@@ -45,7 +45,7 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-15-mifile-live-fees-recovery-v39';
+const ADMIN_BUILD_ID = '2026-10-16-guided-draft-review-v40';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3052,6 +3052,86 @@ const html = String.raw`<!doctype html>
     .settings-layout { max-width: 850px; padding: 24px; }
     .draft-panel-toolbar { flex: 0 0 auto; }
     .draft-pdf-viewer iframe { min-height: 0; }
+    .draft-workspace-shell { border-radius: 4px; box-shadow: none; min-height: 600px; }
+    .draft-workspace { grid-template-columns: minmax(0, 1.15fr) minmax(440px, 1fr); }
+    .draft-workspace-header { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+    .draft-workspace-actions { flex-wrap: nowrap; }
+    .draft-tools-menu { position: relative; }
+    .draft-tools-menu > summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); background: #fff; }
+    .draft-tools-menu > summary::-webkit-details-marker { display: none; }
+    .draft-tools-menu[open] > summary { background: #e9edef; }
+    .draft-tools-items { position: absolute; z-index: 25; top: calc(100% + 5px); right: 0; display: grid; width: 230px; max-width: calc(100vw - 44px); padding: 6px; gap: 3px; background: #fff; border: 1px solid var(--line); border-radius: 4px; box-shadow: 0 6px 18px #18212b22; }
+    .draft-tools-items button { width: 100%; justify-content: flex-start; border-color: transparent; white-space: normal; font-size: 12px; min-height: 36px; padding: 7px 9px; }
+    .draft-tools-items button:hover { background: #f0f3f4; }
+    .draft-preview-actions { display: flex; gap: 6px; align-items: center; }
+    .draft-preview-actions .draft-tools-items { left: 0; right: auto; }
+    .draft-panel-toolbar { gap: 8px; padding: 10px; }
+    .draft-document-select { flex: 1 1 100%; }
+    .draft-fields-panel { overflow: hidden; }
+    .draft-fields-heading { min-height: 44px; padding: 10px 16px; background: #fff; }
+    .draft-section-tabs { display: flex; gap: 0; padding: 0 12px; border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+    .draft-section-tabs button { flex: 1; padding: 11px 6px; min-width: 0; min-height: 42px; border: 0; border-radius: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .draft-section-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 700; }
+    .draft-section-tabs button { transition: none; }
+    .toast-region.draft-toast-region { top: 74px; bottom: auto; }
+    #draftDocumentCount { font-size: 11px; color: var(--muted); }
+    #draftFieldsForm { flex: 1; min-height: 0; overflow: auto; padding: 18px 16px; }
+    .draft-next-action { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); padding: 12px 16px; background: #f8faf9; flex: 0 0 auto; }
+    .draft-next-action > div { min-width: 0; }
+    .draft-next-action strong, .draft-next-action span { display: block; overflow-wrap: anywhere; }
+    .draft-next-action strong { font-size: 12px; }
+    .draft-next-action span { font-size: 11px; color: var(--muted); margin-top: 3px; }
+    #draftPrepareBtn { max-width: 100%; white-space: normal; min-width: 150px; justify-content: center; }
+    .draft-overview-row { padding: 13px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+    .draft-overview-row > div { min-width: 0; }
+    .draft-overview-row small, .draft-overview-row span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; white-space: pre-line; overflow-wrap: anywhere; }
+    .draft-overview-row strong { font-size: 13px; overflow-wrap: anywhere; }
+    .draft-overview-row small { font-size: 10px; margin: 0 0 5px; font-weight: 650; text-transform: uppercase; }
+    .draft-overview-files { display: grid; gap: 0; margin-top: 18px; }
+    .draft-overview-file { display: flex; align-items: center; gap: 9px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+    .draft-overview-file > svg { flex: 0 0 16px; width: 16px; height: 16px; color: var(--good); }
+    .draft-overview-file.needs-review > svg { color: var(--warn); }
+    .draft-overview-file > span { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+    .draft-overview-file small { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }
+    .draft-field-section { margin-bottom: 20px; }
+    .draft-field-source:empty { display: none; }
+    .draft-optional { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 10px; }
+    .draft-optional > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--muted); padding-bottom: 12px; }
+    .draft-optional.wide { grid-column: 1 / -1; }
+    .draft-doc-details { border-bottom: 1px solid var(--line); padding: 0; }
+    .draft-doc-details > summary { cursor: pointer; display: flex; gap: 8px; padding: 13px 0; align-items: center; list-style: none; }
+    .draft-doc-details > summary::-webkit-details-marker { display: none; }
+    .draft-doc-details > summary > span { flex: 1; min-width: 0; }
+    .draft-doc-details > summary strong { display: block; font-size: 12px; overflow-wrap: anywhere; }
+    .draft-doc-details > summary small { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
+    .draft-doc-details > summary svg { width: 15px; height: 15px; flex: 0 0 auto; }
+    .draft-doc-details[open] > summary > svg { transform: rotate(90deg); }
+    .draft-document-mapping { border: 0; border-radius: 0; padding: 5px 0 14px; background: transparent; }
+    .draft-confirm-dialog { border: 1px solid var(--line); border-radius: 6px; padding: 24px; width: 460px; max-width: calc(100vw - 24px); max-height: calc(100dvh - 32px); overflow: auto; color: var(--text); }
+    .draft-confirm-dialog::backdrop { background: #1e242a66; }
+    .draft-confirm-dialog h2 { font-size: 18px; margin: 0 0 12px; }
+    .draft-confirm-dialog p { font-size: 13px; line-height: 1.65; white-space: pre-line; }
+    .draft-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+    @media (max-width: 1080px) { .draft-workspace { grid-template-columns: minmax(0, 1fr) minmax(390px, 1fr); } }
+    @media (max-width: 820px) {
+      .draft-workspace { display: block; }
+      body.draft-editing header.app-header > .header-actions { display: none; }
+      .draft-workspace-header { grid-template-columns: auto minmax(0, 1fr) auto; }
+      .draft-workspace-actions .draft-tools-items button { width: 100%; font-size: 12px; padding: 7px 9px; }
+      .draft-fields-panel.mobile-active { overflow: hidden; }
+      .draft-workspace-shell { height: calc(100dvh - 116px); min-height: 0; }
+    }
+    @media (max-width: 620px) {
+      .draft-panel-toolbar { flex-direction: row; flex-wrap: wrap; align-items: center; }
+      .draft-document-select { flex: 1 1 100%; }
+      .draft-document-links { width: auto; margin-left: auto; }
+      .draft-source-actions { display: grid; grid-template-columns: 1fr; width: 230px; }
+      #draftFieldsForm { padding: 12px; }
+      .draft-next-action { flex-wrap: wrap; padding: 10px 12px; gap: 8px; }
+      .draft-next-action > div { flex: 1 1 100%; }
+      #draftPrepareBtn { width: 100%; }
+      .draft-workspace-shell { height: calc(100dvh - 116px); }
+    }
     .settings-section { padding: 0 0 28px; margin-bottom: 24px; border-bottom: 1px solid var(--line); }
     .settings-section h2 { font-size: 18px; margin: 0 0 20px; }
     .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
@@ -3288,16 +3368,20 @@ const html = String.raw`<!doctype html>
           </div>
           <div id="draftWorkspaceStatuses" class="draft-workspace-statuses"></div>
           <div class="draft-workspace-actions">
+            <button id="draftSaveBtn" type="button" title="Save changes"><i data-lucide="save"></i>Save</button>
+            <details class="draft-tools-menu" id="draftActionsMenu">
+              <summary class="icon-button" title="More case actions" aria-label="More case actions"><i data-lucide="ellipsis"></i></summary>
+              <div class="draft-tools-items">
             <button id="draftManualCopyBtn" class="hidden" type="button" title="Create a separate manual filing package from this notification"><i data-lucide="copy-plus"></i>Use as manual package</button>
             <button id="draftRejectBtn" class="danger" type="button"><i data-lucide="x"></i>Reject</button>
             <button id="draftApproveBtn" type="button"><i data-lucide="check-check"></i>Approve</button>
-            <button id="draftPrepareBtn" type="button"><i data-lucide="upload-cloud"></i>Prepare in MiFILE</button>
-            <button id="draftSaveBtn" class="primary" type="button"><i data-lucide="save"></i>Save changes</button>
+              </div>
+            </details>
           </div>
         </div>
         <div class="draft-mobile-switch" role="group" aria-label="Draft workspace view">
           <button type="button" data-draft-mobile-mode="document" class="active"><i data-lucide="file-text"></i>Document</button>
-          <button type="button" data-draft-mobile-mode="fields"><i data-lucide="clipboard-list"></i>Fields</button>
+          <button type="button" data-draft-mobile-mode="fields"><i data-lucide="clipboard-list"></i>Review</button>
         </div>
         <div class="draft-workspace">
           <section id="draftDocumentPanel" class="draft-document-panel">
@@ -3306,14 +3390,19 @@ const html = String.raw`<!doctype html>
                 <span>Document</span>
                 <select id="draftDocumentSelect" aria-label="Preview document"></select>
               </label>
-              <div class="draft-source-actions">
+              <div class="draft-preview-actions">
+                <button id="draftAddDocumentBtn" type="button" title="Add one or more PDFs to this Draft"><i data-lucide="file-plus-2"></i>Add PDFs</button>
+                <details class="draft-tools-menu" id="draftDocumentTools">
+                  <summary class="icon-button" title="Document tools" aria-label="Document tools"><i data-lucide="ellipsis"></i></summary>
+                  <div class="draft-source-actions draft-tools-items">
                 <button id="draftPrimaryBtn" type="button" title="Use the selected document as the primary source"><i data-lucide="star"></i>Primary source</button>
                 <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
-                <button id="draftAddDocumentBtn" type="button" title="Add one or more PDFs to this Draft"><i data-lucide="file-plus-2"></i>Add PDFs</button>
                 <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
                 <button id="draftCourtRuleBtn" type="button" title="Apply the current rule to documents without a manual submission choice"><i data-lucide="list-checks"></i>Apply court rule</button>
                 <button id="draftRemoveFormBtn" class="icon-button danger" type="button" title="Remove PDF from Draft only" aria-label="Remove PDF from Draft"><i data-lucide="trash-2"></i></button>
                 <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF or upload a corrected file"><i data-lucide="replace"></i>Replace PDF</button>
+                  </div>
+                </details>
                 <input id="draftDocumentFileInput" class="hidden" type="file" accept="application/pdf,.pdf" multiple>
               </div>
               <div class="draft-document-links">
@@ -3327,23 +3416,46 @@ const html = String.raw`<!doctype html>
           <section id="draftFieldsPanel" class="draft-fields-panel">
             <div class="draft-fields-heading">
               <div>
-                <strong>Filing fields</strong>
-                <span>Review extracted values before approval</span>
+                <strong id="draftSectionHeading">Package review</strong>
               </div>
               <span id="draftUnsavedBadge" class="unsaved-badge hidden">Unsaved</span>
             </div>
+            <nav class="draft-section-tabs" aria-label="Case review sections" role="tablist">
+              <button id="draftReviewTab" type="button" role="tab" data-draft-tab="review" aria-controls="draftReviewPane">Review</button>
+              <button id="draftDataTab" type="button" role="tab" data-draft-tab="data" aria-controls="draftDataPane">Case data</button>
+              <button id="draftDocumentsTab" type="button" role="tab" data-draft-tab="documents" aria-controls="draftDocumentsPane">Documents <span id="draftDocumentCount"></span></button>
+              <button id="draftActivityTab" type="button" role="tab" data-draft-tab="activity" aria-controls="draftActivityPane">Activity</button>
+            </nav>
             <form id="draftFieldsForm">
+              <div id="draftReviewPane" data-draft-pane="review" role="tabpanel" aria-labelledby="draftReviewTab">
+                <div id="draftPreparationStatus"></div>
               <div id="draftValidationSummary"></div>
+                <div id="draftReviewOverview"></div>
+              </div>
+              <div id="draftActivityPane" data-draft-pane="activity" role="tabpanel" aria-labelledby="draftActivityTab" class="hidden">
               <div id="draftFilingJobPanel"></div>
-              <div id="draftFieldGroups"></div>
               <label class="draft-notes-field">
                 <span>Reviewer notes</span>
                 <textarea id="draftReviewerNotes" placeholder="Internal review notes"></textarea>
               </label>
+              </div>
+              <div id="draftFieldGroups"></div>
             </form>
+            <div class="draft-next-action">
+              <div><strong id="draftNextActionTitle"></strong><span id="draftNextActionNote"></span></div>
+              <button id="draftPrepareBtn" class="primary" type="button"><i data-lucide="check-check"></i>Confirm &amp; prepare</button>
+            </div>
           </section>
         </div>
       </div>
+      <dialog id="draftConfirmDialog" class="draft-confirm-dialog" aria-labelledby="draftConfirmTitle" aria-describedby="draftConfirmMessage">
+        <form method="dialog">
+          <h2 id="draftConfirmTitle"></h2>
+          <p id="draftConfirmMessage"></p>
+          <div id="draftConfirmSummary"></div>
+          <div class="draft-confirm-actions"><button value="cancel">Cancel</button><button id="draftConfirmAccept" class="primary" value="confirm">Confirm</button></div>
+        </form>
+      </dialog>
     </section>
     <section id="settingsPane" class="full-span hidden settings-layout">
       <section class="settings-section">
@@ -3523,6 +3635,8 @@ const html = String.raw`<!doctype html>
       draftDirty: false,
       draftEditRevision: 0,
       draftMobileMode: 'document',
+      draftSection: 'review',
+      draftMutationBusy: false,
       editingMappingId: null,
       view: 'queue',
       pagination: { page: 1, pageSize: 50, totalItems: 0, totalPages: 1 },
@@ -3674,7 +3788,13 @@ const html = String.raw`<!doctype html>
     }
 
     function setView(view) {
+      if (state.draftMutationBusy) {
+        showToast('Please wait for the current operation to finish.');
+        return;
+      }
       state.view = view;
+      document.body.classList.toggle('draft-editing', view === 'drafts' && Boolean(state.selectedDraftId));
+      document.getElementById('toastRegion').classList.toggle('draft-toast-region', view === 'drafts' && Boolean(state.selectedDraftId));
       document.getElementById('queuePane').classList.toggle('hidden', view !== 'queue');
       document.getElementById('detailPane').classList.toggle('hidden', view !== 'queue');
       document.getElementById('draftsPane').classList.toggle('hidden', view !== 'drafts');
@@ -4249,6 +4369,7 @@ const html = String.raw`<!doctype html>
       const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
       if (!detail.caseDraft) throw new Error('Draft data is not available');
       state.selectedDraftId = draftId;
+      state.draftSection = 'review';
       state.draftDetail = detail;
       state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
         encodeURIComponent(draftId));
@@ -4262,6 +4383,8 @@ const html = String.raw`<!doctype html>
           : (detail.documents && detail.documents[0] ? detail.documents[0].id : null);
       document.getElementById('draftListView').classList.add('hidden');
       document.getElementById('draftWorkspaceView').classList.remove('hidden');
+      document.body.classList.add('draft-editing');
+      document.getElementById('toastRegion').classList.add('draft-toast-region');
       renderDraftWorkspace();
     }
 
@@ -4273,6 +4396,8 @@ const html = String.raw`<!doctype html>
       state.activeDraftDocumentId = null;
       state.draftDirty = false;
       document.getElementById('draftWorkspaceView').classList.add('hidden');
+      document.body.classList.remove('draft-editing');
+      document.getElementById('toastRegion').classList.remove('draft-toast-region');
       document.getElementById('draftListView').classList.remove('hidden');
       loadDrafts(true).catch(showDraftError);
     }
@@ -4288,12 +4413,9 @@ const html = String.raw`<!doctype html>
       document.getElementById('draftWorkspaceSubject').textContent =
         detail.email.subject || '(no subject)';
       document.getElementById('draftWorkspaceStatuses').innerHTML =
-        statusPill(draft.status) + validationPill(draft.validationStatus) +
-        statusPill(draft.filingStatus);
+        statusPill(draft.status);
       document.getElementById('draftApproveBtn').innerHTML = icon('check-check') +
         'Confirm package';
-      document.getElementById('draftPrepareBtn').innerHTML = icon('upload-cloud') +
-        'Prepare in MiFILE';
       const manualCopyButton = document.getElementById('draftManualCopyBtn');
       manualCopyButton.classList.add('hidden');
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
@@ -4309,7 +4431,7 @@ const html = String.raw`<!doctype html>
         'filed_successfully',
       ].includes(draft.status);
       if (draftLocked) {
-        document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source])')
+        document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source]):not([data-preview-draft-document])')
           .forEach(control => { control.disabled = true; });
       }
       document.getElementById('draftReviewerNotes').disabled = draftLocked;
@@ -4325,14 +4447,116 @@ const html = String.raw`<!doctype html>
 
     function updateDraftPreparationButton() {
       const draft = state.draftDetail && state.draftDetail.caseDraft;
-      document.getElementById('draftPrepareBtn').disabled = !draft ||
-        state.draftMutationBusy ||
-        draft.filingStatus === 'queued' ||
-        !['ready_to_file', 'filing_failed'].includes(draft.status) ||
-        !state.mifileConfig || !state.mifileConfig.ready ||
-        (JSON.parse(draft.normalizedDataJson || '{}').manualDocumentEdits && !draft.reviewedAt) ||
-        draft.filingEligible === false ||
-        (draft.validationIssues || []).some(issue => issue.severity === 'error');
+      if (!draft) return;
+      const button = document.getElementById('draftPrepareBtn');
+      const issues = draft.validationIssues || [];
+      const errors = issues.filter(issue => issue.severity === 'error').length;
+      const prepared = ['filing_prepared', 'filed_successfully'].includes(draft.status);
+      const filed = draft.status === 'filed_successfully';
+      const unavailable = draft.filingEligible === false || draft.status === 'rejected';
+      const reconcile = draft.status === 'filing_reconciliation';
+      const running = draft.filingStatus === 'queued' || draft.status === 'filing_in_progress';
+      const ready = state.mifileConfig && state.mifileConfig.ready;
+      const title = unavailable ? (draft.status === 'rejected' ? 'Package rejected' : 'Court notification') :
+        filed ? 'Filed in MiFILE' : prepared ? 'Saved in MiFILE' : reconcile ? 'Check MiFILE before retrying' :
+        running ? 'Preparation in progress' : state.draftDirty ? 'Changes not saved' :
+        errors ? errors + (errors === 1 ? ' correction needed' : ' corrections needed') :
+        !ready ? 'MiFILE account needs attention' : 'Ready for your confirmation';
+      document.getElementById('draftNextActionTitle').textContent = title;
+      document.getElementById('draftNextActionNote').textContent = prepared
+        ? filed ? 'Court filing recorded. Open MiFILE for details.' : 'Unsubmitted only. Nothing has been sent to the court.'
+        : running ? 'You can leave this page. Preparation continues in the background.'
+        : 'Destination: MiFILE Unsubmitted. No payment or court submission.';
+      const label = unavailable ? (draft.status === 'rejected' ? 'Rejected' : 'Download history only') :
+        prepared ? 'Open MiFILE' : reconcile ? 'Check result' : running ? 'View progress' :
+        state.draftDirty ? 'Save & check' : errors ? 'Review corrections' : !ready ? 'Account settings' :
+        draft.status === 'filing_failed' ? 'Retry preparation' : 'Confirm & prepare';
+      button.innerHTML = icon(prepared ? 'external-link' : reconcile ? 'search' : running ? 'activity' :
+        state.draftDirty ? 'save' : errors ? 'arrow-right' : !ready ? 'settings' : 'check-check') + escapeHtml(label);
+      button.disabled = state.draftMutationBusy || draft.filingEligible === false || draft.status === 'rejected';
+    }
+
+    function setDraftSection(section, scroll = false) {
+      if (!['review', 'data', 'documents', 'activity'].includes(section)) return;
+      state.draftSection = section;
+      document.querySelectorAll('[data-draft-tab]').forEach(button => {
+        const selected = button.dataset.draftTab === section;
+        button.setAttribute('aria-selected', String(selected));
+        button.tabIndex = selected ? 0 : -1;
+      });
+      document.querySelectorAll('[data-draft-pane]').forEach(pane =>
+        pane.classList.toggle('hidden', pane.dataset.draftPane !== section));
+      document.getElementById('draftSectionHeading').textContent = {
+        review: 'Package review', data: 'Case data', documents: 'Filing documents', activity: 'Preparation & activity',
+      }[section];
+      if (scroll) document.getElementById('draftFieldsForm').scrollTop = 0;
+    }
+
+    function confirmDraftAction(title, message, label, summary = '') {
+      const dialog = document.getElementById('draftConfirmDialog');
+      if (dialog.open) return Promise.resolve(false);
+      document.getElementById('draftConfirmTitle').textContent = title;
+      document.getElementById('draftConfirmMessage').textContent = message;
+      document.getElementById('draftConfirmSummary').innerHTML = summary;
+      document.getElementById('draftConfirmAccept').textContent = label;
+      dialog.returnValue = '';
+      const previousFocus = document.activeElement;
+      return new Promise(resolve => {
+        dialog.addEventListener('close', () => {
+          if (previousFocus && previousFocus.isConnected) previousFocus.focus();
+          resolve(dialog.returnValue === 'confirm');
+        }, { once: true });
+        dialog.showModal();
+      });
+    }
+
+    function renderDraftOverview(draft) {
+      const data = draft.editableData || {};
+      const filing = draft.filingData || {};
+      const documents = state.draftDetail.documents || [];
+      const partyName = party => party && (party.partyType === 'entity'
+        ? party.entityName || party.displayName
+        : [party.firstName, party.middleName, party.lastName].filter(Boolean).join(' ') || party.displayName) || 'Not entered';
+      const partyAddress = party => party && [party.address1, party.address2,
+        [party.city, party.state, party.postalCode].filter(Boolean).join(' ')].filter(Boolean).join(', ') || '';
+      const row = (label, value, secondary, target) => '<div class="draft-overview-row"><div><small>' +
+        escapeHtml(label) + '</small><strong>' + escapeHtml(value || 'Not entered') + '</strong>' +
+        (secondary ? '<span>' + escapeHtml(secondary) + '</span>' : '') + '</div>' +
+        '<button type="button" class="icon-button" data-open-draft-section="data" data-draft-jump="' + target +
+        '" title="Review ' + escapeHtml(label) + '" aria-label="Review ' + escapeHtml(label) + '">' + icon('pencil') + '</button></div>';
+      document.getElementById('draftReviewOverview').innerHTML =
+        row('Court', data.courtName, filing.caseType, 'identifiers') +
+        row('Plaintiff', partyName(filing.plaintiff), partyAddress(filing.plaintiff), 'plaintiff') +
+        row('Defendants', (filing.defendants || []).map(partyName).join('; '),
+          (filing.defendants || []).map(partyAddress).filter(Boolean).join('\n'), 'defendants') +
+        row('Claim', filing.moneyJudgmentRequested === true ? 'Possession and money judgment' :
+          filing.moneyJudgmentRequested === false ? 'Possession only' : 'Review paragraph 10',
+          filing.moneyJudgmentRequested === true ? '$' + (filing.claimAmount || 'Not entered') : '', 'details') +
+        '<div class="draft-overview-files"><div class="draft-section-heading"><h3>Documents (' + documents.length +
+        ')</h3><button type="button" class="icon-button" data-open-draft-section="documents" title="Manage documents" aria-label="Manage documents">' + icon('sliders-horizontal') + '</button></div>' +
+        documents.map(doc => {
+          const attention = !doc.oneDriveUrl || (draft.validationIssues || []).some(issue => issue.field === 'document.' + doc.id);
+          return '<div class="draft-overview-file' + (attention ? ' needs-review' : '') + '">' +
+            icon(attention ? 'circle-alert' : 'file-check-2') + '<span>' +
+            escapeHtml(statusLabel(doc.packageRole || doc.documentType || 'Document')) +
+            '<small>' + escapeHtml(doc.filingType || 'Filing type not assigned') +
+            (doc.formTemplate ? ' · Form library' : '') +
+            (doc.requiredForFiling === false ? ' · Excluded' : '') + '</small></span>' +
+            '<button type="button" class="icon-button" data-preview-draft-document="' + escapeHtml(doc.id) +
+            '" title="Preview PDF" aria-label="Preview ' + escapeHtml(doc.currentFilename || 'PDF') + '">' + icon('eye') + '</button></div>';
+        }).join('') + '</div>';
+      document.getElementById('draftDocumentCount').textContent = documents.length;
+      document.querySelectorAll('[data-open-draft-section]').forEach(button =>
+        button.addEventListener('click', () => {
+          setDraftSection(button.dataset.openDraftSection, true);
+          const target = document.querySelector('[data-draft-section="' + button.dataset.draftJump + '"]');
+          if (target) target.scrollIntoView({block:'start', behavior:'instant'});
+        }));
+      document.querySelectorAll('[data-preview-draft-document]').forEach(button => button.onclick = () => {
+        state.activeDraftDocumentId = button.dataset.previewDraftDocument;
+        renderDraftDocuments(documents);
+        setDraftMobileMode('document');
+      });
     }
 
     document.getElementById('newDraftBtn').addEventListener('click', async () => {
@@ -4348,6 +4572,7 @@ const html = String.raw`<!doctype html>
 
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
+      const logWasOpen = Boolean(root.querySelector('[data-filing-log]')?.open);
       const jobs = state.draftFilingJobs || [];
       const config = state.mifileConfig || {
         accountEnvironment: 'test',
@@ -4367,6 +4592,17 @@ const html = String.raw`<!doctype html>
         (!config.ready && config.issues && config.issues.length
           ? '<br>' + escapeHtml(config.issues.join(' '))
           : '') + '</span></div>';
+      const latest = jobs[0];
+      document.getElementById('draftPreparationStatus').innerHTML = latest
+        ? '<div class="draft-validation' + (latest.status === 'prepared' ? ' is-ready' : '') + '"><strong>' +
+          escapeHtml(statusLabel(latest.status)) + '</strong><span>' +
+          escapeHtml(latest.temporaryCaseNumber || (latest.status === 'reconciliation_required'
+            ? 'Check History > Unsubmitted before another attempt.'
+            : latest.status === 'running' ? 'Preparing documents in MiFILE.'
+            : latest.status === 'failed' ? latest.errorMessage || 'Open Activity for details.' : 'Unsubmitted preparation')) +
+          '</span><button type="button" data-show-preparation>View activity</button></div>' : '';
+      const progressButton = document.querySelector('[data-show-preparation]');
+      if (progressButton) progressButton.onclick = () => setDraftSection('activity', true);
       if (!jobs.length) {
         const eligibilityIssues = state.draftDetail.caseDraft.filingEligibilityIssues || [];
         root.innerHTML = accountStrip + '<div class="draft-filing-job-panel">' +
@@ -4406,10 +4642,10 @@ const html = String.raw`<!doctype html>
         (job.status === 'failed' ? '<div class="draft-filing-job-actions">' +
           '<button type="button" data-retry-filing-job="' + escapeHtml(job.id) + '">' +
           icon('rotate-cw') + 'Retry preparation</button></div>' : '') +
-        (log.length ? '<div class="draft-filing-log">' + log.map(entry =>
+        (log.length ? '<details class="draft-optional" data-filing-log' + (logWasOpen ? ' open' : '') + '><summary>Technical log (' + log.length + ')</summary><div class="draft-filing-log">' + log.map(entry =>
           '<div class="draft-filing-log-row"><span>' + escapeHtml(fmtDate(entry.at)) +
           '</span><strong>' + escapeHtml(entry.checkpoint) + '</strong><span>' +
-          escapeHtml(entry.message) + '</span></div>').join('') + '</div>' : '') +
+          escapeHtml(entry.message) + '</span></div>').join('') + '</div></details>' : '') +
       '</div>';
       root.querySelectorAll('[data-retry-filing-job]').forEach(button => {
         button.addEventListener('click', () => {
@@ -4430,7 +4666,7 @@ const html = String.raw`<!doctype html>
       const message = found
         ? 'Confirm that you found this case in MiFILE History → Unsubmitted. The Draft will be marked Prepared.'
         : 'Confirm that no matching case exists in MiFILE History → Unsubmitted. Retry will be enabled.';
-      if (!window.confirm(message)) return;
+      if (!await confirmDraftAction('Confirm MiFILE result', message, found ? 'Bundle found' : 'No bundle found')) return;
       await api('/api/filing-jobs/' + encodeURIComponent(jobId) + '/reconcile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4446,18 +4682,18 @@ const html = String.raw`<!doctype html>
     }
 
     async function refreshDraftFilingState() {
-      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty || state.draftMutationBusy) return;
+      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open) return;
       const draftId = state.selectedDraftId;
       const revision = state.draftEditRevision;
       const jobs = await api('/api/filing-jobs?caseDraftId=' +
         encodeURIComponent(draftId));
-      if (state.selectedDraftId !== draftId || state.draftDirty || state.draftEditRevision !== revision) return;
+      if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open || state.draftEditRevision !== revision) return;
       const previous = state.draftFilingJobs[0];
       const latest = jobs[0];
       state.draftFilingJobs = jobs;
       if (!previous || !latest || previous.updatedAt !== latest.updatedAt) {
         const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
-        if (state.selectedDraftId !== draftId || state.draftDirty || state.draftEditRevision !== revision) return;
+        if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open || state.draftEditRevision !== revision) return;
         state.draftDetail = detail;
         renderDraftWorkspace();
       } else {
@@ -4466,38 +4702,81 @@ const html = String.raw`<!doctype html>
     }
 
     async function queueDraftFiling(isRetry) {
-      const detail = state.draftDetail;
+      if (state.draftMutationBusy || document.getElementById('draftConfirmDialog').open) return;
+      let detail = state.draftDetail;
       if (!detail || !detail.caseDraft) return;
       if (state.draftDirty) await saveDraft(true);
+      detail = state.draftDetail;
+      const issues = detail.caseDraft.validationIssues || [];
+      const blocking = issues.find(issue => issue.severity === 'error');
+      if (blocking) {
+        setDraftSection('review');
+        focusDraftIssue(blocking);
+        showToast('Complete the required corrections before preparing this package.', 'error');
+        return;
+      }
       if (!state.mifileConfig || !state.mifileConfig.ready) {
         throw new Error((state.mifileConfig && state.mifileConfig.issues || [
           'MiFILE account is not ready.',
         ]).join(' '));
       }
-      if (!isRetry && !window.confirm(
-        'Prepare this case using ' + state.mifileConfig.accountLabel +
-        '? The system will save an unsubmitted bundle. It will not pay or submit it to the court.',
+      const confirmedRevision = state.draftEditRevision;
+      const expectedUpdatedAt = detail.caseDraft.updatedAt;
+      if (!await confirmDraftAction(isRetry ? 'Retry MiFILE preparation?' : 'Confirm this package?',
+        'Account: ' + state.mifileConfig.accountLabel + '\nFiler: Devlin, Adam (P72877).\n' +
+        'The package will be saved to History > Unsubmitted. No payment or court submission will be made.' +
+        (issues.length ? '\nReview notes: ' + issues.map(issue => issue.message).join(' ') : ''),
+        isRetry ? 'Retry in Unsubmitted' : 'Confirm & prepare',
+        '<div class="draft-overview-row"><div><strong>' + escapeHtml(detail.caseDraft.editableData.caseTitle || detail.email.subject || 'New case') +
+        '</strong><span>' + escapeHtml(detail.caseDraft.editableData.courtName || '') + '</span><span>' +
+        (detail.documents || []).filter(doc => doc.requiredForFiling !== false).length + ' included PDFs</span></div></div>',
       )) return;
+      if (state.draftEditRevision !== confirmedRevision || state.selectedDraftId !== detail.caseDraft.id) {
+        throw new Error('The package changed. Review it before confirming.');
+      }
       const button = document.getElementById('draftPrepareBtn');
+      state.draftMutationBusy = true;
+      renderDraftWorkspace();
       setButtonBusy(button, true, 'Queueing');
       try {
         await api('/api/drafts/' + encodeURIComponent(detail.caseDraft.id) +
           '/filing-jobs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode: 'prepare', retry: Boolean(isRetry) }),
+          body: JSON.stringify({ mode: 'prepare', retry: Boolean(isRetry), confirmPackage: true, expectedUpdatedAt }),
         });
         state.draftDetail = await api('/api/drafts/' +
           encodeURIComponent(detail.caseDraft.id));
         state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
           encodeURIComponent(detail.caseDraft.id));
-        renderDraftWorkspace();
         await loadDrafts(true);
         showToast('MiFILE preparation queued. Progress will update here.');
       } finally {
+        state.draftMutationBusy = false;
         setButtonBusy(button, false);
-        updateDraftPreparationButton();
+        if (state.selectedDraftId) renderDraftWorkspace();
       }
+    }
+
+    async function handleDraftNextAction() {
+      const draft = state.draftDetail && state.draftDetail.caseDraft;
+      if (!draft || state.draftMutationBusy) return;
+      if (['filing_prepared', 'filed_successfully'].includes(draft.status)) {
+        window.open('https://mifile.courts.michigan.gov/filings/myHistory', '_blank', 'noopener');
+        return;
+      }
+      if (['filing_in_progress', 'filing_reconciliation'].includes(draft.status) || draft.filingStatus === 'queued') {
+        setDraftSection('activity', true);
+        setDraftMobileMode('fields');
+        return;
+      }
+      if (!state.draftDirty && (draft.validationIssues || []).some(issue => issue.severity === 'error')) {
+        setDraftSection('review', true);
+        setDraftMobileMode('fields');
+        return;
+      }
+      if (!state.mifileConfig || !state.mifileConfig.ready) { setView('settings'); return; }
+      await queueDraftFiling(draft.status === 'filing_failed');
     }
 
     function renderDraftFields(draft) {
@@ -4581,8 +4860,8 @@ const html = String.raw`<!doctype html>
           '</div>' +
         '</section>';
 
-      const legacyGroups = DRAFT_FIELD_GROUPS.map(group =>
-        '<section class="draft-field-section"><h3>' + escapeHtml(group.title) + '</h3>' +
+      const legacyGroups = DRAFT_FIELD_GROUPS.map((group, index) =>
+        '<section class="draft-field-section" data-draft-section="' + (index ? 'references' : 'identifiers') + '"><h3>' + escapeHtml(group.title) + '</h3>' +
           '<div class="draft-field-grid">' +
           group.fields.map(field => {
             const issue = issueByField.get(field.key);
@@ -4597,7 +4876,7 @@ const html = String.raw`<!doctype html>
             '</label>';
           }).join('') +
           '</div></section>'
-      ).join('');
+      );
 
       const filingSetup =
         '<section class="draft-field-section" data-draft-section="setup">' +
@@ -4761,10 +5040,65 @@ const html = String.raw`<!doctype html>
           MIFILE_FILING_TYPES.map(value => '<option value="' + escapeHtml(value) + '"></option>').join('') +
         '</datalist>';
 
+      const previousOpen = new Set(Array.from(document.querySelectorAll('#draftFieldGroups details[open]'))
+        .map(element => element.dataset.disclosure));
       document.getElementById('draftFieldGroups').innerHTML =
-        extractionSummary + legacyGroups + filingSetup + caseDetails + plaintiff + defendantSection +
-        attorney + documentMappings;
+        '<div id="draftDataPane" data-draft-pane="data" role="tabpanel" aria-labelledby="draftDataTab">' +
+          legacyGroups[0] + caseDetails + plaintiff + defendantSection +
+          '<details class="draft-optional" data-disclosure="filing-setup"><summary>MiFILE setup & attorney</summary>' +
+            filingSetup + attorney + '</details></div>' +
+        '<div id="draftDocumentsPane" data-draft-pane="documents" role="tabpanel" aria-labelledby="draftDocumentsTab">' +
+          documentMappings + '</div>' +
+        '<div data-draft-pane="activity">' + extractionSummary + legacyGroups[1] + '</div>';
       decorateDraftReviewFields(draft);
+      const identifierGrid = document.querySelector('[data-draft-section="identifiers"] .draft-field-grid');
+      const identifiers = document.createElement('details');
+      identifiers.className = 'draft-optional wide';
+      identifiers.dataset.disclosure = 'assigned-identifiers';
+      identifiers.innerHTML = '<summary>Assigned case numbers</summary><div class="draft-field-grid"></div>';
+      ['caseNumber', 'temporaryCaseNumber', 'newCaseNumber'].forEach(field => {
+        identifiers.lastElementChild.appendChild(identifierGrid.querySelector('[data-draft-field="' + field + '"]').closest('.draft-field'));
+      });
+      identifierGrid.appendChild(identifiers);
+      document.querySelectorAll('[data-party-role]').forEach(party => {
+        const optional = document.createElement('details');
+        optional.className = 'draft-optional';
+        optional.dataset.disclosure = party.dataset.partyRole + '-' + party.dataset.partyIndex;
+        optional.innerHTML = '<summary>Additional party details</summary><div class="draft-field-grid"></div>';
+        ['displayName', 'middleName', 'suffix', 'address2', 'phone', 'email'].forEach(field => {
+          const input = party.querySelector('[data-party-field="' + field + '"]');
+          if (input) optional.lastElementChild.appendChild(input.closest('.draft-field'));
+        });
+        party.appendChild(optional);
+        const type = party.querySelector('[data-party-field="partyType"]');
+        const syncPartyType = () => {
+          party.querySelectorAll('[data-party-field]').forEach(input => {
+            const field = input.dataset.partyField;
+            if (!['entityName', 'firstName', 'middleName', 'lastName', 'suffix'].includes(field)) return;
+            input.closest('.draft-field').classList.toggle('hidden', field === 'entityName'
+              ? type.value !== 'entity' : type.value === 'entity');
+          });
+        };
+        type.addEventListener('change', syncPartyType);
+        syncPartyType();
+      });
+      const detailsSection = document.querySelector('[data-draft-section="details"] .draft-field-grid');
+      const relatedDetails = document.createElement('details');
+      relatedDetails.className = 'draft-optional wide';
+      relatedDetails.dataset.disclosure = 'related-case';
+      relatedDetails.innerHTML = '<summary>Related case details</summary><div class="draft-field-grid"></div>';
+      ['relatedCaseCourt', 'relatedCaseDocketNumber', 'relatedCaseJudge', 'relatedCasePending'].forEach(field => {
+        relatedDetails.lastElementChild.appendChild(detailsSection.querySelector('[data-filing-field="' + field + '"]').closest('.draft-field'));
+      });
+      detailsSection.appendChild(relatedDetails);
+      const relatedAction = detailsSection.querySelector('[data-filing-field="relatedCivilAction"]');
+      relatedAction.addEventListener('change', () => { relatedDetails.open = relatedAction.value === 'previously_filed'; });
+      relatedDetails.open = relatedAction.value === 'previously_filed';
+      document.querySelectorAll('#draftFieldGroups details[data-disclosure]').forEach(element => {
+        if (previousOpen.has(element.dataset.disclosure)) element.open = true;
+      });
+      renderDraftOverview(draft);
+      setDraftSection(state.draftSection);
       validationRoot.querySelectorAll('[data-review-issue]').forEach(button => {
         button.addEventListener('click', () => focusDraftIssue(issues[Number(button.dataset.reviewIssue)]));
       });
@@ -4868,6 +5202,14 @@ const html = String.raw`<!doctype html>
       if (!issue) return;
       const target = draftIssueTarget(issue);
       if (!target) return;
+      const pane = target.closest('[data-draft-pane]');
+      if (pane) setDraftSection(pane.dataset.draftPane);
+      let ancestor = target.parentElement;
+      while (ancestor && ancestor.id !== 'draftFieldsForm') {
+        if (ancestor.tagName === 'DETAILS') ancestor.open = true;
+        if (ancestor.classList.contains('draft-field')) ancestor.classList.remove('hidden');
+        ancestor = ancestor.parentElement;
+      }
       const row = target.closest('[data-draft-document-id]');
       if (row) {
         state.activeDraftDocumentId = row.dataset.draftDocumentId;
@@ -4917,8 +5259,9 @@ const html = String.raw`<!doctype html>
           : DRAFT_SOURCE_LABELS[source] || source;
         const label = input.closest('.draft-field');
         const empty = input.type !== 'checkbox' && !input.value;
+        if (empty) return;
         label.insertAdjacentHTML('beforeend', '<span class="draft-field-source">' +
-          escapeHtml(empty ? 'Missing' : sourceLabel) +
+          escapeHtml(sourceLabel) +
           (!empty && source === 'complaint' && confidence && confidence !== 'high'
             ? ' · ' + escapeHtml(confidence === 'low' ? 'Check value' : 'Review value') : '') +
           (!empty && source === 'complaint' && draft.primaryDocumentId
@@ -5025,7 +5368,14 @@ const html = String.raw`<!doctype html>
         state.draftDetail.caseDraft.manualPackage);
       const coreDocument = !manualPackage &&
         ['complaint', 'advice', 'local', 'request', 'summons'].includes(document.packageRole);
-      return '<div class="draft-document-mapping" data-draft-document-id="' +
+      return '<details class="draft-doc-details" data-disclosure="document-' + escapeHtml(document.id) + '">' +
+        '<summary>' + icon('chevron-right') + '<span><strong>' +
+        escapeHtml(document.currentFilename || document.documentType || ('Document ' + (index + 1))) +
+        '</strong><small>' + escapeHtml(document.filingType || 'Filing type not assigned') +
+        (document.formTemplate ? ' · Form library' : '') + '</small></span>' +
+        '<button type="button" class="icon-button" data-preview-draft-document="' + escapeHtml(document.id) +
+        '" title="Preview PDF" aria-label="Preview PDF">' + icon('eye') + '</button></summary>' +
+        '<div class="draft-document-mapping" data-draft-document-id="' +
         escapeHtml(document.id) + '">' +
         '<label class="draft-field">' +
           '<span class="draft-field-label" title="' +
@@ -5082,7 +5432,7 @@ const html = String.raw`<!doctype html>
             (document.requiredForFiling ? ' checked' : '') +
             (coreDocument || document.packageRole === 'fee' ? ' disabled' : '') + '>' +
         '</label>' +
-      '</div>';
+      '</div></details>';
     }
 
     function setDraftPrimaryDocument(documentId) {
@@ -5264,6 +5614,7 @@ const html = String.raw`<!doctype html>
         'filed_successfully',
       ].includes(draft.status));
       document.getElementById('draftSaveBtn').disabled = !dirty || Boolean(locked);
+      updateDraftPreparationButton();
     }
 
     function collectDraftFields() {
@@ -5356,7 +5707,17 @@ const html = String.raw`<!doctype html>
 
     async function saveDraft(silent) {
       const detail = state.draftDetail;
-      if (!detail || !detail.caseDraft) return;
+      if (!detail || !detail.caseDraft || state.draftMutationBusy) return;
+      const payload = {
+        fields: collectDraftFields(), filingData: collectDraftFilingData(),
+        documents: collectDraftDocumentMappings(), primaryDocumentId: detail.caseDraft.primaryDocumentId,
+        reviewerNotes: document.getElementById('draftReviewerNotes').value,
+      };
+      state.draftMutationBusy = true;
+      const controls = Array.from(document.querySelectorAll(
+        '#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source]):not([data-preview-draft-document]), #closeDraftBtn, #draftRejectBtn, #draftApproveBtn, #draftPrepareBtn, .draft-preview-actions button',
+      )).map(control => ({ control, disabled: control.disabled }));
+      controls.forEach(({control}) => { control.disabled = true; });
       const button = document.getElementById('draftSaveBtn');
       setButtonBusy(button, true, 'Saving');
       let saved = false;
@@ -5365,21 +5726,17 @@ const html = String.raw`<!doctype html>
           encodeURIComponent(detail.caseDraft.id), {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fields: collectDraftFields(),
-            filingData: collectDraftFilingData(),
-            documents: collectDraftDocumentMappings(),
-            primaryDocumentId: detail.caseDraft.primaryDocumentId,
-            reviewerNotes: document.getElementById('draftReviewerNotes').value,
-          }),
+          body: JSON.stringify(payload),
         });
         state.draftDirty = false;
         saved = true;
-        renderDraftWorkspace();
         await loadDrafts(true);
         if (!silent) showToast('Draft changes saved.');
       } finally {
+        state.draftMutationBusy = false;
+        controls.forEach(({control, disabled}) => { control.disabled = disabled; });
         setButtonBusy(button, false);
+        if (saved) renderDraftWorkspace();
         setDraftDirty(saved ? false : true);
       }
     }
@@ -6531,7 +6888,25 @@ const html = String.raw`<!doctype html>
       reviewDraft('approve').catch(showDraftError);
     });
     document.getElementById('draftPrepareBtn').addEventListener('click', () => {
-      queueDraftFiling(false).catch(showDraftError);
+      handleDraftNextAction().catch(showDraftError);
+    });
+    document.querySelectorAll('[data-draft-tab]').forEach(button => {
+      button.addEventListener('click', () => setDraftSection(button.dataset.draftTab, true));
+      button.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const tabs = Array.from(document.querySelectorAll('[data-draft-tab]'));
+        const index = tabs.indexOf(button);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 :
+          (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        setDraftSection(tabs[next].dataset.draftTab, true);
+        tabs[next].focus();
+      });
+    });
+    document.addEventListener('click', event => {
+      document.querySelectorAll('.draft-tools-menu[open]').forEach(menu => {
+        if (!menu.contains(event.target) || event.target.closest('button')) menu.open = false;
+      });
     });
     document.getElementById('draftRejectBtn').addEventListener('click', () => {
       reviewDraft('reject').catch(showDraftError);
@@ -7055,16 +7430,23 @@ export function createAdminServer(
                     return;
                 }
                 try {
+                    if (parsed.confirmPackage === true && (!getMiFileRuntimeConfig().ready ||
+                        typeof parsed.expectedUpdatedAt !== 'string' || !parsed.expectedUpdatedAt)) {
+                        sendJson(res, 409, { error: 'Refresh the Draft and verify the MiFILE account before confirming.' });
+                        return;
+                    }
                     const job = db.queueFilingJob(
                         decodeURIComponent(queueFilingMatch[1]),
                         'prepare',
                         parsed.retry === true ? 'admin_retry' : 'admin',
                         'admin',
+                        parsed.confirmPackage === true,
+                        typeof parsed.expectedUpdatedAt === 'string' ? parsed.expectedUpdatedAt : undefined,
                     );
                     sendJson(res, 202, job);
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
-                    if (!/active MiFILE job|Approve the Draft|Filing is blocked:/.test(message)) throw error;
+                    if (!/active MiFILE job|Approve the Draft|Filing is blocked:|Cannot approve draft:|The Draft changed|Resolve or complete|not a new filing package/.test(message)) throw error;
                     sendJson(res, 409, { error: message });
                 }
                 return;

@@ -5250,46 +5250,52 @@ export class WorkflowDatabase {
         mode: FilingJobMode = 'prepare',
         triggerSource = 'admin',
         triggeredBy = 'admin',
+        confirmPackage = false,
+        expectedUpdatedAt?: string,
     ): FilingJobView {
         if (mode !== 'prepare') {
             throw new Error(
                 'Final court submission is disabled. Only unsubmitted MiFILE preparation is available.',
             );
         }
-        const detail = this.getDraftDetail(caseDraftId);
-        if (!detail?.caseDraft) throw new Error('Case draft not found');
-        const allowedStatuses = new Set(['ready_to_file', 'filing_failed']);
-        if (!allowedStatuses.has(detail.caseDraft.status)) {
-            throw new Error('Approve the Draft before preparing it in MiFILE');
-        }
-        if (this.safeJson(detail.caseDraft.normalizedDataJson)?.manualDocumentEdits && !detail.caseDraft.reviewedAt) {
-            throw new Error('Approve the Draft after reviewing the changed documents before preparing it in MiFILE');
-        }
-        const active = this.db
-            .prepare(`
+        return this.runInTransaction(() => {
+            if (expectedUpdatedAt && this.getDraftDetail(caseDraftId)?.caseDraft?.updatedAt !== expectedUpdatedAt) {
+                throw new Error('The Draft changed. Review the latest package before confirming.');
+            }
+            if (confirmPackage) this.reviewCaseDraft(caseDraftId, 'approve');
+            const detail = this.getDraftDetail(caseDraftId);
+            if (!detail?.caseDraft) throw new Error('Case draft not found');
+            const allowedStatuses = new Set(['ready_to_file', 'filing_failed']);
+            if (!allowedStatuses.has(detail.caseDraft.status)) {
+                throw new Error('Approve the Draft before preparing it in MiFILE');
+            }
+            if (this.safeJson(detail.caseDraft.normalizedDataJson)?.manualDocumentEdits && !detail.caseDraft.reviewedAt) {
+                throw new Error('Approve the Draft after reviewing the changed documents before preparing it in MiFILE');
+            }
+            const active = this.db
+                .prepare(`
                 SELECT id FROM filing_jobs
                 WHERE case_draft_id = ? AND status IN ('queued', 'running')
                 LIMIT 1
             `)
-            .get(caseDraftId) as { id: string } | undefined;
-        if (active) throw new Error('This Draft already has an active MiFILE job');
+                .get(caseDraftId) as { id: string } | undefined;
+            if (active) throw new Error('This Draft already has an active MiFILE job');
 
-        const payload = this.buildFilingPayload(caseDraftId);
-        const attempt = this.db
-            .prepare(`
+            const payload = this.buildFilingPayload(caseDraftId);
+            const attempt = this.db
+                .prepare(`
                 SELECT COALESCE(MAX(attempt_number), 0) + 1 AS attempt
                 FROM filing_jobs WHERE case_draft_id = ?
             `)
-            .get(caseDraftId) as { attempt: number };
-        const id = randomUUID();
-        const timestamp = nowIso();
-        const initialLog: FilingJobLogEntry[] = [{
-            at: timestamp,
-            level: 'info',
-            checkpoint: 'queued',
-            message: 'Unsubmitted MiFILE preparation queued from Draft Editor.',
-        }];
-        this.runInTransaction(() => {
+                .get(caseDraftId) as { attempt: number };
+            const id = randomUUID();
+            const timestamp = nowIso();
+            const initialLog: FilingJobLogEntry[] = [{
+                at: timestamp,
+                level: 'info',
+                checkpoint: 'queued',
+                message: 'Unsubmitted MiFILE preparation queued from Draft Editor.',
+            }];
             this.db.prepare(`
                 INSERT INTO filing_jobs (
                     id, case_draft_id, attempt_number, mode, status,
@@ -5323,10 +5329,10 @@ export class WorkflowDatabase {
                 attemptNumber: Number(attempt.attempt),
                 triggerSource,
             });
+            const job = this.getFilingJob(id);
+            if (!job) throw new Error('Queued MiFILE job could not be loaded');
+            return job;
         });
-        const job = this.getFilingJob(id);
-        if (!job) throw new Error('Queued MiFILE job could not be loaded');
-        return job;
     }
 
     recoverInterruptedFilingJobs(): number {

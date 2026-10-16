@@ -91,6 +91,14 @@ Adam supplies Complaint, Summons, Request and at least one supporting document. 
 - The court must be explicitly selected if the Complaint has not provided a usable MiFILE court name. Court-specific Other/Connected relationships must be reviewed where no definitive mapping is available.
 - Completed email intakes with zero current validation issues and no previous filing job can automatically queue preparation when the filing worker is enabled and ready. Set `MIFILE_AUTO_PREPARE_ENABLED=false` to disable this. Manual packages are excluded. Failed or uncertain filing jobs require review instead of automatic resubmission. The system does not automatically email a correction request to the sender.
 
+## Guided Draft review
+
+The Draft workspace opens on **Review**: court, parties, claim and included documents, with required corrections linked to their exact input. The Complaint PDF remains alongside the review. **Case data**, **Documents**, and **Activity** keep editing, Filing Types, inclusion, primary source selection, notes and diagnostics available without displaying every control at once. Optional party details, assigned case numbers, advanced MiFILE settings and technical logs expand on demand. Document tools (extract, replace, remove, standard forms and court rules) are in the menu beside **Add PDFs**. Secondary case actions, including confirm without preparation and reject, are in the header menu.
+
+**Confirm & prepare** replaces the former two-step confirmation and preparation path. The confirmation dialog identifies the case, PDF count, account and Unsubmitted-only limit. Cancel has no side effects. Approval and the immutable preparation snapshot are committed in one database transaction. Changed server versions are rejected for fresh review; required validation errors, existing jobs, reconciliation and court-notification restrictions cannot be bypassed. No payment or final submission is enabled.
+
+The primary action changes with the case: **Save & check**, **Review corrections**, **Confirm & prepare**, **View progress**, **Check result**, or **Open MiFILE**. Saving locks mutating controls until completion. Tab/disclosure selection, unsaved inputs and PDF navigation survive ordinary refreshes. Known-good new email intakes retain their existing automatic Unsubmitted preparation; incomplete packages still require correction, and uncertain remote results still require checking MiFILE before retrying.
+
 ## Account settings
 
 The existing environment credentials remain active until an account is saved through Settings. To enable saving credentials, configure admin authentication and a persistent encryption key in Render:
