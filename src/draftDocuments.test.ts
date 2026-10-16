@@ -149,6 +149,22 @@ test('interrupted extraction is recovered and preparation cannot race a running 
     }finally{f.close();}
 });
 
+test('rejecting a Draft while reading is in flight cannot reopen it or restore approval',async()=>{
+    for (const failing of [false,true]) {
+    const f=fixture();
+    try {
+        let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+        const pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract:async()=>{
+            await gate;if(failing) throw new Error('Interrupted read failed');return {...extraction,extractorVersion:4};
+        }});
+        f.db.reviewCaseDraft(f.draftId,'reject');
+        release();await pending;
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.status,'rejected');
+        assert.equal(JSON.parse(f.db.getDraftDetail(f.draftId)!.caseDraft!.normalizedDataJson!).complaintAutoExtraction,undefined);
+    }finally{f.close();}
+    }
+});
+
 test('old extraction versions wait for automatic upgrade before automatic MiFILE preparation',async()=>{
     const f=fixture();
     try {

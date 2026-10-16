@@ -6334,6 +6334,7 @@ export class WorkflowDatabase {
                 SET primary_document_id = ?,
                     normalized_data_json = ?,
                     status = ?,
+                    reviewed_at = NULL,
                     validation_status = 'warnings',
                     updated_at = ?
                 WHERE id = ?
@@ -6463,7 +6464,7 @@ export class WorkflowDatabase {
             SET normalized_data_json = json_set(normalized_data_json, '$.complaintExtractionError', ?),
                 status = 'needs_review', validation_status = 'failed', updated_at = ?
             WHERE id = ? AND filing_status != 'queued'
-              AND status NOT IN ('filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived')
+              AND status NOT IN ('filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived', 'rejected')
         `).run(message, nowIso(), caseDraftId);
         if (result.changes) this.insertAuditLog('case_draft', caseDraftId, 'complaint_extraction_failed', { documentId, message });
     }

@@ -57,6 +57,8 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
             const latest = db.getDraftDetail(draftId);
             // A replacement, removal or primary-source change invalidates work already in flight.
             if (!latest?.caseDraft || db.getComplaintSourceVersion(source.id) !== sourceVersion ||
+                !['not_started','failed'].includes(latest.caseDraft.filingStatus) ||
+                !['parsed','needs_review','validation_failed','ready_to_file','filing_failed'].includes(latest.caseDraft.status) ||
                 (latest.caseDraft.primaryDocumentId && latest.caseDraft.primaryDocumentId !== source.id) ||
                 !latest.documents.some(doc => doc.id === source.id && doc.packageRole === 'complaint' && doc.oneDriveUrl && doc.status !== 'retrying')) {
                 db.clearStaleComplaintExtractionState(draftId,sourceVersion);
@@ -69,6 +71,8 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
         } catch (error) {
             const latest = db.getDraftDetail(draftId);
             if (db.getComplaintSourceVersion(source.id) === sourceVersion && latest?.documents.some(doc=>doc.id===source.id && doc.packageRole==='complaint') &&
+                latest.caseDraft && ['not_started','failed'].includes(latest.caseDraft.filingStatus) &&
+                ['parsed','needs_review','validation_failed','ready_to_file','filing_failed'].includes(latest.caseDraft.status) &&
                 (!latest.caseDraft?.primaryDocumentId || latest.caseDraft.primaryDocumentId===source.id)) {
                 db.recordComplaintExtractionFailure(draftId, source.id, error);
                 db.setComplaintAutoExtractionState(draftId, { ...state, status: 'failed',
