@@ -1,0 +1,57 @@
+export interface CheckboxAnchor { text: string; x: number; y: number; width: number; height: number }
+export type ComplaintSelections = Partial<Record<'money' | 'rent' | 'damages' | 'noRelated' | 'previousRelated', boolean>>;
+
+/** Read the interior only after finding all four sides of a real square next to its label. */
+export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: number, height: number,
+    anchor: CheckboxAnchor): boolean | undefined {
+    const sx = width / 612, sy = height / 792;
+    const dark = (x: number, y: number) => {
+        const px = Math.round(x * sx), py = Math.round(y * sy);
+        if (px < 0 || py < 0 || px >= width || py >= height) return false;
+        const i = (py * width + px) * 4;
+        return pixels[i + 3] > 100 && (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3 < 175;
+    };
+    let best: { score: number; x: number; y: number; side: number } | undefined;
+    for (let side = 7; side <= 11; side += 0.5) {
+        for (let x = anchor.x - 17; x <= anchor.x - side - 1; x += 0.5) {
+            for (let y = anchor.y - 3; y <= anchor.y + 3; y += 0.5) {
+                const edges = [0, 0, 0, 0];
+                for (let n = 1; n <= 10; n++) {
+                    const offset = side * (0.1 + n * 0.075);
+                    edges[0] += Number(dark(x + offset, y));
+                    edges[1] += Number(dark(x + offset, y + side));
+                    edges[2] += Number(dark(x, y + offset));
+                    edges[3] += Number(dark(x + side, y + offset));
+                }
+                const score = edges.reduce((sum, value) => sum + value, 0) / 40;
+                if (Math.min(...edges) < 6 || score < 0.8 || (best && score <= best.score)) continue;
+                best = {score, x, y, side};
+            }
+        }
+    }
+    if (!best) return;
+    let ink = 0, samples = 0;
+    for (let x = best.x + 2; x <= best.x + best.side - 2; x += 0.3) {
+        for (let y = best.y + 2; y <= best.y + best.side - 2; y += 0.3) {
+            ink += Number(dark(x, y)); samples++;
+        }
+    }
+    const density = ink / samples;
+    return density > 0.14 ? true : density < 0.025 ? false : undefined;
+}
+
+export function readComplaintSelections(pixels: Uint8ClampedArray, width: number, height: number,
+    words: CheckboxAnchor[]): ComplaintSelections {
+    const result: ComplaintSelections = {};
+    const candidates = words.map(word => ({ ...word, text: words.filter(other => other.x >= word.x - 0.5 &&
+        Math.abs(other.y - word.y) < 3).sort((a,b)=>a.x-b.x).map(other=>other.text).join(' ') }));
+    const labels: Array<[keyof ComplaintSelections, RegExp]> = [
+        ['money', /^10\.(?:\s|$)/], ['rent', /^Rent owing/i], ['damages', /^Damages claimed/i],
+        ['noRelated', /^There is no other pending/i], ['previousRelated', /^A civil action between/i],
+    ];
+    for (const [key, pattern] of labels) {
+        const anchor = candidates.find(word => pattern.test(word.text));
+        if (anchor) result[key] = readCheckboxBeforeAnchor(pixels, width, height, anchor);
+    }
+    return result;
+}

@@ -22,7 +22,7 @@ const attachment = (name: string, id = name) => ({
 });
 const pdf = testPdfFixture();
 const extraction: ComplaintExtractionResult = {
-    extractorVersion: 2, formType: 'NONPAYMENT OF RENT', pageCount: 1, textHash: 'fixture',
+    extractorVersion: 4, formType: 'NONPAYMENT OF RENT', pageCount: 1, textHash: 'fixture',
     data: {
         courtDistrict: '25',
         plaintiff: { displayName: 'Example Property LLC', entityName: 'Example Property LLC',

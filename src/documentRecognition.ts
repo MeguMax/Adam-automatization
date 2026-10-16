@@ -32,7 +32,7 @@ function filenameRole(filename: string): RecognizedRole {
 export function recognizeDocumentText(pages: string[], filename: string): DocumentRecognition {
     const roles = new Set<RecognizedRole>();
     const patterns: Array<[RecognizedRole, RegExp]> = [
-        ['complaint', /^(?:complaint|complaint[, ]+(?:for )?(?:possession|nonpayment|termination|health hazard).*|(?:judicial district\s+)?complaint to(?: recover possession of property)?|recover possession of property)$/i],
+        ['complaint', /^(?:DC\s*102[ac]\s+)?(?:complaint|complaint[, ]+(?:for )?(?:possession|nonpayment|termination|health hazard).*|(?:judicial district\s+)?complaint to(?: recover possession of property)?|recover possession of property)$/i],
         ['summons', /^summons(?:\s*[,(-]\s*landlord[-\s]tenant(?:\s*\/\s*land contract)?\s*\)?)?$/i],
         ['request', /^request for court mailing(?: and (?:record|record of mailing by court))?(?:\s*\(.*)?$/i],
         ['advice', /^advice of rights(?: and information)?(?:\s*\(.*)?$/i],

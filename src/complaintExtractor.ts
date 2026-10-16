@@ -3,6 +3,10 @@ import path from 'path';
 import { validatePdfBuffer, pdfResourceOptions } from './pdfValidation';
 import { documentLabel } from './documentRecognition';
 import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
+import { createCanvas } from '@napi-rs/canvas';
+import { readComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
+
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 4;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -53,7 +57,7 @@ export interface ComplaintExtractionWarning {
 
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
-    extractorVersion: 1 | 2 | 3;
+    extractorVersion: 1 | 2 | 3 | 4;
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -694,26 +698,75 @@ export async function extractComplaintPdf(
         }
 
         const formResult = parseComplaintFormFields(lines.join('\n'), widgets, document.numPages);
-        if (formResult) return formResult;
+        if (formResult) return { ...formResult, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION };
 
         const result = parseComplaintText(lines, {
             pageCount: document.numPages,
             documentType,
             positionedValues,
         });
+        let recovered: ComplaintExtractionResult = { ...result, textSource: 'pdf' };
         if (result.warnings.some(warning => warning.code === 'missing_filled_section')) {
             const layout = parseLayoutComplaint(layoutPages, document.numPages, 'pdf');
-            if (layout.data.plaintiff && layout.data.defendants?.length) return layout;
-            return parseScannedComplaint(await recognizeScannedPdf(buffer), document.numPages);
+            recovered = layout.data.plaintiff && layout.data.defendants?.length
+                ? layout : parseScannedComplaint(await recognizeScannedPdf(buffer), document.numPages);
         }
-        return { ...result, textSource: 'pdf' };
+        const selections: ComplaintSelections = {};
+        for (let index = 0; index < layoutPages.length; index++) {
+            if (!layoutPages[index].words.some(word => /^10\.$|^There is no other pending|^A civil action between/i.test(word.text))) continue;
+            const page = await document.getPage(index + 1);
+            const viewport = page.getViewport({scale:3});
+            if (viewport.width * viewport.height > 5_000_000) continue;
+            const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+            const context = canvas.getContext('2d');
+            await page.render({canvasContext:context, viewport}).promise;
+            Object.assign(selections, readComplaintSelections(context.getImageData(0,0,canvas.width,canvas.height).data,
+                canvas.width, canvas.height, layoutPages[index].words));
+            canvas.width=1; canvas.height=1; page.cleanup();
+        }
+        if (selections.money === undefined && recovered.textSource !== 'ocr' && recovered.data.moneyJudgmentRequested === false) {
+            delete recovered.data.moneyJudgmentRequested;
+            delete recovered.data.claimAmount;
+            recovered.warnings.push({code:'claim_amount_review',message:'The paragraph 10 checkbox could not be verified from the page.'});
+        }
+        recovered = applyVisualComplaintSelections(recovered, selections, layoutPages);
+        return {...recovered, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION};
     } finally {
         await loadingTask.destroy();
     }
 }
 
+export function applyVisualComplaintSelections(result: ComplaintExtractionResult, selections: ComplaintSelections,
+    pages: OcrPage[]): ComplaintExtractionResult {
+    if (selections.noRelated !== undefined && selections.previousRelated !== undefined && selections.noRelated !== selections.previousRelated) {
+        result.data.relatedCivilAction = selections.noRelated ? 'none' : 'previously_filed';
+        result.fieldConfidence.relatedCivilAction = 'high';
+        if (selections.noRelated) result.warnings = result.warnings.filter(w => w.code !== 'related_action_review');
+    }
+    if (selections.money !== undefined) {
+        result.data.moneyJudgmentRequested = selections.money;
+        result.fieldConfidence.moneyJudgmentRequested = 'high';
+        if (!selections.money) result.data.claimAmount = '0.00';
+        else if (selections.rent === true && selections.damages === false) {
+            const words = pages.flatMap(page => page.words);
+            const label = words.find(word => /total rent due now is/i.test(word.text));
+            const candidates = label ? words.filter(word => word.pageNumber === label.pageNumber &&
+                word.x >= label.x + label.width - 2 && word.x < label.x + label.width + 100 &&
+                word.confidence >= 90 && Math.abs(word.y - label.y) < 8) : [];
+            const amounts = candidates.map(word => normalizedMoney(word.text)).filter((amount): amount is string => !!amount);
+            if (amounts.length === 1) result.data.claimAmount = amounts[0];
+        }
+        if (result.data.claimAmount) {
+            result.fieldConfidence.claimAmount = 'high';
+            result.warnings = result.warnings.filter(w => w.code !== 'claim_amount_review');
+        }
+    }
+    return result;
+}
+
 export function parseScannedComplaint(pages: OcrPage[], pageCount = pages.length): ComplaintExtractionResult {
-    return parseLayoutComplaint(pages, pageCount, 'ocr');
+    return applyVisualComplaintSelections(parseLayoutComplaint(pages, pageCount, 'ocr'),
+        Object.assign({}, ...pages.map(page => page.selections || {})), pages);
 }
 
 function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf' | 'ocr'): ComplaintExtractionResult {

@@ -6,6 +6,7 @@ import { getWorkflowDatabase, PlaintiffMappingSeed } from './database';
 import { runWorker } from './index';
 import { runFilingWorker } from './filingWorker';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
+import { runDraftExtractionWorker } from './draftExtraction';
 
 function isWorkerEnabled(): boolean {
     const value = (process.env.WORKER_ENABLED ?? 'true').trim().toLowerCase();
@@ -50,6 +51,9 @@ async function main(): Promise<void> {
     const filingWorkerPromise = filingWorkerEnabled
         ? runFilingWorker({ signal: controller.signal })
         : Promise.resolve();
+    const extractionWorkerPromise = workerEnabled
+        ? runDraftExtractionWorker(getWorkflowDatabase(), controller.signal)
+        : Promise.resolve();
     let shuttingDown = false;
 
     const shutdown = async (reason: string, exitCode = 0) => {
@@ -65,6 +69,7 @@ async function main(): Promise<void> {
             filingWorkerPromise.catch(error => {
                 console.error('MiFILE filing worker stopped during shutdown:', error);
             }),
+            extractionWorkerPromise.catch(error => console.error('Extraction worker stopped:', error)),
         ]);
         getWorkflowDatabase().close();
         process.exit(exitCode);
@@ -72,6 +77,10 @@ async function main(): Promise<void> {
 
     process.once('SIGINT', () => void shutdown('SIGINT'));
     process.once('SIGTERM', () => void shutdown('SIGTERM'));
+    extractionWorkerPromise.catch(error => {
+        console.error('Automatic Complaint extraction worker stopped:', error);
+        void shutdown('extraction worker failure', 1);
+    });
 
     if (workerEnabled) {
         console.log('Production worker enabled.');

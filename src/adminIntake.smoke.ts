@@ -266,7 +266,7 @@ async function main() {
         await page.waitForFunction(() => document.querySelector('.draft-source-summary')?.textContent?.includes('PDF form fields'));
         const extracted=db.getDraftDetail(draftId)!.caseDraft!;
         assert.equal(await page.locator('[data-filing-field="mailingRequested"]').isDisabled(),true);
-        assert.equal(extracted.complaintExtraction?.extractorVersion,3);
+        assert.equal(extracted.complaintExtraction?.extractorVersion,4);
         assert.equal(extracted.filingData.defendants[0].postalCode,'48146');
         assert.equal(extracted.filingData.claimAmount,'1991.50');
         assert.ok(!extracted.validationIssues.some(issue=>issue.field==='complaintExtraction'));
@@ -286,6 +286,10 @@ async function main() {
         const partyExtras=page.locator('[data-disclosure="plaintiff-0"]');
         await partyExtras.locator('summary').click();
         await partyExtras.locator('[data-party-field="phone"]').fill('2485550101');
+        // A background extraction finishes after the user starts editing a different field.
+        const newerExtraction=structuredClone(extracted.complaintExtraction!);
+        newerExtraction.data.defendants![0].phone='248-555-0177';
+        db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,newerExtraction);
         assert.equal(await page.locator('[data-party-role="plaintiff"] [data-party-field="firstName"]').isHidden(),true);
         let releaseSave!:()=>void;
         let saveRequested!:()=>void;
@@ -303,6 +307,7 @@ async function main() {
         await page.waitForFunction(() => !document.querySelector('[data-review-field="filingData.plaintiff.address1"]')?.hasAttribute('aria-invalid'));
         await context.unroute(draftRoute);
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.filingData.plaintiff!.phone,'2485550101');
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.filingData.defendants[0].phone,'248-555-0177','Saving an older screen must retain fresh automatic values in untouched fields');
         assert.equal(await partyExtras.evaluate(element=>(element as HTMLDetailsElement).open),true);
         assert.equal(await page.locator('#draftDataTab').getAttribute('aria-selected'),'true');
         assert.match(await plaintiffAddress.locator('..').innerText(), /Manual/);
@@ -331,8 +336,8 @@ async function main() {
         await page.setViewportSize({width:1440,height:1000});
 
         for (const [name, text] of [
-            ['Summons.pdf', 'SUMMONS LANDLORD TENANT LAND CONTRACT'],
-            ['Request.pdf', 'REQUEST FOR COURT MAILING AND RECORD OF MAILING BY COURT'],
+            ['Summons.pdf', 'SUMMONS, LANDLORD-TENANT/LAND CONTRACT'],
+            ['Request.pdf', 'REQUEST FOR COURT MAILING AND RECORD'],
             ['Demand.pdf', 'DEMAND FOR POSSESSION NONPAYMENT OF RENT'],
         ]) {
             const upload = page.waitForResponse(response => response.url().endsWith('/documents') && response.request().method() === 'POST');
@@ -467,6 +472,14 @@ async function main() {
         assert.equal(repaired.id,failedDocument);assert.equal(repaired.status,'replaced');assert.ok(repaired.oneDriveUrl);
         assert.equal(repaired.sourceUrl,null);assert.equal(repaired.nextRetryAt,null);
         for(const name of ['Morgan Tenant','Taylor Resident']){
+            if(name==='Taylor Resident'){
+                await page.locator('#draftDataTab').click();
+                const extras=page.locator('[data-disclosure="plaintiff-0"]');
+                if(!await extras.evaluate(element=>(element as HTMLDetailsElement).open)) await extras.locator('summary').click();
+                await extras.locator('[data-party-field="phone"]').fill('248-555-0191');
+                await page.locator('#draftSaveBtn').click();
+                await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
+            }
             const replaced=page.waitForResponse(response=>response.url().endsWith('/content') && response.request().method()==='PUT');
             await clickDocumentTool('draftReplaceDocumentBtn');
             page.once('dialog',dialog=>dialog.accept());
@@ -474,11 +487,9 @@ async function main() {
                 buffer:testComplaintFormFixture({7:name+', and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146'})});
             assert.equal((await replaced).status(),200);
             await page.waitForFunction(()=>document.getElementById('closeDraftBtn')?.hasAttribute('disabled')===false);
-            assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction,null);
-            const extractedResponse=page.waitForResponse(response=>response.url().endsWith('/extract-complaint') && response.status()===200);
-            await clickDocumentTool('draftExtractBtn');await extractedResponse;
-            await page.waitForFunction(()=>!document.getElementById('draftExtractBtn')?.classList.contains('loading'));
+            assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction?.extractorVersion,4);
             assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.filingData.defendants[0].displayName,name);
+            if(name==='Taylor Resident') assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.filingData.plaintiff!.phone,'248-555-0191');
         }
         await page.screenshot({path:path.join(screenshots,'draft-complaint-replacement.png'),fullPage:true});
         const oneDriveCount=storedFiles.size;

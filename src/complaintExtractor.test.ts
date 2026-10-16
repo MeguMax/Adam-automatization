@@ -6,8 +6,12 @@ import {
     parseComplaintFormFields,
     extractComplaintPdf,
     ComplaintFormWidget,
+    applyVisualComplaintSelections,
 } from './complaintExtractor';
 import { testComplaintFormFixture } from './testPdfFixture';
+import { createCanvas } from '@napi-rs/canvas';
+import { readCheckboxBeforeAnchor } from './pdfCheckboxes';
+import { recognizeDocumentText } from './documentRecognition';
 
 const POSSESSION_ONLY_TEXT = `
 DC 102a (11/23) COMPLAINT, NONPAYMENT OF RENT, Landlord-Tenant
@@ -175,4 +179,29 @@ test('real interactive PDF extracts Widget values even when page text contains o
     assert.equal(result.data.defendants?.[0].postalCode, '48146');
     assert.equal(result.data.claimAmount, '1991.50');
     assert.equal(result.warnings.length, 0);
+    assert.equal(recognizeDocumentText(['DC 102a COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT'], 'scan001.pdf').source,'content');
+});
+
+test('visual checkbox reading distinguishes a checked square, an empty square and absent geometry',()=>{
+    const canvas=createCanvas(1836,2376);const context=canvas.getContext('2d');context.scale(3,3);
+    context.fillStyle='#fff';context.fillRect(0,0,612,792);context.strokeStyle='#000';context.lineWidth=0.6;
+    const anchor={text:'10.',x:60,y:100,width:14,height:10};
+    const read=()=>readCheckboxBeforeAnchor(context.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,anchor);
+    assert.equal(read(),undefined);
+    context.strokeRect(48,100,9,9);assert.equal(read(),false);
+    context.lineWidth=1.5;context.beginPath();context.moveTo(49,104);context.lineTo(52,107);context.lineTo(56,101);context.stroke();
+    assert.equal(read(),true);
+});
+
+test('paragraph 10 uses explicitly referenced total rent, never the monthly rent or unselected damages',()=>{
+    const make=()=>parseComplaintText('COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT');
+    const pages=[{text:'',confidence:100,lines:[],words:[
+        {text:'d. Total rent due now is $',x:268,y:610,width:111,height:10,pageNumber:1,confidence:100},
+        {text:'2,350.07',x:383,y:606,width:39,height:10,pageNumber:1,confidence:100},
+        {text:'975.00',x:434,y:391,width:31,height:10,pageNumber:2,confidence:100},
+    ]}];
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,rent:true,damages:false},pages).data.claimAmount,'2350.07');
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,rent:true,damages:true},pages).data.claimAmount,undefined);
+    assert.equal(applyVisualComplaintSelections(make(),{money:false},pages).data.claimAmount,'0.00');
+    assert.equal(applyVisualComplaintSelections(make(),{noRelated:false,previousRelated:false},pages).data.relatedCivilAction,undefined);
 });

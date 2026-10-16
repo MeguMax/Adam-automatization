@@ -1,5 +1,6 @@
 import { fork } from 'node:child_process';
 import path from 'node:path';
+import type { ComplaintSelections } from './pdfCheckboxes';
 
 export interface OcrLine {
     text: string;
@@ -11,6 +12,7 @@ export interface OcrLine {
     pageNumber: number;
 }
 export interface OcrPage {
+    selections?: ComplaintSelections;
     text: string;
     confidence: number;
     lines: OcrLine[];

@@ -5,6 +5,7 @@ import type { Page as RecognizedPage } from 'tesseract.js';
 import sharp from 'sharp';
 import type { OcrPage, OcrLine } from './pdfOcr';
 import { pdfResourceOptions } from './pdfValidation';
+import { readComplaintSelections } from './pdfCheckboxes';
 
 sharp.concurrency(1);
 
@@ -103,6 +104,11 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                 }
             }
             await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
+            if (Math.abs(recognized.rotationRadians || 0) < 0.015) {
+                const raw = await sharp(image).toColourspace('srgb').ensureAlpha().raw().toBuffer({resolveWithObject:true});
+                recognized.selections = readComplaintSelections(new Uint8ClampedArray(raw.data.buffer,raw.data.byteOffset,raw.data.length),
+                    raw.info.width,raw.info.height,recognized.words.filter(word=>word.confidence>=80));
+            }
             pages.push({ ...recognized, recognitionPasses: passes });
         }
         process.send?.({ pages });

@@ -28,7 +28,7 @@ import {
     uploadFileBufferToFolder,
     ensureIntakeFolder,
 } from './oneDriveClient';
-import { extractComplaintPdf, isComplaintDocument } from './complaintExtractor';
+import { isComplaintDocument } from './complaintExtractor';
 import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { parseWorkflowEmail } from './workflowEmail';
@@ -43,9 +43,11 @@ import { invalidateMifileSession, testMiFileCredentials } from './mifileSession'
 import { pdfPreviewHtml } from './pdfPreview';
 import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
+import { ensureDraftComplaintExtraction } from './draftExtraction';
+import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-16-guided-draft-review-v40';
+const ADMIN_BUILD_ID = '2026-10-16-automatic-complaint-extraction-v41';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3396,7 +3398,7 @@ const html = String.raw`<!doctype html>
                   <summary class="icon-button" title="Document tools" aria-label="Document tools"><i data-lucide="ellipsis"></i></summary>
                   <div class="draft-source-actions draft-tools-items">
                 <button id="draftPrimaryBtn" type="button" title="Use the selected document as the primary source"><i data-lucide="star"></i>Primary source</button>
-                <button id="draftExtractBtn" type="button" title="Extract filing fields from the primary Complaint"><i data-lucide="scan-text"></i>Extract fields</button>
+                <button id="draftExtractBtn" type="button" title="Read the Complaint again; manual corrections are preserved"><i data-lucide="scan-text"></i>Re-read Complaint</button>
                 <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
                 <button id="draftCourtRuleBtn" type="button" title="Apply the current rule to documents without a manual submission choice"><i data-lucide="list-checks"></i>Apply court rule</button>
                 <button id="draftRemoveFormBtn" class="icon-button danger" type="button" title="Remove PDF from Draft only" aria-label="Remove PDF from Draft"><i data-lucide="trash-2"></i></button>
@@ -3419,6 +3421,7 @@ const html = String.raw`<!doctype html>
                 <strong id="draftSectionHeading">Package review</strong>
               </div>
               <span id="draftUnsavedBadge" class="unsaved-badge hidden">Unsaved</span>
+                <span id="draftExtractionProgress" class="muted hidden" role="status">Reading Complaint...</span>
             </div>
             <nav class="draft-section-tabs" aria-label="Case review sections" role="tablist">
               <button id="draftReviewTab" type="button" role="tab" data-draft-tab="review" aria-controls="draftReviewPane">Review</button>
@@ -4386,6 +4389,23 @@ const html = String.raw`<!doctype html>
       document.body.classList.add('draft-editing');
       document.getElementById('toastRegion').classList.add('draft-toast-region');
       renderDraftWorkspace();
+      autoExtractDraft(draftId).catch(showDraftError);
+    }
+
+    async function autoExtractDraft(draftId) {
+      const originalDetail = state.draftDetail;
+      const draft = state.draftDetail && state.draftDetail.caseDraft;
+      if (!draft || !draft.filingEligible || !['not_started', 'failed'].includes(draft.filingStatus) || state.draftMutationBusy) return;
+      const revision = state.draftEditRevision;
+      const progress = document.getElementById('draftExtractionProgress');
+      progress.classList.remove('hidden');
+      try {
+        const detail = await api('/api/drafts/' + encodeURIComponent(draftId) + '/auto-extract', {method:'POST'});
+        if (state.selectedDraftId === draftId && state.draftDetail === originalDetail && !state.draftDirty && !state.draftMutationBusy && state.draftEditRevision === revision) {
+          state.draftDetail = detail;
+          renderDraftWorkspace();
+        }
+      } finally { if (state.selectedDraftId === draftId) progress.classList.add('hidden'); }
     }
 
     function closeDraft() {
@@ -4406,6 +4426,13 @@ const html = String.raw`<!doctype html>
       const detail = state.draftDetail;
       const draft = detail && detail.caseDraft;
       if (!detail || !draft) return;
+      if (state.draftServerSnapshotOwner !== detail) {
+        state.draftServerSnapshotOwner = detail;
+        state.draftServerSnapshot = JSON.parse(JSON.stringify({fields:draft.editableData, filingData:draft.filingData,
+          documents:(detail.documents || []).map(doc=>({id:doc.id,filingName:doc.filingName || doc.currentFilename || '',filingType:doc.filingType || '',
+            filingRelation:doc.filingRelation,requiredForFiling:doc.requiredForFiling})),
+          primaryDocumentId:draft.primaryDocumentId, reviewerNotes:draft.reviewerNotes || ''}));
+      }
       const data = draft.editableData || {};
       const caseNumber = data.caseNumber || data.newCaseNumber ||
         data.temporaryCaseNumber || data.caseTitle || 'Unassigned draft';
@@ -5115,8 +5142,9 @@ const html = String.raw`<!doctype html>
       const moneyJudgment = document.querySelector(
         '[data-filing-field="moneyJudgmentRequested"]',
       );
-      document.querySelectorAll('[data-document-field="filingRelation"]').forEach(input => {
+      document.querySelectorAll('[data-document-field="filingRelation"], [data-document-field="filingType"]').forEach(input => {
         input.addEventListener('change', () => { input.dataset.reviewed = 'true'; });
+        input.addEventListener('input', () => { input.dataset.reviewed = 'true'; });
       });
       const claimAmount = document.querySelector('[data-filing-field="claimAmount"]');
       const syncClaimAmount = () => {
@@ -5128,7 +5156,7 @@ const html = String.raw`<!doctype html>
       syncClaimAmount();
       document.querySelectorAll('[data-set-primary-document]').forEach(button => {
         button.addEventListener('click', () => {
-          setDraftPrimaryDocument(button.dataset.setPrimaryDocument);
+          setDraftPrimaryDocument(button.dataset.setPrimaryDocument).catch(showDraftError);
         });
       });
       document.getElementById('draftReviewerNotes').oninput = () => setDraftDirty(true);
@@ -5251,7 +5279,12 @@ const html = String.raw`<!doctype html>
         if (!field) return;
         input.dataset.reviewField = field;
         if (!key) return;
-        const source = (draft.filingFieldSources || {})[key] || 'empty';
+        let source = (draft.filingFieldSources || {})[key] || 'empty';
+        const paths = JSON.parse(draft.normalizedDataJson || '{}').manualFilingPaths;
+        const path = field.replace(/^filingData\./, '');
+        if (source === 'manual' && Array.isArray(paths) && !paths.some(manual => path === manual || path.startsWith(manual + '.'))) {
+          source = extraction?.appliedFields?.includes(key) ? 'complaint' : 'default';
+        }
         const confidence = extraction && extraction.fieldConfidence && extraction.fieldConfidence[key];
         const sourceLabel = source === 'complaint' && extraction
           ? extraction.extractionMethod === 'form_fields' ? 'PDF fields'
@@ -5400,13 +5433,13 @@ const html = String.raw`<!doctype html>
         '<label class="draft-field filing-type-field ' +
           (issue ? 'has-' + escapeHtml(issue.severity) : '') + '">' +
           '<span class="draft-field-label"><span>Filing Type</span></span>' +
-          '<input type="text" list="mifileFilingTypes" data-document-field="filingType" value="' +
+          '<input type="text" list="mifileFilingTypes" data-document-field="filingType" data-reviewed="' + Boolean(document.filingTypeReviewed) + '" value="' +
             escapeHtml(document.filingType || '') + '">' +
         '</label>' +
         '<label class="draft-field filing-relation-field ' +
           (issue ? 'has-' + escapeHtml(issue.severity) : '') + '">' +
           '<span class="draft-field-label"><span>Submission</span></span>' +
-          '<select data-document-field="filingRelation"' +
+          '<select data-document-field="filingRelation" data-reviewed="' + Boolean(document.filingRelationReviewed) + '"' +
             (coreDocument || document.packageRole === 'fee' ? ' disabled' : '') + '>' +
             '<option value="unknown"' +
               (document.filingRelation === 'unknown' ? ' selected' : '') + '>Review required</option>' +
@@ -5435,7 +5468,7 @@ const html = String.raw`<!doctype html>
       '</div></details>';
     }
 
-    function setDraftPrimaryDocument(documentId) {
+    async function setDraftPrimaryDocument(documentId) {
       const detail = state.draftDetail;
       const draft = detail && detail.caseDraft;
       const documents = (detail && detail.documents) || [];
@@ -5460,6 +5493,7 @@ const html = String.raw`<!doctype html>
       renderDraftFields(draft);
       renderDraftDocuments(documents);
       setDraftDirty(true);
+      await saveDraft(true);
     }
 
     function renderDraftDocuments(documents) {
@@ -5680,6 +5714,7 @@ const html = String.raw`<!doctype html>
             id: root.dataset.draftDocumentId,
             filingName: filingName ? filingName.value : '',
             filingType: filingType ? filingType.value : '',
+            filingTypeReviewed: Boolean(filingType && filingType.dataset.reviewed === 'true'),
             filingRelation: filingRelation ? filingRelation.value : 'unknown',
             filingRelationReviewed: Boolean(filingRelation && filingRelation.dataset.reviewed === 'true'),
             requiredForFiling: required ? required.checked : true,
@@ -5700,7 +5735,9 @@ const html = String.raw`<!doctype html>
         if (!mapping) return;
         document.filingName = mapping.filingName;
         document.filingType = mapping.filingType;
+        document.filingTypeReviewed = mapping.filingTypeReviewed;
         document.filingRelation = mapping.filingRelation;
+        document.filingRelationReviewed = mapping.filingRelationReviewed;
         document.requiredForFiling = mapping.requiredForFiling;
       });
     }
@@ -5709,6 +5746,7 @@ const html = String.raw`<!doctype html>
       const detail = state.draftDetail;
       if (!detail || !detail.caseDraft || state.draftMutationBusy) return;
       const payload = {
+        base: state.draftServerSnapshot,
         fields: collectDraftFields(), filingData: collectDraftFilingData(),
         documents: collectDraftDocumentMappings(), primaryDocumentId: detail.caseDraft.primaryDocumentId,
         reviewerNotes: document.getElementById('draftReviewerNotes').value,
@@ -6916,7 +6954,7 @@ const html = String.raw`<!doctype html>
       renderActiveDraftDocument((state.draftDetail && state.draftDetail.documents) || []);
     });
     document.getElementById('draftPrimaryBtn').addEventListener('click', () => {
-      setDraftPrimaryDocument(state.activeDraftDocumentId);
+      setDraftPrimaryDocument(state.activeDraftDocumentId).catch(showDraftError);
     });
     document.getElementById('draftExtractBtn').addEventListener('click', () => {
       extractPrimaryComplaint().catch(showDraftError);
@@ -7716,6 +7754,7 @@ export function createAdminServer(
                     }
                     db.recordDocumentReplacement(documentId, {fileSize:content.length,mimeType:'application/pdf',token:replacement.token,...uploaded});
                     db.recordDocumentRecognition(documentId, await recognizeDocumentPdf(content, uploadedPdfFilename(req.headers['x-file-name'])));
+                    await ensureDraftComplaintExtraction(db, draftId, {documentId, content});
                     db.refreshEmailAfterDocumentRetries(replacement.detail.email.id, draftId);
                     sendJson(res, 200, await applyLibraryForms(db,draftId));
                 } catch (error) {
@@ -7832,11 +7871,7 @@ export function createAdminServer(
                 if (isIntake) db.recordDocumentRecognition(addedDocumentId, await recognizeDocumentPdf(content, originalFilename));
                 const addedType = db.getDraftDetail(caseDraftId)?.documents.find(item => item.id === addedDocumentId)?.documentType;
                 if (isComplaintDocument(addedType, null)) {
-                    try {
-                        db.applyComplaintExtraction(caseDraftId, addedDocumentId, await extractComplaintPdf(content));
-                    } catch (error) {
-                        db.recordComplaintExtractionFailure(caseDraftId, addedDocumentId, error);
-                    }
+                    await ensureDraftComplaintExtraction(db, caseDraftId, {documentId: addedDocumentId, content});
                 }
                 sendJson(res, 201, isIntake ? await applyLibraryForms(db, caseDraftId) : db.refreshCaseDraftValidation(caseDraftId));
                 return;
@@ -7850,6 +7885,15 @@ export function createAdminServer(
                     return;
                 }
                 sendJson(res, 200, detail);
+                return;
+            }
+
+            const autoExtractMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/auto-extract$/);
+            if (req.method === 'POST' && autoExtractMatch) {
+                const draftId = decodeURIComponent(autoExtractMatch[1]);
+                const detail = await ensureDraftComplaintExtraction(db, draftId);
+                sendJson(res, 200, detail.caseDraft?.complaintExtraction && detail.caseDraft.filingEligible && ['not_started','failed'].includes(detail.caseDraft.filingStatus)
+                    ? await applyLibraryForms(db, draftId) : detail);
                 return;
             }
 
@@ -7879,24 +7923,13 @@ export function createAdminServer(
                     return;
                 }
 
-                const sharedItem = await resolveSharedDriveItem(primary.oneDriveUrl);
-                const content = await downloadDriveItemBuffer(
-                    sharedItem.driveId,
-                    sharedItem.itemId,
-                );
-                let extraction;
-                try {
-                    extraction = await extractComplaintPdf(content, primary.documentType);
-                } catch (error) {
-                    db.recordComplaintExtractionFailure(caseDraftId, primary.id, error);
+                try { db.getDraftDocumentEditContext(primary.id); }
+                catch (error) { sendJson(res, 409, {error:(error as Error).message}); return; }
+                const latest = await ensureDraftComplaintExtraction(db, caseDraftId, {force:true});
+                if (JSON.parse(latest.caseDraft?.normalizedDataJson || '{}').complaintExtractionError) {
                     sendJson(res, 422, { error: 'Complaint extraction failed. Check the Draft validation details.' });
                     return;
                 }
-                db.applyComplaintExtraction(
-                    caseDraftId,
-                    primary.id,
-                    extraction,
-                );
                 const updated = JSON.parse(detail.caseDraft.normalizedDataJson || '{}').sourceKind === 'new_filing_intake'
                     ? await applyLibraryForms(db, caseDraftId) : db.refreshCaseDraftValidation(caseDraftId);
                 sendJson(res, 200, updated);
@@ -7906,6 +7939,32 @@ export function createAdminServer(
             if (req.method === 'PATCH' && draftMatch) {
                 const body = await readRequestBody(req);
                 const parsed = body ? JSON.parse(body) : {};
+                // The browser may still show an older automatic result while the user is typing.
+                // Apply only their actual edits to the latest server values.
+                if (parsed.base && typeof parsed.base === 'object' && !Array.isArray(parsed.base)) {
+                    const latest = db.getDraftDetail(decodeURIComponent(draftMatch[1]));
+                    if (!latest?.caseDraft) { sendJson(res,404,{error:'Draft not found'}); return; }
+                    const base = parsed.base;
+                    if (parsed.fields && base.fields) parsed.fields = Object.fromEntries(Object.entries(parsed.fields)
+                        .filter(([key,value])=>String(value ?? '') !== String(base.fields[key] ?? '')));
+                    if (parsed.filingData && base.filingData) {
+                        const edits = new Set(changedFieldPaths('filingData',base.filingData,parsed.filingData));
+                        parsed.filingData = mergeExtractedField('filingData',parsed.filingData,latest.caseDraft.filingData,edits);
+                    }
+                    if (Array.isArray(parsed.documents) && Array.isArray(base.documents)) {
+                        parsed.documents = parsed.documents.flatMap((mapping: any) => {
+                            const original = base.documents.find((doc:any)=>doc.id===mapping.id);
+                            const current = latest.documents.find(doc=>doc.id===mapping.id);
+                            if (!original || !current) return [mapping];
+                            const keys = ['filingName','filingType','filingRelation','requiredForFiling'] as const;
+                            const changed = keys.filter(key=>mapping[key] !== original[key]);
+                            if (!changed.length && !mapping.filingTypeReviewed && !mapping.filingRelationReviewed) return [];
+                            return [{...mapping,...Object.fromEntries(keys.filter(key=>!changed.includes(key)).map(key=>[key,current[key]]))}];
+                        });
+                    }
+                    if (parsed.primaryDocumentId === base.primaryDocumentId) delete parsed.primaryDocumentId;
+                    if (parsed.reviewerNotes === base.reviewerNotes) delete parsed.reviewerNotes;
+                }
                 const detail = db.updateCaseDraft(
                     decodeURIComponent(draftMatch[1]),
                     parsed.fields ?? {},
@@ -7918,6 +7977,10 @@ export function createAdminServer(
                         ? parsed.primaryDocumentId
                         : undefined,
                 );
+                if (Object.prototype.hasOwnProperty.call(parsed, 'primaryDocumentId') &&
+                    detail.caseDraft?.primaryDocumentId && detail.caseDraft.primaryDocumentId !== detail.caseDraft.complaintExtraction?.documentId) {
+                    await ensureDraftComplaintExtraction(db, decodeURIComponent(draftMatch[1]));
+                }
                 sendJson(res, 200, JSON.parse(detail.caseDraft?.normalizedDataJson || '{}').sourceKind === 'new_filing_intake'
                     ? await applyLibraryForms(db, decodeURIComponent(draftMatch[1])) : detail);
                 return;

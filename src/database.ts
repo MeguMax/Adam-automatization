@@ -7,8 +7,10 @@ import { DOCUMENT_LABELS, documentLabel, DocumentRecognition } from './documentR
 import { LibraryForm, FormRole, courtKey } from './formLibraryTypes';
 import { isProcessingReportSubject } from './processingReport';
 import { resolveCourt, districtCode } from './courtForms';
+import { changedFieldPaths, mergeExtractedField, protectedFieldPaths } from './draftFieldMerge';
 import {
     ComplaintExtractionResult,
+    CURRENT_COMPLAINT_EXTRACTOR_VERSION,
     isComplaintDocument,
 } from './complaintExtractor';
 
@@ -368,6 +370,7 @@ export interface DraftDocumentFilingUpdate {
     id: string;
     filingName?: unknown;
     filingType?: unknown;
+    filingTypeReviewed?: boolean;
     filingRelation?: unknown;
     filingSequence?: unknown;
     requiredForFiling?: unknown;
@@ -973,6 +976,8 @@ const DRAFT_FILING_DATA_KEYS = [
 type DraftFilingDataKey = typeof DRAFT_FILING_DATA_KEYS[number];
 
 type StoredComplaintExtraction = ComplaintExtractionResult & {
+    appliedCourtName?: string;
+    appliedCaseTitle?: string;
     documentId: string;
     extractedAt: string;
     appliedFields: string[];
@@ -992,7 +997,7 @@ function complaintExtractionFromDraft(data: unknown): StoredComplaintExtraction 
     if (
         typeof source.documentId !== 'string' ||
         typeof source.extractedAt !== 'string' ||
-        (source.extractorVersion !== 1 && source.extractorVersion !== 2 && source.extractorVersion !== 3) ||
+        (![1, 2, 3, 4].includes(source.extractorVersion as number)) ||
         !source.data ||
         typeof source.data !== 'object'
     ) {
@@ -1085,6 +1090,8 @@ function draftFieldSources(
     const current = draftEditableData(normalized);
     const complaint = complaintExtractionFromDraft(normalized);
     const complaintValues: Partial<Record<EditableDraftField, string>> = {};
+    if (complaint?.appliedCourtName) complaintValues.courtName = complaint.appliedCourtName;
+    if (complaint?.appliedCaseTitle) complaintValues.caseTitle = complaint.appliedCaseTitle;
     if (complaint?.data.caseNumber) {
         complaintValues.caseNumber = complaint.data.caseNumber;
     }
@@ -1105,7 +1112,9 @@ function draftFieldSources(
     const sources = {} as Record<EditableDraftField, DraftFieldSource>;
 
     for (const field of EDITABLE_DRAFT_FIELDS) {
-        if (!current[field]) {
+        if (Array.isArray(normalizedObject.manualEditableFields) && normalizedObject.manualEditableFields.includes(field)) {
+            sources[field] = 'manual';
+        } else if (!current[field]) {
             sources[field] = 'empty';
         } else if (current[field] === complaintValues[field]) {
             sources[field] = 'complaint';
@@ -2522,15 +2531,73 @@ export class WorkflowDatabase {
         return rows.map(row => row.name).filter(Boolean).sort();
     }
 
+    getComplaintSourceVersion(documentId: string): string | null {
+        const row = this.db.prepare(`SELECT one_drive_url, file_size, metadata_json FROM document_records WHERE id = ? AND is_active = 1`)
+            .get(documentId) as { one_drive_url: string | null; file_size: number | null; metadata_json: string | null } | undefined;
+        return row ? toJson([documentId, row.one_drive_url, row.file_size, this.safeJson(row.metadata_json)?.replacement?.token || null]) : null;
+    }
+
+    setComplaintAutoExtractionState(draftId: string, state: Record<string, unknown>): void {
+        this.db.prepare(`UPDATE case_drafts SET normalized_data_json = json_set(normalized_data_json, '$.complaintAutoExtraction', json(?)), updated_at = ?
+            WHERE id = ? AND filing_status IN ('not_started','failed') AND status IN ('parsed', 'needs_review', 'validation_failed', 'ready_to_file','filing_failed')`)
+            .run(toJson(state), nowIso(), draftId);
+    }
+
+    clearStaleComplaintExtractionState(draftId: string, sourceVersion: string | null): void {
+        this.db.prepare(`UPDATE case_drafts SET normalized_data_json = json_remove(normalized_data_json, '$.complaintAutoExtraction'), updated_at = ?
+            WHERE id = ? AND json_extract(normalized_data_json, '$.complaintAutoExtraction.sourceVersion') = ?
+              AND json_extract(normalized_data_json, '$.complaintAutoExtraction.status') = 'running'`)
+            .run(nowIso(),draftId,sourceVersion);
+    }
+
+    recoverInterruptedComplaintExtractions(): number {
+        const rows = this.db.prepare(`SELECT id, normalized_data_json FROM case_drafts
+            WHERE filing_status IN ('not_started','failed') AND status IN ('parsed','needs_review','validation_failed','ready_to_file','filing_failed')
+              AND json_extract(normalized_data_json, '$.complaintAutoExtraction.status') = 'running'`)
+            .all() as Array<{id:string;normalized_data_json:string}>;
+        for (const row of rows) {
+            const state = this.safeJson(row.normalized_data_json).complaintAutoExtraction;
+            this.recordComplaintExtractionFailure(row.id,state.documentId,new Error('Automatic Complaint reading was interrupted by a restart.'));
+            this.setComplaintAutoExtractionState(row.id,{...state,status:'failed',nextRetryAt:state.attempts<3?nowIso():null});
+        }
+        return rows.length;
+    }
+
+    listPendingComplaintExtractions(version: number, limit = 1): string[] {
+        return (this.db.prepare(`SELECT c.id FROM case_drafts c JOIN email_records e ON e.id = c.email_id
+            WHERE json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'
+              AND c.filing_status IN ('not_started','failed') AND c.status IN ('parsed', 'needs_review', 'validation_failed', 'ready_to_file','filing_failed')
+              AND e.processing_status != 'processing'
+              AND (COALESCE(json_extract(c.normalized_data_json, '$.complaintExtraction.extractorVersion'), 0) < ?
+                OR json_extract(c.normalized_data_json, '$.complaintExtractionError') IS NOT NULL)
+              AND (COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.extractorVersion'), 0) != ?
+                OR (COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.attempts'), 0) < 3
+                  AND COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.nextRetryAt'), '') <= ?))
+              AND EXISTS (SELECT 1 FROM document_records d WHERE d.case_draft_id = c.id AND d.is_active = 1
+                AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','replaced','downloaded')
+                AND COALESCE(json_extract(d.metadata_json, '$.recognition.source'), '') != 'conflict'
+                AND lower(d.document_type) LIKE '%complaint%')
+              AND ((c.primary_document_id IS NOT NULL AND EXISTS (SELECT 1 FROM document_records p
+                WHERE p.id = c.primary_document_id AND p.is_active = 1 AND p.one_drive_url IS NOT NULL
+                  AND COALESCE(json_extract(p.metadata_json, '$.recognition.source'), '') != 'conflict'
+                  AND p.status IN ('uploaded','replaced','downloaded') AND lower(p.document_type) LIKE '%complaint%'))
+                OR (c.primary_document_id IS NULL AND (SELECT COUNT(*) FROM document_records d
+                  WHERE d.case_draft_id = c.id AND d.is_active = 1 AND lower(d.document_type) LIKE '%complaint%'
+                    AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','replaced','downloaded')) = 1))
+            ORDER BY c.updated_at LIMIT ?`).all(version, version, nowIso(), limit) as Array<{id:string}>).map(row=>row.id);
+    }
+
     queueValidatedIntakes(limit = 5): number {
         const rows = this.db.prepare(`SELECT c.id FROM case_drafts c
             WHERE json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'
               AND c.status = 'ready_to_file' AND c.validation_status = 'passed' AND c.filing_status = 'not_started'
+              AND COALESCE(json_extract(c.normalized_data_json, '$.complaintExtraction.extractorVersion'), 0) >= ?
+              AND COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.status'), '') != 'running'
               AND COALESCE(json_extract(c.normalized_data_json, '$.intake.manual'), 0) = 0
               AND COALESCE(json_extract(c.normalized_data_json, '$.manualDocumentEdits'), 0) = 0
               AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status = 'processed')
               AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = c.id)
-            ORDER BY c.created_at LIMIT ?`).all(limit) as Array<{id:string}>;
+            ORDER BY c.created_at LIMIT ?`).all(CURRENT_COMPLAINT_EXTRACTOR_VERSION, limit) as Array<{id:string}>;
         let queued = 0;
         for (const row of rows) {
             const detail = this.getDraftDetail(row.id);
@@ -2770,10 +2837,11 @@ export class WorkflowDatabase {
         const normalized = this.safeJson(row.normalized_data_json) || {};
         const extraction = complaintExtractionFromDraft(normalized);
         const manual = inferredManualFilingFields(extracted, normalized);
+        const manualPaths = protectedFieldPaths(normalized, manual);
         const filing = draftFilingData(normalized);
         const originalFiling = draftFilingData(extracted);
         for (const key of DRAFT_FILING_DATA_KEYS) {
-            if (!manual.has(key) && extraction?.appliedFields.includes(key)) (filing as any)[key] = originalFiling[key];
+            if (extraction?.appliedFields.includes(key)) (filing as any)[key] = mergeExtractedField(key, filing[key], originalFiling[key], manualPaths);
         }
         const sources = draftFieldSources(extracted, normalized);
         const originalFields = draftEditableData(extracted);
@@ -2781,8 +2849,10 @@ export class WorkflowDatabase {
         for (const field of EDITABLE_DRAFT_FIELDS) if (sources[field] === 'complaint') normalized[field] = originalFields[field];
         normalized.filingData = filing;
         normalized.manualFilingFields = Array.from(manual);
+        normalized.manualFilingPaths = Array.from(manualPaths);
         delete normalized.complaintExtraction;
         delete normalized.complaintExtractionError;
+        delete normalized.complaintAutoExtraction;
         this.db.prepare('UPDATE case_drafts SET normalized_data_json = ?, reviewed_at = NULL WHERE id = ?')
             .run(toJson(normalized), draftId);
     }
@@ -5265,6 +5335,9 @@ export class WorkflowDatabase {
             if (confirmPackage) this.reviewCaseDraft(caseDraftId, 'approve');
             const detail = this.getDraftDetail(caseDraftId);
             if (!detail?.caseDraft) throw new Error('Case draft not found');
+            if (this.safeJson(detail.caseDraft.normalizedDataJson)?.complaintAutoExtraction?.status === 'running') {
+                throw new Error('Filing is blocked: Complaint extraction is still running.');
+            }
             const allowedStatuses = new Set(['ready_to_file', 'filing_failed']);
             if (!allowedStatuses.has(detail.caseDraft.status)) {
                 throw new Error('Approve the Draft before preparing it in MiFILE');
@@ -5608,6 +5681,7 @@ export class WorkflowDatabase {
                     validation_status,
                     filing_status,
                     primary_document_id,
+                    extracted_data_json,
                     normalized_data_json,
                     reviewer_notes
                 FROM case_drafts
@@ -5620,6 +5694,7 @@ export class WorkflowDatabase {
                 validation_status: ValidationStatus;
                 filing_status: FilingStatus;
                 primary_document_id: string | null;
+                extracted_data_json: string | null;
                 normalized_data_json: string | null;
                 reviewer_notes: string | null;
             }
@@ -5677,13 +5752,16 @@ export class WorkflowDatabase {
         next.filingData = nextFilingData;
 
         const manualFilingFields = storedManualFilingFields(next);
+        const manualPaths = protectedFieldPaths(next, inferredManualFilingFields(this.safeJson(existing.extracted_data_json), next));
         if (filingDataInput !== undefined) {
             for (const key of DRAFT_FILING_DATA_KEYS) {
                 if (!jsonValuesEqual(previousFilingData[key], nextFilingData[key])) {
                     manualFilingFields.add(key);
+                    changedFieldPaths(key, previousFilingData[key], nextFilingData[key]).forEach(path => manualPaths.add(path));
                 }
             }
             next.manualFilingFields = Array.from(manualFilingFields).sort();
+            next.manualFilingPaths = Array.from(manualPaths).sort();
         }
 
         if (filingDataInput !== undefined) {
@@ -5707,6 +5785,9 @@ export class WorkflowDatabase {
             }
         }
 
+        next.manualEditableFields = [...new Set([
+            ...(Array.isArray(next.manualEditableFields) ? next.manualEditableFields : []), ...Object.keys(newFields),
+        ])].sort();
         const notes = reviewerNotes === undefined
             ? existing.reviewer_notes
             : reviewerNotes.trim().slice(0, 10_000) || null;
@@ -5742,7 +5823,20 @@ export class WorkflowDatabase {
             }
         }
         const primaryDocumentChanged = primaryDocumentId !== existing.primary_document_id;
-        if (primaryDocumentChanged) delete next.complaintExtraction;
+        if (primaryDocumentChanged) {
+            const previousExtraction = complaintExtractionFromDraft(next);
+            const original = this.safeJson(existing.extracted_data_json);
+            const originalFiling = draftFilingData(original);
+            for (const key of DRAFT_FILING_DATA_KEYS.filter(key => previousExtraction?.appliedFields.includes(key))) {
+                (nextFilingData as any)[key] = mergeExtractedField(key, nextFilingData[key], originalFiling[key], manualPaths);
+            }
+            const sources = draftFieldSources(original, next);
+            const originalFields = draftEditableData(original);
+            for (const field of EDITABLE_DRAFT_FIELDS) if (sources[field] === 'complaint') next[field] = originalFields[field];
+            delete next.complaintExtraction;
+            delete next.complaintExtractionError;
+            delete next.complaintAutoExtraction;
+        }
         const issues = validateDraftData(next);
         const validationStatus: ValidationStatus = issues.some(issue => issue.severity === 'error')
             ? 'failed'
@@ -5797,7 +5891,7 @@ export class WorkflowDatabase {
                 if (!documentId) throw new Error('Every document mapping requires an id');
                 const existingDocument = this.db
                     .prepare(`
-                        SELECT id, document_type, current_filename, original_filename, filing_relation, filing_relation_source
+                        SELECT id, document_type, current_filename, original_filename, filing_type, filing_type_source, filing_relation, filing_relation_source
                         FROM document_records
                         WHERE id = ?
                           AND case_draft_id = ?
@@ -5852,9 +5946,11 @@ export class WorkflowDatabase {
                     : packageRole === 'fee'
                         ? false
                         : mapping.requiredForFiling !== false;
-                const relationSource = (existingDocument as any).filing_relation_source === 'court_rule' &&
-                    mapping.filingRelationReviewed !== true && (existingDocument as any).filing_relation === filingRelation
-                    ? 'court_rule' : 'manual';
+                const relationSource = mapping.filingRelationReviewed !== true && (existingDocument as any).filing_relation === filingRelation &&
+                    (mapping.filingRelationReviewed === false || (existingDocument as any).filing_relation_source === 'court_rule')
+                    ? (existingDocument as any).filing_relation_source || 'suggested' : 'manual';
+                const typeSource = mapping.filingTypeReviewed === false && filingType === (existingDocument as any).filing_type
+                    ? (existingDocument as any).filing_type_source : filingType ? 'manual' : null;
 
                 this.db
                     .prepare(`
@@ -5874,7 +5970,7 @@ export class WorkflowDatabase {
                         filingName,
                         filingType,
                         filingType,
-                        filingType ? 'manual' : null,
+                        typeSource,
                         filingRelation,
                         relationSource,
                         requiredForFiling ? 1 : 0,
@@ -6111,6 +6207,11 @@ export class WorkflowDatabase {
             : {};
         const filing = draftFilingData(next);
         const manualFields = inferredManualFilingFields(extractedData, next);
+        const manualPaths = protectedFieldPaths(next, manualFields);
+        const legacySources = draftFieldSources(extractedData, next);
+        const explicitManual = new Set(Array.isArray(next.manualEditableFields) ? next.manualEditableFields : []);
+        let appliedCourtName: string | undefined;
+        let appliedCaseTitle: string | undefined;
         const appliedFields: string[] = [];
         // Re-extraction must not preserve an old guessed checkbox/amount as if
         // the new scan had verified it. Explicit manual edits remain protected.
@@ -6124,16 +6225,16 @@ export class WorkflowDatabase {
             filing.claimAmount = null;
         }
         const apply = <K extends DraftFilingDataKey>(key: K, value: DraftFilingData[K]) => {
-            if (manualFields.has(key) || value === undefined || value === null) return;
-            filing[key] = value;
+            if (manualPaths.has(key) || value === undefined || value === null) return;
+            filing[key] = mergeExtractedField(key, filing[key], value, manualPaths);
             appliedFields.push(key);
         };
 
         if (extraction.data.courtDistrict) {
             apply('courtDistrict', extraction.data.courtDistrict);
-            if (!next.courtName && !manualFields.has('courtDistrict')) {
+            if ((!next.courtName || legacySources.courtName === 'complaint') && !explicitManual.has('courtName') && !manualFields.has('courtDistrict')) {
                 const court = resolveCourt(extraction.data.courtDistrict, this.getKnownCourtNames());
-                if (court) next.courtName = court;
+                if (court) { next.courtName = court; appliedCourtName = court; }
             }
         }
         if (extraction.data.plaintiff) {
@@ -6183,20 +6284,21 @@ export class WorkflowDatabase {
             apply('mailingRequested', true);
         }
 
-        const legacySources = draftFieldSources(extractedData, next);
         if (extraction.data.caseNumber && legacySources.caseNumber !== 'manual') {
             next.caseNumber = extraction.data.caseNumber;
         }
         if (extraction.data.plaintiff && legacySources.plaintiff !== 'manual') {
-            next.plaintiff = extraction.data.plaintiff.displayName;
+            next.plaintiff = draftPartyName(filing.plaintiff);
         }
         if (extraction.data.defendants?.length && legacySources.defendant !== 'manual') {
-            next.defendant = extraction.data.defendants
-                .map(party => party.displayName)
+            next.defendant = filing.defendants
+                .map(party => draftPartyName(party))
                 .join(', ');
         }
-        if (next.sourceKind === 'new_filing_intake' && !next.caseTitle && next.plaintiff && next.defendant) {
+        if (next.sourceKind === 'new_filing_intake' && (!next.caseTitle || legacySources.caseTitle === 'complaint') &&
+            !explicitManual.has('caseTitle') && next.plaintiff && next.defendant) {
             next.caseTitle = `${next.plaintiff} V ${next.defendant}`;
+            appliedCaseTitle = String(next.caseTitle);
         }
         if (extraction.data.attorney && legacySources.filerName !== 'manual') {
             next.filerName = extraction.data.attorney.displayName;
@@ -6205,11 +6307,14 @@ export class WorkflowDatabase {
         const timestamp = nowIso();
         next.filingData = filing;
         next.manualFilingFields = Array.from(manualFields).sort();
+        next.manualFilingPaths = Array.from(manualPaths).sort();
         next.complaintExtraction = {
             ...extraction,
             documentId,
             extractedAt: timestamp,
             appliedFields,
+            appliedCourtName,
+            appliedCaseTitle,
         } satisfies StoredComplaintExtraction;
         delete next.complaintExtractionError;
 
@@ -6346,7 +6451,7 @@ export class WorkflowDatabase {
         }
         if (root?.complaintExtractionError) issues.push({
             field: 'complaintExtraction', severity: 'error',
-            message: `Complaint extraction failed: ${root.complaintExtractionError}. Replace the PDF or run Extract again.`,
+            message: `Complaint extraction failed: ${root.complaintExtractionError}. Automatic retry is scheduled when available; a corrected PDF can also be uploaded.`,
         });
         return issues;
     }
@@ -6428,6 +6533,9 @@ export class WorkflowDatabase {
             if (Array.isArray(oldNormalizedObject.manualFilingFields)) {
                 nextNormalized.manualFilingFields = oldNormalizedObject.manualFilingFields;
             }
+            if (oldNormalizedObject.complaintAutoExtraction) nextNormalized.complaintAutoExtraction = oldNormalizedObject.complaintAutoExtraction;
+            if (Array.isArray(oldNormalizedObject.manualFilingPaths)) nextNormalized.manualFilingPaths = oldNormalizedObject.manualFilingPaths;
+            if (Array.isArray(oldNormalizedObject.manualEditableFields)) nextNormalized.manualEditableFields = oldNormalizedObject.manualEditableFields;
             if (oldNormalizedObject.manualDocumentEdits === true) nextNormalized.manualDocumentEdits = true;
             if (oldNormalizedObject.complaintExtractionError) {
                 nextNormalized.complaintExtractionError = oldNormalizedObject.complaintExtractionError;
