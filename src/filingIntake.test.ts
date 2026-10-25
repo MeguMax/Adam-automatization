@@ -8,7 +8,7 @@ import { buildFilingIntake, intakeFileName, intakeSenderAllowed, isFilingIntakeS
 import { emailAttachmentSourceId, emailAttachmentSourceName } from './emailAttachmentSource';
 import { downloadIntakeDocuments } from './filingIntakeDownload';
 import { processFilingIntake } from './filingIntakeWorker';
-import type { ComplaintExtractionResult } from './complaintExtractor';
+import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
 import { testPdfFixture } from './testPdfFixture';
 
 const message = {
@@ -22,7 +22,7 @@ const attachment = (name: string, id = name) => ({
 });
 const pdf = testPdfFixture();
 const extraction: ComplaintExtractionResult = {
-    extractorVersion: 4, formType: 'NONPAYMENT OF RENT', pageCount: 1, textHash: 'fixture',
+    extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION, formType: 'NONPAYMENT OF RENT', pageCount: 1, textHash: 'fixture',
     data: {
         courtDistrict: '25',
         plaintiff: { displayName: 'Example Property LLC', entityName: 'Example Property LLC',
@@ -240,7 +240,7 @@ test('a validated intake queues only preparation, locks account changes, and can
         assert.throws(() => f.db.reviewCaseDraft(f.draftId, 'approve'), /filename only/);
         f.db.updateCaseDraft(f.draftId, {}, undefined, undefined, detail.documents.map(doc => ({
             id: doc.id, filingType: doc.filingType, filingName: doc.currentFilename,
-            filingRelation: 'separate', requiredForFiling: true,
+            filingRelation: 'separate', filingRelationReviewed: true, requiredForFiling: true,
         })));
         f.db.reviewCaseDraft(f.draftId, 'approve');
         assert.throws(() => f.db.queueFilingJob(f.draftId, 'submit' as any), /Final court submission is disabled/);
@@ -267,7 +267,7 @@ test('automatic preparation only queues complete new intakes once and never skip
         const detail = f.db.updateCaseDraft(f.draftId, {courtName:'25th District Court'});
         f.db.updateCaseDraft(f.draftId, {}, undefined, undefined, detail.documents.map(doc => ({
             id:doc.id, filingType:doc.filingType, filingName:doc.currentFilename,
-            filingRelation:'separate', requiredForFiling:true,
+            filingRelation:'separate', filingRelationReviewed:true, requiredForFiling:true,
         })));
         f.db.refreshCaseDraftValidation(f.draftId);
         assert.equal(f.db.queueValidatedIntakes(), 1);

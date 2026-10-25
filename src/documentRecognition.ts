@@ -40,7 +40,10 @@ export function recognizeDocumentText(pages: string[], filename: string): Docume
         ['ancillary', /^(?:state of michigan\s+)?(?:demand for possession(?:\s+nonpayment of rent)?|notice to quit(?: to recover possession of property)?|warranty deed|quit\s*claim deed|affidavit(?: of [a-z ]+)?|residential lease(?: agreement)?|lease agreement)$/i],
     ];
     for (const page of pages) {
-        const lines = page.split(/\r?\n/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 24);
+        const allLines = page.split(/\r?\n/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+        // A scan can merge the two-column heading. The printed SCAO footer is a second title anchor.
+        if (allLines.some(line=>/^DC\s*102[ac]\s*(?:\([^)]*\)\s*)?COMPLAINT\b/i.test(line))) roles.add('complaint');
+        const lines = allLines.slice(0, 24);
         const candidates = lines.flatMap((line, index) => [line, `${line} ${lines[index + 1] || ''}`.trim()]);
         for (const line of candidates) for (const [role, pattern] of patterns) if (pattern.test(line)) roles.add(role);
     }

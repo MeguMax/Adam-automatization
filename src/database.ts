@@ -8,6 +8,7 @@ import { LibraryForm, FormRole, courtKey } from './formLibraryTypes';
 import { isProcessingReportSubject } from './processingReport';
 import { resolveCourt, districtCode } from './courtForms';
 import { changedFieldPaths, mergeExtractedField, protectedFieldPaths } from './draftFieldMerge';
+import { ADAM_OFFICE, ADAM_ATTORNEY, ADAM_FILING_POLICY_VERSION, approvedSupportingRelation } from './adamFilingPolicy';
 import {
     ComplaintExtractionResult,
     CURRENT_COMPLAINT_EXTRACTOR_VERSION,
@@ -997,7 +998,7 @@ function complaintExtractionFromDraft(data: unknown): StoredComplaintExtraction 
     if (
         typeof source.documentId !== 'string' ||
         typeof source.extractedAt !== 'string' ||
-        (![1, 2, 3, 4].includes(source.extractorVersion as number)) ||
+        (![1, 2, 3, 4, 5].includes(source.extractorVersion as number)) ||
         !source.data ||
         typeof source.data !== 'object'
     ) {
@@ -2644,7 +2645,17 @@ export class WorkflowDatabase {
 
     applyCourtFilingRule(draftId: string, replacePinned = false): EmailDetail {
         const detail = this.assertEditableIntake(draftId);
-        const key = courtKey(detail.caseDraft!.editableData.courtName || '');
+        const courtName = detail.caseDraft!.editableData.courtName || '';
+        const key = courtKey(courtName);
+        const approved = approvedSupportingRelation(courtName);
+        // A saved or disabled rule is an operator decision; never replace it with a default.
+        if (approved && !this.db.prepare('SELECT id FROM court_filing_rules WHERE court_key = ? LIMIT 1').get(key)) {
+            const id = `${ADAM_FILING_POLICY_VERSION}:${key}`;
+            this.db.prepare(`INSERT OR IGNORE INTO court_filing_rules (id,court_name,court_key,relation,notes,created_at)
+                VALUES (?,?,?,?,?,?)`).run(id,courtName,key,approved,
+                'Adam-confirmed policy: listed courts use Connected to Complaint; all other courts use Other. Explicit court overrides take precedence.',nowIso());
+            this.insertAuditLog('court_rule',id,'attorney_court_policy_applied',{courtName,relation:approved,version:ADAM_FILING_POLICY_VERSION});
+        }
         const rule = this.listCourtFilingRules().find(item => item.courtKey === key);
         let changed = false;
         this.runInTransaction(() => {
@@ -6238,8 +6249,11 @@ export class WorkflowDatabase {
             }
         }
         if (extraction.data.plaintiff) {
+            const contacts = Object.fromEntries(Object.entries(ADAM_OFFICE).map(([key, value]) =>
+                [key, (extraction.data.plaintiff as unknown as Record<string, unknown>)[key] || value]));
             apply('plaintiff', sanitizeDraftParty({
                 ...extraction.data.plaintiff,
+                ...contacts,
                 partyType: 'entity',
             }, 'plaintiff-1', 'entity'));
         }
@@ -6247,10 +6261,13 @@ export class WorkflowDatabase {
             apply('defendants', extraction.data.defendants.map((party, index) =>
                 sanitizeDraftParty({
                     ...party,
-                    partyType: 'person',
+                    partyType: party.partyType || (party.entityName ? 'entity' : 'person'),
                 }, `defendant-${index + 1}`, 'person')));
         }
-        if (extraction.data.attorney) {
+        const useConfirmedAttorney = !extraction.data.attorney || extraction.data.attorney.barNumber === 'P72877';
+        if (useConfirmedAttorney) {
+            apply('attorney', sanitizeDraftAttorney(ADAM_ATTORNEY, ADAM_ATTORNEY.name));
+        } else if (extraction.data.attorney) {
             apply('attorney', sanitizeDraftAttorney(
                 extraction.data.attorney,
                 extraction.data.attorney.displayName,
@@ -6301,11 +6318,17 @@ export class WorkflowDatabase {
             appliedCaseTitle = String(next.caseTitle);
         }
         if (extraction.data.attorney && legacySources.filerName !== 'manual') {
-            next.filerName = extraction.data.attorney.displayName;
+            next.filerName = useConfirmedAttorney ? ADAM_ATTORNEY.name : extraction.data.attorney.displayName;
         }
 
         const timestamp = nowIso();
         next.filingData = filing;
+        next.filingPolicy = {version:ADAM_FILING_POLICY_VERSION,
+            defaultPaths:[
+                ...Object.keys(ADAM_OFFICE).filter(key => extraction.data.plaintiff &&
+                    !(extraction.data.plaintiff as unknown as Record<string, unknown>)[key]).map(key => 'plaintiff.' + key),
+                ...(useConfirmedAttorney ? Object.keys(ADAM_ATTORNEY).map(key => 'attorney.' + key) : []),
+            ]};
         next.manualFilingFields = Array.from(manualFields).sort();
         next.manualFilingPaths = Array.from(manualPaths).sort();
         next.complaintExtraction = {

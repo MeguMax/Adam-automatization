@@ -6,11 +6,12 @@ import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 4;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 5;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
 export interface ComplaintPartyExtraction {
+    partyType?: 'person' | 'entity';
     displayName: string;
     entityName?: string;
     firstName?: string;
@@ -57,7 +58,7 @@ export interface ComplaintExtractionWarning {
 
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
-    extractorVersion: 1 | 2 | 3 | 4;
+    extractorVersion: 1 | 2 | 3 | 4 | 5;
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -118,6 +119,7 @@ function cleanName(value: string): string {
     return normalizeLine(value)
         .replace(/^v(?:\.|s\.?)?\s+/i, '')
         .replace(/[;,]+$/g, '')
+        .replace(/\s*[|:]+\s*$/g, '')
         .trim();
 }
 
@@ -181,13 +183,29 @@ function partyFromLines(lines: string[]): ComplaintPartyExtraction | undefined {
     };
 }
 
+const ENTITY_NAME = /\b(?:L\.?L\.?C\.?|L\.?L\.?P\.?|L\.?P\.?|incorporated|inc\.?|corp(?:oration)?\.?|ltd\.?|limited|association|management|apartments?|properties)\b/i;
+
 function applyDefendants(result: ComplaintExtractionResult, party: ComplaintPartyExtraction, confidence: ComplaintFieldConfidence): void {
-    result.data.includeAllOtherOccupants = /all other occupants/i.test(party.displayName);
-    const name = cleanName(party.displayName.replace(/(?:,?\s+and\s+)?all other occupants/ig, ''));
-    const names = name.split(/\s+(?:and|&)\s+|\s*,\s*/).map(cleanName).filter(Boolean);
-    const canSplit = names.length > 1 && names.every(value => Boolean(personNameParts(value).lastName));
+    const boundary = party.displayName.search(/(?:,?\s+and\s+)?\ball other occupants\b/i);
+    result.data.includeAllOtherOccupants = boundary >= 0;
+    const name = cleanName(boundary >= 0 ? party.displayName.slice(0, boundary) : party.displayName);
+    const commaParts: string[] = [];
+    for (const part of name.split(/\s*,\s*/)) {
+        if (commaParts.length && /^(?:L\.?L\.?C\.?|L\.?L\.?P\.?|L\.?P\.?|Inc\.?|Corp\.?|Ltd\.?|Jr\.?|Sr\.?|II|III|IV)$/i.test(part)) {
+            commaParts[commaParts.length - 1] += ', ' + part;
+        } else if (part.trim()) commaParts.push(part.trim());
+    }
+    const names = commaParts.flatMap(part => {
+        const afterCompany=part.match(/^(.*?\b(?:L\.?L\.?C\.?|L\.?L\.?P\.?|Inc\.?|Corp\.?|Ltd\.?))\s+(?:and|&)\s+(.+)$/i);
+        if(afterCompany) return [afterCompany[1],...afterCompany[2].split(/\s+(?:and|&)\s+/)];
+        return ENTITY_NAME.test(part) ? [part] : part.split(/\s+(?:and|&)\s+/);
+    }).map(cleanName).filter(Boolean);
+    const canSplit = names.length > 1 && names.every(value => ENTITY_NAME.test(value) || Boolean(personNameParts(value).lastName));
     result.data.defendants = (canSplit ? names : [name]).map(displayName => ({
-        ...party, displayName, ...personNameParts(displayName),
+        ...party, displayName,
+        ...(ENTITY_NAME.test(displayName) ? { partyType: 'entity' as const, entityName: displayName,
+            firstName:undefined,middleName:undefined,lastName:undefined,suffix:undefined } :
+            { partyType: 'person' as const, ...personNameParts(displayName) }),
     }));
     result.fieldConfidence.defendants = confidence;
     result.fieldConfidence.includeAllOtherOccupants = confidence;
@@ -228,14 +246,15 @@ export function parseComplaintFormFields(text: string, widgets: ComplaintFormWid
     const defendant = partyFromLines(defendantLines);
     if (defendant) applyDefendants(result, defendant, 'high');
     const cityIndex = defendantLines.findIndex(line => Boolean(parseCityStateZip(line).state));
-    if (cityIndex >= 0 && defendantLines.slice(cityIndex + 1).some(line => !normalizedPhone(line))) result.warnings.push({
+    const extraCaption = cityIndex >= 0 ? defendantLines.slice(cityIndex + 1).filter(line => !normalizedPhone(line)) : [];
+    if (extraCaption.length && !/^Notice\s+per\s+MCL\s+600\.3238\(6\)/i.test(extraCaption[0])) result.warnings.push({
         code: 'caption_review', message: 'The Defendant caption contains additional notice recipients or instructions. Review the parties before preparation.',
     });
     const attorneyLines = normalizedLines(value(6));
     const bar = attorneyLines[0]?.match(/\(?\bP\d{5,8}\b\)?/i);
     const attorney = partyFromLines([attorneyLines[0]?.replace(/\(?\bP\d{5,8}\b\)?/i, '').trim() || '', ...attorneyLines.slice(1)]);
     if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() }; result.fieldConfidence.attorney = 'high'; }
-    const district = value(1).trim().match(/^(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)?$/i);
+    const district = value(1).trim().match(/^(\d{1,3}[AB]?(?:-?\d)?)(?:st|nd|rd|th)?$/i);
     if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = 'high'; }
     if (value(2).trim()) { result.data.caseNumber = value(2).trim(); result.fieldConfidence.caseNumber = 'high'; }
     const none = checked(8), previous = checked(9);
@@ -747,7 +766,25 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
         result.data.moneyJudgmentRequested = selections.money;
         result.fieldConfidence.moneyJudgmentRequested = 'high';
         if (!selections.money) result.data.claimAmount = '0.00';
-        else if (selections.rent === true && selections.damages === false) {
+        else if (selections.damages === true) {
+            const candidates: string[] = [];
+            for (const page of pages) {
+                for (const anchor of page.words.filter(word => /damages/i.test(word.text) && word.confidence >= 80)) {
+                    const line = page.words.filter(word => Math.abs(word.y - anchor.y) < 5 && word.x >= anchor.x)
+                        .sort((a,b) => a.x-b.x);
+                    if (!/^damages\s+claimed\s*:/i.test(line.map(word=>word.text).join(' '))) continue;
+                    const amount = line.filter(word => word.confidence >= 90)
+                        .map(word => normalizedMoney(word.text)).filter((value): value is string => !!value);
+                    if (amount.length === 1) candidates.push(amount[0]);
+                    else if (!amount.length && line.every(word=>word.confidence>=90)) {
+                        const combined=line.map(word=>word.text).join(' ').match(/^damages\s+claimed\s*:\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*$/i);
+                        const total=combined && normalizedMoney(combined[1]);
+                        if(total) candidates.push(total);
+                    }
+                }
+            }
+            if (new Set(candidates).size === 1) result.data.claimAmount = candidates[0];
+        } else if (selections.rent === true && selections.damages === false) {
             const words = pages.flatMap(page => page.words);
             const label = words.find(word => /total rent due now is/i.test(word.text));
             const candidates = label ? words.filter(word => word.pageNumber === label.pageNumber &&
@@ -794,10 +831,13 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     const plaintiffLabel = left.find(line => /plaintiff.{0,8}name/i.test(line.text));
     const defendantLabel = right.find(line => /defendant.{0,8}name/i.test(line.text));
     const attorneyLabel = left.find(line => /plaintiff.{0,8}attorney/i.test(line.text));
-    const statesLabel = [...left, ...right].find(line => /the plaintiff states/i.test(line.text));
+    const statesLabel = groupLines(words).find(line => /\b(?:the\s+)?plaintiff\s+states\b/i.test(line.text));
     function party(rows: Array<{y: number; text: string}>, start?: number, end?: number): ComplaintPartyExtraction | undefined {
         if (start === undefined || end === undefined) return;
         const values = rows.filter(line => line.y > start + 6 && line.y < end - 2).map(line => line.text.trim());
+        // Caption names may wrap. The address begins at the first numbered street line.
+        const street = values.findIndex(line => /^\d+[A-Z]?(?:[-/]\d+)?\s+\S/i.test(line));
+        if (street > 1) values.splice(0, street, values.slice(0, street).join(' '));
         const name = values[0];
         if (!name || !/[a-z]{2}/i.test(name) || /name,? address|telephone|plaintiff|defendant|attorney/i.test(name)) return;
         return partyFromLines(values);
@@ -814,6 +854,14 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     const header = groupLines(words.filter(word => word.y < (plaintiffLabel?.y || 180))).map(line => line.text).join('\n');
     const district = header.match(/\b(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)?\s+(?:judicial\s+)?district\b/i);
     if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = source === 'pdf' ? 'high' : 'medium'; }
+    if (!district) {
+        const candidates = words.filter(word => word.x < 150 && word.y > 65 && word.y < 110 && word.confidence >= (source === 'ocr' ? 50 : 80));
+        const codes = candidates.map(word => word.text.match(/^(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)$/i)?.[1]).filter(Boolean);
+        if (new Set(codes).size === 1) {
+            result.data.courtDistrict = codes[0]!.toUpperCase();
+            result.fieldConfidence.courtDistrict = candidates.some(word=>word.confidence<80) ? 'low' : 'medium';
+        }
+    }
     if (attorneyLabel) {
         const end = [...left, ...right].filter(line => line.y > attorneyLabel.y && /^2\.|^there is no other pending/i.test(line.text)).sort((a,b)=>a.y-b.y)[0]?.y || attorneyLabel.y + 120;
         const rows = left.filter(line => line.y > attorneyLabel.y + 6 && line.y < end - 2).map(line => line.text);

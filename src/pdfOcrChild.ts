@@ -68,6 +68,16 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
             // Separate columns and form rules can confuse full-page segmentation.
             // Re-read caption blocks, not the whole document, for names/addresses.
             if (/complaint/i.test(recognized.text) && Math.abs(recognized.rotationRadians || 0) < 0.015) {
+                for (const word of recognized.words.filter(word => word.x < 200 && word.y > 45 && word.y < 110 &&
+                    word.confidence < 80 && /^\d{1,3}[AB]?(?:-\d)?(?:st|nd|rd|th)$/i.test(word.text))) {
+                    const crop = {left:Math.max(0,Math.floor((word.x-2)/xScale)),top:Math.max(0,Math.floor((word.y-2)/yScale)),
+                        width:Math.ceil((word.width+4)/xScale),height:Math.ceil((word.height+4)/yScale)};
+                    if (crop.left+crop.width>pixelWidth || crop.top+crop.height>pixelHeight) continue;
+                    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_WORD});
+                    const reread=(await worker.recognize(image,{rectangle:crop},{text:true,blocks:true})).data;
+                    passes++;
+                    if (reread.text.trim().toUpperCase()===word.text.toUpperCase() && reread.confidence>=80) word.confidence=reread.confidence;
+                }
                 const rows = (items: OcrLine[]) => {
                     const grouped: OcrLine[][] = [];
                     for (const word of [...items].sort((a,b)=>a.y-b.y || a.x-b.x)) {
@@ -81,7 +91,7 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                 const plaintiff = left.find(row => /plaintiff.{0,8}name/i.test(row.text));
                 const defendant = right.find(row => /defendant.{0,8}name/i.test(row.text));
                 const attorney = left.find(row => /plaintiff.{0,8}attorney/i.test(row.text));
-                const states = [...left,...right].find(row => /the plaintiff states/i.test(row.text));
+                const states = rows(recognized.words).find(row => /\b(?:the\s+)?plaintiff\s+states\b/i.test(row.text));
                 for (const [label, end, xMax] of [
                     [plaintiff, attorney?.y, 289], [defendant, states?.y, 585],
                 ] as const) {

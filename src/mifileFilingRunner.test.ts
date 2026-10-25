@@ -41,6 +41,30 @@ function filingDocument(index: number, connected = false): FilingDocumentPayload
     };
 }
 
+test('MiFILE case forms keep business Defendants separate from people',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.route('**/*',route=>route.abort());
+        await page.setContent([0,1,2].map(index=>{
+            const p='psn'+index;
+            return `<input type="radio" id="${p}IsPerson_0" name="${p}type"><input type="radio" id="${p}IsPerson_1" name="${p}type">`+
+                ['EntityName','FirstName','MiddleName','FamilyName','Suffix','Address','Address2','City','Zip','Phone','Email']
+                    .map(name=>`<input id="${p}${name}">`).join('')+
+                `<select id="${p}Country"><option value="US">US</option></select><select id="${p}State"><option>Michigan</option></select>`;
+        }).join(''));
+        const runner=new MiFileFilingRunner();
+        const base={id:'party',displayName:'Example Ventures LLC',partyType:'entity',entityName:'Example Ventures LLC',
+            address1:'100 Main Street',city:'Wayne',state:'MI',postalCode:'48184'};
+        await (runner as any).fillParty(page.mainFrame(),0,base,false);
+        for(const [index,first,last] of [[1,'Morgan','Tenant'],[2,'Taylor','Resident']] as const)
+            await (runner as any).fillParty(page.mainFrame(),index,{...base,partyType:'person',entityName:null,firstName:first,lastName:last},false);
+        assert.equal(await page.locator('#psn0IsPerson_1').isChecked(),true);
+        assert.equal(await page.locator('#psn0EntityName').inputValue(),'Example Ventures LLC');
+        assert.equal(await page.locator('#psn1FirstName').inputValue(),'Morgan');
+        assert.equal(await page.locator('#psn2FamilyName').inputValue(),'Resident');
+    } finally {await page.close();}
+});
+
 async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean; feeLabels?: boolean } = {}): Promise<Page> {
     const page = await browser.newPage();
     await page.route('**/*', route => route.abort());

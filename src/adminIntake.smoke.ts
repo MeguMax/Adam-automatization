@@ -5,6 +5,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { chromium } from 'playwright';
 import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
+import { CURRENT_COMPLAINT_EXTRACTOR_VERSION } from './complaintExtractor';
 
 async function main() {
     const originalCwd = process.cwd();
@@ -264,18 +265,31 @@ async function main() {
         await page.locator('#draftAddDocumentBtn').click();
         await page.locator('#draftDocumentFileInput').setInputFiles({ name:'Complaint.pdf',mimeType:'application/pdf',buffer:testComplaintFormFixture() });
         await page.waitForFunction(() => document.querySelector('.draft-source-summary')?.textContent?.includes('PDF form fields'));
-        const extracted=db.getDraftDetail(draftId)!.caseDraft!;
+        let extracted=db.getDraftDetail(draftId)!.caseDraft!;
         assert.equal(await page.locator('[data-filing-field="mailingRequested"]').isDisabled(),true);
-        assert.equal(extracted.complaintExtraction?.extractorVersion,4);
+        assert.equal(extracted.complaintExtraction?.extractorVersion,CURRENT_COMPLAINT_EXTRACTOR_VERSION);
         assert.equal(extracted.filingData.defendants[0].postalCode,'48146');
         assert.equal(extracted.filingData.claimAmount,'1991.50');
         assert.ok(!extracted.validationIssues.some(issue=>issue.field==='complaintExtraction'));
         assert.ok(!extracted.validationIssues.some(issue=>issue.message.startsWith('No PDF attachments were received.')));
+        assert.equal(extracted.filingData.plaintiff.address1,'30850 Telegraph Rd Ste 250');
+        assert.equal(extracted.filingData.plaintiff.email,'ajd@devlinlawpllc.com');
+        await page.locator('#draftDataTab').click();
+        const defaultAddress=page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
+        assert.match(await defaultAddress.locator('xpath=..').textContent() || '',/Attorney rule/);
+        // An intentional manual blank must remain a real correction, not refill from policy.
+        await defaultAddress.fill('');
+        const blankSaved=page.waitForResponse(response=>response.url().endsWith('/api/drafts/'+draftId) && response.request().method()==='PATCH' && response.status()===200);
+        await page.locator('#draftSaveBtn').click();
+        await blankSaved;
+        await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
+        extracted=db.getDraftDetail(draftId)!.caseDraft!;
         const addressIssue = extracted.validationIssues.findIndex(issue => issue.field === 'filingData.plaintiff.address1');
         assert.ok(addressIssue >= 0, 'Missing Plaintiff street address must point to that exact field');
         await page.locator('#draftReviewTab').click();
         await page.locator('[data-review-issue="' + addressIssue + '"]').click();
         const plaintiffAddress = page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
+        await page.waitForFunction(()=>document.querySelector('[data-party-role="plaintiff"] [data-party-field="address1"]')===document.activeElement);
         assert.equal(await plaintiffAddress.evaluate(element => element === document.activeElement), true);
         assert.equal(await plaintiffAddress.getAttribute('aria-invalid'), 'true');
         assert.equal(await page.locator('#draftApproveBtn').isDisabled(), true);
@@ -348,15 +362,20 @@ async function main() {
         }
         const ancillary = db.getDraftDetail(draftId)!.documents.find(document => document.packageRole === 'ancillary')!;
         assert.ok(ancillary);
-        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue =>
-            issue.field === 'document.' + ancillary.id && issue.severity === 'error'));
-        assert.equal(await page.locator('#draftApproveBtn').isDisabled(), true);
+        assert.equal(ancillary.filingRelation,'separate');
+        assert.equal(ancillary.filingRelationSource,'court_rule');
         await page.locator('#draftDocumentsTab').click();
         await page.locator('[data-disclosure="document-' + ancillary.id + '"] summary').click();
         await page.evaluate(()=>(window as any).renderDraftWorkspace());
         assert.equal(await page.locator('#draftDocumentsTab').getAttribute('aria-selected'),'true');
         assert.equal(await page.locator('[data-disclosure="document-' + ancillary.id + '"]').evaluate(element=>(element as HTMLDetailsElement).open),true);
         const ancillaryRow = page.locator('[data-draft-document-id="' + ancillary.id + '"]');
+        await ancillaryRow.locator('[data-document-field="filingRelation"]').selectOption('unknown');
+        const unknownSaved=page.waitForResponse(response=>response.url().endsWith('/api/drafts/'+draftId) && response.request().method()==='PATCH' && response.status()===200);
+        await page.locator('#draftSaveBtn').click();
+        await unknownSaved;
+        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+ancillary.id && issue.severity==='error'));
+        assert.equal(await page.locator('#draftApproveBtn').isDisabled(),true);
         await ancillaryRow.locator('[data-document-field="filingRelation"]').selectOption('separate');
         // Explicit review also covers filename-only recognition in a small synthetic fixture.
         await ancillaryRow.locator('[data-document-field="filingType"]').fill('Other');
@@ -487,7 +506,7 @@ async function main() {
                 buffer:testComplaintFormFixture({7:name+', and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146'})});
             assert.equal((await replaced).status(),200);
             await page.waitForFunction(()=>document.getElementById('closeDraftBtn')?.hasAttribute('disabled')===false);
-            assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction?.extractorVersion,4);
+            assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction?.extractorVersion,CURRENT_COMPLAINT_EXTRACTOR_VERSION);
             assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.filingData.defendants[0].displayName,name);
             if(name==='Taylor Resident') assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.filingData.plaintiff!.phone,'248-555-0191');
         }

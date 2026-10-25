@@ -161,13 +161,38 @@ test('AcroForm missing values and ambiguous boxes do not default to possession o
     assert.equal(parseComplaintFormFields(FORM_TITLE, formWidgets({5:'',7:''})), null, 'empty overlay widgets must not override visible flattened text');
 });
 
-test('DC102c recovery Complaint is supported and extra caption notice recipients still require review', () => {
+test('DC102c excludes the attorney-confirmed third-party notice block from the parties', () => {
     const result = parseComplaintFormFields('DC 102c COMPLAINT TO RECOVER POSSESSION OF PROPERTY\nSUPPLEMENTAL COMPLAINT',
         formWidgets({39:'Off',7:'Taylor Tenant, Jordan Resident, and all other occupants\r300 Rental Street\rExample City, MI 48002\rNotice per MCL 600.3238(6):\rExample Association'}, 'dc102c'))!;
     assert.equal(result.formType, 'RECOVER POSSESSION OF PROPERTY');
     assert.equal(result.data.moneyJudgmentRequested, false);
     assert.equal(result.data.claimAmount, '0.00');
     assert.equal(result.data.defendants?.length, 2);
+    assert.ok(!result.warnings.some(w=>w.code==='caption_review'));
+});
+
+test('mixed companies and people become separate parties without splitting a company suffix or name', () => {
+    const result = parseComplaintFormFields(FORM_TITLE,formWidgets({7:
+        'Example Ventures, LLC, Morgan Tenant, Taylor Resident, and all other occupants; Third Party LLC\r300 Rental Street\rExample City, MI 48002'}))!;
+    assert.deepEqual(result.data.defendants?.map(p=>[p.displayName,p.partyType]),[
+        ['Example Ventures, LLC','entity'],['Morgan Tenant','person'],['Taylor Resident','person'],
+    ]);
+    assert.equal(result.data.defendants?.[0].entityName,'Example Ventures, LLC');
+    assert.equal(result.data.defendants?.[1].lastName,'Tenant');
+    assert.ok(result.data.defendants?.every(p=>p.address1==='300 Rental Street'));
+    assert.ok(!result.warnings.some(w=>w.code==='multiple_defendants_review'));
+    const company=parseComplaintFormFields(FORM_TITLE,formWidgets({7:'Smith and Jones LLC\r300 Rental Street\rExample City, MI 48002'}))!;
+    assert.equal(company.data.defendants?.length,1);
+    assert.equal(company.data.defendants?.[0].entityName,'Smith and Jones LLC');
+    const joined=parseComplaintFormFields(FORM_TITLE,formWidgets({7:'Example Ventures LLC and Morgan Tenant\r300 Rental Street\rExample City, MI 48002'}))!;
+    assert.deepEqual(joined.data.defendants?.map(p=>p.partyType),['entity','person']);
+    const ambiguous=parseComplaintFormFields(FORM_TITLE,formWidgets({7:'Tenant, Morgan\r300 Rental Street\rExample City, MI 48002'}))!;
+    assert.ok(ambiguous.warnings.some(w=>w.code==='multiple_defendants_review'));
+});
+
+test('unknown caption instructions still require review',()=>{
+    const result=parseComplaintFormFields(FORM_TITLE,formWidgets({7:
+        'Morgan Tenant\r300 Rental Street\rExample City, MI 48002\rUnexpected party instructions'}))!;
     assert.ok(result.warnings.some(w=>w.code==='caption_review'));
 });
 
@@ -204,4 +229,20 @@ test('paragraph 10 uses explicitly referenced total rent, never the monthly rent
     assert.equal(applyVisualComplaintSelections(make(),{money:true,rent:true,damages:true},pages).data.claimAmount,undefined);
     assert.equal(applyVisualComplaintSelections(make(),{money:false},pages).data.claimAmount,'0.00');
     assert.equal(applyVisualComplaintSelections(make(),{noRelated:false,previousRelated:false},pages).data.relatedCivilAction,undefined);
+});
+
+test('selected explicit damages are read from grouped OCR words, not the monthly rental rate',()=>{
+    const make=()=>parseComplaintText('COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT');
+    const words=[{text:'Damages',x:90,y:716,width:40,height:9,pageNumber:1,confidence:96},
+        {text:'claimed:',x:133,y:716,width:34,height:8,pageNumber:1,confidence:95},
+        {text:'1991.5',x:174,y:713,width:24,height:7,pageNumber:1,confidence:92}];
+    const pages=[{text:'',confidence:95,lines:[],words}];
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,rent:true,damages:true},pages).data.claimAmount,'1991.50');
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,rent:true,damages:false},pages).data.claimAmount,undefined);
+    const low=[{...pages[0],words:words.map(w=>({...w,confidence:75}))}];
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},low).data.claimAmount,undefined);
+    const conflict=[...pages,{...pages[0],words:words.map(w=>({...w,text:w.text==='1991.5'?'2500.00':w.text}))}];
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},conflict).data.claimAmount,undefined);
+    const combined=[{...pages[0],words:[{...words[0],text:'Damages claimed: 1991.50',width:140}]}];
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},combined).data.claimAmount,'1991.50');
 });

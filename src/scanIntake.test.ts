@@ -22,6 +22,14 @@ test('Advice prose mentioning summons is not a second document title', () => {
     assert.equal(recognizeDocumentText(['Advice of Rights and Information (Landlord-Tenant)', 'Summons, Landlord-Tenant/Land Contract'], '').source, 'conflict');
 });
 
+test('scanned Complaint footers identify the form without promoting prose references to titles',()=>{
+    const scan='Original - Court\nih JUDICIAL DISTRICT COMPLAINT\n29th NONPAYMENT OF RENT\n'+
+        Array(30).fill('Body text').join('\n')+'\nDC 102a (11/23) COMPLAINT, NONPAYMENT OF RENT, Landlord-Tenant';
+    assert.equal(recognizeDocumentText([scan],'scan001.pdf').source,'content');
+    assert.equal(recognizeDocumentText([scan],'scan001.pdf').role,'complaint');
+    assert.equal(recognizeDocumentText(['Advice of Rights and Information (Landlord-Tenant)\nAttach form DC 102a Complaint if applicable'],'Advice.pdf').role,'advice');
+});
+
 test('actual Request title, DC102c layout, and letterhead Demand titles are recognized without filenames', () => {
     assert.equal(recognizeDocumentText(['REQUEST FOR COURT MAILING AND\nRECORD OF MAILING BY COURT\n(Landlord-Tenant)'], '').source, 'content');
     assert.equal(recognizeDocumentText(['JUDICIAL DISTRICT COMPLAINT TO\nRECOVER POSSESSION OF PROPERTY'], '').role, 'complaint');
@@ -98,6 +106,21 @@ test('OCR handles the two-column caption when The plaintiff states is on the rig
     assert.equal(result.data.defendants?.[0].postalCode,'48146');
     assert.equal(result.fieldConfidence.defendants,'low');
     assert.equal(result.data.moneyJudgmentRequested,undefined);
+    assert.ok(result.warnings.some(w=>w.code==='scan_review'));
+});
+
+test('a caption boundary split across columns still finds wrapped business and person Defendants',()=>{
+    const items=[['29th',48,80,59],['Plaintiff name, address',40,130,95],['Example Property LLC',40,146,95],
+        ["Plaintiff's attorney, bar no.",40,202,95],['Defendant name, address',326,130,95],
+        ['Example Ventures LLC, Morgan Tenant, and',326,146,95],['all other occupants',326,160,95],
+        ['200 Rental Avenue',326,175,95],['Wayne, MI 48184',326,189,95],
+        ['The',291,215,95],['plaintiff states:',326,215,95]]
+        .map(([text,x,y,confidence])=>({text:String(text),x:Number(x),y:Number(y),confidence:Number(confidence),width:140,height:9,pageNumber:1}));
+    const result=parseScannedComplaint([{text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT\n'+items.map(i=>i.text).join('\n'),confidence:95,lines:items,words:items}]);
+    assert.equal(result.data.courtDistrict,'29');
+    assert.equal(result.fieldConfidence.courtDistrict,'low');
+    assert.deepEqual(result.data.defendants?.map(p=>[p.displayName,p.partyType]),[['Example Ventures LLC','entity'],['Morgan Tenant','person']]);
+    assert.equal(result.data.defendants?.[0].postalCode,'48184');
     assert.ok(result.warnings.some(w=>w.code==='scan_review'));
 });
 

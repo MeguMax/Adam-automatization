@@ -47,7 +47,7 @@ import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-16-automatic-complaint-extraction-v42';
+const ADMIN_BUILD_ID = '2026-10-25-attorney-confirmed-filing-policy-v43';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3508,6 +3508,7 @@ const html = String.raw`<!doctype html>
       </section>
       <section class="settings-section court-rules-section">
         <h2>Court filing rules</h2>
+        <p class="muted">Attorney-confirmed defaults: Connected for 1, 17, 18, 32A, 41A-1, 45, 47, 54A, 56A, 66, 71A and 73A. Other for remaining District Courts. Saved overrides take precedence.</p>
         <form id="courtRuleForm">
           <div class="settings-grid">
             <label class="field"><span class="field-label">Exact MiFILE court</span><input id="courtRuleCourt" list="courtRuleCourts" required maxlength="300"></label>
@@ -5280,13 +5281,16 @@ const html = String.raw`<!doctype html>
         input.dataset.reviewField = field;
         if (!key) return;
         let source = (draft.filingFieldSources || {})[key] || 'empty';
-        const paths = JSON.parse(draft.normalizedDataJson || '{}').manualFilingPaths;
+        const storedDraft = JSON.parse(draft.normalizedDataJson || '{}');
+        const paths = storedDraft.manualFilingPaths;
         const path = field.replace(/^filingData\./, '');
         if (source === 'manual' && Array.isArray(paths) && !paths.some(manual => path === manual || path.startsWith(manual + '.'))) {
           source = extraction?.appliedFields?.includes(key) ? 'complaint' : 'default';
         }
         const confidence = extraction && extraction.fieldConfidence && extraction.fieldConfidence[key];
-        const sourceLabel = source === 'complaint' && extraction
+        const policyDefault = (storedDraft.filingPolicy?.defaultPaths || []).includes(path) &&
+          !(paths || []).some(manual => path === manual || path.startsWith(manual + '.')) && source !== 'manual';
+        const sourceLabel = policyDefault ? 'Attorney rule' : source === 'complaint' && extraction
           ? extraction.extractionMethod === 'form_fields' ? 'PDF fields'
             : extraction.textSource === 'ocr' ? 'Scan OCR' : 'PDF text'
           : DRAFT_SOURCE_LABELS[source] || source;

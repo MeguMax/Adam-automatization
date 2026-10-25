@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { ADAM_OFFICE, approvedSupportingRelation } from './adamFilingPolicy';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +9,7 @@ import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
 import { recognizeDocumentText } from './documentRecognition';
-import type { ComplaintExtractionResult } from './complaintExtractor';
+import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
 import { ensureDraftComplaintExtraction } from './draftExtraction';
 
 const court = 'MI Example County - 25th District Court';
@@ -40,6 +41,47 @@ function fixture(initialCourt: string | null = court) {
     db.markEmailProcessed(email.id);
     return {db,parsed,email,draftId,complaint,ancillary,add,close(){db.close();fs.rmSync(directory,{recursive:true,force:true});}};
 }
+
+test('attorney-confirmed contacts fill missing Plaintiff data without overwriting manual blanks',()=>{
+    const f=fixture();
+    try {
+        const missing=structuredClone(extraction);
+        missing.data.plaintiff={displayName:'Example Owner LLC',entityName:'Example Owner LLC'};
+        missing.data.defendants=[{displayName:'Example Ventures LLC',partyType:'entity',entityName:'Example Ventures LLC',
+            address1:'200 Main Street',city:'Lincoln Park',state:'MI',postalCode:'48146'}];
+        let detail=f.db.applyComplaintExtraction(f.draftId,f.complaint,missing);
+        const filing=detail.caseDraft!.filingData;
+        for(const [key,value] of Object.entries(ADAM_OFFICE)) assert.equal((filing.plaintiff as any)[key],value);
+        assert.equal(filing.defendants[0].partyType,'entity');
+        assert.equal(filing.defendants[0].entityName,'Example Ventures LLC');
+        assert.equal(filing.attorney.barNumber,'P72877');
+        f.db.updateCaseDraft(f.draftId,{},undefined,{...filing,plaintiff:{...filing.plaintiff,address1:null,email:'manual@example.com'}});
+        detail=f.db.applyComplaintExtraction(f.draftId,f.complaint,missing);
+        assert.equal(detail.caseDraft!.filingData.plaintiff.address1,null);
+        assert.equal(detail.caseDraft!.filingData.plaintiff.email,'manual@example.com');
+    } finally {f.close();}
+});
+
+test('approved court defaults distinguish divisions and respect saved and disabled overrides',()=>{
+    for(const code of ['45th','17th','47th','41A-1','18th','1st','32A','71A','54A','66th','56A','73A'])
+        assert.equal(approvedSupportingRelation(`MI Example County - ${code} District Court`),'connected_to_complaint',code);
+    assert.equal(approvedSupportingRelation('MI Example County - 41A-2 District Court'),'separate');
+    assert.equal(approvedSupportingRelation('MI Example County - 41A District Court'),null);
+    assert.equal(approvedSupportingRelation('41A1'),null);
+    const f=fixture();
+    try {
+        let detail=f.db.applyCourtFilingRule(f.draftId);
+        assert.equal(detail.documents.find(d=>d.id===f.ancillary)!.filingRelation,'separate');
+        assert.match(f.db.listCourtFilingRules()[0].id,/adam-confirmed/);
+        const rule=f.db.saveCourtFilingRule({courtName:court,relation:'manual_review',confirmed:true});
+        detail=f.db.applyCourtFilingRule(f.draftId,true);
+        assert.equal(detail.documents.find(d=>d.id===f.ancillary)!.filingRelation,'unknown');
+        f.db.disableCourtFilingRule(rule.id);
+        detail=f.db.applyCourtFilingRule(f.draftId,true);
+        assert.equal(detail.documents.find(d=>d.id===f.ancillary)!.filingRelation,'unknown');
+        assert.equal(f.db.listCourtFilingRules().length,0,'disabled override must not reactivate the default');
+    } finally {f.close();}
+});
 
 test('one confirmation reviews and queues a complete package, rejects duplicates and stale snapshots',()=>{
     const f=fixture();
@@ -85,7 +127,7 @@ test('automatic extraction deduplicates work and merges into manual leaf edits m
         let release!:()=>void;
         const gate=new Promise<void>(resolve=>{release=resolve;});
         let calls=0;
-        const extract=async()=>{calls++;await gate;return {...structuredClone(extraction),extractorVersion:4 as const};};
+        const extract=async():Promise<ComplaintExtractionResult>=>{calls++;await gate;return {...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};};
         const pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract});
         const duplicate=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract});
         const filing=structuredClone(f.db.getDraftDetail(f.draftId)!.caseDraft!.filingData);
@@ -95,9 +137,9 @@ test('automatic extraction deduplicates work and merges into manual leaf edits m
         release();await Promise.all([pending,duplicate]);
         assert.equal(calls,1);
         assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.filingData.plaintiff!.phone,'248-555-0101');
-        assert.equal(f.db.listPendingComplaintExtractions(4).length,0);
+        assert.equal(f.db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION).length,0);
         const newer=structuredClone(extraction);newer.data.plaintiff!.city='Updated City';newer.data.plaintiff!.phone='999-555-0101';
-        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...newer,extractorVersion:4});
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...newer,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
         const final=f.db.getDraftDetail(f.draftId)!.caseDraft!;
         assert.equal(final.filingData.plaintiff!.city,'Updated City');
         assert.equal(final.filingData.plaintiff!.phone,'248-555-0101');
@@ -127,7 +169,7 @@ test('automatic failures back off persistently without changing successful PDF d
         await ensureDraftComplaintExtraction(f.db,f.draftId,options);
         await ensureDraftComplaintExtraction(f.db,f.draftId,options);
         assert.equal(calls,1);
-        assert.equal(f.db.listPendingComplaintExtractions(4).length,0);
+        assert.equal(f.db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION).length,0);
         assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.complaint)!.status,'uploaded');
         assert.match(f.db.getDraftDetail(f.draftId)!.caseDraft!.normalizedDataJson!,/nextRetryAt/);
     }finally{f.close();}
@@ -137,14 +179,14 @@ test('interrupted extraction is recovered and preparation cannot race a running 
     const f=fixture();
     try {
         f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
-        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:4});
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
         f.db.setComplaintAutoExtractionState(f.draftId,{documentId:f.complaint,sourceVersion:f.db.getComplaintSourceVersion(f.complaint),
-            extractorVersion:4,status:'running',attempts:1});
+            extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,status:'running',attempts:1});
         assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/still running/);
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
         assert.equal(f.db.recoverInterruptedComplaintExtractions(),1);
         assert.ok(f.db.listPendingComplaintExtractions(4).includes(f.draftId));
-        await ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract:async()=>({...extraction,extractorVersion:4})});
+        await ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract:async()=>({...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION})});
         assert.ok(!JSON.parse(f.db.getDraftDetail(f.draftId)!.caseDraft!.normalizedDataJson!).complaintExtractionError);
     }finally{f.close();}
 });
@@ -155,7 +197,7 @@ test('rejecting a Draft while reading is in flight cannot reopen it or restore a
     try {
         let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
         const pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract:async()=>{
-            await gate;if(failing) throw new Error('Interrupted read failed');return {...extraction,extractorVersion:4};
+            await gate;if(failing) throw new Error('Interrupted read failed');return {...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};
         }});
         f.db.reviewCaseDraft(f.draftId,'reject');
         release();await pending;
@@ -173,7 +215,7 @@ test('old extraction versions wait for automatic upgrade before automatic MiFILE
         f.db.refreshCaseDraftValidation(f.draftId);
         assert.deepEqual(f.db.getDraftDetail(f.draftId)!.caseDraft!.validationIssues,[]);
         assert.equal(f.db.queueValidatedIntakes(),0);
-        await ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract:async()=>({...extraction,extractorVersion:4})});
+        await ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),extract:async()=>({...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION})});
         assert.equal(f.db.queueValidatedIntakes(),1);
     }finally{f.close();}
 });
@@ -184,12 +226,12 @@ test('a replacement invalidates an extraction in flight, then automatically read
         let release!:()=>void;
         const gate=new Promise<void>(resolve=>{release=resolve;});
         const pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('old'),extract:async()=>{
-            await gate;return {...structuredClone(extraction),extractorVersion:4};
+            await gate;return {...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};
         }});
         const reservation=f.db.beginDocumentReplacement(f.complaint);
         f.db.recordDocumentReplacement(f.complaint,{token:reservation.token,fileSize:123,mimeType:'application/pdf'});
         const newer=structuredClone(extraction);newer.data.plaintiff!.entityName='New Owner LLC';newer.data.plaintiff!.displayName='New Owner LLC';
-        const replacement=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('new'),extract:async()=>({...newer,extractorVersion:4})});
+        const replacement=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('new'),extract:async()=>({...newer,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION})});
         release();await pending;await replacement;
         assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.filingData.plaintiff!.entityName,'New Owner LLC');
     }finally{f.close();}
@@ -457,7 +499,7 @@ test('court rules require confirmation and exact courts, retain versions, and pr
 test('the intake pipeline applies a confirmed court rule before automatically queueing a complete package',async()=>{
     const f=fixture();
     try{
-        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:4});
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
         f.db.saveCourtFilingRule({courtName:court,relation:'connected_to_complaint',confirmed:true});
         const detail=await processFilingIntake(f.db,f.email.id,f.draftId,f.parsed,{download:async()=>{throw new Error('No files need downloading');},extract:async()=>extraction});
         assert.equal(detail.documents.find(doc=>doc.id===f.ancillary)!.filingRelationSource,'court_rule');
@@ -474,9 +516,9 @@ test('a court change clears the old automatic rule; Manual review and disabled r
         f.db.applyCourtFilingRule(f.draftId);
         f.db.updateCaseDraft(f.draftId,{courtName:otherCourt},undefined,{...f.db.getDraftDetail(f.draftId)!.caseDraft!.filingData,courtDistrict:'29'});
         let document=f.db.applyCourtFilingRule(f.draftId).documents.find(doc=>doc.id===f.ancillary)!;
-        assert.equal(document.filingRelation,'unknown');assert.equal(document.courtRule,null);
+        assert.equal(document.filingRelation,'separate');assert.equal(document.courtRule?.courtKey,f.db.listCourtFilingRules().find(r=>r.courtName===otherCourt)?.courtKey);
         const manual=f.db.saveCourtFilingRule({courtName:otherCourt,relation:'manual_review',notes:'Court-specific exceptions must be reviewed',confirmed:true});
-        document=f.db.applyCourtFilingRule(f.draftId).documents.find(doc=>doc.id===f.ancillary)!;
+        document=f.db.applyCourtFilingRule(f.draftId,true).documents.find(doc=>doc.id===f.ancillary)!;
         assert.equal(document.filingRelation,'unknown');
         assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/Choose whether/);
         f.db.disableCourtFilingRule(manual.id);
