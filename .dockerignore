@@ -8,6 +8,10 @@ logs/
 temp/
 tmp/
 coverage/
+output/
+**/__pycache__/
+*.mp4
+plaintiff-mappings.json
 *.log
 *.sqlite
 *.sqlite-*

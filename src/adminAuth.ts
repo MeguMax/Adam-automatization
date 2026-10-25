@@ -13,7 +13,7 @@ function equal(left: string, right: string): boolean {
     return timingSafeEqual(digest(left), digest(right));
 }
 
-function credentialsMatch(username: unknown, password: unknown): boolean {
+export function credentialsMatch(username: unknown, password: unknown): boolean {
     if (!hasAdminCredentials() || typeof username !== 'string' || typeof password !== 'string') return false;
     const userMatches = equal(username, process.env.ADMIN_USERNAME!);
     const passwordMatches = equal(password, process.env.ADMIN_PASSWORD!);

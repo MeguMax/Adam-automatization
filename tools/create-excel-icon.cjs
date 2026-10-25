@@ -1,0 +1,13 @@
+const fs = require('node:fs');
+const path = require('node:path');
+const { createCanvas } = require('@napi-rs/canvas');
+const canvas = createCanvas(96, 96);
+const ctx = canvas.getContext('2d');
+ctx.fillStyle = '#246b57';
+ctx.fillRect(0, 0, 96, 96);
+ctx.fillStyle = '#ffffff';
+ctx.font = 'bold 40px sans-serif';
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText('DL', 48, 48);
+fs.writeFileSync(path.resolve(__dirname, '../excel-addin/icon.png'), canvas.toBuffer('image/png'));

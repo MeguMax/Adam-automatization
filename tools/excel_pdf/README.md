@@ -34,11 +34,11 @@ obtained from the selected row in the running Excel application:
 python tools/excel_pdf/generate.py --template "forms.pdf" --form dc105 --values-json "calculated-fields.json" --output "output/pdf/example-dc105.pdf"
 ```
 
-The add-in still needs Office.js integration, authenticated deployment, selected-row
-controls, current calculated display values, and desktop/Excel Online save UX.
-An Excel Online add-in cannot silently write to a Windows path. That path refers to
-Adam's local OneDrive-synced Documents folder; browser downloads or authenticated
-OneDrive storage must be implemented as separate delivery options.
+The Office.js task-pane adapter now lives in `excel-addin/` and uses calculated
+values from the running Excel host, not XLSX caches. See `EXCEL_PDF_ADDIN.md` for
+installation, runtime boundaries and verification status. Its current save action
+is an explicit download. Automatic OneDrive delivery and the first native Office
+installation still need verification/integration.
 
 Microsoft's selected-range API reference:
 https://learn.microsoft.com/en-us/office/dev/add-ins/excel/excel-add-ins-workbooks#get-the-active-cell-or-selected-range

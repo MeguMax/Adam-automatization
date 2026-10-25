@@ -3,6 +3,7 @@ import fs from 'fs';
 import { URL } from 'url';
 import { randomUUID } from 'crypto';
 import { createAdminAuth, hasAdminCredentials } from './adminAuth';
+import { createExcelPdfHandler } from './excelPdf';
 import {
     CaseDraftStatus,
     EmailDetail,
@@ -47,7 +48,7 @@ import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-25-attorney-confirmed-filing-policy-v43';
+const ADMIN_BUILD_ID = '2026-10-25-excel-pdf-taskpane-v44';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -7121,6 +7122,7 @@ export function createAdminServer(
 
     let accountTestRunning = false;
     const authorize = createAdminAuth();
+    const excelPdf = createExcelPdfHandler();
     const server = http.createServer(async (req, res) => {
         try {
             const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -7139,6 +7141,7 @@ export function createAdminServer(
                 return;
             }
 
+            if (await excelPdf(req, res, url.pathname)) return;
             if (!await authorize(req, res, url.pathname)) return;
 
             if (req.method === 'GET' && url.pathname === '/assets/lucide.js') {

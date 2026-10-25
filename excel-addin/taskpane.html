@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF Forms | Devlin Law</title>
+  <link rel="icon" href="/excel/icon.png">
+  <link rel="stylesheet" href="/excel/style.css">
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script defer src="/excel/lucide.js"></script>
+  <script defer src="/excel/row.js"></script>
+  <script defer src="/excel/app.js"></script>
+</head>
+<body>
+  <header><img src="/excel/icon.png" width="32" height="32" alt=""><div><strong>PDF Forms</strong><span>Devlin Law PLLC</span></div>
+    <button id="logout" class="icon" title="Sign out" aria-label="Sign out" hidden><i data-lucide="log-out"></i></button>
+  </header>
+  <main>
+    <section id="signIn">
+      <h1>Sign in</h1>
+      <form id="loginForm">
+        <label for="username">Admin username</label><input id="username" autocomplete="username" maxlength="254" required>
+        <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" maxlength="1024" required>
+        <button id="login" class="primary" type="submit">Sign in</button>
+      </form>
+    </section>
+    <section id="workspace" hidden>
+      <div class="section-heading"><h1>Selected case</h1><button id="refresh" class="icon" title="Refresh selected row" aria-label="Refresh selected row"><i data-lucide="refresh-cw"></i></button></div>
+      <p id="selection" class="secondary">Connecting to Excel...</p>
+      <p id="caseName" class="case-name"></p>
+      <label for="form">Court form</label>
+      <select id="form" disabled><option value="">Loading forms...</option></select>
+      <button id="generate" class="primary" disabled><i data-lucide="file-plus-2"></i><span>Generate PDF</span></button>
+      <section id="result" hidden>
+        <div class="section-heading"><h2>Generated PDF</h2><a id="download" class="icon" title="Download fillable PDF" aria-label="Download fillable PDF"><i data-lucide="download"></i></a></div>
+        <p id="resultName" class="secondary"></p>
+        <div id="preview" aria-label="Generated PDF preview"></div>
+        <a id="save" class="save" download>Download PDF</a>
+      </section>
+    </section>
+    <p id="status" role="status" aria-live="polite"></p>
+    <p id="error" role="alert" aria-live="assertive"></p>
+  </main>
+</body>
+</html>
