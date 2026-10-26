@@ -381,6 +381,7 @@ export class MiFileFilingRunner {
     }
 
     private async openNewLtCase(page: Page, payload: FilingPayload): Promise<void> {
+        await this.log('info', 'select_filing', 'Choosing the MiFILE court, filer, and LT case type.');
         if (!page.url().endsWith('/file')) {
             await page.goto('https://mifile.courts.michigan.gov/file', {
                 waitUntil: 'domcontentloaded',
@@ -449,8 +450,7 @@ export class MiFileFilingRunner {
                 'select_filing',
             );
         }
-        await page.locator('#searchField').fill('Landlord');
-        await page.getByText(payload.caseType, { exact: true }).click();
+        await this.selectCaseType(page, payload.caseType);
         await page.locator('#nextButton').click();
         await page.locator('#formFrame').waitFor({ state: 'visible' });
         await page.waitForTimeout(1_500);
@@ -458,6 +458,29 @@ export class MiFileFilingRunner {
             courtName: payload.courtName,
             caseType: payload.caseType,
         });
+    }
+
+    private async selectCaseType(page: Page, caseType: string): Promise<void> {
+        // MiFILE can expose the search box before the asynchronously loaded tree.
+        // Its initialisation can reset an earlier search, leaving all leaves hidden.
+        const tree = page.getByRole('tree');
+        await tree.locator('[role="treeitem"][aria-level="1"]').first()
+            .waitFor({ state: 'visible', timeout: this.timeoutMs });
+        await page.locator('#searchField').fill('Landlord');
+        const option = tree.getByRole('treeitem', { name: caseType, exact: true });
+        await option.waitFor({ state: 'visible', timeout: this.timeoutMs });
+        await option.click();
+        try {
+            await page.waitForFunction(expected => {
+                const selected = Array.from(document.querySelectorAll('[role="tree"] [role="treeitem"][aria-selected="true"]'));
+                return selected.length === 1 && selected[0].textContent?.trim() === expected;
+            }, caseType, { timeout: this.timeoutMs });
+        } catch {
+            throw new MiFileFilingError(
+                `MiFILE did not confirm the requested case type: ${caseType}.`,
+                'CASE_TYPE_SELECTION_UNCONFIRMED', 'select_filing',
+            );
+        }
     }
 
     private async completeCaseForm(page: Page, payload: FilingPayload): Promise<void> {

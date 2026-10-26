@@ -41,6 +41,58 @@ function filingDocument(index: number, connected = false): FilingDocumentPayload
     };
 }
 
+async function caseTypePage(options: { delayed?: boolean; ignoreClick?: boolean; wrongType?: boolean } = {}): Promise<Page> {
+    const page = await browser.newPage();
+    await page.route('**/*', route => route.abort());
+    await page.setContent(`<input id="searchField"><div id="treeHost"></div><script>
+        const options = ${JSON.stringify(options)};
+        function initialise() {
+            searchField.value = '';
+            treeHost.innerHTML = '<ul role="tree"><li role="treeitem" aria-level="1">Housing and Real Estate Suits</li>' +
+                '<li role="treeitem" aria-level="2" aria-selected="false" style="display:none">' +
+                (options.wrongType ? 'GC - Civil cases for money damages except landlord-tenant' : 'LT - Landlord-Tenant Summary Proceedings') + '</li></ul>';
+            const leaf = treeHost.querySelector('[aria-level="2"]');
+            searchField.oninput = () => leaf.style.display = searchField.value === 'Landlord' ? 'block' : 'none';
+            leaf.onclick = () => { if (!options.ignoreClick) leaf.setAttribute('aria-selected', 'true'); };
+        }
+        if (options.delayed) setTimeout(initialise, 150); else initialise();
+        </script>`);
+    return page;
+}
+
+test('MiFILE waits for the court case-type tree before filtering and verifies the LT selection', async () => {
+    for (const delayed of [false, true]) {
+        const page = await caseTypePage({ delayed });
+        try {
+            const runner = new MiFileFilingRunner();
+            (runner as any).timeoutMs = 1_000;
+            await (runner as any).selectCaseType(page, 'LT - Landlord-Tenant Summary Proceedings');
+            assert.equal(await page.getByRole('treeitem', { name: 'LT - Landlord-Tenant Summary Proceedings', exact: true })
+                .getAttribute('aria-selected'), 'true');
+        } finally { await page.close(); }
+    }
+});
+
+test('MiFILE stops when the court does not confirm the selected case type', async () => {
+    const page = await caseTypePage({ ignoreClick: true });
+    try {
+        const runner = new MiFileFilingRunner();
+        (runner as any).timeoutMs = 300;
+        await assert.rejects((runner as any).selectCaseType(page, 'LT - Landlord-Tenant Summary Proceedings'),
+            (error: any) => error.code === 'CASE_TYPE_SELECTION_UNCONFIRMED' && error.checkpoint === 'select_filing');
+    } finally { await page.close(); }
+});
+
+test('MiFILE never selects another case type merely because its description mentions landlord-tenant', async () => {
+    const page = await caseTypePage({ wrongType: true });
+    try {
+        const runner = new MiFileFilingRunner();
+        (runner as any).timeoutMs = 300;
+        await assert.rejects((runner as any).selectCaseType(page, 'LT - Landlord-Tenant Summary Proceedings'));
+        assert.equal(await page.locator('[aria-selected="true"]').count(), 0);
+    } finally { await page.close(); }
+});
+
 test('MiFILE case forms keep business Defendants separate from people',async()=>{
     const page=await browser.newPage();
     try {
