@@ -3,7 +3,7 @@ import type { ParsedEmailInfo } from './emailProcessor';
 import type { DownloadResult } from './downloadFiledDocuments';
 import { ComplaintExtractionResult } from './complaintExtractor';
 import { recognizeDocumentPdf } from './documentRecognition';
-import { applyLibraryForms } from './formLibrary';
+import { applyLibraryForms, type FormUploadDependencies } from './formLibrary';
 
 export async function processFilingIntake(
     db: WorkflowDatabase,
@@ -13,6 +13,7 @@ export async function processFilingIntake(
     dependencies: {
         download(parsed: ParsedEmailInfo): Promise<DownloadResult>;
         extract(buffer: Buffer, documentType: string | null): Promise<ComplaintExtractionResult>;
+        forms?: FormUploadDependencies;
     },
 ) {
     const initial = db.getDraftDetail(draftId);
@@ -76,5 +77,5 @@ export async function processFilingIntake(
     }
     if (parsed.filedDocuments.length) db.refreshEmailAfterDocumentRetries(emailId, draftId);
     else db.markEmailProcessed(emailId);
-    return applyLibraryForms(db, draftId);
+    return applyLibraryForms(db, draftId, dependencies.forms);
 }

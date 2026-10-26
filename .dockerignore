@@ -3,6 +3,7 @@ dist/
 .git/
 .env
 .env.*
+**/.secrets/
 data/
 logs/
 temp/

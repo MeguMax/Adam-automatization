@@ -6,7 +6,7 @@ One authorized email creates one new Draft and one OneDrive folder. The worker p
 
 The Draft editor displays the PDF with page navigation and zoom beside the editable fields. On mobile, switch between Document and Fields. Missing data, unreadable files, ambiguous document roles, and incomplete packages require review.
 
-Completed email packages with no validation issues and no previous filing job can be queued automatically for preparation. Manual packages and packages requiring correction use the Draft review controls and **Prepare in MiFILE**. The only destination is **History > Unsubmitted**. Final submission and payment remain disabled. Both the alternate and primary accounts access live MiFILE; "alternate" does not mean sandbox. The only permitted filer is **Devlin, Adam**.
+Completed email packages with no validation issues and no previous filing job are queued automatically when the preparation worker is enabled and ready. No Sync, extraction, confirmation or preparation button is needed for this path. Manual packages and corrected packages use **Confirm & prepare** after resolving their review items. The only destination is **History > Unsubmitted**. Final submission and payment remain disabled. Both the alternate and primary accounts access live MiFILE; "alternate" does not mean sandbox. The only permitted filer is **Devlin, Adam**.
 
 ## Sending a package
 
@@ -28,7 +28,7 @@ OCR renders up to approximately 300 DPI within the existing 8-million-pixel limi
 
 Adam has confirmed his office contacts for missing Plaintiff contact fields: 30850 Telegraph Rd Ste 250, Bingham Farms, MI 48025; 248-703-6201; ajd@devlinlawpllc.com. Explicit Complaint addresses and manual corrections, including intentionally cleared fields, are preserved. The permitted filer uses the confirmed Adam J Devlin / P72877 office profile. Policy-derived fields are labelled **Attorney rule**, not PDF-extracted facts. Missing required documents and genuinely uncertain answers remain correction items. Existing editable intakes can be refreshed by the serialized extraction worker; locked/prepared cases and court notifications are not changed.
 
-Live Draft refresh checks the selected record and edit revision again after each background response. Responses started before a field edit do not replace unsaved input, including while navigating between Drafts.
+Live Draft refresh checks the selected record and edit revision again after each background response. Responses started before a field edit do not replace unsaved input, including while navigating between Drafts. When an unedited form refreshes, the active field, text selection and field-panel scroll position are preserved so a correction link does not lose keyboard focus during the next poll.
 
 ## Correcting and confirming a Draft
 
@@ -109,7 +109,9 @@ The primary action changes with the case: **Save & check**, **Review corrections
 
 ## Account settings
 
-The existing environment credentials remain active until an account is saved through Settings. To enable saving credentials, configure admin authentication and a persistent encryption key in Render:
+The existing environment credentials remain active until an account is saved through Settings. Admin authentication is required. In production, no extra Render secret is needed for a fresh installation: the server creates one random 256-bit key at `/var/data/.secrets/mifile-credentials.key` and reuses it after restarts. The key file is separate from SQLite, private to the server user on Linux, and excluded from Git and Docker builds. Back it up securely; restoring the database alone cannot decrypt a saved account.
+
+An explicit environment key takes precedence. This is also the configuration for standalone `npm run admin`:
 
 ```text
 MIFILE_CREDENTIALS_KEY=<64 hexadecimal characters>
@@ -137,6 +139,14 @@ npm.cmd run test:admin-intake
 The browser smoke test uses an isolated SQLite database and mocked OneDrive and MiFILE sign-in services. It checks account saving, credential redaction, cross-origin rejection, uploading a PDF to an initially empty Draft, PDF canvas rendering, and desktop/mobile layout. It also corrects missing fields, completes a six-document package, confirms it, queues one preparation job, and simulates a restart at Save Progress followed by reconciliation. The MiFILE uploader tests use a local browser fixture to check all six uploads, exact Filing Type selection, missing Connected controls, and refusal to save or submit on those failures. These tests do not create a real MiFILE bundle. Screenshots are written to `output/intake-qa`.
 
 Before inviting live client packages, deploy the update, confirm the inbox and accepted senders in Settings, and run one controlled package through the real Microsoft 365 and OneDrive services. Select the exact court, resolve validation issues, and prepare that package in MiFILE. Confirm the resulting bundle in History > Unsubmitted. Local tests do not substitute for this live integration check.
+
+### October 26 live automatic acceptance check
+
+- A clearly marked fictional email was delivered once to the configured Microsoft 365 inbox. Without pressing Sync, extraction, confirmation or preparation controls, Render processed its five attached PDFs, extracted Complaint fields, added the approved Advice/Local, and saved `TEMP-H5WNXK2C` in MiFILE Unsubmitted. Preparation itself took 26 seconds; email arrival to saved bundle took approximately 57 seconds.
+- The bundle was reopened independently from History > Unsubmitted. All seven source PDFs and MiFILE's generated Case Initiation Form were present with successful upload states. Both supporting PDFs were Connected children of the Complaint, not merged documents. MiFILE's history count excludes Connected children; that count alone is not the source-PDF total.
+- A second email deliberately omitted Request. All six available PDFs were retained, Review identified the missing Request, and no MiFILE job was created. It did not block the complete package. Both email tokens were found once in Inbox; the complete Draft had one preparation attempt.
+- Evidence is retained under `output/qa-email-complete-2026-10-26/` and `output/qa-email-incomplete-2026-10-26/` in the local QA workspace. The test used the alternate live account and made no payment or final court submission. It does not certify every unseen document format or the client's primary login.
+
 # September 24: intake recovery and scanned documents
 
 - Drafts defaults to new filing packages. Existing court notifications remain in Queue and in the optional All records view; they are not new cases.

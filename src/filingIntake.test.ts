@@ -8,8 +8,9 @@ import { buildFilingIntake, intakeFileName, intakeSenderAllowed, isFilingIntakeS
 import { emailAttachmentSourceId, emailAttachmentSourceName } from './emailAttachmentSource';
 import { downloadIntakeDocuments } from './filingIntakeDownload';
 import { processFilingIntake } from './filingIntakeWorker';
-import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
-import { testPdfFixture } from './testPdfFixture';
+import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, extractComplaintPdf, type ComplaintExtractionResult } from './complaintExtractor';
+import { testComplaintFormFixture, testPdfFixture } from './testPdfFixture';
+import { saveFormPdf } from './formLibrary';
 
 const message = {
     id: 'new-intake-message', internetMessageId: '<new-intake@example.com>',
@@ -275,6 +276,78 @@ test('automatic preparation only queues complete new intakes once and never skip
         const job = f.db.claimNextFilingJob();
         assert.equal(job?.mode, 'prepare');
         assert.equal(job?.triggerSource, 'validated_intake');
+    } finally { f.close(); }
+});
+
+test('email pipeline reads PDF fields, inserts library forms, connects both supporting PDFs, and queues only the complete intake', async () => {
+    const names = ['Complaint.pdf', 'Summons.pdf', 'Request.pdf', 'Demand.pdf', 'Lease.pdf'];
+    const f = fixture(names.filter(name => name !== 'Request.pdf'));
+    const court = 'MI Oakland County - Oak Park - 45th District Court';
+    const content = new Map([
+        ['Complaint.pdf', testComplaintFormFixture({ 1: '45th', 5: 'QA Pipeline Property LLC',
+            6: 'Adam J Devlin P72877\r30850 Telegraph Rd Ste 250\rBingham Farms, MI 48025\r248 703 6201',
+            7: 'Jamie Pipeline, and all other occupants\r101 Rental Street\rOak Park, MI 48237' })],
+        ['Summons.pdf', testPdfFixture('Summons, Landlord-Tenant/Land Contract')],
+        ['Request.pdf', testPdfFixture('Request for Court Mailing and Record (Landlord-Tenant)')],
+        ['Demand.pdf', testPdfFixture('DEMAND FOR POSSESSION')],
+        ['Lease.pdf', testPdfFixture('RESIDENTIAL LEASE AGREEMENT')],
+    ]);
+    const uploads: string[] = [];
+    const upload = async (_key: string, filename: string) => {
+        uploads.push(filename);
+        return { fileName: filename, driveId: 'fixture', itemId: filename,
+            webUrl: `https://onedrive.example/${encodeURIComponent(filename)}` };
+    };
+    const dependencies = {
+        download: (input: typeof f.parsed) => downloadIntakeDocuments(input, {
+            download: async source => {
+                const buffer = content.get(emailAttachmentSourceName(source.downloadUrl)!);
+                assert.ok(buffer, 'expected attachment source');
+                return buffer;
+            }, upload, wait: async () => {},
+        }),
+        extract: extractComplaintPdf,
+        forms: { upload },
+    };
+    try {
+        await saveFormPdf(f.db, { role: 'advice', courtName: '', filename: 'Advice.pdf',
+            content: testPdfFixture('Advice of Rights and Information (Landlord-Tenant)') });
+        await saveFormPdf(f.db, { role: 'local', courtName: court, filename: '45 Local.pdf',
+            content: testPdfFixture('Local Rental and Housing Information') });
+        const incomplete = await processFilingIntake(f.db, f.email.id, f.draftId, f.parsed, dependencies);
+        assert.equal(incomplete.documents.length, 6);
+        assert.ok(incomplete.caseDraft?.validationIssues.some(issue => /missing Request/.test(issue.message)));
+        assert.equal(f.db.queueValidatedIntakes(), 0);
+
+        const completeMessage = { ...message, id: 'complete-pipeline', internetMessageId: '<complete-pipeline@example.com>' };
+        const email = f.db.registerEmail(completeMessage);
+        const parsed = buildFilingIntake(completeMessage, names.map(name => attachment(name)));
+        const draftId = f.db.createCaseDraft(email.id, parsed);
+        const complete = await processFilingIntake(f.db, email.id, draftId, parsed, dependencies);
+        assert.equal(complete.caseDraft?.editableData.courtName, court);
+        assert.equal(complete.caseDraft?.filingData.plaintiff.displayName, 'QA Pipeline Property LLC');
+        assert.equal(complete.caseDraft?.filingData.defendants[0].displayName, 'Jamie Pipeline');
+        assert.equal(complete.caseDraft?.filingData.claimAmount, '1991.50');
+        assert.deepEqual(complete.caseDraft?.validationIssues, []);
+        assert.equal(complete.documents.length, 7);
+        assert.ok(complete.documents.every(document => document.status === 'uploaded'));
+        assert.equal(complete.documents.filter(document => document.formTemplate).length, 2);
+        const uploadCount = uploads.length;
+        await processFilingIntake(f.db, email.id, draftId, parsed, dependencies);
+        assert.equal(uploads.length, uploadCount, 'reprocessing must not duplicate uploads or forms');
+        assert.equal(f.db.queueValidatedIntakes(), 1);
+        assert.equal(f.db.queueValidatedIntakes(), 0);
+        const job = f.db.claimNextFilingJob()!;
+        assert.equal(job.caseDraftId, draftId);
+        assert.equal(job.mode, 'prepare');
+        assert.equal(job.triggerSource, 'validated_intake');
+        assert.equal(job.payload?.documents.length, 7);
+        const complaint = job.payload!.documents.find(document => document.packageRole === 'complaint')!;
+        const connected = job.payload!.documents.filter(document => document.packageRole === 'ancillary');
+        assert.equal(connected.length, 2);
+        assert.equal(complaint.isPrimary, true);
+        assert.ok(connected.every(document => document.filingRelation === 'connected_to_complaint'));
+        assert.equal(f.db.getDraftDetail(f.draftId)?.caseDraft?.filingStatus, 'not_started');
     } finally { f.close(); }
 });
 

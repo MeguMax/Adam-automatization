@@ -290,6 +290,8 @@ async function main() {
         await page.locator('[data-review-issue="' + addressIssue + '"]').click();
         const plaintiffAddress = page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
         await page.waitForFunction(()=>document.querySelector('[data-party-role="plaintiff"] [data-party-field="address1"]')===document.activeElement);
+        const focusedBeforeRefresh = await plaintiffAddress.elementHandle();
+        await page.waitForFunction(element => !element?.isConnected, focusedBeforeRefresh);
         assert.equal(await plaintiffAddress.evaluate(element => element === document.activeElement), true);
         assert.equal(await plaintiffAddress.getAttribute('aria-invalid'), 'true');
         assert.equal(await page.locator('#draftApproveBtn').isDisabled(), true);

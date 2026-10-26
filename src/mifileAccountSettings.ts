@@ -1,4 +1,6 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { getWorkflowDatabase, WorkflowDatabase } from './database';
 
 export interface MiFileCredentials {
@@ -20,6 +22,60 @@ function encryptionKey(environment: NodeJS.ProcessEnv): Buffer {
 
 export function accountSettingsEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
     return /^[a-f0-9]{64}$/i.test(environment.MIFILE_CREDENTIALS_KEY || '');
+}
+
+export function initializeMiFileAccountEncryption(
+    db: WorkflowDatabase,
+    environment: NodeJS.ProcessEnv = process.env,
+): { source: 'environment' | 'persistent_file'; created: boolean } {
+    if (environment.MIFILE_CREDENTIALS_KEY) {
+        encryptionKey(environment);
+        return { source: 'environment', created: false };
+    }
+
+    const directory = path.join(path.dirname(db.getPath()), '.secrets');
+    const filename = path.join(directory, 'mifile-credentials.key');
+    const stored = db.getRuntimeSetting('mifile_account');
+    if (fs.existsSync(directory)) {
+        const info = fs.lstatSync(directory);
+        if (!info.isDirectory() || info.isSymbolicLink()) {
+            throw new Error('MiFILE key directory must be a private directory, not a symbolic link.');
+        }
+    } else {
+        fs.mkdirSync(directory, { mode: 0o700 });
+    }
+    if (process.platform !== 'win32') fs.chmodSync(directory, 0o700);
+
+    let created = false;
+    if (!fs.existsSync(filename)) {
+        // Never replace a lost key: that would make the saved account unrecoverable.
+        if (stored) {
+            throw new Error('Saved MiFILE account has no encryption key. Restore MIFILE_CREDENTIALS_KEY or the private key file.');
+        }
+        try {
+            const handle = fs.openSync(filename, 'wx', 0o600);
+            try {
+                fs.writeFileSync(handle, randomBytes(32).toString('hex'), 'utf8');
+                fs.fsyncSync(handle);
+            } finally {
+                fs.closeSync(handle);
+            }
+            created = true;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+    }
+    const info = fs.lstatSync(filename);
+    if (!info.isFile() || info.isSymbolicLink() || info.size !== 64) {
+        throw new Error('MiFILE encryption key file is invalid. Restore the original private key; it was not replaced.');
+    }
+    if (process.platform !== 'win32') fs.chmodSync(filename, 0o600);
+    const key = fs.readFileSync(filename, 'utf8');
+    const candidate = { ...environment, MIFILE_CREDENTIALS_KEY: key };
+    encryptionKey(candidate);
+    if (stored) decryptMiFileAccount(stored, candidate);
+    environment.MIFILE_CREDENTIALS_KEY = key;
+    return { source: 'persistent_file', created };
 }
 
 export function encryptMiFileAccount(credentials: MiFileCredentials, environment: NodeJS.ProcessEnv): string {

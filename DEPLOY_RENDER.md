@@ -73,7 +73,9 @@ The new Render database is persistent from its first deploy onward. Transfer the
 
 ## Switch the MiFILE Account
 
-The September intake update adds **Settings > MiFILE account**. For this version, prefer **Verify and save** in the admin panel after configuring `MIFILE_CREDENTIALS_KEY` (64 hexadecimal characters) and admin authentication. Saved credentials are encrypted in persistent SQLite, take precedence over environment credentials, and are used by both downloading and preparation sessions. Preserve the same encryption key across deploys. See [INTAKE_WORKFLOW.md](INTAKE_WORKFLOW.md) for the key-generation command, sender configuration, and rollout checks.
+Use **Settings > MiFILE account > Verify and save** with admin authentication enabled. The production server now creates a random private encryption key on the persistent disk at `/var/data/.secrets/mifile-credentials.key` when no `MIFILE_CREDENTIALS_KEY` is configured. The key survives deployments; its directory and file are owner-only on Linux. An explicit `MIFILE_CREDENTIALS_KEY` (64 hexadecimal characters) takes precedence and is never changed automatically. No key value is logged or returned by the API.
+
+Saved credentials are encrypted in persistent SQLite, take precedence over environment credentials, and are used by both downloading and preparation sessions. Back up the private key separately and securely along with the database and form library. A lost, corrupt or incorrect key is never silently regenerated for an existing saved account, and the system will not fall back to another login. Restore the original key before using that saved account. Standalone `npm run admin` still uses an explicitly configured key. See [INTAKE_WORKFLOW.md](INTAKE_WORKFLOW.md) for sender configuration and rollout checks.
 
 Both account labels refer to live MiFILE, not a sandbox. The instructions below remain the environment-only fallback until an account has been saved in the admin panel.
 

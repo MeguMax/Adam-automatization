@@ -48,7 +48,7 @@ import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-26-persistent-admin-sessions-v47';
+const ADMIN_BUILD_ID = '2026-10-26-self-service-account-v48';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4846,6 +4846,12 @@ const html = String.raw`<!doctype html>
     }
 
     function renderDraftFields(draft) {
+      const focusedControl = document.activeElement;
+      const focusedField = focusedControl?.dataset?.reviewField;
+      const selection = focusedField && typeof focusedControl.selectionStart === 'number'
+        ? {start:focusedControl.selectionStart, end:focusedControl.selectionEnd, direction:focusedControl.selectionDirection}
+        : null;
+      const formScroll = document.getElementById('draftFieldsForm').scrollTop;
       const issues = draft.validationIssues || [];
       const issueByField = new Map(issues.map(issue => [issue.field, issue]));
       const sourceMap = draft.fieldSources || {};
@@ -5237,6 +5243,15 @@ const html = String.raw`<!doctype html>
         });
       });
       renderIcons();
+      if (focusedField && !focusedControl.isConnected) {
+        const replacement = Array.from(document.querySelectorAll('[data-review-field]'))
+          .find(control => control.dataset.reviewField === focusedField);
+        if (replacement && !replacement.disabled) {
+          replacement.focus({preventScroll:true});
+          if (selection) replacement.setSelectionRange(selection.start, selection.end, selection.direction);
+          document.getElementById('draftFieldsForm').scrollTop = formScroll;
+        }
+      }
     }
 
     function draftIssueTarget(issue) {

@@ -7,6 +7,7 @@ import { runWorker } from './index';
 import { runFilingWorker } from './filingWorker';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { runDraftExtractionWorker } from './draftExtraction';
+import { initializeMiFileAccountEncryption } from './mifileAccountSettings';
 
 function isWorkerEnabled(): boolean {
     const value = (process.env.WORKER_ENABLED ?? 'true').trim().toLowerCase();
@@ -36,6 +37,11 @@ function closeServer(server: http.Server): Promise<void> {
 
 async function main(): Promise<void> {
     importPlaintiffMappingSeed();
+    try {
+        console.log('MiFILE account encryption:', initializeMiFileAccountEncryption(getWorkflowDatabase()));
+    } catch (error) {
+        console.error('MiFILE account settings unavailable:', (error as Error).message);
+    }
 
     const port = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
     const server = createAdminServer(port, {
