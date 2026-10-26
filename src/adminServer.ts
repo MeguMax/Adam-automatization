@@ -46,9 +46,10 @@ import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
+import { filingReleaseChecks } from './mifilePreparationEvidence';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-26-self-service-account-v48';
+const ADMIN_BUILD_ID = '2026-10-26-verified-unsubmitted-v49';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4622,6 +4623,7 @@ const html = String.raw`<!doctype html>
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
       const logWasOpen = Boolean(root.querySelector('[data-filing-log]')?.open);
+      const releaseWasOpen = Boolean(root.querySelector('[data-release-checks]')?.open);
       const previousChecklist = root.querySelector('[data-upload-checklist]');
       const jobs = state.draftFilingJobs || [];
       const config = state.mifileConfig || {
@@ -4690,6 +4692,16 @@ const html = String.raw`<!doctype html>
             escapeHtml(job.temporaryCaseNumber) + '</span>' : '') +
         '</div>' +
         progressMarkup +
+        (job.status === 'prepared' && job.releaseChecks ? '<details class="draft-optional" data-release-checks' + (releaseWasOpen ? ' open' : '') + '><summary>Before court submission</summary><div class="draft-filing-job-meta">' +
+          '<span>Saved bundle: ' + (job.releaseChecks.savedBundleVerified ? 'Reopened and checked' : 'No automatic readback recorded') + '</span>' +
+          '<span>Source PDF fingerprints: ' + (job.releaseChecks.sourceSnapshotPinned ? 'Recorded at preparation' : 'Not recorded') + '</span>' +
+          '<span>Current account: ' + (job.releaseChecks.sameAccount ? 'Matches prepared bundle' : 'Needs verification') + '</span>' +
+          '<span>Primary account: ' + (job.releaseChecks.primaryAccountConfirmed ? 'Confirmed' : 'Not confirmed for this bundle') + '</span>' +
+          '<span>Displayed fees before checkout: ' + (job.releaseChecks.displayedSubtotalCents === null ? 'Not recorded' :
+            escapeHtml(new Intl.NumberFormat('en-US', {style:'currency',currency:'USD'}).format(job.releaseChecks.displayedSubtotalCents / 100))) + '</span>' +
+          '<span>Checkout total and processing fee: Not verified</span>' +
+          '<span>Payment and final court submission: Disabled</span>' +
+          '</div></details>' : '') +
         (job.errorMessage ? '<div class="draft-filing-job-error">' +
           escapeHtml((job.errorCode ? job.errorCode + ': ' : '') + job.errorMessage) + '</div>' : '') +
         (job.status === 'reconciliation_required' ?
@@ -7467,13 +7479,15 @@ export function createAdminServer(
 
             if (req.method === 'GET' && url.pathname === '/api/filing-jobs') {
                 const caseDraftId = url.searchParams.get('caseDraftId')?.trim() || undefined;
+                let account = null;
+                try { account = getMiFileCredentials(); } catch { /* Saved credentials need attention. */ }
                 sendJson(
                     res,
                     200,
                     db.listFilingJobs(
                         caseDraftId,
                         Number(url.searchParams.get('limit') || 100),
-                    ),
+                    ).map(job => ({ ...job, releaseChecks: filingReleaseChecks(job, account) })),
                 );
                 return;
             }
@@ -7485,7 +7499,9 @@ export function createAdminServer(
                     sendJson(res, 404, { error: 'MiFILE job not found' });
                     return;
                 }
-                sendJson(res, 200, job);
+                let account = null;
+                try { account = getMiFileCredentials(); } catch { /* Saved credentials need attention. */ }
+                sendJson(res, 200, { ...job, releaseChecks: filingReleaseChecks(job, account) });
                 return;
             }
 

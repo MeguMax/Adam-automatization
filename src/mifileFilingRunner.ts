@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { chromium, Frame, Locator, Page } from 'playwright';
 import {
     DraftAttorney,
@@ -13,7 +14,9 @@ import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClien
 import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
-import { authenticateMifilePage, dismissMifileModalIfAny } from './mifileSession';
+import { authenticateMifilePage, dismissMifilePreparationNotice } from './mifileSession';
+import { isRequiredMiFileFiler, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
+    type FilingSourceFingerprint, type MiFileFeeObservation, type MiFileSavedBundleEvidence } from './mifilePreparationEvidence';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_UPLOAD_TIMEOUT_MS = 180_000;
@@ -35,6 +38,7 @@ export interface MiFilePreparationResult {
     mifileVersion: string | null;
     screenshotPath: string | null;
     documentManifest?: MiFileDocumentReceipt[];
+    savedBundleEvidence?: MiFileSavedBundleEvidence;
 }
 
 export interface MiFileDocumentReceipt {
@@ -69,6 +73,7 @@ export class MiFileFilingError extends Error {
 interface MaterializedDocument {
     document: FilingDocumentPayload;
     localPath: string;
+    fingerprint: FilingSourceFingerprint;
 }
 
 function envFlag(value: string | undefined, fallback: boolean): boolean {
@@ -260,18 +265,45 @@ export class MiFileFilingRunner {
             );
             await this.saveProgress(page);
 
+            const savedUrl = page.url();
+            const savedText = await page.locator('body').innerText();
+            const externalBundleId = miFileBundleId(savedUrl);
+            const temporaryCaseNumber = savedText.match(/\bTEMP-[A-Z0-9-]+\b/i)?.[0] || null;
+            if (!externalBundleId || !temporaryCaseNumber) {
+                throw new MiFileFilingError('MiFILE saved the bundle but its exact reference could not be verified.',
+                    'SAVED_BUNDLE_REFERENCE_MISSING', 'save_progress');
+            }
+            await this.log('info', 'verify_saved_bundle', 'Reopening the saved bundle to verify its PDFs and filer.', {
+                event: 'bundle_saved', externalBundleId, temporaryCaseNumber,
+            });
+            lastCheckpoint = 'verify_saved_bundle';
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: this.timeoutMs });
+            await page.locator('#documentTable').waitFor({ state: 'visible', timeout: this.timeoutMs });
+            await dismissMifilePreparationNotice(page);
+            await this.verifySavedBundle(page, job.payload, documentManifest, credentials.username, externalBundleId, temporaryCaseNumber);
+            const sources = documents.map(document => document.fingerprint);
+            const savedBundleEvidence: MiFileSavedBundleEvidence = {
+                version: 1, verifiedAt: new Date().toISOString(), externalBundleId, temporaryCaseNumber,
+                accountEmail: credentials.username.trim().toLowerCase(), filer: REQUIRED_MIFILE_FILER,
+                courtName: job.payload.courtName, sourcePdfCount: documents.length,
+                connectedPdfCount: documentManifest.filter(document => document.filingRelation === 'connected_to_complaint').length,
+                generatedPdfCount: 1, packageDigest: preparationDigest(job.payload, sources), sources,
+                fees: await this.observeFees(page), paymentAuthorized: false, courtSubmissionAuthorized: false,
+            };
+
             const screenshotPath = path.join(jobDirectory, 'prepared.png');
             await page.screenshot({ path: screenshotPath, fullPage: true });
             const bodyText = await page.locator('body').innerText();
             const result = {
                 checkpoint: 'saved_unsubmitted' as const,
                 url: page.url(),
-                externalBundleId: this.extractBundleId(page.url(), bodyText),
-                temporaryCaseNumber: bodyText.match(/\bTEMP-[A-Z0-9-]+\b/i)?.[0] ?? null,
+                externalBundleId,
+                temporaryCaseNumber,
                 uploadedDocuments: documents.length,
                 mifileVersion: bodyText.match(/Version\s+([\d.]+)/i)?.[1] ?? null,
                 screenshotPath,
                 documentManifest,
+                savedBundleEvidence,
             };
             await this.log(
                 'info',
@@ -346,7 +378,9 @@ export class MiFileFilingRunner {
                 `${String(index + 1).padStart(2, '0')}-${safePathToken(document.filename.replace(/\.pdf$/i, ''))}.pdf`,
             );
             fs.writeFileSync(localPath, buffer);
-            materialized.push({ document, localPath });
+            materialized.push({ document, localPath, fingerprint: {
+                documentId: document.id, bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex'),
+            } });
             await this.log('info', 'materialize_documents', 'PDF validated for MiFILE upload.', {
                 documentId: document.id,
                 filename: document.filename,
@@ -357,7 +391,7 @@ export class MiFileFilingRunner {
     }
 
     private async login(page: Page, credentials: MiFileCredentials): Promise<void> {
-        await authenticateMifilePage(page, credentials);
+        await authenticateMifilePage(page, credentials, { strictNotices: true });
         // The identity cookie can arrive just before MiFILE finishes its own
         // redirect to /cases. Let that navigation settle before opening /file.
         await page.waitForTimeout(1_500);
@@ -365,11 +399,7 @@ export class MiFileFilingRunner {
             waitUntil: 'domcontentloaded',
             timeout: this.timeoutMs,
         });
-        await dismissMifileModalIfAny(page);
-        const notificationOk = await firstVisible(
-            page.getByRole('button', { name: 'OK', exact: true }),
-        );
-        if (notificationOk) await notificationOk.click();
+        await dismissMifilePreparationNotice(page);
         if (page.url().toLowerCase().includes('/login')) {
             throw new MiFileFilingError(
                 'MiFILE rejected the login or requested additional verification.',
@@ -377,6 +407,7 @@ export class MiFileFilingRunner {
                 'login',
             );
         }
+        await this.verifyAccount(page, credentials.username);
         await this.log('info', 'login', 'Authenticated with MiFILE.');
     }
 
@@ -389,12 +420,12 @@ export class MiFileFilingRunner {
             });
         }
         await page.waitForTimeout(1_000);
-        await dismissMifileModalIfAny(page);
+        await dismissMifilePreparationNotice(page);
         const courtName = courtDisplayName(payload.courtName);
         const courtInput = page.locator('#court_select_dropdown');
         await courtInput.fill(courtName);
         await page.waitForTimeout(300);
-        await dismissMifileModalIfAny(page);
+        await dismissMifilePreparationNotice(page);
         const courtOption = await firstVisible(
             page.locator('li.inner-list-item').filter({ hasText: courtName }),
         );
@@ -407,10 +438,10 @@ export class MiFileFilingRunner {
         }
         await courtOption.click();
         await page.selectOption('#actionSelect', { label: 'Initiate a new case' });
-        const configuredFiler = 'Devlin, Adam';
+        const configuredFiler = REQUIRED_MIFILE_FILER;
         const selectedFiler = page.locator('#filer-input-selected');
         const selectedFilerText = await selectedFiler.inputValue().catch(() => '');
-        if (!selectedFilerText.toLowerCase().includes(configuredFiler.toLowerCase())) {
+        if (!isRequiredMiFileFiler(selectedFilerText)) {
             const filerInput = page.locator('#filer-input-empty');
             await filerInput.waitFor({ state: 'visible', timeout: this.timeoutMs });
             await filerInput.click();
@@ -427,7 +458,7 @@ export class MiFileFilingRunner {
                     });
                 });
             const filerOption = await firstVisible(
-                filerOptions.filter({ hasText: configuredFiler }),
+                filerOptions.filter({ hasText: /^\s*Devlin,\s+Adam\s+\(P72877\)\s*$/i }),
             );
             if (!filerOption) {
                 const availableFilers = (await filerOptions.allTextContents())
@@ -443,7 +474,7 @@ export class MiFileFilingRunner {
             await filerOption.click();
         }
         const confirmedFiler = await selectedFiler.inputValue().catch(() => '');
-        if (!confirmedFiler.toLowerCase().includes(configuredFiler.toLowerCase())) {
+        if (!isRequiredMiFileFiler(confirmedFiler)) {
             throw new MiFileFilingError(
                 `MiFILE did not select the required filer: ${configuredFiler}.`,
                 'FILER_NOT_AVAILABLE',
@@ -571,6 +602,7 @@ export class MiFileFilingRunner {
             attorneyIndex,
             payload.filingData.attorney,
         );
+        await this.verifyCaseAnswers(frame, payload);
         await saveForm.click();
         await page.locator('#fileUpload').waitFor({
             state: 'attached',
@@ -625,6 +657,92 @@ export class MiFileFilingRunner {
         await frame.locator(`#${prefix}Email`).fill(email);
         const phone = frame.locator(`#${prefix}Phone`);
         if (await phone.count()) await phone.fill(attorney.phone || '');
+    }
+
+    private async verifyCaseAnswers(frame: Frame, payload: FilingPayload): Promise<void> {
+        const filing = payload.filingData;
+        const related = filing.relatedCivilAction === 'none' ? 0 : 1;
+        const actualAmount = usdCents(await frame.locator('#claimAmount').inputValue());
+        const expectedAmount = filing.moneyJudgmentRequested ? usdCents(filing.claimAmount || '') : 0;
+        let correct = expectedAmount !== null && actualAmount === expectedAmount &&
+            await frame.locator(`#relatedCivilActions_${related}`).isChecked() &&
+            !await frame.locator(`#relatedCivilActions_${1 - related}`).isChecked() &&
+            await frame.locator('#requestSecondMail').isChecked();
+        if (filing.relatedCivilAction === 'previously_filed') {
+            const sameCourt = /^this court$/i.test(filing.relatedCaseCourt || '');
+            correct = correct && await frame.locator(`#relatedCivilActions_CourtOption_${sameCourt ? 0 : 1}`).isChecked() &&
+                await frame.locator('#relatedCivilActions_CaseNumber').inputValue() === filing.relatedCaseDocketNumber &&
+                await frame.locator(`#relatedCivilActions_State_${filing.relatedCasePending ? 0 : 1}`).isChecked();
+            if (!sameCourt) correct = correct &&
+                await frame.locator('#relatedCivilActions_Court').inputValue() === filing.relatedCaseCourt;
+        }
+        if (!correct) throw new MiFileFilingError('MiFILE did not retain the required Complaint answers, claim amount or mailing request.',
+            'CASE_FORM_VALUES_MISMATCH', 'case_form');
+        await this.log('info', 'case_form', 'Confirmed Complaint answers, claim amount and mailing request in the MiFILE form.');
+    }
+
+    private async verifyAccount(page: Page, username: string): Promise<void> {
+        const header = await page.getByRole('banner').innerText();
+        if (!header.toLowerCase().split(/\s+/).includes(username.trim().toLowerCase())) {
+            throw new MiFileFilingError('The signed-in MiFILE account does not match the configured login.',
+                'ACCOUNT_IDENTITY_MISMATCH', 'login');
+        }
+    }
+
+    private async verifySavedBundle(page: Page, payload: FilingPayload, receipts: MiFileDocumentReceipt[],
+        username: string, bundleId: string, temporaryCaseNumber: string): Promise<void> {
+        try {
+            if (miFileBundleId(page.url()) !== bundleId) throw new Error('MiFILE did not reopen the expected saved bundle.');
+            await this.verifyAccount(page, username);
+            const body = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
+            if (!body.includes(payload.courtName.replace(/\s+/g, ' ')) ||
+                body.match(/\bTEMP-[A-Z0-9-]+\b/i)?.[0] !== temporaryCaseNumber ||
+                !isRequiredMiFileFiler(await page.locator('#filer-input-selected').inputValue())) {
+                throw new Error('Saved bundle court, temporary case or filer did not match the preparation snapshot.');
+            }
+            if (await page.getByRole('checkbox', { name: 'Serve Document', exact: true }).isChecked() ||
+                await page.locator('#isEmergency').isChecked()) {
+                throw new Error('Unexpected service or emergency settings require review.');
+            }
+            await page.waitForFunction(expected => document.querySelectorAll(
+                '#documentTable tbody[id^="filing-"], #documentTable tbody[id^="child-"]').length === expected,
+            receipts.length + 1, { timeout: this.timeoutMs });
+            const generated = page.locator('#documentTable tbody[id^="filing-"]').filter({ hasNot: page.locator('input[name^="documentName_"]') });
+            if (await generated.count() !== 1 || !(await generated.innerText()).includes('CASE INIT FORM')) {
+                throw new Error('The generated Case Initiation Form is missing or ambiguous.');
+            }
+            await this.verifyDocumentManifest(page, receipts);
+        } catch (error) {
+            throw new MiFileFilingError(error instanceof Error ? error.message : 'Saved bundle verification failed.',
+                'SAVED_BUNDLE_VERIFICATION_FAILED', 'verify_saved_bundle');
+        }
+        await this.log('info', 'verify_saved_bundle', 'Reopened bundle matches the expected court, account, filer and complete PDF manifest.',
+            { externalBundleId: bundleId, temporaryCaseNumber, sourcePdfCount: receipts.length });
+    }
+
+    private async observeFees(page: Page): Promise<MiFileFeeObservation> {
+        const lines = await page.locator('#documentTable tbody[id]').evaluateAll(rows => rows.map(row => {
+            const cells = Array.from(row.querySelector('tr')?.children || []) as HTMLElement[];
+            return { label: row.querySelector<HTMLInputElement>('input[name^="documentName_"]')?.value || cells[1]?.innerText || 'Case Initiation Form',
+                quantity: null, amount: cells[cells.length - 2]?.innerText || '' };
+        }));
+        const additional = await page.locator('table').evaluateAll(tables => tables.filter(table =>
+            table.getClientRects().length && (table as HTMLElement).innerText.includes('Additional Payment Type')).flatMap(table =>
+            Array.from(table.querySelectorAll('tbody tr')).map(row => {
+                const cells = Array.from(row.children) as HTMLElement[];
+                return { label: cells[0]?.innerText.trim() || 'Additional payment',
+                    quantity: /^\d+$/.test(cells[1]?.innerText.trim() || '') ? Number(cells[1].innerText) : null,
+                    amount: cells[2]?.innerText.trim() || '' };
+            })));
+        const observed = [...lines, ...additional].map(line => ({ label: line.label.trim().slice(0, 200),
+            quantity: line.quantity, cents: usdCents(line.amount) }));
+        const subtotal = observed.length && observed.every(line => line.cents !== null) &&
+            additional.every(line => line.quantity === 1) &&
+            additional.filter(line => line.label === 'Mailing Fee').length === 1
+            ? observed.reduce((sum, line) => sum + line.cents!, 0) : null;
+        return { source: 'unsubmitted_upload', currency: 'USD', observedAt: new Date().toISOString(), lines: observed,
+            displayedSubtotalCents: subtotal !== null && Number.isSafeInteger(subtotal) ? subtotal : null,
+            checkoutTotalCents: null, processingFeeCents: null };
     }
 
     private async fillParty(
@@ -697,7 +815,7 @@ export class MiFileFilingRunner {
     private async selectFilingType(page: Page, row: Locator, file: FilingDocumentPayload): Promise<void> {
         const typeInput = row.locator('input[id^="selectFilingTypeInput_"]');
         await typeInput.fill(file.filingType);
-        await dismissMifileModalIfAny(page);
+        await dismissMifilePreparationNotice(page);
         await typeInput.fill(file.filingType);
         const escaped = file.filingType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const pattern = `^\\s*${escaped}(?:\\s+-\\s+\\$[\\d,]+\\.\\d{2})?\\s*$`;
@@ -807,6 +925,15 @@ export class MiFileFilingRunner {
         if (await rows.count() + await page.locator('tbody[id^="child-"]').count() !== initialCount + documents.length) {
             throw new MiFileFilingError('The MiFILE PDF count changed before saving. Check every source PDF.', 'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
         }
+        await this.verifyDocumentManifest(page, receipts);
+        return receipts;
+    }
+
+    private async verifyDocumentManifest(page: Page, receipts: MiFileDocumentReceipt[]): Promise<void> {
+        if (!receipts.length || new Set(receipts.map(receipt => receipt.documentId)).size !== receipts.length ||
+            new Set(receipts.map(receipt => receipt.mifileRowId)).size !== receipts.length) {
+            throw new MiFileFilingError('The PDF manifest contains missing or duplicate identities.', 'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
+        }
         for (const receipt of receipts) {
             const row = page.locator('#' + receipt.mifileRowId);
             if (await row.count() !== 1 || await row.locator('input[name^="documentName_"]').inputValue() !== receipt.filingName) {
@@ -820,22 +947,26 @@ export class MiFileFilingRunner {
             if (!new RegExp(`^\\s*${escaped}(?:\\s+-\\s+\\$[\\d,]+\\.\\d{2})?\\s*$`).test(selectedType)) {
                 throw new MiFileFilingError(`MiFILE changed the Filing Type for ${receipt.filename} before saving.`, 'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
             }
+            if (receipt.filingRelation === 'connected_to_complaint') {
+                const parent = receipts.find(item => item.documentId === receipt.parentDocumentId);
+                if (!parent || !/^filing-\d+$/.test(parent.mifileRowId) ||
+                    !receipt.mifileRowId.startsWith(`child-${parent.mifileRowId.slice('filing-'.length)}-`)) {
+                    throw new MiFileFilingError(`The Connected parent for ${receipt.filename} changed.`,
+                        'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
+                }
+            }
         }
-        return receipts;
     }
 
     private async saveProgress(page: Page): Promise<void> {
         await page.getByRole('button', { name: 'Save Progress', exact: true }).click();
         const confirmation = page.getByText('Your progress has been saved.', { exact: false });
         await confirmation.waitFor({ state: 'visible', timeout: this.timeoutMs });
-        const ok = await firstVisible(page.getByRole('button', { name: 'OK', exact: true }));
-        if (ok) await ok.click();
-    }
-
-    private extractBundleId(url: string, bodyText: string): string | null {
-        const fromUrl = url.match(/(?:batch|bundle|filing)[=/]([a-f0-9-]{16,}|\d+)/i)?.[1];
-        if (fromUrl) return fromUrl;
-        return bodyText.match(/Bundle(?:\s+No\.?|\s+Number)?\s*[:#]?\s*([A-Z0-9-]+)/i)?.[1] ?? null;
+        const savedDialog = await firstVisible(page.getByRole('dialog').filter({ hasText: 'Your progress has been saved.' }));
+        if (savedDialog) {
+            await savedDialog.getByRole('button', { name: 'OK', exact: true }).click();
+            await savedDialog.waitFor({ state: 'hidden' });
+        }
     }
 
     private async log(

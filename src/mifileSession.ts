@@ -107,9 +107,26 @@ export async function dismissMifileModalIfAny(page: Page): Promise<void> {
     await page.waitForTimeout(250);
 }
 
+export class MiFileNoticeRequiresReviewError extends Error {}
+
+export async function dismissMifilePreparationNotice(page: Page): Promise<void> {
+    const dialogs = page.locator('div[role="dialog"], div[uib-modal-window]');
+    for (const dialog of await dialogs.all()) {
+        if (!await dialog.isVisible()) continue;
+        const text = await dialog.innerText();
+        if (!text.includes('Do any of your public documents contain Protected Personal Identifying Information (PII)?') ||
+            /\b(accept|agree|authorize|payment|consent|terms of (?:use|service))\b/i.test(text)) {
+            throw new MiFileNoticeRequiresReviewError('MiFILE displayed an unexpected notice. Review it manually before preparation continues.');
+        }
+        await dialog.getByRole('button', { name: 'OK', exact: true }).click();
+        await dialog.waitFor({ state: 'hidden' });
+    }
+}
+
 export async function authenticateMifilePage(
     page: Page,
     credentials = getMiFileCredentials(),
+    options: { strictNotices?: boolean } = {},
 ): Promise<void> {
     if (!credentials.username || !credentials.password) {
         throw new Error('MIFILE_USER / MIFILE_PASSWORD not set in env');
@@ -126,13 +143,15 @@ export async function authenticateMifilePage(
                     timeout: 60_000,
                 },
             );
-            await dismissMifileModalIfAny(page);
+            if (options.strictNotices) await dismissMifilePreparationNotice(page);
+            else await dismissMifileModalIfAny(page);
             await page.fill('input#Email', credentials.username);
             await page.fill('input#Password', credentials.password);
-            await page.locator('button.flatButton.login-button').click({ force: true });
+            await page.locator('button.flatButton.login-button').click({ force: !options.strictNotices });
             await waitForAuthenticatedCookies(page);
             return;
         } catch (error) {
+            if (error instanceof MiFileNoticeRequiresReviewError) throw error;
             lastError = error;
         }
     }

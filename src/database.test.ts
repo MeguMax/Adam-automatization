@@ -1105,11 +1105,13 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
         assert.equal(db.claimNextFilingJob()?.id, retry.id);
         db.appendFilingJobLog(retry.id, {
             level: 'info',
-            checkpoint: 'save_progress',
-            message: 'Save Progress clicked in test.',
+            checkpoint: 'verify_saved_bundle',
+            message: 'Saved bundle readback interrupted in test.',
+            details: { event: 'bundle_saved', externalBundleId: 'fd2c1ad4-633d-429a-0166-08df32c555de', temporaryCaseNumber: 'TEMP-QA' },
         });
         assert.equal(db.recoverInterruptedFilingJobs(), 1);
         assert.equal(db.getFilingJob(retry.id)?.status, 'reconciliation_required');
+        assert.equal(db.getFilingJob(retry.id)?.externalBundleId, 'fd2c1ad4-633d-429a-0166-08df32c555de');
         assert.equal(
             db.getDraftDetail(draftId)?.caseDraft?.status,
             'filing_reconciliation',

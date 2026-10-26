@@ -37,14 +37,14 @@ export function filingPreparationProgress(job: Pick<FilingJobView, 'payload' | '
     }
     const stages: Record<string, string> = { materialize_documents: 'Reading PDFs from OneDrive', account_preflight: 'Checking account',
         starting: 'Starting preparation', login: 'Signing in to MiFILE', select_filing: 'Selecting court', case_form: 'Completing case details',
-        document_upload: 'Uploading PDFs', save_progress: 'Saving to Unsubmitted', saved_unsubmitted: 'Saved in Unsubmitted' };
+        document_upload: 'Uploading PDFs', save_progress: 'Saving to Unsubmitted', verify_saved_bundle: 'Checking the saved bundle', saved_unsubmitted: 'Saved in Unsubmitted' };
     const stage = job.status === 'queued' ? 'Waiting for preparation' : job.status === 'prepared' ? 'Saved in Unsubmitted' :
         job.status === 'reconciliation_required' ? 'Check the partial bundle in MiFILE' : job.status === 'failed' ? 'Preparation stopped' : stages[job.checkpoint || ''] || 'Preparing in MiFILE';
     const known = job.executionLog.some(entry => ['document_started', 'document_ready', 'document_failed'].includes(String(entry.details?.event))) || Array.isArray(manifest);
     let uploaded: number | null = documents.filter(document => document.status === 'uploaded').length;
     let evidence: FilingPreparationProgress['evidence'] = confirmed ? 'confirmed' : 'verified';
     if (!known && !confirmed && (['prepared', 'reconciliation_required'].includes(job.status) ||
-        (job.status === 'failed' && ['document_upload','save_progress','saved_unsubmitted'].includes(job.checkpoint || '')))) {
+        (job.status === 'failed' && ['document_upload','save_progress','verify_saved_bundle','saved_unsubmitted'].includes(job.checkpoint || '')))) {
         const reported = job.result?.uploadedDocuments;
         if (job.status === 'prepared' && typeof reported === 'number' && Number.isInteger(reported) && reported >= 0 && reported <= documents.length) {
             uploaded = reported; evidence = 'reported';

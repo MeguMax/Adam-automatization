@@ -4,7 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after, before } from 'node:test';
 import { chromium, Browser, Page } from 'playwright';
-import type { FilingDocumentPayload, FilingJobView } from './database';
+import type { FilingDocumentPayload, FilingJobView, FilingPayload } from './database';
+import { createHash } from 'node:crypto';
+import { filingReleaseChecks, isRequiredMiFileFiler, miFileBundleId, preparationDigest, usdCents } from './mifilePreparationEvidence';
 import { testPdfFixture } from './testPdfFixture';
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mifile-runner-qa-'));
@@ -347,6 +349,9 @@ test('long and duplicate source names materialize as distinct PDF filenames with
             assert.equal(path.extname(file.localPath), '.pdf');
             assert.equal(path.dirname(file.localPath), target);
             assert.ok(path.basename(file.localPath).length < 200);
+            const bytes = fs.readFileSync(file.localPath);
+            assert.equal(file.fingerprint.bytes, bytes.length);
+            assert.equal(file.fingerprint.sha256, createHash('sha256').update(bytes).digest('hex'));
         }
     } finally { drive.resolveSharedDriveItem = resolve; drive.downloadDriveItemBuffer = download; }
 });
@@ -374,8 +379,8 @@ test('partial case forms, uploads and uncertain saves require reconciliation wit
     const {MiFileFilingError}=require('./mifileFilingRunner') as typeof import('./mifileFilingRunner');
     const {runFilingWorker}=require('./filingWorker') as typeof import('./filingWorker');
     const db=getWorkflowDatabase();
-    const checkpoints=['case_form','document_upload','save_progress','saved_unsubmitted'];
-    const jobs=[0,1,2,3,4].map(index=>{
+    const checkpoints=['case_form','document_upload','save_progress','verify_saved_bundle','saved_unsubmitted'];
+    const jobs=Array.from({length:checkpoints.length+1},(_,index)=>{
         const message={id:'worker-recovery-'+index,subject:'NEW LT FILING - QA '+index,
             from:{emailAddress:{address:'qa@example.com'}}};
         const parsed=buildFilingIntake(message,[]);
@@ -403,7 +408,11 @@ test('partial case forms, uploads and uncertain saves require reconciliation wit
     MiFileFilingRunner.prototype.prepare=async job=>{
         processed.push(job.id);
         const index=jobs.findIndex(item=>item.id===job.id);
-        if(index<checkpoints.length) throw new MiFileFilingError('Simulated partial Unsubmitted bundle','MIFILE_AUTOMATION_FAILED',checkpoints[index]);
+        if(index<checkpoints.length) {
+            if(checkpoints[index]==='verify_saved_bundle') db.appendFilingJobLog(job.id, {level:'info',checkpoint:'verify_saved_bundle',
+                details:{event:'bundle_saved',externalBundleId:'fd2c1ad4-633d-429a-0166-08df32c555de',temporaryCaseNumber:'TEMP-QA'},message:'Saved bundle'});
+            throw new MiFileFilingError('Simulated partial Unsubmitted bundle','MIFILE_AUTOMATION_FAILED',checkpoints[index]);
+        }
         controller.abort();
         return {checkpoint:'saved_unsubmitted',externalBundleId:'qa-bundle',temporaryCaseNumber:'TEMP-QA',
             uploadedDocuments:1,mifileVersion:null,screenshotPath:null,url:'https://mifile.example/qa'};
@@ -417,11 +426,173 @@ test('partial case forms, uploads and uncertain saves require reconciliation wit
             assert.throws(()=>db.queueFilingJob(job.caseDraftId),/Approve the Draft/);
             assert.equal(db.listFilingJobs(job.caseDraftId).length,1);
         }
-        assert.equal(db.getFilingJob(jobs[4].id)!.status,'prepared');
+        const verifiedJob = db.getFilingJob(jobs[3].id)!;
+        assert.equal(verifiedJob.externalBundleId,'fd2c1ad4-633d-429a-0166-08df32c555de');
+        assert.equal(verifiedJob.temporaryCaseNumber,'TEMP-QA');
+        assert.equal(db.getFilingJob(jobs[jobs.length-1].id)!.status,'prepared');
     }finally{
         controller.abort();
         MiFileFilingRunner.prototype.prepare=previous;
         if(previousAuto===undefined) delete process.env.MIFILE_AUTO_PREPARE_ENABLED;
         else process.env.MIFILE_AUTO_PREPARE_ENABLED=previousAuto;
     }
+});
+
+test('bundle references and filer checks reject lookalikes and never guess an ID from body text', () => {
+    const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
+    assert.equal(miFileBundleId(`https://mifile.courts.michigan.gov/filing/create/${id}`), id);
+    for (const url of [`https://example.com/filing/create/${id}`, `https://mifile.courts.michigan.gov/filing/create/${id}?other=1`,
+        'https://mifile.courts.michigan.gov/filing/create/not-a-bundle', 'Bundle Number: saved', `http://mifile.courts.michigan.gov/filing/create/${id}`])
+        assert.equal(miFileBundleId(url), null);
+    assert.ok(isRequiredMiFileFiler(' Devlin,  Adam (P72877) '));
+    for (const label of ['Devlin, Adam', 'Devlin, Adam Jr (P72877)', 'Devlin, Adam (P11111)', 'Other Devlin, Adam (P72877)'])
+        assert.equal(isRequiredMiFileFiler(label), false);
+});
+
+test('displayed money is parsed as exact cents, without guessing malformed or negative values', () => {
+    for (const [value, cents] of [['$0.00', 0], ['$1,234.56', 123456], ['90', 9000], ['13.00', 1300]] as const)
+        assert.equal(usdCents(value), cents);
+    for (const value of ['', '-1.00', '1.2', '1,23.45', '1.234,56', 'NaN', '1e3', '$10.00 $20.00'])
+        assert.equal(usdCents(value), null);
+});
+
+test('source fingerprints bind all PDFs and case fields to the preparation snapshot', () => {
+    const payload = { documents: [filingDocument(0), filingDocument(1)], courtName: 'Court', filingData: {claimAmount:'1.00'} } as FilingPayload;
+    const sources = payload.documents.map(document => ({documentId:document.id,sha256:'ab'.repeat(32),bytes:200}));
+    const digest = preparationDigest(payload, sources);
+    assert.equal(digest, preparationDigest(payload, [...sources].reverse()));
+    assert.notEqual(digest, preparationDigest({...payload, courtName:'Other Court'}, sources));
+    assert.notEqual(digest, preparationDigest(payload, sources.map((source,index)=>index ? source : {...source,sha256:'cd'.repeat(32)})));
+    assert.throws(()=>preparationDigest(payload,[sources[0],sources[0]]));
+    assert.throws(()=>preparationDigest(payload,sources.slice(1)));
+});
+
+async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;wrongAccount?:boolean;wrongFiler?:boolean;
+    missingPdf?:boolean;extraPdf?:boolean;wrongParent?:boolean;warning?:boolean;serve?:boolean;quantity?:number} = {}) {
+    const page = await browser.newPage();
+    const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
+    const rows = `<tbody id="filing-0"><tr><td></td><td>Case Initiation Form</td><td>1 KB</td><td>CASE INIT FORM</td><td><span class="glyphicon-ok">Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>` +
+        `<tbody id="filing-1"><tr><td></td><td><input name="documentName_1" value="${options.wrongName?'Wrong PDF':'Document 0'}"></td><td></td><td>1 KB</td><td><input id="selectFilingTypeInput_1" value="${options.wrongType?'Other':'Complaint for Possession Only'}"></td><td><span class="glyphicon-ok">Uploaded</span></td><td>$45.00</td><td>View</td></tr></tbody>` +
+        (options.missingPdf?'':`<tbody id="child-${options.wrongParent?2:1}-0"><tr><td></td><td><input name="documentName_0" value="Document 1"></td><td></td><td>1 KB</td><td>CONNECTED FILING</td><td><span class="glyphicon-${options.warning?'alert':'ok'}" ${options.warning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>`) +
+        (options.extraPdf?'<tbody id="filing-2"><tr><td>Unexpected PDF</td></tr></tbody>':'');
+    const html = `<header>${options.wrongAccount?'other@example.com':'qa@example.com'}</header><main>MI Example County - 45th District Court TEMP-QA</main>` +
+        `<input id="filer-input-selected" value="${options.wrongFiler?'Devlin, Adam (P00000)':'Devlin, Adam (P72877)'}">` +
+        `<label><input type="checkbox" ${options.serve?'checked':''}>Serve Document</label><input type="checkbox" id="isEmergency">` +
+        `<table id="documentTable"><caption>Filing documents</caption>${rows}</table>` +
+        `<table><thead><tr><th>Additional Payment Type</th><th>Quantity</th><th>Fee</th><th>Actions</th></tr></thead><tbody><tr><td>Mailing Fee</td><td>${options.quantity??1}</td><td>$13.00</td><td>Remove</td></tr></tbody></table>` +
+        `<button onclick="window.submitted=true">Submit</button><button onclick="window.next=true">Next</button>`;
+    await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:html}));
+    await page.goto(`https://mifile.courts.michigan.gov/filing/create/${id}`);
+    const receipts = [0,1].map(index=>({documentId:'doc-'+index,filename:`Document-${index}.pdf`,filingName:`Document ${index}`,
+        filingType:index?'CONNECTED FILING':'Complaint for Possession Only',filingRelation:index?'connected_to_complaint':'separate',
+        parentDocumentId:index?'doc-0':null,mifileRowId:index?'child-1-0':'filing-1'}));
+    return {page,id,receipts,payload:{courtName:'MI Example County - 45th District Court'} as FilingPayload};
+}
+
+test('saved-bundle readback verifies account, filer, generated form and Connected PDFs without reaching checkout', async () => {
+    const f = await savedBundlePage();
+    try {
+        await (new MiFileFilingRunner() as any).verifySavedBundle(f.page,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA');
+        const fees = await (new MiFileFilingRunner() as any).observeFees(f.page);
+        assert.equal(fees.displayedSubtotalCents,5800);
+        assert.equal(fees.checkoutTotalCents,null);
+        assert.equal(fees.processingFeeCents,null);
+        assert.equal(fees.lines.at(-1).label,'Mailing Fee');
+        assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+    } finally {await f.page.close();}
+});
+
+test('persisted bundle mismatches stop for reconciliation; no missing PDF, warning or other filer is accepted', async () => {
+    for (const options of [{wrongName:true},{wrongType:true},{wrongAccount:true},{wrongFiler:true},{missingPdf:true},
+        {extraPdf:true},{wrongParent:true},{warning:true},{serve:true}]) {
+        const f = await savedBundlePage(options);
+        try {
+            const runner = new MiFileFilingRunner(); (runner as any).timeoutMs=200; (runner as any).uploadTimeoutMs=200;
+            await assert.rejects((runner as any).verifySavedBundle(f.page,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA'),
+                (error:any)=>error.code==='SAVED_BUNDLE_VERIFICATION_FAILED'&&error.checkpoint==='verify_saved_bundle');
+            assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+        } finally {await f.page.close();}
+    }
+});
+
+test('unfamiliar fee quantities do not produce a guessed subtotal', async () => {
+    const f = await savedBundlePage({quantity:2});
+    try {assert.equal((await (new MiFileFilingRunner() as any).observeFees(f.page)).displayedSubtotalCents,null);}
+    finally {await f.page.close();}
+});
+
+test('preparation acknowledges only the known PII information notice and never accepts or removes other dialogs', async () => {
+    const {dismissMifilePreparationNotice}=require('./mifileSession') as typeof import('./mifileSession');
+    const page=await browser.newPage();
+    try {
+        await page.setContent('<div role="dialog">New terms and payment authorization<button onclick="window.accepted=true">OK</button></div>');
+        await assert.rejects(dismissMifilePreparationNotice(page),/unexpected notice/);
+        assert.equal(await page.getByRole('dialog').isVisible(),true);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).accepted)),false);
+        await page.setContent('<div role="dialog">Do any of your public documents contain Protected Personal Identifying Information (PII)? Additional payment authorization<button onclick="window.accepted=true">OK</button></div>');
+        await assert.rejects(dismissMifilePreparationNotice(page),/unexpected notice/);
+        assert.equal(await page.getByRole('dialog').isVisible(),true);
+        await page.setContent('<div role="dialog">Do any of your public documents contain Protected Personal Identifying Information (PII)?<button onclick="this.parentElement.remove()">OK</button></div>');
+        await dismissMifilePreparationNotice(page);
+        assert.equal(await page.getByRole('dialog').count(),0);
+    } finally {await page.close();}
+});
+
+test('Save Progress acknowledges only its own success dialog and never an unrelated OK button',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent('<button onclick="document.getElementById(\'saved\').hidden=false">Save Progress</button>'+
+            '<div role="dialog">Payment authorization<button onclick="window.wrongOk=true">OK</button></div>'+
+            '<div role="dialog" id="saved" hidden>Your progress has been saved.<button onclick="window.savedOk=true;this.parentElement.hidden=true">OK</button></div>'+
+            '<button onclick="window.submitted=true">Submit</button>');
+        await (new MiFileFilingRunner() as any).saveProgress(page);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).savedOk)),true);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).wrongOk||(window as any).submitted)),false);
+    } finally {await page.close();}
+});
+
+test('Complaint answers are read back from MiFILE controls before the case form can be saved',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent('<input id="claimAmount" value="0"><input type="radio" name="related" id="relatedCivilActions_0" checked><input type="radio" name="related" id="relatedCivilActions_1"><input type="checkbox" id="requestSecondMail" checked>');
+        const payload={filingData:{relatedCivilAction:'none',moneyJudgmentRequested:false}};
+        const runner=new MiFileFilingRunner();
+        await (runner as any).verifyCaseAnswers(page.mainFrame(),payload);
+        await page.locator('#claimAmount').fill('1.00');
+        await assert.rejects((runner as any).verifyCaseAnswers(page.mainFrame(),payload),(error:any)=>error.code==='CASE_FORM_VALUES_MISMATCH');
+        await page.locator('#claimAmount').fill('0'); await page.locator('#requestSecondMail').uncheck();
+        await assert.rejects((runner as any).verifyCaseAnswers(page.mainFrame(),payload),(error:any)=>error.code==='CASE_FORM_VALUES_MISMATCH');
+        await page.locator('#requestSecondMail').check();
+        await page.locator('#claimAmount').fill('1,234.56');
+        const supplemental={filingData:{relatedCivilAction:'none',moneyJudgmentRequested:true,claimAmount:'1234.56'}};
+        await (runner as any).verifyCaseAnswers(page.mainFrame(),supplemental);
+        await page.locator('#claimAmount').fill('1234.00');
+        await assert.rejects((runner as any).verifyCaseAnswers(page.mainFrame(),supplemental),(error:any)=>error.code==='CASE_FORM_VALUES_MISMATCH');
+    } finally {await page.close();}
+});
+
+test('release checks require matching evidence and account but never authorize payment or filing',()=>{
+    const payload={documents:[filingDocument(0)],courtName:'Court'} as FilingPayload;
+    const sources=[{documentId:'doc-0',sha256:'ab'.repeat(32),bytes:200}];
+    const id='fd2c1ad4-633d-429a-0166-08df32c555de';
+    const job={status:'prepared',payload,externalBundleId:id,temporaryCaseNumber:'TEMP-QA',result:{
+        url:`https://mifile.courts.michigan.gov/filing/create/${id}`,
+        documentManifest:[{documentId:'doc-0',filingName:'Document 0',filingType:'Complaint for Possession Only',filingRelation:'separate',parentDocumentId:null}],
+        savedBundleEvidence:{version:1,verifiedAt:new Date().toISOString(),sourcePdfCount:1,generatedPdfCount:1,
+            courtName:'Court',connectedPdfCount:0,
+            externalBundleId:id,temporaryCaseNumber:'TEMP-QA',filer:'Devlin, Adam (P72877)',accountEmail:'qa@example.com',
+            sources,packageDigest:preparationDigest(payload,sources),fees:{source:'unsubmitted_upload',currency:'USD',displayedSubtotalCents:5800}},
+    }} as unknown as FilingJobView;
+    const account={username:'qa@example.com',accountEnvironment:'test',productionConfirmed:false};
+    const result=filingReleaseChecks(job,account);
+    assert.equal(result.savedBundleVerified,true);
+    assert.equal(result.sourceSnapshotPinned,true);
+    assert.equal(result.sameAccount,true);
+    assert.equal(result.primaryAccountConfirmed,false);
+    assert.equal(result.finalActionsEnabled,false);
+    assert.equal(result.checkoutVerified,false);
+    assert.equal(result.currentSourceContentVerified,false);
+    assert.equal(filingReleaseChecks(job,{...account,username:'primary@example.com'}).sameAccount,false);
+    assert.equal(filingReleaseChecks({...job,result:{}},account).savedBundleVerified,false);
+    assert.equal(filingReleaseChecks({...job,payload:{...payload,courtName:'Changed Court'}},account).savedBundleVerified,false);
 });

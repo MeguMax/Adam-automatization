@@ -473,6 +473,17 @@ async function main() {
         assert.equal(db.listFilingJobs(draftId).length,1);
         assert.equal(db.getFilingJob(job.id)!.progress!.evidence,'confirmed');
         assert.equal(db.getFilingJob(job.id)!.progress!.uploaded,6);
+        await page.locator('#draftActivityTab').click();
+        await page.locator('[data-release-checks] summary').click();
+        assert.match(await page.locator('[data-release-checks]').innerText(),/No automatic readback recorded/);
+        assert.match(await page.locator('[data-release-checks]').innerText(),/Payment and final court submission: Disabled/);
+        await page.evaluate(() => (window as any).refreshDraftFilingState());
+        assert.equal(await page.locator('[data-release-checks]').evaluate(element=>(element as HTMLDetailsElement).open),true);
+        await page.screenshot({path:path.join(screenshots,'draft-release-checks-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-release-checks-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#draftReviewTab').click();
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;

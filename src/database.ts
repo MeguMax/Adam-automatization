@@ -5465,7 +5465,7 @@ export class WorkflowDatabase {
         const timestamp = nowIso();
         this.runInTransaction(() => {
             for (const row of rows) {
-                const outcomeUnknown = ['case_form', 'document_upload', 'save_progress', 'saved_unsubmitted'].includes(
+                const outcomeUnknown = ['case_form', 'document_upload', 'save_progress', 'verify_saved_bundle', 'saved_unsubmitted'].includes(
                     row.checkpoint || '',
                 );
                 const jobStatus: FilingJobStatus = outcomeUnknown
@@ -5595,11 +5595,18 @@ export class WorkflowDatabase {
         const log = Array.isArray(parsed) ? parsed.slice(-999) : [];
         log.push({ ...entry, at: entry.at || nowIso() });
         const timestamp = nowIso();
+        const bundleSaved = entry.details?.event === 'bundle_saved';
+        const bundle = bundleSaved && typeof entry.details?.externalBundleId === 'string' &&
+            /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(entry.details.externalBundleId)
+            ? entry.details.externalBundleId : null;
+        const temporary = bundleSaved && typeof entry.details?.temporaryCaseNumber === 'string' &&
+            /^TEMP-[A-Z0-9-]+$/i.test(entry.details.temporaryCaseNumber) ? entry.details.temporaryCaseNumber : null;
         this.db.prepare(`
             UPDATE filing_jobs
-            SET execution_log = ?, checkpoint = ?, last_heartbeat_at = ?, updated_at = ?
+            SET execution_log = ?, checkpoint = ?, last_heartbeat_at = ?, updated_at = ?,
+                external_bundle_id = COALESCE(?, external_bundle_id), temporary_case_number = COALESCE(?, temporary_case_number)
             WHERE id = ?
-        `).run(toJson(log), entry.checkpoint, timestamp, timestamp, filingJobId);
+        `).run(toJson(log), entry.checkpoint, timestamp, timestamp, bundle, temporary, filingJobId);
     }
 
     completeFilingJob(input: {

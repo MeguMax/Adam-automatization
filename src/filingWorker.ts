@@ -59,6 +59,7 @@ export async function runFilingWorker(options: {
                     uploadedDocuments: result.uploadedDocuments,
                     mifileVersion: result.mifileVersion,
                     documentManifest: result.documentManifest || null,
+                    savedBundleEvidence: result.savedBundleEvidence || null,
                 },
                 debugArtifactPath: result.screenshotPath,
             });
@@ -72,7 +73,7 @@ export async function runFilingWorker(options: {
                     'unknown',
                 );
             // Saving the initiation form already creates an Unsubmitted bundle.
-            const outcomeUnknown = ['case_form', 'document_upload', 'save_progress', 'saved_unsubmitted'].includes(
+            const outcomeUnknown = ['case_form', 'document_upload', 'save_progress', 'verify_saved_bundle', 'saved_unsubmitted'].includes(
                 filingError.checkpoint,
             );
             const errorCode = outcomeUnknown
