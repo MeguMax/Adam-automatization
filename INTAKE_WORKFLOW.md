@@ -64,6 +64,8 @@ The stored source hashes identify the bytes used during preparation; they do not
 
 Controlled intake subjects starting with `NEW LT FILING - QA` are exposed as `testOnly` in release checks and visibly marked Do not submit to court. These fictional acceptance fixtures must not enter a future payment/submission rollout. The Review document summary displays Connected to Complaint when that relationship is selected, rather than misleadingly displaying its fallback Other label.
 
+The PDF preview starts navigation after its iframe is connected to the visible workspace. A load that remains at `about:blank` is retried once for that exact selected PDF; normal refreshes preserve the preview, and authentication/cross-origin failures are not bypassed. Browser smoke coverage includes opening a populated Prepared Draft from a fresh page and a deliberately blanked preview, with nonblank canvas checks on desktop and mobile layouts.
+
 ### Remaining court-submission gate
 
 The current release still rejects `submit` jobs and contains no payment or final-submit action. Enabling that stage is a separate rollout, not an environment toggle. It requires the client's primary account, an owner-configured payment method in MiFILE, a current itemized Checkout quote, approval tied to the exact account/bundle/documents/amount, and a verified submission/payment receipt. An uncertain result must be reconciled from MiFILE history before any retry; submitted, clerk-accepted and rejected outcomes must remain distinct. Final financial and legal confirmation stays with the account owner during the initial rollout.

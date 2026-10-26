@@ -50,7 +50,7 @@ import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-27-release-review-v56';
+const ADMIN_BUILD_ID = '2026-10-27-initial-preview-v57';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -5666,11 +5666,23 @@ const html = String.raw`<!doctype html>
       if (activeDocument && activeDocument.oneDriveUrl) {
         const previewKey = activeDocument.id + ':' + (activeDocument.updatedAt || '');
         if (viewer.dataset.previewKey !== previewKey) {
-          viewer.innerHTML = '<iframe title="' +
-            escapeHtml(activeDocument.currentFilename || activeDocument.documentType || 'PDF document') +
-            '" src="/api/documents/' + encodeURIComponent(activeDocument.id) +
-            '/preview?v=' + encodeURIComponent(activeDocument.updatedAt || '') + '"></iframe>';
+          const previewUrl = '/api/documents/' + encodeURIComponent(activeDocument.id) +
+            '/preview?v=' + encodeURIComponent(activeDocument.updatedAt || '');
+          const frame = window.document.createElement('iframe');
+          frame.title = activeDocument.currentFilename || activeDocument.documentType || 'PDF document';
+          frame.addEventListener('load', () => {
+            if (!frame.isConnected || viewer.dataset.previewKey !== previewKey || frame.dataset.blankRecovered) return;
+            try {
+              if (frame.contentDocument && frame.contentDocument.URL === 'about:blank') {
+                frame.dataset.blankRecovered = 'true';
+                frame.src = previewUrl;
+              }
+            } catch { /* Cross-origin/auth failures are not overridden. */ }
+          });
+          viewer.replaceChildren(frame);
           viewer.dataset.previewKey = previewKey;
+          // Start navigation only after the browsing context is connected.
+          frame.src = previewUrl;
         }
       } else {
         delete viewer.dataset.previewKey;

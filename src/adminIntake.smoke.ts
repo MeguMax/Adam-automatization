@@ -519,6 +519,41 @@ async function main() {
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;
         assert.equal((await context.request.put(`${url}/api/documents/${lockedDocument.id}/content`,{headers:{Origin:url},data:testComplaintFormFixture()})).status(),409);
         assert.equal((await context.request.delete(`${url}/api/drafts/${draftId}/documents/${lockedDocument.id}`,{headers:{Origin:url}})).status(),409);
+        const fresh = await context.newPage();
+        try {
+            await fresh.setViewportSize({width:1440,height:1000});
+            await fresh.goto(url);
+            await fresh.locator('#draftsTab').click();
+            await fresh.locator('[data-open-draft="'+draftId+'"]').click();
+            const pdf = fresh.frameLocator('#draftPdfViewer iframe');
+            await pdf.locator('canvas').waitFor({state:'visible'});
+            await pdf.locator('#message').waitFor({state:'hidden'});
+            const nonblank = () => pdf.locator('canvas').evaluate(canvas => {
+                const c = canvas as HTMLCanvasElement;
+                const pixels = c.getContext('2d')!.getImageData(0,0,c.width,c.height).data;
+                for(let i=0;i<pixels.length;i+=4) if(pixels[i+3]>0 && pixels[i]<200 && pixels[i+1]<200 && pixels[i+2]<200) return true;
+                return false;
+            });
+            assert.equal(await nonblank(),true,'Initial prepared-Draft preview renders without switching documents');
+            const recovered = fresh.waitForEvent('framenavigated', {predicate:frame=>frame.url().includes('/api/documents/'+lockedDocument.id+'/preview')});
+            await fresh.locator('#draftPdfViewer iframe').evaluate(frame=>{
+                delete (frame as HTMLElement).dataset.blankRecovered;
+                (frame as HTMLIFrameElement).src='about:blank';
+            });
+            await recovered;
+            await pdf.locator('canvas').waitFor({state:'visible'});
+            await pdf.locator('#message').waitFor({state:'hidden'});
+            assert.equal(await nonblank(),true,'A stalled blank preview recovers once without changing the selected PDF');
+            await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-desktop.png'),fullPage:true});
+            await fresh.setViewportSize({width:390,height:844});
+            await fresh.waitForFunction(()=>{
+                const frame=document.querySelector<HTMLIFrameElement>('#draftPdfViewer iframe');
+                const canvas=frame?.contentDocument?.querySelector('canvas');
+                return Boolean(frame&&canvas&&canvas.getBoundingClientRect().width<=frame.clientWidth-20);
+            });
+            assert.equal(await fresh.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+            await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-mobile.png'),fullPage:true});
+        } finally {await fresh.close();}
         await page.locator('#settingsTab').click();
         const localForm = db.listLibraryForms().find(form => form.role === 'local')!;
         page.once('dialog', dialog => dialog.accept());
