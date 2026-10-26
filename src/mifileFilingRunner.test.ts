@@ -551,6 +551,32 @@ test('Save Progress acknowledges only its own success dialog and never an unrela
     } finally {await page.close();}
 });
 
+test('a late court-news notice is acknowledged before normal sign-in without forcing through an overlay',async()=>{
+    const {clickMifilePreparationSignIn}=require('./mifileSession') as typeof import('./mifileSession');
+    for(const agreement of [false,true]) {
+        const page=await browser.newPage();
+        try {
+            await page.setContent(`<button disabled class="flatButton login-button" onclick="window.signedIn=true">Sign In</button><script>
+                setTimeout(()=>{
+                    const notice=document.createElement('div');
+                    notice.style='position:fixed;inset:0;z-index:999;background:white';
+                    const title=document.createElement('h3');title.textContent='TrueFiling Notification';notice.appendChild(title);
+                    notice.appendChild(document.createTextNode('New Courts Going Live on MiFILE '+${JSON.stringify(agreement?'Payment authorization':'Tuesday, October 13th')}));
+                    const ok=document.createElement('button');ok.textContent='OK';
+                    ok.onclick=()=>{window.acknowledged=true;document.querySelector('button.login-button').disabled=false;notice.remove();};
+                    notice.appendChild(ok);document.body.appendChild(notice);
+                },50);</script>`);
+            if(agreement) {
+                await assert.rejects(clickMifilePreparationSignIn(page),/unexpected notice/);
+                assert.equal(await page.evaluate(()=>Boolean((window as any).acknowledged||(window as any).signedIn)),false);
+            } else {
+                await clickMifilePreparationSignIn(page);
+                assert.equal(await page.evaluate(()=>Boolean((window as any).acknowledged&&(window as any).signedIn)),true);
+            }
+        } finally {await page.close();}
+    }
+});
+
 test('Complaint answers are read back from MiFILE controls before the case form can be saved',async()=>{
     const page=await browser.newPage();
     try {

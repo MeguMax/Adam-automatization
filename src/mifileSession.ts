@@ -110,17 +110,35 @@ export async function dismissMifileModalIfAny(page: Page): Promise<void> {
 export class MiFileNoticeRequiresReviewError extends Error {}
 
 export async function dismissMifilePreparationNotice(page: Page): Promise<void> {
-    const dialogs = page.locator('div[role="dialog"], div[uib-modal-window]');
+    const news = page.getByText('TrueFiling Notification', { exact: true })
+        .locator('xpath=ancestor::div[.//button[normalize-space()="OK"]][1]');
+    const dialogs = page.locator('div[role="dialog"], div[uib-modal-window], .ui-dialog').or(news);
     for (const dialog of await dialogs.all()) {
         if (!await dialog.isVisible()) continue;
         const text = await dialog.innerText();
-        if (!text.includes('Do any of your public documents contain Protected Personal Identifying Information (PII)?') ||
+        const knownInformation = text.includes('Do any of your public documents contain Protected Personal Identifying Information (PII)?') ||
+            (text.includes('TrueFiling Notification') && text.includes('New Courts Going Live on MiFILE'));
+        if (!knownInformation ||
             /\b(accept|agree|authorize|payment|consent|terms of (?:use|service))\b/i.test(text)) {
             throw new MiFileNoticeRequiresReviewError('MiFILE displayed an unexpected notice. Review it manually before preparation continues.');
         }
         await dialog.getByRole('button', { name: 'OK', exact: true }).click();
         await dialog.waitFor({ state: 'hidden' });
     }
+}
+
+export async function clickMifilePreparationSignIn(page: Page): Promise<void> {
+    const button = page.locator('button.flatButton.login-button');
+    await dismissMifilePreparationNotice(page);
+    try {
+        await button.click({ trial: true, timeout: 2_000 });
+    } catch {
+        // The court-news notice is loaded asynchronously after the login form.
+        await dismissMifilePreparationNotice(page);
+        await button.click({ trial: true, timeout: 5_000 });
+    }
+    await dismissMifilePreparationNotice(page);
+    await button.click();
 }
 
 export async function authenticateMifilePage(
@@ -147,7 +165,8 @@ export async function authenticateMifilePage(
             else await dismissMifileModalIfAny(page);
             await page.fill('input#Email', credentials.username);
             await page.fill('input#Password', credentials.password);
-            await page.locator('button.flatButton.login-button').click({ force: !options.strictNotices });
+            if (options.strictNotices) await clickMifilePreparationSignIn(page);
+            else await page.locator('button.flatButton.login-button').click({ force: true });
             await waitForAuthenticatedCookies(page);
             return;
         } catch (error) {
@@ -210,7 +229,7 @@ export async function testMiFileCredentials(credentials: MiFileCredentials): Pro
     });
     try {
         const page = await testBrowser.newPage();
-        await authenticateMifilePage(page, credentials);
+        await authenticateMifilePage(page, credentials, { strictNotices: true });
     } catch {
         throw new Error('MiFILE sign-in could not be verified. Check the credentials, service availability, or additional verification requirements.');
     } finally {
