@@ -52,6 +52,8 @@ Each source PDF receives a SHA-256 digest and byte count when downloaded from On
 
 **Activity > Before court submission** distinguishes this automatic evidence from older or manually reconciled bundles. Displayed fees are captured from the saved upload page as integer USD cents. They are a pre-checkout subtotal, not a charge authorization or final amount: the Checkout total, processing fee and payment method are not inferred. Missing or ambiguous fee values and quantities stay unknown. No card numbers or security codes are collected by this application.
 
+Failed jobs expose their existing diagnostic PNG through an authenticated, non-cached link in Activity. The endpoint accepts only a job ID, checks the canonical per-job diagnostics directory, PNG signature and size, and cannot read an arbitrary filesystem path. Login progress is recorded before authentication starts, so a slow sign-in is not shown as a OneDrive download.
+
 The stored source hashes identify the bytes used during preparation; they do not make OneDrive immutable or attest to a freshly downloaded MiFILE PDF. Before a future payment action, the system must re-check the source content, remote bundle and Checkout fees, then obtain a fresh per-package confirmation. Switching accounts invalidates the current-account check for previously prepared bundles. Old jobs are not retroactively marked verified or automatically re-created.
 
 ### Remaining court-submission gate

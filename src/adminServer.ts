@@ -34,6 +34,7 @@ import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { parseWorkflowEmail } from './workflowEmail';
 import path from 'node:path';
+import os from 'node:os';
 import { planFormImports } from './courtForms';
 import { getFilingIntakeConfig, intakeFileName, buildFilingIntake } from './filingIntake';
 import {
@@ -49,7 +50,7 @@ import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-26-verified-unsubmitted-v49';
+const ADMIN_BUILD_ID = '2026-10-26-preparation-diagnostics-v50';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4704,6 +4705,8 @@ const html = String.raw`<!doctype html>
           '</div></details>' : '') +
         (job.errorMessage ? '<div class="draft-filing-job-error">' +
           escapeHtml((job.errorCode ? job.errorCode + ': ' : '') + job.errorMessage) + '</div>' : '') +
+        (job.debugArtifactPath && job.errorMessage ? '<div class="draft-filing-job-actions"><a target="_blank" rel="noopener" href="/api/filing-jobs/' +
+          encodeURIComponent(job.id) + '/screenshot">View diagnostic screenshot</a></div>' : '') +
         (job.status === 'reconciliation_required' ?
           '<div class="reconciliation-notice"><strong>Check MiFILE first.</strong> ' +
           'Open History → Unsubmitted and look for this case. Do not retry until the result is confirmed.</div>' +
@@ -7492,6 +7495,25 @@ export function createAdminServer(
                 return;
             }
 
+            const filingScreenshot = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/screenshot$/);
+            if (req.method === 'GET' && filingScreenshot) {
+                const job = db.getFilingJob(decodeURIComponent(filingScreenshot[1]));
+                try {
+                    if (!job?.debugArtifactPath) throw new Error('Missing diagnostic');
+                    const root = fs.realpathSync(process.env.MIFILE_FILING_DEBUG_DIR || process.env.TRUECERTIFY_DEBUG_DIR ||
+                        path.join(os.tmpdir(), 'mifile-filing-debug'));
+                    const filename = fs.realpathSync(job.debugArtifactPath);
+                    if (path.dirname(filename) !== path.join(root, job.id) || path.extname(filename).toLowerCase() !== '.png' ||
+                        fs.statSync(filename).size > 5 * 1024 * 1024) throw new Error('Invalid diagnostic');
+                    const content = fs.readFileSync(filename);
+                    if (!content.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('Invalid PNG');
+                    res.writeHead(200, { 'Content-Type':'image/png', 'Content-Length':content.length,
+                        'Content-Disposition':'inline; filename="mifile-diagnostic.png"', 'Cache-Control':'no-store',
+                        'X-Content-Type-Options':'nosniff', 'Content-Security-Policy':"default-src 'none'; sandbox" });
+                    res.end(content);
+                } catch { sendJson(res, 404, { error:'Diagnostic screenshot is unavailable.' }); }
+                return;
+            }
             const filingJobMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)$/);
             if (req.method === 'GET' && filingJobMatch) {
                 const job = db.getFilingJob(decodeURIComponent(filingJobMatch[1]));

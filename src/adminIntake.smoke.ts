@@ -17,6 +17,7 @@ async function main() {
         TENANT_ID: '11111111-1111-1111-1111-111111111111', CLIENT_ID: 'test-client', CLIENT_SECRET: 'test-secret',
         USER_EMAIL: 'intake@example.com', ONEDRIVE_ROOT_SHARE_URL: 'https://onedrive.example/root',
         WORKFLOW_DB_PATH: path.join(directory, 'workflow.sqlite'), ADMIN_SYNC_ENABLED: 'false',
+        MIFILE_FILING_DEBUG_DIR: path.join(directory, 'mifile-debug'),
         ADMIN_USERNAME: 'qa', ADMIN_PASSWORD: 'qa-admin-only',
         MIFILE_USER: 'alternate@example.com', MIFILE_PASSWORD: 'qa-mifile-only',
         MIFILE_CREDENTIALS_KEY: 'ab'.repeat(32), NODE_ENV: 'test',
@@ -473,6 +474,26 @@ async function main() {
         assert.equal(db.listFilingJobs(draftId).length,1);
         assert.equal(db.getFilingJob(job.id)!.progress!.evidence,'confirmed');
         assert.equal(db.getFilingJob(job.id)!.progress!.uploaded,6);
+        const debugFolder=path.join(process.env.MIFILE_FILING_DEBUG_DIR!,job.id);
+        fs.mkdirSync(debugFolder,{recursive:true});
+        const diagnostic=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=','base64');
+        const diagnosticPath=path.join(debugFolder,'prepared.png');
+        fs.writeFileSync(diagnosticPath,diagnostic);
+        const diagnosticJob=db.getFilingJob(job.id)!;
+        db.completeFilingJob({filingJobId:job.id,status:'prepared',checkpoint:'manually_reconciled',result:diagnosticJob.result,debugArtifactPath:diagnosticPath});
+        const diagnosticResponse=await context.request.get(`${url}/api/filing-jobs/${job.id}/screenshot`);
+        assert.equal(diagnosticResponse.status(),200);
+        assert.equal(diagnosticResponse.headers()['content-type'],'image/png');
+        assert.equal(diagnosticResponse.headers()['cache-control'],'no-store');
+        assert.deepEqual(await diagnosticResponse.body(),diagnostic);
+        const unauthenticated=await browser.newContext();
+        try {assert.equal((await unauthenticated.request.get(`${url}/api/filing-jobs/${job.id}/screenshot`)).status(),401);}
+        finally {await unauthenticated.close();}
+        const outsideDiagnostic=path.join(directory,'outside.png');
+        fs.writeFileSync(outsideDiagnostic,diagnostic);
+        db.completeFilingJob({filingJobId:job.id,status:'prepared',checkpoint:'manually_reconciled',result:diagnosticJob.result,debugArtifactPath:outsideDiagnostic});
+        assert.equal((await context.request.get(`${url}/api/filing-jobs/${job.id}/screenshot`)).status(),404);
+        db.completeFilingJob({filingJobId:job.id,status:'prepared',checkpoint:'manually_reconciled',result:diagnosticJob.result,debugArtifactPath:diagnosticPath});
         await page.locator('#draftActivityTab').click();
         await page.locator('[data-release-checks] summary').click();
         assert.match(await page.locator('[data-release-checks]').innerText(),/No automatic readback recorded/);

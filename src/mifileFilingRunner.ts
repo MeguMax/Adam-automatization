@@ -249,6 +249,7 @@ export class MiFileFilingRunner {
             page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
             page.setDefaultTimeout(this.timeoutMs);
             lastCheckpoint = 'login';
+            await this.log('info', 'login', 'Signing in to MiFILE.');
             await this.login(page, credentials);
             lastCheckpoint = 'select_filing';
             await this.openNewLtCase(page, job.payload);
