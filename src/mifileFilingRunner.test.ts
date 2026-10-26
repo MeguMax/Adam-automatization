@@ -590,6 +590,34 @@ test('Save Progress acknowledges only its own success dialog and never an unrela
     } finally {await page.close();}
 });
 
+test('preparation waits for a loading notice and rechecks nested containers without accepting unfamiliar content',async()=>{
+    const {dismissMifilePreparationNotice}=require('./mifileSession') as typeof import('./mifileSession');
+    for(const agreement of [false,true]) {
+        const page=await browser.newPage();
+        try {
+            await page.setContent(`<div id="notice" uib-modal-window style="min-height:100px;min-width:200px"></div><script>
+                setTimeout(()=>{
+                    const notice=document.getElementById('notice');
+                    const content=document.createElement('div');content.setAttribute('role','dialog');
+                    const heading=document.createElement('h3');heading.textContent='TrueFiling Notification';content.appendChild(heading);
+                    content.appendChild(document.createTextNode(${JSON.stringify(agreement?'Payment authorization':'New Courts Going Live on MiFILE Tuesday, October 13th')}));
+                    const ok=document.createElement('button');ok.textContent='OK';
+                    ok.onclick=()=>{window.acknowledged=true;notice.remove();};
+                    content.appendChild(ok);notice.appendChild(content);
+                },150);</script>`);
+            if(agreement) {
+                await assert.rejects(dismissMifilePreparationNotice(page),/unexpected notice/);
+                assert.equal(await page.evaluate(()=>Boolean((window as any).acknowledged)),false);
+                assert.equal(await page.locator('#notice').isVisible(),true);
+            } else {
+                await dismissMifilePreparationNotice(page);
+                assert.equal(await page.evaluate(()=>Boolean((window as any).acknowledged)),true);
+                assert.equal(await page.locator('#notice').count(),0);
+            }
+        } finally {await page.close();}
+    }
+});
+
 test('a late court-news notice is acknowledged before normal sign-in without forcing through an overlay',async()=>{
     const {clickMifilePreparationSignIn}=require('./mifileSession') as typeof import('./mifileSession');
     for(const agreement of [false,true]) {

@@ -113,17 +113,33 @@ export async function dismissMifilePreparationNotice(page: Page): Promise<void> 
     const news = page.getByText('TrueFiling Notification', { exact: true })
         .locator('xpath=ancestor::div[.//button[normalize-space()="OK"]][1]');
     const dialogs = page.locator('div[role="dialog"], div[uib-modal-window], .ui-dialog').or(news);
-    for (const dialog of await dialogs.all()) {
+    for (let handled = 0; handled < 4; handled++) {
+        const dialog = dialogs.filter({ visible: true }).first();
+        if (!await dialog.count()) return;
+        let text = '';
+        const deadline = Date.now() + 5_000;
+        // Angular renders the backdrop and empty dialog before loading its content.
+        while (await dialog.isVisible() && Date.now() < deadline) {
+            text = (await dialog.innerText()).trim();
+            if (text && !/^(?:TrueFiling Notification\s*)?(?:OK)?$/i.test(text)) break;
+            await page.waitForTimeout(100);
+        }
         if (!await dialog.isVisible()) continue;
-        const text = await dialog.innerText();
         const knownInformation = text.includes('Do any of your public documents contain Protected Personal Identifying Information (PII)?') ||
             (text.includes('TrueFiling Notification') && text.includes('New Courts Going Live on MiFILE'));
         if (!knownInformation ||
             /\b(accept|agree|authorize|payment|consent|terms of (?:use|service))\b/i.test(text)) {
             throw new MiFileNoticeRequiresReviewError('MiFILE displayed an unexpected notice. Review it manually before preparation continues.');
         }
-        await dialog.getByRole('button', { name: 'OK', exact: true }).click();
-        await dialog.waitFor({ state: 'hidden' });
+        const element = await dialog.elementHandle();
+        try {
+            await dialog.getByRole('button', { name: 'OK', exact: true }).click();
+            await page.waitForFunction(el => !el || !el.isConnected || !el.getClientRects().length ||
+                getComputedStyle(el).visibility === 'hidden', element);
+        } finally { await element?.dispose(); }
+    }
+    if (await dialogs.filter({ visible: true }).count()) {
+        throw new MiFileNoticeRequiresReviewError('MiFILE displayed repeated notices. Review them manually before preparation continues.');
     }
 }
 
