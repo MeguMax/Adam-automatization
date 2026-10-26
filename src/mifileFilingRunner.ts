@@ -276,6 +276,9 @@ export class MiFileFilingRunner {
             }
             await this.log('info', 'verify_saved_bundle', 'Reopening the saved bundle to verify its PDFs and filer.', {
                 event: 'bundle_saved', externalBundleId, temporaryCaseNumber,
+                accountEmail: credentials.username.trim().toLowerCase(), documentManifest,
+                sources: documents.map(document => document.fingerprint),
+                packageDigest: preparationDigest(job.payload, documents.map(document => document.fingerprint)),
             });
             lastCheckpoint = 'verify_saved_bundle';
             await page.reload({ waitUntil: 'domcontentloaded', timeout: this.timeoutMs });
@@ -726,8 +729,14 @@ export class MiFileFilingRunner {
             await page.waitForFunction(expected => document.querySelectorAll(
                 '#documentTable tbody[id^="filing-"], #documentTable tbody[id^="child-"]').length === expected,
             receipts.length + 1, { timeout: this.timeoutMs });
-            const generated = page.locator('#documentTable tbody[id^="filing-"]').filter({ hasNot: page.locator('input[name^="documentName_"]') });
-            if (await generated.count() !== 1 || !(await generated.innerText()).includes('CASE INIT FORM')) {
+            const generated = await page.locator('#documentTable tbody[id^="filing-"]').evaluateAll(rows => rows.filter(row =>
+                row.querySelector<HTMLInputElement>('input[name^="documentName_"]')?.value === 'Case Initiation Form' &&
+                row.querySelector<HTMLInputElement>('input[placeholder="Select or Type Filing Type"]')?.value === 'ISI_CASE_INIT_FORM_DT' &&
+                Array.from(row.querySelectorAll('td')).some(cell => cell.innerText.trim() === 'CASE INIT FORM') &&
+                Array.from(row.querySelectorAll('.glyphicon-ok')).some(icon => icon.getClientRects().length > 0) &&
+                !Array.from(row.querySelectorAll('.glyphicon-alert[ng-show*="uploadStatus"],.glyphicon-remove[ng-show*="uploadStatus"]'))
+                    .some(icon => icon.getClientRects().length > 0)).map(row => row.id));
+            if (generated.length !== 1 || receipts.some(receipt => receipt.mifileRowId === generated[0])) {
                 throw new Error('The generated Case Initiation Form is missing or ambiguous.');
             }
             await this.verifyDocumentManifest(page, receipts);

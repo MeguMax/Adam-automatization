@@ -507,10 +507,11 @@ test('source fingerprints bind all PDFs and case fields to the preparation snaps
 });
 
 async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;wrongAccount?:boolean;wrongFiler?:boolean;
-    missingPdf?:boolean;extraPdf?:boolean;wrongParent?:boolean;warning?:boolean;serve?:boolean;quantity?:number} = {}) {
+    missingPdf?:boolean;extraPdf?:boolean;wrongParent?:boolean;warning?:boolean;serve?:boolean;quantity?:number;
+    wrongGeneratedType?:boolean;generatedWarning?:boolean} = {}) {
     const page = await browser.newPage();
     const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
-    const rows = `<tbody id="filing-0"><tr><td></td><td>Case Initiation Form</td><td>1 KB</td><td>CASE INIT FORM</td><td><span class="glyphicon-ok">Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>` +
+    const rows = `<tbody id="filing-0"><tr><td></td><td>Case Initiation Form<input hidden name="documentName_0" value="Case Initiation Form"></td><td>1 KB</td><td>CASE INIT FORM<input hidden placeholder="Select or Type Filing Type" value="${options.wrongGeneratedType?'Other':'ISI_CASE_INIT_FORM_DT'}"></td><td><span class="glyphicon-${options.generatedWarning?'alert':'ok'}" ${options.generatedWarning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>` +
         `<tbody id="filing-1"><tr><td></td><td><input name="documentName_1" value="${options.wrongName?'Wrong PDF':'Document 0'}"></td><td></td><td>1 KB</td><td><input id="selectFilingTypeInput_1" value="${options.wrongType?'Other':'Complaint for Possession Only'}"></td><td><span class="glyphicon-ok">Uploaded</span></td><td>$45.00</td><td>View</td></tr></tbody>` +
         (options.missingPdf?'':`<tbody id="child-${options.wrongParent?2:1}-0"><tr><td></td><td><input name="documentName_0" value="Document 1"></td><td></td><td>1 KB</td><td>CONNECTED FILING</td><td><span class="glyphicon-${options.warning?'alert':'ok'}" ${options.warning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>`) +
         (options.extraPdf?'<tbody id="filing-2"><tr><td>Unexpected PDF</td></tr></tbody>':'');
@@ -543,7 +544,7 @@ test('saved-bundle readback verifies account, filer, generated form and Connecte
 
 test('persisted bundle mismatches stop for reconciliation; no missing PDF, warning or other filer is accepted', async () => {
     for (const options of [{wrongName:true},{wrongType:true},{wrongAccount:true},{wrongFiler:true},{missingPdf:true},
-        {extraPdf:true},{wrongParent:true},{warning:true},{serve:true}]) {
+        {extraPdf:true},{wrongParent:true},{warning:true},{serve:true},{wrongGeneratedType:true},{generatedWarning:true}]) {
         const f = await savedBundlePage(options);
         try {
             const runner = new MiFileFilingRunner(); (runner as any).timeoutMs=200; (runner as any).uploadTimeoutMs=200;
