@@ -6,7 +6,7 @@ import test, { after, before } from 'node:test';
 import { chromium, Browser, Page } from 'playwright';
 import type { FilingDocumentPayload, FilingJobView, FilingPayload } from './database';
 import { createHash } from 'node:crypto';
-import { filingReleaseChecks, isRequiredMiFileFiler, miFileBundleId, preparationDigest, usdCents } from './mifilePreparationEvidence';
+import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, usdCents } from './mifilePreparationEvidence';
 import { testPdfFixture } from './testPdfFixture';
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mifile-runner-qa-'));
@@ -454,6 +454,45 @@ test('displayed money is parsed as exact cents, without guessing malformed or ne
         assert.equal(usdCents(value), cents);
     for (const value of ['', '-1.00', '1.2', '1,23.45', '1.234,56', 'NaN', '1e3', '$10.00 $20.00'])
         assert.equal(usdCents(value), null);
+});
+
+test('filer options match the actual structured name, role, state and bar number, not surrounding text', () => {
+    const label = 'Name: Devlin, Adam, Role: Attorney, State: MI, Number: P72877, Organization: Devlin Law, PLLC';
+    assert.ok(isRequiredMiFileFilerOption(label));
+    assert.ok(isRequiredMiFileFilerOption('Devlin, Adam (P72877)'));
+    for (const invalid of [label.replace('Adam,', 'Adam Jr,'), label.replace('P72877', 'P00000'),
+        label.replace('Attorney', 'Pro Se'), label.replace('State: MI', 'State: OH'),
+        'Other ' + label, 'Devlin, Adam Attorney MI P72877 Devlin Law, PLLC'])
+        assert.equal(isRequiredMiFileFilerOption(invalid), false);
+});
+
+test('MiFILE selects the structured filer option and stops on ambiguity or a wrong confirmed bar number', async () => {
+    const label = 'Name: Devlin, Adam, Role: Attorney, State: MI, Number: P72877, Organization: Devlin Law, PLLC';
+    for (const mode of ['correct', 'wrong_bar', 'wrong_name', 'ambiguous', 'wrong_confirmation']) {
+        const page = await browser.newPage();
+        const optionLabel = mode === 'wrong_bar' ? label.replace('P72877', 'P11111') :
+            mode === 'wrong_name' ? label.replace('Adam,', 'Adam Jr,') : label;
+        const row = `<div role="option" aria-label="${optionLabel}"><span>Devlin, Adam</span><span>Attorney</span><span>MI</span><span>P72877</span><span>Devlin Law, PLLC</span></div>`;
+        await page.setContent(`<input id="filer-input-selected" value=""><input id="filer-input-empty">` +
+            `<div id="filer-listbox" hidden>${row}${mode === 'ambiguous' ? row : ''}</div>` +
+            `<script>document.getElementById('filer-input-empty').onclick=()=>document.getElementById('filer-listbox').hidden=false;
+            document.querySelectorAll('[role="option"]').forEach(option=>option.onclick=()=>{
+                document.getElementById('filer-input-selected').value='Devlin, Adam (${mode === 'wrong_confirmation' ? 'P11111' : 'P72877'})';
+                document.getElementById('filer-listbox').hidden=true;
+            });</script>`);
+        try {
+            const runner = new MiFileFilingRunner();
+            (runner as any).timeoutMs = 1_000;
+            if (mode === 'correct') {
+                await (runner as any).selectRequiredFiler(page);
+                assert.equal(await page.locator('#filer-input-selected').inputValue(), 'Devlin, Adam (P72877)');
+            } else {
+                await assert.rejects((runner as any).selectRequiredFiler(page),
+                    (error: any) => error.code === 'FILER_NOT_AVAILABLE' && error.checkpoint === 'select_filing');
+                if (mode !== 'wrong_confirmation') assert.equal(await page.locator('#filer-input-selected').inputValue(), '');
+            }
+        } finally { await page.close(); }
+    }
 });
 
 test('source fingerprints bind all PDFs and case fields to the preparation snapshot', () => {

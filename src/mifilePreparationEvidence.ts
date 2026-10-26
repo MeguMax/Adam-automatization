@@ -7,6 +7,12 @@ export function isRequiredMiFileFiler(value: string): boolean {
     return value.trim().replace(/\s+/g, ' ').toLowerCase() === REQUIRED_MIFILE_FILER.toLowerCase();
 }
 
+export function isRequiredMiFileFilerOption(value: string): boolean {
+    const normalized = value.trim().replace(/\s+/g, ' ');
+    return isRequiredMiFileFiler(normalized) ||
+        /^Name: Devlin, Adam, Role: Attorney, State: MI, Number: P72877, Organization: .+$/i.test(normalized);
+}
+
 export function miFileBundleId(url: string): string | null {
     try {
         const parsed = new URL(url);

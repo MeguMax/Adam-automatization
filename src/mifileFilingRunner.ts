@@ -15,7 +15,7 @@ import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
 import { authenticateMifilePage, dismissMifilePreparationNotice } from './mifileSession';
-import { isRequiredMiFileFiler, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
+import { isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
     type FilingSourceFingerprint, type MiFileFeeObservation, type MiFileSavedBundleEvidence } from './mifilePreparationEvidence';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -439,6 +439,18 @@ export class MiFileFilingRunner {
         }
         await courtOption.click();
         await page.selectOption('#actionSelect', { label: 'Initiate a new case' });
+        await this.selectRequiredFiler(page);
+        await this.selectCaseType(page, payload.caseType);
+        await page.locator('#nextButton').click();
+        await page.locator('#formFrame').waitFor({ state: 'visible' });
+        await page.waitForTimeout(1_500);
+        await this.log('info', 'select_filing', 'Selected court, filer, and LT case type.', {
+            courtName: payload.courtName,
+            caseType: payload.caseType,
+        });
+    }
+
+    private async selectRequiredFiler(page: Page): Promise<void> {
         const configuredFiler = REQUIRED_MIFILE_FILER;
         const selectedFiler = page.locator('#filer-input-selected');
         const selectedFilerText = await selectedFiler.inputValue().catch(() => '');
@@ -458,10 +470,13 @@ export class MiFileFilingRunner {
                         timeout: this.timeoutMs,
                     });
                 });
-            const filerOption = await firstVisible(
-                filerOptions.filter({ hasText: /^\s*Devlin,\s+Adam\s+\(P72877\)\s*$/i }),
-            );
-            if (!filerOption) {
+            const matchingFilers = [];
+            for (let index = 0; index < await filerOptions.count(); index++) {
+                const option = filerOptions.nth(index);
+                if (await option.isVisible() && isRequiredMiFileFilerOption(
+                    await option.getAttribute('aria-label') || await option.innerText())) matchingFilers.push(option);
+            }
+            if (matchingFilers.length !== 1) {
                 const availableFilers = (await filerOptions.allTextContents())
                     .map(value => value.trim())
                     .filter(Boolean);
@@ -472,7 +487,7 @@ export class MiFileFilingRunner {
                     'select_filing',
                 );
             }
-            await filerOption.click();
+            await matchingFilers[0].click();
         }
         const confirmedFiler = await selectedFiler.inputValue().catch(() => '');
         if (!isRequiredMiFileFiler(confirmedFiler)) {
@@ -482,14 +497,6 @@ export class MiFileFilingRunner {
                 'select_filing',
             );
         }
-        await this.selectCaseType(page, payload.caseType);
-        await page.locator('#nextButton').click();
-        await page.locator('#formFrame').waitFor({ state: 'visible' });
-        await page.waitForTimeout(1_500);
-        await this.log('info', 'select_filing', 'Selected court, filer, and LT case type.', {
-            courtName: payload.courtName,
-            caseType: payload.caseType,
-        });
     }
 
     private async selectCaseType(page: Page, caseType: string): Promise<void> {
