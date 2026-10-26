@@ -443,7 +443,6 @@ export class MiFileFilingRunner {
         await this.selectCaseType(page, payload.caseType);
         await page.locator('#nextButton').click();
         await page.locator('#formFrame').waitFor({ state: 'visible' });
-        await page.waitForTimeout(1_500);
         await this.log('info', 'select_filing', 'Selected court, filer, and LT case type.', {
             courtName: payload.courtName,
             caseType: payload.caseType,
@@ -522,15 +521,27 @@ export class MiFileFilingRunner {
         }
     }
 
-    private async completeCaseForm(page: Page, payload: FilingPayload): Promise<void> {
-        const frame = page.frames().find(candidate => candidate.url().includes('/getform'));
-        if (!frame) {
+    private async waitForCaseForm(page: Page): Promise<Frame> {
+        const element = await page.locator('#formFrame').elementHandle();
+        try {
+            const frame = await element?.contentFrame();
+            if (!frame) throw new Error('Missing case form frame.');
+            await frame.waitForURL(url => url.origin === 'https://mifile.courts.michigan.gov' &&
+                url.pathname.endsWith('/getform'), { timeout: this.timeoutMs });
+            await frame.locator('#psn0Address').waitFor({ state: 'visible', timeout: this.timeoutMs });
+            await frame.locator('#claimAmount').waitFor({ state: 'attached', timeout: this.timeoutMs });
+            return frame;
+        } catch {
             throw new MiFileFilingError(
-                'MiFILE case-initiation form did not open.',
+                'MiFILE case-initiation form did not finish loading. No case fields were entered.',
                 'CASE_FORM_NOT_FOUND',
                 'case_form',
             );
-        }
+        } finally { await element?.dispose(); }
+    }
+
+    private async completeCaseForm(page: Page, payload: FilingPayload): Promise<void> {
+        const frame = await this.waitForCaseForm(page);
         await this.fillParty(frame, 0, payload.filingData.plaintiff, true);
         for (let index = 0; index < payload.filingData.defendants.length; index += 1) {
             if (index > 0) {

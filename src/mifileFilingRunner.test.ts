@@ -664,6 +664,28 @@ test('Complaint answers are read back from MiFILE controls before the case form 
     } finally {await page.close();}
 });
 
+test('case-form preparation waits for delayed iframe navigation and required fields on the trusted MiFILE origin',async()=>{
+    for(const mode of ['delayed','wrong_origin','missing_fields']) {
+        const page=await browser.newPage();
+        try {
+            await page.route('**/form/getform',route=>route.fulfill({contentType:'text/html',body:mode==='missing_fields'?
+                '<p>Loading...</p>':'<input id="psn0Address"><input id="claimAmount">'}));
+            const origin=mode==='wrong_origin'?'https://other.example':'https://mifile.courts.michigan.gov';
+            await page.setContent(`<iframe id="formFrame"></iframe><script>setTimeout(()=>{
+                document.getElementById('formFrame').src='${origin}/form/getform';
+            },150);</script>`);
+            const runner=new MiFileFilingRunner();
+            (runner as any).timeoutMs=500;
+            if(mode==='delayed') {
+                const frame=await (runner as any).waitForCaseForm(page);
+                assert.equal(frame.url(),'https://mifile.courts.michigan.gov/form/getform');
+                assert.equal(await frame.locator('#psn0Address').inputValue(),'');
+            } else await assert.rejects((runner as any).waitForCaseForm(page),
+                (error:any)=>error.code==='CASE_FORM_NOT_FOUND'&&error.checkpoint==='case_form');
+        } finally {await page.close();}
+    }
+});
+
 test('release checks require matching evidence and account but never authorize payment or filing',()=>{
     const payload={documents:[filingDocument(0)],courtName:'Court'} as FilingPayload;
     const sources=[{documentId:'doc-0',sha256:'ab'.repeat(32),bytes:200}];

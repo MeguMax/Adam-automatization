@@ -56,6 +56,8 @@ Failed jobs expose their existing diagnostic PNG through an authenticated, non-c
 
 An empty Angular notice container is given up to five seconds to load its text before classification. Each acknowledged notice is tracked by its actual element and the visible dialog set is read again afterwards, avoiding duplicate nested wrappers or a newly displayed notice being mistaken for the old one. Unknown or still-empty notices remain blocking; no authorization is inferred from an empty backdrop.
 
+The case-initiation iframe may appear before its form has loaded. Preparation waits for that exact frame to navigate to MiFILE's trusted `/getform` page and expose the Plaintiff address and claim amount fields, rather than assuming it is ready after a fixed delay. An unrelated frame, wrong origin or incomplete form cannot receive case data.
+
 The stored source hashes identify the bytes used during preparation; they do not make OneDrive immutable or attest to a freshly downloaded MiFILE PDF. Before a future payment action, the system must re-check the source content, remote bundle and Checkout fees, then obtain a fresh per-package confirmation. Switching accounts invalidates the current-account check for previously prepared bundles. Old jobs are not retroactively marked verified or automatically re-created.
 
 ### Remaining court-submission gate
