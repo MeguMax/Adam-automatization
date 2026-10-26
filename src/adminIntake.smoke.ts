@@ -427,16 +427,50 @@ async function main() {
         assert.equal(await page.locator('#toastRegion .toast').count(),1);
         await page.locator('[aria-label="Dismiss notification"]').click();
         assert.equal(db.claimNextFilingJob()!.id,job.id);
+        for (const document of job.payload!.documents.slice(0,2)) db.appendFilingJobLog(job.id,{
+            level:'info',checkpoint:'document_upload',message:'Simulated verified upload.',details:{event:'document_ready',documentId:document.id},
+        });
+        db.appendFilingJobLog(job.id,{level:'info',checkpoint:'document_upload',message:'Simulated active upload.',
+            details:{event:'document_started',documentId:job.payload!.documents[2].id}});
+        await page.evaluate(() => (window as any).refreshDraftFilingState());
+        assert.match(await page.locator('#draftFilingJobPanel').innerText(),/Verified PDFs: 2 \/ 6/);
+        assert.match(await page.locator('#draftNextActionTitle').innerText(),/Uploading PDFs \(2 \/ 6\)/);
+        await page.screenshot({path:path.join(screenshots,'draft-mifile-progress.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        await page.locator('[data-draft-mobile-mode="fields"]').click();
+        await page.locator('[data-upload-checklist] summary').click();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        assert.equal(await page.locator('#draftPrepareBtn').evaluate(element=>element.getBoundingClientRect().bottom<=innerHeight),true);
+        await page.screenshot({path:path.join(screenshots,'draft-mifile-progress-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         db.appendFilingJobLog(job.id,{level:'info',checkpoint:'save_progress',message:'Simulated interrupted save; no remote call was made.'});
         assert.equal(db.recoverInterruptedFilingJobs(),1);
         await page.evaluate(() => (window as any).refreshDraftFilingState());
         await page.locator('[data-reconcile-filing-job="found"]').waitFor();
         assert.equal(await page.locator('#draftPrepareBtn').innerText(),'Check result');
+        const incompleteConfirmation=await context.request.post(`${url}/api/filing-jobs/${job.id}/reconcile`,{headers:{Origin:url},data:{resolution:'found'}});
+        assert.equal(incompleteConfirmation.status(),422);
+        assert.equal(db.getFilingJob(job.id)!.status,'reconciliation_required');
+        for(const ids of [[job.payload!.documents[0].id],job.payload!.documents.map(()=>job.payload!.documents[0].id)]) {
+            assert.throws(()=>db.resolveFilingJobReconciliation({filingJobId:job.id,resolution:'found',verifiedDocumentIds:ids}),/every expected PDF/);
+            assert.equal(db.getFilingJob(job.id)!.status,'reconciliation_required');
+        }
         await page.locator('[data-reconcile-filing-job="found"]').click();
+        assert.equal(await page.locator('#draftConfirmAccept').isDisabled(),true);
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.locator('#draftConfirmDialog').evaluate(element=>element.scrollWidth<=element.clientWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-reconcile-mobile.png'),fullPage:true});
+        await page.locator('#draftConfirmDialog [value="cancel"]').click();
+        await page.setViewportSize({width:1440,height:1000});
+        assert.equal(db.getFilingJob(job.id)!.status,'reconciliation_required');
+        await page.locator('[data-reconcile-filing-job="found"]').click();
+        await page.locator('#draftReconcileComplete').check();
         await page.locator('#draftConfirmAccept').click();
         await page.waitForFunction(() => document.getElementById('draftFilingJobPanel')?.textContent?.includes('Prepared'));
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.status,'filing_prepared');
         assert.equal(db.listFilingJobs(draftId).length,1);
+        assert.equal(db.getFilingJob(job.id)!.progress!.evidence,'confirmed');
+        assert.equal(db.getFilingJob(job.id)!.progress!.uploaded,6);
         await page.locator('#draftReviewTab').click();
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;

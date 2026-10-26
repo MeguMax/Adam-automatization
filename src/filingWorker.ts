@@ -58,6 +58,7 @@ export async function runFilingWorker(options: {
                     url: result.url,
                     uploadedDocuments: result.uploadedDocuments,
                     mifileVersion: result.mifileVersion,
+                    documentManifest: result.documentManifest || null,
                 },
                 debugArtifactPath: result.screenshotPath,
             });

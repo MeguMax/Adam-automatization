@@ -9,6 +9,7 @@ import { isProcessingReportSubject } from './processingReport';
 import { resolveCourt, districtCode } from './courtForms';
 import { changedFieldPaths, mergeExtractedField, protectedFieldPaths } from './draftFieldMerge';
 import { ADAM_OFFICE, ADAM_ATTORNEY, ADAM_FILING_POLICY_VERSION, approvedSupportingRelation } from './adamFilingPolicy';
+import { filingPreparationProgress, type FilingPreparationProgress } from './filingProgress';
 import {
     ComplaintExtractionResult,
     CURRENT_COMPLAINT_EXTRACTOR_VERSION,
@@ -540,6 +541,7 @@ export interface FilingJobView {
     executionLog: FilingJobLogEntry[];
     payload: FilingPayload | null;
     result: Record<string, unknown> | null;
+    progress?: FilingPreparationProgress;
     debugArtifactPath: string | null;
     triggeredBy: string | null;
     createdAt: string;
@@ -5646,6 +5648,7 @@ export class WorkflowDatabase {
     resolveFilingJobReconciliation(input: {
         filingJobId: string;
         resolution: 'found' | 'not_found';
+        verifiedDocumentIds?: unknown;
         externalBundleId?: string | null;
         temporaryCaseNumber?: string | null;
     }): FilingJobView {
@@ -5654,13 +5657,20 @@ export class WorkflowDatabase {
         if (existing.status !== 'reconciliation_required') {
             throw new Error('This MiFILE job does not require reconciliation');
         }
+        if (!['found', 'not_found'].includes(input.resolution)) throw new Error('Choose a valid reconciliation result.');
+        const expected = Array.isArray(existing.payload?.documents) ? existing.payload.documents.map(document => document.id) : [];
+        const verified = input.verifiedDocumentIds;
+        if (input.resolution === 'found' && (!expected.length || !Array.isArray(verified) || verified.length !== expected.length ||
+            new Set(verified).size !== expected.length || !expected.every(id => verified.includes(id)))) {
+            throw new Error('Check every expected PDF, Filing Type and connection in MiFILE before marking this bundle Prepared. A partial bundle must remain under review.');
+        }
         this.appendFilingJobLog(input.filingJobId, {
             level: 'info',
             checkpoint: 'manually_reconciled',
             message: input.resolution === 'found'
-                ? 'User confirmed that the bundle exists in MiFILE History > Unsubmitted.'
+                ? 'User confirmed the complete PDF package, Filing Types and connections in MiFILE History > Unsubmitted.'
                 : 'User confirmed that no matching bundle exists in MiFILE History > Unsubmitted.',
-            details: { resolution: input.resolution },
+            details: { resolution: input.resolution, verifiedDocumentIds: input.resolution === 'found' ? verified : [] },
         });
         return this.completeFilingJob({
             filingJobId: input.filingJobId,
@@ -5672,7 +5682,7 @@ export class WorkflowDatabase {
                 : 'No matching unsubmitted MiFILE bundle was found. Preparation may now be retried.',
             externalBundleId: input.externalBundleId ?? null,
             temporaryCaseNumber: input.temporaryCaseNumber ?? null,
-            result: { reconciliationResolution: input.resolution },
+            result: { reconciliationResolution: input.resolution, reconciliationVerifiedDocumentIds: input.resolution === 'found' ? verified : [] },
         });
     }
 
@@ -7183,7 +7193,7 @@ export class WorkflowDatabase {
         const executionLog = this.safeJson(String(row.execution_log || ''));
         const payload = this.safeJson(String(row.payload_json || ''));
         const result = this.safeJson(String(row.result_json || ''));
-        return {
+        const job: FilingJobView = {
             id: String(row.id),
             caseDraftId: String(row.case_draft_id),
             emailId: row.email_id ? String(row.email_id) : null,
@@ -7220,6 +7230,8 @@ export class WorkflowDatabase {
             createdAt: String(row.created_at),
             updatedAt: String(row.updated_at),
         };
+        job.progress = filingPreparationProgress(job);
+        return job;
     }
 
     private safeJson(value: string | null | undefined): any {

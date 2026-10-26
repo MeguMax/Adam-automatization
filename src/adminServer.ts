@@ -48,7 +48,7 @@ import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-25-excel-pdf-taskpane-v44';
+const ADMIN_BUILD_ID = '2026-10-26-verified-mifile-uploads-v45';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2363,6 +2363,16 @@ const html = String.raw`<!doctype html>
       font-size: 11px;
       overflow-wrap: anywhere;
     }
+    .draft-upload-progress { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; font-size: 12px; }
+    .draft-upload-progress progress { width: 100%; height: 7px; display: block; margin: 7px 0; accent-color: var(--good); }
+    .draft-upload-checklist { padding: 0; margin: 8px 0 0; list-style: none; }
+    .draft-upload-checklist li { padding: 7px 0; border-top: 1px solid var(--line); }
+    .draft-upload-checklist .file-heading { display: flex; gap: 8px; align-items: start; justify-content: space-between; }
+    .draft-upload-checklist .file-heading > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+    .draft-upload-current { overflow-wrap: anywhere; color: var(--muted); margin: 5px 0; }
+    .reconciliation-files { max-height: 180px; overflow-y: auto; padding-left: 20px; overflow-wrap: anywhere; }
+    .draft-acknowledgement { display: flex; gap: 9px; align-items: start; font-size: 13px; margin: 14px 0 0; }
+    .draft-acknowledgement input { width: 16px; min-height: 16px; height: 16px; flex: 0 0 16px; margin-top: 3px; }
     .mifile-account-strip {
       display: flex;
       align-items: flex-start;
@@ -4486,9 +4496,10 @@ const html = String.raw`<!doctype html>
       const reconcile = draft.status === 'filing_reconciliation';
       const running = draft.filingStatus === 'queued' || draft.status === 'filing_in_progress';
       const ready = state.mifileConfig && state.mifileConfig.ready;
+      const progress = state.draftFilingJobs[0]?.progress;
       const title = unavailable ? (draft.status === 'rejected' ? 'Package rejected' : 'Court notification') :
         filed ? 'Filed in MiFILE' : prepared ? 'Saved in MiFILE' : reconcile ? 'Check MiFILE before retrying' :
-        running ? 'Preparation in progress' : state.draftDirty ? 'Changes not saved' :
+        running ? (progress ? progress.stage + (progress.uploaded !== null && progress.total ? ' (' + progress.uploaded + ' / ' + progress.total + ')' : '') : 'Preparation in progress') : state.draftDirty ? 'Changes not saved' :
         errors ? errors + (errors === 1 ? ' correction needed' : ' corrections needed') :
         !ready ? 'MiFILE account needs attention' : 'Ready for your confirmation';
       document.getElementById('draftNextActionTitle').textContent = title;
@@ -4521,13 +4532,22 @@ const html = String.raw`<!doctype html>
       if (scroll) document.getElementById('draftFieldsForm').scrollTop = 0;
     }
 
-    function confirmDraftAction(title, message, label, summary = '') {
+    function confirmDraftAction(title, message, label, summary = '', acknowledgement = '') {
       const dialog = document.getElementById('draftConfirmDialog');
       if (dialog.open) return Promise.resolve(false);
       document.getElementById('draftConfirmTitle').textContent = title;
       document.getElementById('draftConfirmMessage').textContent = message;
       document.getElementById('draftConfirmSummary').innerHTML = summary;
       document.getElementById('draftConfirmAccept').textContent = label;
+      const accept = document.getElementById('draftConfirmAccept');
+      accept.disabled = Boolean(acknowledgement);
+      if (acknowledgement) {
+        const row = document.createElement('label'); row.className = 'draft-acknowledgement';
+        const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.id = 'draftReconcileComplete';
+        const text = document.createElement('span'); text.textContent = acknowledgement;
+        checkbox.addEventListener('change', () => { accept.disabled = !checkbox.checked; });
+        row.append(checkbox, text); document.getElementById('draftConfirmSummary').append(row);
+      }
       dialog.returnValue = '';
       const previousFocus = document.activeElement;
       return new Promise(resolve => {
@@ -4602,6 +4622,7 @@ const html = String.raw`<!doctype html>
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
       const logWasOpen = Boolean(root.querySelector('[data-filing-log]')?.open);
+      const previousChecklist = root.querySelector('[data-upload-checklist]');
       const jobs = state.draftFilingJobs || [];
       const config = state.mifileConfig || {
         accountEnvironment: 'test',
@@ -4647,6 +4668,16 @@ const html = String.raw`<!doctype html>
       }
       const job = jobs[0];
       const log = (job.executionLog || []).slice(-12).reverse();
+      const progress = job.progress;
+      const checklistOpen = previousChecklist?.dataset.jobStatus === job.status ? previousChecklist.open : ['failed','reconciliation_required'].includes(job.status);
+      const uploadStatus = {pending:'Waiting',uploading:'Uploading',uploaded:'Verified',failed:'Failed',uncertain:'Check MiFILE'};
+      const progressMarkup = !progress ? '' : '<div class="draft-upload-progress"><strong>' + escapeHtml(progress.stage) + '</strong>' +
+        '<div>' + (progress.uploaded === null ? 'Upload count unconfirmed' : (progress.evidence === 'reported' ? 'Reported uploads: ' : progress.evidence === 'confirmed' ? 'PDFs checked by you: ' : 'Verified PDFs: ') + progress.uploaded + ' / ' + progress.total) + '</div>' +
+        (progress.uploaded !== null && progress.total ? '<progress aria-label="PDF upload progress" max="' + progress.total + '" value="' + progress.uploaded + '"></progress>' : '') +
+        (progress.currentFilename ? '<p class="draft-upload-current">' + escapeHtml(progress.currentFilename) + '</p>' : '') +
+        (['verified','confirmed'].includes(progress.evidence) && progress.documents.length ? '<details class="draft-optional" data-upload-checklist data-job-status="' + escapeHtml(job.status) + '"' + (checklistOpen ? ' open' : '') + '><summary>PDF checklist (' + progress.total + ')</summary><ul class="draft-upload-checklist">' +
+          progress.documents.map(document => '<li><div class="file-heading"><span>' + escapeHtml(document.filename) + '</span><span>' + escapeHtml(uploadStatus[document.status] || document.status) + '</span></div>' +
+            (document.error ? '<div class="draft-filing-job-error">' + escapeHtml(document.error) + '</div>' : '') + '</li>').join('') + '</ul></details>' : '') + '</div>';
       root.innerHTML = accountStrip + '<div class="draft-filing-job-panel">' +
         '<div class="draft-filing-job-heading"><strong>MiFILE attempt ' +
           escapeHtml(job.attemptNumber) + '</strong>' + statusPill(job.status) + '</div>' +
@@ -4658,6 +4689,7 @@ const html = String.raw`<!doctype html>
           (job.temporaryCaseNumber ? '<span>Temporary case: ' +
             escapeHtml(job.temporaryCaseNumber) + '</span>' : '') +
         '</div>' +
+        progressMarkup +
         (job.errorMessage ? '<div class="draft-filing-job-error">' +
           escapeHtml((job.errorCode ? job.errorCode + ': ' : '') + job.errorMessage) + '</div>' : '') +
         (job.status === 'reconciliation_required' ?
@@ -4692,14 +4724,19 @@ const html = String.raw`<!doctype html>
 
     async function reconcileFilingJob(jobId, resolution) {
       const found = resolution === 'found';
+      const job = state.draftFilingJobs.find(item => item.id === jobId);
+      const documents = job?.payload?.documents || [];
+      if (found && !documents.length) throw new Error('The expected PDF list is unavailable. Contact support before confirming this bundle.');
       const message = found
-        ? 'Confirm that you found this case in MiFILE History → Unsubmitted. The Draft will be marked Prepared.'
+        ? 'Check this case in MiFILE History → Unsubmitted. All listed PDFs, Filing Types and connections must be correct. Finding a case with only some of its PDFs is not sufficient.'
         : 'Confirm that no matching case exists in MiFILE History → Unsubmitted. Retry will be enabled.';
-      if (!await confirmDraftAction('Confirm MiFILE result', message, found ? 'Bundle found' : 'No bundle found')) return;
+      const summary = found ? '<ul class="reconciliation-files">' + documents.map(document => '<li>' + escapeHtml(document.filename) + '<small> - ' + escapeHtml(document.filingRelation === 'connected_to_complaint' ? 'Connected to Complaint' : document.filingType) + '</small></li>').join('') + '</ul>' : '';
+      if (!await confirmDraftAction('Confirm MiFILE result', message, found ? 'Confirm complete bundle' : 'No bundle found', summary,
+        found ? 'I checked all ' + documents.length + ' PDFs, their Filing Types and connections in MiFILE.' : '')) return;
       await api('/api/filing-jobs/' + encodeURIComponent(jobId) + '/reconcile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resolution }),
+        body: JSON.stringify({ resolution, verifiedDocumentIds: found ? documents.map(document => document.id) : [] }),
       });
       state.draftDetail = await api('/api/drafts/' +
         encodeURIComponent(state.selectedDraftId));
@@ -7449,16 +7486,17 @@ export function createAdminServer(
                     });
                     return;
                 }
-                sendJson(res, 200, db.resolveFilingJobReconciliation({
+                try { sendJson(res, 200, db.resolveFilingJobReconciliation({
                     filingJobId: decodeURIComponent(reconcileFilingJobMatch[1]),
                     resolution: parsed.resolution,
+                    verifiedDocumentIds: parsed.verifiedDocumentIds,
                     externalBundleId: typeof parsed.externalBundleId === 'string'
                         ? parsed.externalBundleId.trim() || null
                         : null,
                     temporaryCaseNumber: typeof parsed.temporaryCaseNumber === 'string'
                         ? parsed.temporaryCaseNumber.trim() || null
                         : null,
-                }));
+                })); } catch (error) { sendJson(res, 422, { error: (error as Error).message }); }
                 return;
             }
 

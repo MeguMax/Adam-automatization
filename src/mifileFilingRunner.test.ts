@@ -65,35 +65,71 @@ test('MiFILE case forms keep business Defendants separate from people',async()=>
     } finally {await page.close();}
 });
 
-async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean; feeLabels?: boolean } = {}): Promise<Page> {
+async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean; feeLabels?: boolean; noOther?: boolean;
+    noConnectEffect?: boolean; insertFirst?: boolean; failedFile?: string; warningFile?: string; merged?: boolean; systemParent?: boolean } = {}): Promise<Page> {
     const page = await browser.newPage();
     await page.route('**/*', route => route.abort());
     await page.setContent(`<input id="fileUpload" type="file" multiple><table id="files"></table>
         <button onclick="window.saved = true">Save Progress</button>
         <button onclick="window.submitted = true">Submit</button>
         <script>
-        fileUpload.onchange = () => Array.from(fileUpload.files).forEach((file,index) => {
-            const row = document.createElement('tbody'); row.id = 'filing-' + index;
-            row.innerHTML = '<tr><td><span class="glyphicon-ok">Uploaded</span>' +
-                '<input name="documentName_' + index + '">' +
-                '<input id="selectFilingTypeInput_' + index + '">' +
-                '<ul class="dropdown-menu" style="display:none"><li role="option">Complaint for Possession Only (Different type)</li>' +
-                ${JSON.stringify(options.missingType ? '' : '<li role="option">Complaint for Possession Only' + (options.feeLabels ? ' - $45.00' : '') + '</li>')} +
-                ${JSON.stringify('<li role="option">Other' + (options.feeLabels ? ' - $0.00' : '') + '</li></ul>')} +
-                (${Boolean(options.missingConnect)} ? '' : '<button type="button" id="filing-' + index + '-connect-filing">Connect</button>') +
-                '</td></tr>';
-            row.querySelectorAll('[role="option"]').forEach(option => option.onclick = () => {
-                row.dataset.selectedType = option.textContent;
-                row.querySelector('input[id^="selectFilingTypeInput_"]').value = option.textContent;
+        const config = ${JSON.stringify(options)};
+        window.uploadSelections = [];
+        window.filings = config.systemParent ? [{source:'system',name:'Case initiation',type:'System',children:[],status:'uploaded'}] : [];
+        function makeRow(model,id,index,child) {
+            const row = document.createElement('tbody'); row.id = id;
+            row.dataset.source = model.source; row.dataset.selectedType = model.type || '';
+            row.innerHTML = '<tr><td></td><td><input name="documentName_' + index + '"></td><td></td><td>1 KB</td><td></td><td></td></tr>';
+            const name = row.querySelector('input'); name.value = model.name; name.oninput = () => model.name = name.value;
+            const state = row.querySelectorAll('td')[5];
+            state.innerHTML = '<span class="glyphicon-ok" style="display:' + (model.status==='uploaded'?'inline':'none') + '">Uploaded</span>' +
+                '<span class="glyphicon-remove" ng-show="parent.uploadStatus==FAILED" style="display:' + (model.status==='failed'?'inline':'none') + '">Upload failed</span>' +
+                '<span class="glyphicon-alert" ng-show="parent.uploadStatus==WARNING" style="display:' + (model.status==='warning'?'inline':'none') + '">Redaction warning</span>';
+            const typeCell = row.querySelectorAll('td')[4];
+            if (child) typeCell.textContent = model.type;
+            else {
+                typeCell.innerHTML = '<input id="selectFilingTypeInput_' + index + '"><ul class="dropdown-menu" style="display:none">' +
+                    '<li role="option">Complaint for Possession Only (Different type)</li>' +
+                    (config.missingType ? '' : '<li role="option">Complaint for Possession Only' + (config.feeLabels?' - $45.00':'') + '</li>') +
+                    (config.noOther ? '' : '<li role="option">Other' + (config.feeLabels?' - $0.00':'') + '</li>') + '</ul>';
+                const input = typeCell.querySelector('input'); input.value = model.type || '';
+                input.oninput = () => {
+                    input.classList.add('ng-invalid-editable');
+                    document.querySelectorAll('.dropdown-menu').forEach(menu=>menu.style.display='none');
+                    typeCell.querySelector('.dropdown-menu').style.display='block';
+                };
+                typeCell.querySelectorAll('[role="option"]').forEach(option=>option.onclick=()=>{
+                    model.type = option.textContent; row.dataset.selectedType = model.type; input.value = model.type;
+                    input.classList.remove('ng-invalid-editable'); typeCell.querySelector('.dropdown-menu').style.display='none';
+                });
+                if (!config.missingConnect && index > 0) {
+                    const connect=document.createElement('button'); connect.type='button'; connect.id=id+'-connect-filing'; connect.textContent='Connect';
+                    connect.onclick=()=>{
+                        if(config.noConnectEffect)return;
+                        const parent=window.filings[index-1]; model.type=config.merged?'MERGED FILING':'CONNECTED FILING'; parent.children.push(model);
+                        window.filings.splice(index,1); render();
+                    };
+                    row.querySelector('td').append(connect);
+                }
+            }
+            return row;
+        }
+        function render(){
+            files.replaceChildren();
+            window.filings.forEach((parent,index)=>{
+                files.append(makeRow(parent,'filing-'+index,index,false));
+                parent.children.forEach((child,childIndex)=>files.append(makeRow(child,'child-'+index+'-'+childIndex,childIndex,true)));
             });
-            row.querySelector('input[id^="selectFilingTypeInput_"]').oninput = () => {
-                document.querySelectorAll('.dropdown-menu').forEach(menu => menu.style.display = 'none');
-                row.querySelector('.dropdown-menu').style.display = 'block';
-            };
-            const connect = row.querySelector('button');
-            if (connect) connect.onclick = () => row.dataset.connected = 'true';
-            files.append(row);
-        });
+        }
+        fileUpload.onchange = () => {
+            window.uploadSelections.push(Array.from(fileUpload.files).map(file=>file.name));
+            Array.from(fileUpload.files).forEach(file=>{
+                const item={source:file.name,name:file.name.replace(/\\.pdf$/i,''),type:'',children:[],
+                    status:file.name===config.failedFile?'failed':file.name===config.warningFile?'warning':'uploaded'};
+                if(config.insertFirst)window.filings.unshift(item);else window.filings.push(item);
+            }); render();
+        };
+        render();
         </script>`);
     return page;
 }
@@ -111,11 +147,13 @@ test('MiFILE uploader assigns all PDFs using exact Filing Types and connects the
     const page = await uploadPage();
     try {
         const runner = new MiFileFilingRunner();
-        await (runner as any).uploadDocuments(page, materialized(6, true));
+        const receipt = await (runner as any).uploadDocuments(page, materialized(6, true));
         assert.equal(await page.locator('tbody').count(), 6);
         assert.equal(await page.locator('#filing-0').getAttribute('data-selected-type'), 'Complaint for Possession Only');
-        assert.equal(await page.locator('#filing-1').getAttribute('data-connected'), 'true');
-        assert.equal(await page.locator('#filing-5 input[name^="documentName_"]').inputValue(), 'Document 5');
+        assert.equal(await page.locator('#child-0-0').getAttribute('data-selected-type'), 'CONNECTED FILING');
+        assert.equal(receipt[1].parentDocumentId, 'doc-0');
+        assert.equal(await page.locator('#filing-4 input[name^="documentName_"]').inputValue(), 'Document 5');
+        assert.ok((await page.evaluate(() => (window as any).uploadSelections)).every((batch: string[]) => batch.length === 1));
         assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
     } finally { await page.close(); }
 });
@@ -127,7 +165,7 @@ test('similar Filing Type labels must not be accepted in place of the requested 
         (runner as any).timeoutMs = 300;
         await assert.rejects((runner as any).uploadDocuments(page, materialized(1)), (error: any) =>
             error.code === 'FILING_TYPE_NOT_AVAILABLE' && error.checkpoint === 'document_upload');
-        assert.equal(await page.locator('#filing-0').getAttribute('data-selected-type'), null);
+        assert.equal(await page.locator('#filing-0').getAttribute('data-selected-type'), '');
         assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
     } finally { await page.close(); }
 });
@@ -147,6 +185,75 @@ test('missing Connected control must fail before saving instead of silently crea
     try {
         await assert.rejects((new MiFileFilingRunner() as any).uploadDocuments(page, materialized(2, true)),
             (error: any) => error.code === 'CONNECTED_FILING_UNAVAILABLE');
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('several Connected PDFs remain under the same Complaint after MiFILE renumbers rows, without selecting Other', async () => {
+    const page = await uploadPage({ noOther: true, systemParent: true });
+    const documents = materialized(4);
+    documents.slice(1).forEach(item => { item.document.filingRelation = 'connected_to_complaint'; });
+    const originalOrder = documents.map(item => item.document.id);
+    try {
+        const receipts = await (new MiFileFilingRunner() as any).uploadDocuments(page, [documents[3], documents[0], documents[1], documents[2]]);
+        assert.deepEqual(documents.map(item => item.document.id), originalOrder);
+        assert.equal(await page.locator('tbody[id^="filing-"]').count(), 2);
+        assert.equal(await page.locator('tbody[id^="child-1-"]').count(), 3);
+        assert.equal(receipts[0].documentId, 'doc-0');
+        for (const receipt of receipts.slice(1)) {
+            assert.equal(receipt.parentDocumentId, 'doc-0');
+            assert.equal(receipt.filingType, 'CONNECTED FILING');
+            assert.equal(await page.locator('#' + receipt.mifileRowId).getAttribute('data-source'), `Document-${receipt.documentId.slice(4)}.pdf`);
+        }
+        assert.equal(await page.locator('#filing-0 input').first().inputValue(), 'Case initiation');
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('unexpected source-row reordering stops classification rather than assigning a type to another PDF', async () => {
+    const page = await uploadPage({ insertFirst: true });
+    try {
+        await assert.rejects((new MiFileFilingRunner() as any).uploadDocuments(page, materialized(2)), (error: any) => error.code === 'UPLOAD_SOURCE_MISMATCH');
+        assert.equal(await page.locator('#filing-1').getAttribute('data-source'), 'Document-0.pdf');
+        assert.equal(await page.locator('#filing-1').getAttribute('data-selected-type'), 'Complaint for Possession Only');
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('a failed upload names the exact PDF and does not proceed to later uploads or saving', async () => {
+    const page = await uploadPage({ failedFile: 'Document-1.pdf' });
+    const log: any[] = [];
+    try {
+        await assert.rejects((new MiFileFilingRunner(entry => { log.push(entry); }) as any).uploadDocuments(page, materialized(3)),
+            (error: any) => error.code === 'DOCUMENT_UPLOAD_FAILED' && error.message.includes('Document-1.pdf'));
+        assert.equal((await page.evaluate(() => (window as any).uploadSelections)).length, 2);
+        assert.equal(log.find(entry => entry.details?.event === 'document_failed').details.documentId, 'doc-1');
+        assert.equal(log.filter(entry => entry.details?.event === 'document_ready').length, 1);
+        assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+    } finally { await page.close(); }
+});
+
+test('redaction warnings and ignored/merged connection controls require review instead of reporting success', async () => {
+    for (const options of [{ warningFile: 'Document-1.pdf' }, { noConnectEffect: true }, { merged: true }]) {
+        const page = await uploadPage(options);
+        try {
+            const runner = new MiFileFilingRunner(); (runner as any).timeoutMs = 200;
+            await assert.rejects((runner as any).uploadDocuments(page, materialized(2, true)), (error: any) =>
+                ['DOCUMENT_UPLOAD_WARNING', 'CONNECTED_FILING_NOT_CONFIRMED'].includes(error.code));
+            assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
+        } finally { await page.close(); }
+    }
+});
+
+test('the final PDF manifest detects a lost or renamed row before Save Progress', async () => {
+    const page = await uploadPage();
+    try {
+        const runner = new MiFileFilingRunner(async entry => {
+            if (entry.details?.event === 'document_ready' && entry.details.documentNumber === 2) {
+                await page.locator('#filing-0 input[name^="documentName_"]').fill('Unexpected change');
+            }
+        });
+        await assert.rejects((runner as any).uploadDocuments(page, materialized(2)), (error: any) => error.code === 'UPLOAD_MANIFEST_MISMATCH');
         assert.equal(await page.evaluate(() => Boolean((window as any).saved || (window as any).submitted)), false);
     } finally { await page.close(); }
 });
@@ -174,6 +281,24 @@ test('partial OneDrive materialization is cleaned up and reports its actual chec
     }
 });
 
+test('long and duplicate source names materialize as distinct PDF filenames with a preserved extension', async () => {
+    const drive = require('./oneDriveClient');
+    const resolve = drive.resolveSharedDriveItem, download = drive.downloadDriveItemBuffer;
+    drive.resolveSharedDriveItem = async () => ({ driveId: 'qa', itemId: 'qa' });
+    drive.downloadDriveItemBuffer = async () => testPdfFixture();
+    const target = path.join(directory, 'long-filenames'); fs.mkdirSync(target);
+    try {
+        const input = [0,1].map(index => ({ ...filingDocument(index), filename: 'x'.repeat(230) + '.PDF' }));
+        const output = await (new MiFileFilingRunner() as any).materializeDocuments({ documents: input }, target);
+        assert.notEqual(output[0].localPath, output[1].localPath);
+        for (const file of output) {
+            assert.equal(path.extname(file.localPath), '.pdf');
+            assert.equal(path.dirname(file.localPath), target);
+            assert.ok(path.basename(file.localPath).length < 200);
+        }
+    } finally { drive.resolveSharedDriveItem = resolve; drive.downloadDriveItemBuffer = download; }
+});
+
 test('old queued snapshots with unknown answers or document relations are stopped before remote access', async () => {
     const runner = new MiFileFilingRunner();
     await assert.rejects(runner.prepare({mode:'submit'} as FilingJobView),
@@ -184,6 +309,7 @@ test('old queued snapshots with unknown answers or document relations are stoppe
         [{...payload,filingData:{...payload.filingData,relatedCivilAction:'unknown'}},'CASE_ANSWERS_UNCONFIRMED'],
         [{...payload,documents:[{...filingDocument(0),filingRelation:'unknown'}]},'DOCUMENT_RELATION_UNCONFIRMED'],
         [{...payload,filingData:{...payload.filingData,moneyJudgmentRequested:true,claimAmount:'0'}},'CLAIM_AMOUNT_UNCONFIRMED'],
+        [{...payload,documents:[{...filingDocument(0),isPrimary:false},filingDocument(1,true)]},'CONNECTED_COMPLAINT_REQUIRED'],
     ] as const) {
         await assert.rejects(runner.prepare({mode:'prepare',payload:invalid} as FilingJobView),
             (error:any)=>error.code===code && error.checkpoint==='starting');

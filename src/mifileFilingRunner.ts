@@ -34,6 +34,17 @@ export interface MiFilePreparationResult {
     uploadedDocuments: number;
     mifileVersion: string | null;
     screenshotPath: string | null;
+    documentManifest?: MiFileDocumentReceipt[];
+}
+
+export interface MiFileDocumentReceipt {
+    documentId: string;
+    filename: string;
+    filingName: string;
+    filingType: string;
+    filingRelation: 'separate' | 'connected_to_complaint';
+    parentDocumentId: string | null;
+    mifileRowId: string;
 }
 
 export class MiFileFilingError extends Error {
@@ -194,6 +205,7 @@ export class MiFileFilingRunner {
                 'DOCUMENT_RELATION_UNCONFIRMED', 'starting',
             );
         }
+        this.validateConnectedPackage(job.payload.documents);
         const runtimeConfig = getMiFileRuntimeConfig();
         const credentials = getMiFileCredentials();
         if (!runtimeConfig.ready) {
@@ -239,7 +251,7 @@ export class MiFileFilingRunner {
             await this.log('info', lastCheckpoint, 'Completing the MiFILE case-initiation fields.');
             await this.completeCaseForm(page, job.payload);
             lastCheckpoint = 'document_upload';
-            await this.uploadDocuments(page, documents);
+            const documentManifest = await this.uploadDocuments(page, documents);
             lastCheckpoint = 'save_progress';
             await this.log(
                 'info',
@@ -259,6 +271,7 @@ export class MiFileFilingRunner {
                 uploadedDocuments: documents.length,
                 mifileVersion: bodyText.match(/Version\s+([\d.]+)/i)?.[1] ?? null,
                 screenshotPath,
+                documentManifest,
             };
             await this.log(
                 'info',
@@ -330,7 +343,7 @@ export class MiFileFilingRunner {
             }
             const localPath = path.join(
                 directory,
-                `${String(index + 1).padStart(2, '0')}-${safePathToken(document.filename)}`,
+                `${String(index + 1).padStart(2, '0')}-${safePathToken(document.filename.replace(/\.pdf$/i, ''))}.pdf`,
             );
             fs.writeFileSync(localPath, buffer);
             materialized.push({ document, localPath });
@@ -632,10 +645,55 @@ export class MiFileFilingRunner {
         }
     }
 
+    private validateConnectedPackage(documents: FilingDocumentPayload[]): void {
+        if (!documents.some(document => document.filingRelation === 'connected_to_complaint')) return;
+        const primary = documents.filter(document => document.isPrimary && document.packageRole === 'complaint' && document.filingRelation === 'separate');
+        if (primary.length !== 1 || documents.some(document => document.filingRelation === 'connected_to_complaint' && document.packageRole !== 'ancillary')) {
+            throw new MiFileFilingError('Connected PDFs require exactly one primary Complaint and supporting documents only.', 'CONNECTED_COMPLAINT_REQUIRED', 'starting');
+        }
+    }
+
+    private async waitForUpload(page: Page, rowId: string, filename: string): Promise<void> {
+        const status = await page.waitForFunction(id => {
+            const row = document.getElementById(id);
+            if (!row) return false;
+            const visible = (selector: string) => [...row.querySelectorAll<HTMLElement>(selector)].find(element =>
+                element.getClientRects().length > 0 && getComputedStyle(element).visibility !== 'hidden');
+            if (visible('.glyphicon-remove[ng-show*="uploadStatus"]')) return 'failed';
+            if (visible('.glyphicon-alert[ng-show*="uploadStatus"]')) return 'warning';
+            return visible('.glyphicon-ok') ? 'uploaded' : false;
+        }, rowId, { timeout: this.uploadTimeoutMs }).then(handle => handle.jsonValue()).catch(() => 'timeout');
+        if (status !== 'uploaded') {
+            throw new MiFileFilingError(status === 'warning'
+                ? `MiFILE reported a document warning for ${filename}. Check its redactions and upload result.`
+                : `MiFILE ${status === 'failed' ? 'rejected' : 'did not confirm uploading'} ${filename}.`,
+            status === 'warning' ? 'DOCUMENT_UPLOAD_WARNING' : status === 'failed' ? 'DOCUMENT_UPLOAD_FAILED' : 'DOCUMENT_UPLOAD_TIMEOUT', 'document_upload');
+        }
+    }
+
+    private async selectFilingType(page: Page, row: Locator, file: FilingDocumentPayload): Promise<void> {
+        const typeInput = row.locator('input[id^="selectFilingTypeInput_"]');
+        await typeInput.fill(file.filingType);
+        await dismissMifileModalIfAny(page);
+        await typeInput.fill(file.filingType);
+        const escaped = file.filingType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = `^\\s*${escaped}(?:\\s+-\\s+\\$[\\d,]+\\.\\d{2})?\\s*$`;
+        const exact = page.locator('ul.dropdown-menu:visible li[role="option"]').filter({ hasText: new RegExp(pattern) }).first();
+        try { await exact.waitFor({ state: 'visible', timeout: this.timeoutMs }); await exact.click(); }
+        catch { throw new MiFileFilingError(`MiFILE does not offer the exact Filing Type "${file.filingType}" for ${file.filename}. Review the document type for this court.`, 'FILING_TYPE_NOT_AVAILABLE', 'document_upload'); }
+        const id = await typeInput.getAttribute('id');
+        await page.waitForFunction(({ id, pattern }) => {
+            const input = document.getElementById(id!) as HTMLInputElement | null;
+            return input && new RegExp(pattern).test(input.value) && !input.classList.contains('ng-invalid-editable') && !input.classList.contains('ng-invalid-parse');
+        }, { id, pattern }, { timeout: this.timeoutMs }).catch(() => {
+            throw new MiFileFilingError(`MiFILE did not confirm the selected Filing Type for ${file.filename}.`, 'FILING_TYPE_NOT_CONFIRMED', 'document_upload');
+        });
+    }
+
     private async uploadDocuments(
         page: Page,
         documents: MaterializedDocument[],
-    ): Promise<void> {
+    ): Promise<MiFileDocumentReceipt[]> {
         if (!documents.length) {
             throw new MiFileFilingError(
                 'The filing package does not contain any PDF documents.',
@@ -643,119 +701,104 @@ export class MiFileFilingRunner {
                 'document_upload',
             );
         }
-        const uploadedRows = new Map<string, string>();
+        this.validateConnectedPackage(documents.map(item => item.document));
+        const rank = (item: MaterializedDocument) => item.document.isPrimary ? 0 : item.document.filingRelation === 'connected_to_complaint' ? 1 : 2;
+        documents = [...documents].sort((left, right) => rank(left) - rank(right));
+        const receipts: MiFileDocumentReceipt[] = [];
+        let primaryRowId: string | null = null;
+        const primaryDocumentId = documents.find(item => item.document.isPrimary)?.document.id || null;
         const rows = page.locator('tbody[id^="filing-"]').filter({
             has: page.locator('input[name^="documentName_"]'),
         });
-        const existingRowIds = new Set(
-            (await rows.evaluateAll(elements => elements.map(element => element.id))).filter(Boolean),
-        );
+        const initialCount = await rows.count() + await page.locator('tbody[id^="child-"]').count();
         await this.log('info', 'document_upload', 'Uploading the complete PDF package to MiFILE.', {
             documentCount: documents.length,
         });
-        await page.locator('#fileUpload').setInputFiles(
-            documents.map(item => item.localPath),
-        );
-        await page.waitForFunction(
-            ({ priorCount, expectedCount }) => document.querySelectorAll(
-                'tbody[id^="filing-"] input[name^="documentName_"]',
-            ).length >= priorCount + expectedCount,
-            { priorCount: existingRowIds.size, expectedCount: documents.length },
-            { timeout: this.uploadTimeoutMs },
-        ).catch(async () => {
-            const actualCount = await rows.count();
-            throw new MiFileFilingError(
-                `MiFILE created ${Math.max(actualCount - existingRowIds.size, 0)} of ` +
-                `${documents.length} expected document rows.`,
-                'UPLOAD_ROWS_INCOMPLETE',
-                'document_upload',
-            );
-        });
-
-        const newRows: Locator[] = [];
-        for (let index = 0; index < await rows.count(); index += 1) {
-            const candidate = rows.nth(index);
-            const rowId = await candidate.getAttribute('id');
-            if (rowId && !existingRowIds.has(rowId)) newRows.push(candidate);
-        }
-        if (newRows.length !== documents.length) {
-            throw new MiFileFilingError(
-                `MiFILE created ${newRows.length} of ${documents.length} expected document rows.`,
-                'UPLOAD_ROWS_INCOMPLETE',
-                'document_upload',
-            );
-        }
-
         for (let index = 0; index < documents.length; index += 1) {
             const item = documents[index];
-            const row = newRows[index];
-            await row.locator('.glyphicon-ok').waitFor({
-                state: 'visible',
-                timeout: this.uploadTimeoutMs,
-            });
-            const rowId = await row.getAttribute('id');
-            if (!rowId) {
-                throw new MiFileFilingError(
-                    `MiFILE did not create a filing row for ${item.document.filename}.`,
-                    'UPLOAD_ROW_MISSING',
-                    'document_upload',
-                );
-            }
-            uploadedRows.set(item.document.id, rowId);
-            await row.locator('input[name^="documentName_"]').fill(item.document.filingName);
-            const typeInput = row.locator('input[id^="selectFilingTypeInput_"]');
-            await typeInput.fill(item.document.filingType);
-            // Some courts display their protected-PII informational notice only
-            // after the first filing-type dropdown opens. It is an acknowledgement
-            // dialog, not a Yes/No case answer, and otherwise covers the option.
-            await dismissMifileModalIfAny(page);
-            await typeInput.fill(item.document.filingType);
-            const escapedType = item.document.filingType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const exactType = page.locator('ul.dropdown-menu:visible li[role="option"]').filter({
-                // MiFILE appends the court's filing fee to its otherwise exact label.
-                hasText: new RegExp(`^\\s*${escapedType}(?:\\s+-\\s+\\$[\\d,]+\\.\\d{2})?\\s*$`),
-            }).first();
+            await this.log('info', 'document_upload', 'Uploading PDF to MiFILE.', { event: 'document_started', documentId: item.document.id,
+                filename: item.document.filename, documentNumber: index + 1, documentCount: documents.length });
             try {
-                await exactType.waitFor({ state: 'visible', timeout: this.timeoutMs });
-                await exactType.click();
-            } catch {
-                throw new MiFileFilingError(
-                    `MiFILE does not offer the exact Filing Type "${item.document.filingType}" for ${item.document.filename}. Review the document type for this court.`,
-                    'FILING_TYPE_NOT_AVAILABLE',
-                    'document_upload',
-                );
+                const before = await rows.evaluateAll(elements => elements.map(element => element.id));
+                // One source per change event avoids matching asynchronous rows by batch position.
+                await page.locator('#fileUpload').setInputFiles(item.localPath);
+                await page.waitForFunction(ids => [...document.querySelectorAll('tbody[id^="filing-"]')].some(row =>
+                    row.querySelector('input[name^="documentName_"]') && !ids.includes(row.id)), before,
+                { timeout: this.uploadTimeoutMs }).catch(() => {
+                    throw new MiFileFilingError(`MiFILE did not create an upload row for ${item.document.filename}.`, 'UPLOAD_ROWS_INCOMPLETE', 'document_upload');
+                });
+                const after = await rows.evaluateAll(elements => elements.map(element => element.id));
+                const added = after.filter(id => !before.includes(id));
+                if (added.length !== 1 || before.some(id => !after.includes(id)) || !/^filing-\d+$/.test(added[0])) {
+                    throw new MiFileFilingError('MiFILE changed the upload rows unexpectedly. Check the partial bundle before retrying.', 'UPLOAD_ROW_AMBIGUOUS', 'document_upload');
+                }
+                let rowId = added[0];
+                let row = page.locator('#' + rowId);
+                await this.waitForUpload(page, rowId, item.document.filename);
+                const uploadedName = path.basename(item.localPath).replace(/\.pdf$/i, '').slice(0, 200);
+                if (await row.locator('input[name^="documentName_"]').inputValue() !== uploadedName) {
+                    throw new MiFileFilingError(`MiFILE's new upload row does not match ${item.document.filename}. No document type was assigned.`, 'UPLOAD_SOURCE_MISMATCH', 'document_upload');
+                }
+                await row.locator('input[name^="documentName_"]').fill(item.document.filingName);
+                if (item.document.filingRelation === 'connected_to_complaint') {
+                    const position = after.indexOf(rowId);
+                    if (!primaryRowId || position < 1 || after[position - 1] !== primaryRowId) {
+                        throw new MiFileFilingError('The supporting PDF is not directly below its primary Complaint. Connection was stopped.', 'CONNECTED_PARENT_MISMATCH', 'document_upload');
+                    }
+                    const parentIndex = primaryRowId.slice('filing-'.length);
+                    const children = page.locator(`tbody[id^="child-${parentIndex}-"]`);
+                    const childIndex = await children.count();
+                    const connect = row.locator('[id$="-connect-filing"]');
+                    if (!await connect.isVisible().catch(() => false) || !await connect.isEnabled()) {
+                        throw new MiFileFilingError(`MiFILE cannot connect ${item.document.filename} to the Complaint. Review the court rule.`, 'CONNECTED_FILING_UNAVAILABLE', 'document_upload');
+                    }
+                    await connect.click();
+                    rowId = `child-${parentIndex}-${childIndex}`;
+                    await page.waitForFunction(({ rowId, name, expectedParents }) => {
+                        const child = document.getElementById(rowId);
+                        const parents = [...document.querySelectorAll('tbody[id^="filing-"]')].filter(row => row.querySelector('input[name^="documentName_"]'));
+                        return child?.querySelector<HTMLInputElement>('input[name^="documentName_"]')?.value === name && parents.length === expectedParents;
+                    }, { rowId, name: item.document.filingName, expectedParents: before.length }, { timeout: this.timeoutMs }).catch(() => {
+                        throw new MiFileFilingError(`MiFILE did not confirm connecting ${item.document.filename} to its Complaint.`, 'CONNECTED_FILING_NOT_CONFIRMED', 'document_upload');
+                    });
+                    row = page.locator('#' + rowId);
+                    if ((await row.locator('td').nth(4).innerText()).trim() !== 'CONNECTED FILING') {
+                        throw new MiFileFilingError('MiFILE did not label the attached PDF as CONNECTED FILING. Review this court\'s connection/merge rule.', 'CONNECTED_FILING_NOT_CONFIRMED', 'document_upload');
+                    }
+                } else await this.selectFilingType(page, row, item.document);
+                if (item.document.isPrimary) primaryRowId = rowId;
+                const receipt: MiFileDocumentReceipt = { documentId: item.document.id, filename: item.document.filename,
+                    filingName: item.document.filingName, filingType: item.document.filingRelation === 'connected_to_complaint' ? 'CONNECTED FILING' : item.document.filingType,
+                    filingRelation: item.document.filingRelation as 'separate' | 'connected_to_complaint',
+                    parentDocumentId: item.document.filingRelation === 'connected_to_complaint' ? primaryDocumentId : null, mifileRowId: rowId };
+                receipts.push(receipt);
+                await this.log('info', 'document_upload', 'PDF uploaded and verified in MiFILE.', { ...receipt, event: 'document_ready', documentNumber: index + 1, documentCount: documents.length });
+            } catch (error) {
+                await this.log('error', 'document_upload', error instanceof Error ? error.message : String(error), {
+                    event: 'document_failed', documentId: item.document.id, filename: item.document.filename,
+                    documentNumber: index + 1, documentCount: documents.length,
+                });
+                throw error;
             }
-            await this.log('info', 'document_upload', 'Document uploaded and classified.', {
-                documentId: item.document.id,
-                filename: item.document.filename,
-                filingType: item.document.filingType,
-                documentNumber: index + 1,
-                documentCount: documents.length,
-            });
         }
-
-        for (const item of documents.filter(candidate =>
-            candidate.document.filingRelation === 'connected_to_complaint')) {
-            const rowId = uploadedRows.get(item.document.id);
-            if (!rowId) {
-                throw new MiFileFilingError(
-                    `MiFILE has no uploaded row for connected document ${item.document.filename}.`,
-                    'CONNECTED_FILING_UNAVAILABLE', 'document_upload',
-                );
-            }
-            const connect = page.locator(`#${rowId}-connect-filing`);
-            if (!await connect.isVisible().catch(() => false)) {
-                throw new MiFileFilingError(
-                    `MiFILE cannot connect ${item.document.filename} to the Complaint. Review this court's Other/Connected rule before retrying.`,
-                    'CONNECTED_FILING_UNAVAILABLE', 'document_upload',
-                );
-            }
-            await connect.click();
-            await page.waitForTimeout(300);
-            await this.log('info', 'document_upload', 'Connected ancillary filing to Complaint.', {
-                documentId: item.document.id,
-            });
+        if (await rows.count() + await page.locator('tbody[id^="child-"]').count() !== initialCount + documents.length) {
+            throw new MiFileFilingError('The MiFILE PDF count changed before saving. Check every source PDF.', 'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
         }
+        for (const receipt of receipts) {
+            const row = page.locator('#' + receipt.mifileRowId);
+            if (await row.count() !== 1 || await row.locator('input[name^="documentName_"]').inputValue() !== receipt.filingName) {
+                throw new MiFileFilingError(`MiFILE lost or replaced the upload row for ${receipt.filename}.`, 'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
+            }
+            await this.waitForUpload(page, receipt.mifileRowId, receipt.filename);
+            const escaped = receipt.filingType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const selectedType = receipt.filingRelation === 'connected_to_complaint'
+                ? (await row.locator('td').nth(4).innerText()).trim()
+                : await row.locator('input[id^="selectFilingTypeInput_"]').inputValue();
+            if (!new RegExp(`^\\s*${escaped}(?:\\s+-\\s+\\$[\\d,]+\\.\\d{2})?\\s*$`).test(selectedType)) {
+                throw new MiFileFilingError(`MiFILE changed the Filing Type for ${receipt.filename} before saving.`, 'UPLOAD_MANIFEST_MISMATCH', 'document_upload');
+            }
+        }
+        return receipts;
     }
 
     private async saveProgress(page: Page): Promise<void> {
