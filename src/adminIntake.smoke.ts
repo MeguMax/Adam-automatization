@@ -387,6 +387,15 @@ async function main() {
         const complete = db.getDraftDetail(draftId)!;
         assert.equal(complete.documents.length, 6);
         assert.deepEqual(complete.caseDraft!.validationIssues, []);
+        await ancillaryRow.locator('[data-document-field="filingRelation"]').selectOption('connected_to_complaint');
+        await page.locator('#draftSaveBtn').click();
+        await page.waitForFunction(() => document.getElementById('draftSaveBtn')?.hasAttribute('disabled') === true);
+        await page.locator('#draftReviewTab').click();
+        assert.match(await page.locator('#draftReviewPane .draft-overview-file').filter({hasText:'Ancillary'}).innerText(),/Connected to Complaint/);
+        await page.locator('#draftDocumentsTab').click();
+        await ancillaryRow.locator('[data-document-field="filingRelation"]').selectOption('separate');
+        await page.locator('#draftSaveBtn').click();
+        await page.waitForFunction(() => document.getElementById('draftSaveBtn')?.hasAttribute('disabled') === true);
         await page.locator('#draftReviewTab').click();
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.reviewedAt,null);
         assert.equal(await page.locator('#draftReviewTab').getAttribute('aria-selected'),'true');

@@ -62,6 +62,8 @@ The case-initiation iframe may appear before its form has loaded. Preparation wa
 
 The stored source hashes identify the bytes used during preparation; they do not make OneDrive immutable or attest to a freshly downloaded MiFILE PDF. Before a future payment action, the system must re-check the source content, remote bundle and Checkout fees, then obtain a fresh per-package confirmation. Switching accounts invalidates the current-account check for previously prepared bundles. Old jobs are not retroactively marked verified or automatically re-created.
 
+Controlled intake subjects starting with `NEW LT FILING - QA` are exposed as `testOnly` in release checks and visibly marked Do not submit to court. These fictional acceptance fixtures must not enter a future payment/submission rollout. The Review document summary displays Connected to Complaint when that relationship is selected, rather than misleadingly displaying its fallback Other label.
+
 ### Remaining court-submission gate
 
 The current release still rejects `submit` jobs and contains no payment or final-submit action. Enabling that stage is a separate rollout, not an environment toggle. It requires the client's primary account, an owner-configured payment method in MiFILE, a current itemized Checkout quote, approval tied to the exact account/bundle/documents/amount, and a verified submission/payment receipt. An uncertain result must be reconciled from MiFILE history before any retry; submitted, clerk-accepted and rejected outcomes must remain distinct. Final financial and legal confirmation stays with the account owner during the initial rollout.

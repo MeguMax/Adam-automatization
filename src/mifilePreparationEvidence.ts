@@ -106,7 +106,8 @@ export function filingReleaseChecks(job: FilingJobView, currentAccount: {
     const observedFees = fees?.source === 'unsubmitted_upload' && fees.currency === 'USD' &&
         fees.displayedSubtotalCents !== null && Number.isSafeInteger(fees.displayedSubtotalCents) && fees.displayedSubtotalCents >= 0
         ? fees.displayedSubtotalCents : null;
-    return { savedBundleVerified, sourceSnapshotPinned, sameAccount, primaryAccountConfirmed,
+    const testOnly = /^NEW LT FILING\s*-\s*QA\b/i.test(job.payload?.subject || '');
+    return { savedBundleVerified, sourceSnapshotPinned, sameAccount, primaryAccountConfirmed, testOnly,
         displayedSubtotalCents: observedFees, checkoutVerified: false as const,
         currentSourceContentVerified: false as const, finalActionsEnabled: false as const };
 }

@@ -708,6 +708,14 @@ test('release checks require matching evidence and account but never authorize p
     assert.equal(result.finalActionsEnabled,false);
     assert.equal(result.checkoutVerified,false);
     assert.equal(result.currentSourceContentVerified,false);
+    assert.equal(result.testOnly,false);
+    const qaPayload={...payload,subject:'NEW LT FILING - QA AUTO acceptance - complete'};
+    const qaJob={...job,payload:qaPayload,result:{...job.result,savedBundleEvidence:{...job.result!.savedBundleEvidence as any,
+        packageDigest:preparationDigest(qaPayload,sources)}}};
+    const qaChecks=filingReleaseChecks(qaJob,account);
+    assert.equal(qaChecks.savedBundleVerified,true);
+    assert.equal(qaChecks.testOnly,true);
+    assert.equal(qaChecks.finalActionsEnabled,false);
     assert.equal(filingReleaseChecks(job,{...account,username:'primary@example.com'}).sameAccount,false);
     assert.equal(filingReleaseChecks({...job,result:{}},account).savedBundleVerified,false);
     assert.equal(filingReleaseChecks({...job,payload:{...payload,courtName:'Changed Court'}},account).savedBundleVerified,false);

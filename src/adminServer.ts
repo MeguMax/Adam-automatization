@@ -50,7 +50,7 @@ import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-27-saved-form-readback-v55';
+const ADMIN_BUILD_ID = '2026-10-27-release-review-v56';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4590,7 +4590,8 @@ const html = String.raw`<!doctype html>
           return '<div class="draft-overview-file' + (attention ? ' needs-review' : '') + '">' +
             icon(attention ? 'circle-alert' : 'file-check-2') + '<span>' +
             escapeHtml(statusLabel(doc.packageRole || doc.documentType || 'Document')) +
-            '<small>' + escapeHtml(doc.filingType || 'Filing type not assigned') +
+            '<small>' + escapeHtml(doc.filingRelation === 'connected_to_complaint' ? 'Connected to Complaint' :
+              doc.filingType || 'Filing type not assigned') +
             (doc.formTemplate ? ' · Form library' : '') +
             (doc.requiredForFiling === false ? ' · Excluded' : '') + '</small></span>' +
             '<button type="button" class="icon-button" data-preview-draft-document="' + escapeHtml(doc.id) +
@@ -4694,6 +4695,7 @@ const html = String.raw`<!doctype html>
         '</div>' +
         progressMarkup +
         (job.status === 'prepared' && job.releaseChecks ? '<details class="draft-optional" data-release-checks' + (releaseWasOpen ? ' open' : '') + '><summary>Before court submission</summary><div class="draft-filing-job-meta">' +
+          (job.releaseChecks.testOnly ? '<strong>QA test package: Do not submit to court</strong>' : '') +
           '<span>Saved bundle: ' + (job.releaseChecks.savedBundleVerified ? 'Reopened and checked' : 'No automatic readback recorded') + '</span>' +
           '<span>Source PDF fingerprints: ' + (job.releaseChecks.sourceSnapshotPinned ? 'Recorded at preparation' : 'Not recorded') + '</span>' +
           '<span>Current account: ' + (job.releaseChecks.sameAccount ? 'Matches prepared bundle' : 'Needs verification') + '</span>' +
