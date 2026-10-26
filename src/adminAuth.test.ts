@@ -2,20 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { createAdminAuth } from './adminAuth';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { createAdminAuth, type AdminSessionStore } from './adminAuth';
+import { WorkflowDatabase } from './database';
 
-async function fixture(run: (base: string, advance: (ms: number) => void) => Promise<void>, production = false) {
+async function fixture(run: (base: string, advance: (ms: number) => void, restart: () => void) => Promise<void>,
+    production = false, store?: () => AdminSessionStore) {
     const saved = { ADMIN_USERNAME: process.env.ADMIN_USERNAME, ADMIN_PASSWORD: process.env.ADMIN_PASSWORD, NODE_ENV: process.env.NODE_ENV };
     Object.assign(process.env, { ADMIN_USERNAME: 'admin', ADMIN_PASSWORD: 'test-password', NODE_ENV: production ? 'production' : 'test' });
     let clock = Date.now();
-    const auth = createAdminAuth(() => clock);
+    let auth = createAdminAuth(() => clock, store?.());
     const server = http.createServer(async (req, res) => {
         if (await auth(req, res, new URL(req.url!, 'http://localhost').pathname)) res.end('protected');
     });
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    try { await run(base, ms => { clock += ms; }); }
+    try { await run(base, ms => { clock += ms; }, () => { auth = createAdminAuth(() => clock, store?.()); }); }
     finally {
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });
         for (const [key, value] of Object.entries(saved)) {
@@ -99,3 +106,45 @@ test('production uses Secure cookies and limits login attempts', async () => fix
     advance(60_001);
     assert.equal((await login(base, 'test-password', origin)).status, 200);
 }, true));
+
+test('SQLite sessions survive a restart without storing reusable tokens and retain logout, expiry and credential revocation', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'admin-session-qa-'));
+    const filename = path.join(directory, 'workflow.sqlite');
+    let db = new WorkflowDatabase(filename);
+    try {
+        await fixture(async (base, advance, restart) => {
+            const token = (await login(base)).headers.get('set-cookie')!.split(';')[0];
+            const rawToken = token.slice(token.indexOf('=') + 1);
+            const inspection = new DatabaseSync(filename, { readOnly: true });
+            try {
+                const rows = inspection.prepare('SELECT * FROM admin_sessions').all();
+                assert.equal(rows.length, 1);
+                assert.equal(rows[0].token_hash, createHash('sha256').update(rawToken).digest('hex'));
+                assert.ok(!JSON.stringify(rows).includes(rawToken));
+                assert.ok(!JSON.stringify(rows).includes('test-password'));
+            } finally { inspection.close(); }
+            db.close(); db = new WorkflowDatabase(filename); restart();
+            assert.equal((await fetch(base + '/api/summary', { headers: { Cookie: token } })).status, 200);
+            const storedHash = createHash('sha256').update(rawToken).digest('hex');
+            assert.equal((await fetch(base + '/api/summary', { headers: { Cookie: 'legal_admin_session=' + storedHash } })).status, 401);
+            assert.equal((await fetch(base + '/api/change', { method: 'POST', headers: { Cookie: token, Origin: 'https://untrusted.example' } })).status, 403);
+            await fetch(base + '/auth/logout', { method: 'POST', headers: { Cookie: token, Origin: base } });
+            db.close(); db = new WorkflowDatabase(filename); restart();
+            assert.equal((await fetch(base + '/api/summary', { headers: { Cookie: token } })).status, 401);
+            const expiring = (await login(base)).headers.get('set-cookie')!.split(';')[0];
+            advance(12 * 60 * 60 * 1000 + 1);
+            db.close(); db = new WorkflowDatabase(filename); restart();
+            assert.equal((await fetch(base + '/api/summary', { headers: { Cookie: expiring } })).status, 401);
+            const revoked = (await login(base)).headers.get('set-cookie')!.split(';')[0];
+            process.env.ADMIN_PASSWORD = 'changed-password';
+            db.close(); db = new WorkflowDatabase(filename); restart();
+            assert.equal((await fetch(base + '/api/summary', { headers: { Cookie: revoked } })).status, 401);
+            process.env.ADMIN_PASSWORD = 'test-password';
+            restart();
+            assert.equal((await fetch(base + '/api/summary', { headers: { Cookie: revoked } })).status, 401);
+        }, false, () => db.getAdminSessionStore());
+    } finally {
+        db.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});

@@ -4,6 +4,35 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 const COOKIE = 'legal_admin_session';
 const SESSION_MS = 12 * 60 * 60 * 1000;
 
+export interface AdminSession {
+    expires: number;
+    version: string;
+}
+
+export interface AdminSessionStore {
+    get(tokenHash: string): AdminSession | undefined;
+    set(tokenHash: string, session: AdminSession): void;
+    delete(tokenHash: string): void;
+    prune(now: number, keep: number): void;
+}
+
+function memorySessions(): AdminSessionStore {
+    const sessions = new Map<string, AdminSession>();
+    return {
+        get: key => sessions.get(key),
+        set: (key, value) => { sessions.set(key, value); },
+        delete: key => { sessions.delete(key); },
+        prune: (time, keep) => {
+            for (const [key, value] of sessions) if (value.expires <= time) sessions.delete(key);
+            while (sessions.size > keep) sessions.delete(sessions.keys().next().value!);
+        },
+    };
+}
+
+function tokenHash(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+}
+
 export function hasAdminCredentials(): boolean {
     return Boolean(process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD);
 }
@@ -20,8 +49,8 @@ export function credentialsMatch(username: unknown, password: unknown): boolean 
     return userMatches && passwordMatches;
 }
 
-function credentialVersion(): string {
-    return createHash('sha256').update(JSON.stringify([process.env.ADMIN_USERNAME, process.env.ADMIN_PASSWORD])).digest('hex');
+function credentialVersion(sessionHash: string): string {
+    return createHash('sha256').update(JSON.stringify([process.env.ADMIN_USERNAME, process.env.ADMIN_PASSWORD, sessionHash])).digest('hex');
 }
 
 function sessionToken(req: http.IncomingMessage): string {
@@ -105,18 +134,22 @@ async function readLogin(req: http.IncomingMessage): Promise<unknown> {
     });
 }
 
-export function createAdminAuth(now: () => number = Date.now) {
-    const sessions = new Map<string, { expires: number; version: string }>();
+export function createAdminAuth(now: () => number = Date.now, sessions: AdminSessionStore = memorySessions()) {
     let attempts = 0;
     let windowStart = now();
+    let lastPruned = 0;
 
     // Return true only when the protected route may continue.
     return async (req: http.IncomingMessage, res: http.ServerResponse, pathname: string): Promise<boolean> => {
         const time = now();
-        for (const [token, session] of sessions) if (session.expires <= time) sessions.delete(token);
-        const token = sessionToken(req);
+        if (time - lastPruned >= 60_000 || time < lastPruned) {
+            sessions.prune(time, 1000);
+            lastPruned = time;
+        }
+        const token = tokenHash(sessionToken(req));
         const session = sessions.get(token);
-        const validSession = session?.version === credentialVersion();
+        const validSession = Boolean(session && session.expires > time && session.version === credentialVersion(token));
+        if (session && !validSession) sessions.delete(token);
         let validBasic = false;
         const basic = req.headers.authorization;
         if (basic?.startsWith('Basic ')) {
@@ -151,10 +184,11 @@ export function createAdminAuth(now: () => number = Date.now) {
                 json(res, 401, { error: 'Incorrect username or password.' });
                 return false;
             }
-            if (token) sessions.delete(token);
-            if (sessions.size >= 1000) sessions.delete(sessions.keys().next().value!);
+            sessions.delete(token);
+            sessions.prune(time, 999);
             const newToken = randomBytes(32).toString('hex');
-            sessions.set(newToken, { expires: time + SESSION_MS, version: credentialVersion() });
+            const newHash = tokenHash(newToken);
+            sessions.set(newHash, { expires: time + SESSION_MS, version: credentialVersion(newHash) });
             res.setHeader('Set-Cookie', cookie(newToken, SESSION_MS / 1000));
             json(res, 200, { ok: true });
             return false;

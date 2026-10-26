@@ -6,7 +6,7 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
 - Use the Render Professional tier. In `render.yaml`, its valid Blueprint value is `pro`. SQLite requires the persistent disk and must run in one service instance.
 - Keep exactly one active worker. Disable the old Render worker before enabling the new one.
-- The public admin uses a login page at `/login` with `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Choose a long unique password. Browser sessions use HttpOnly, Secure, SameSite cookies and expire after 12 hours or a service restart. Changing the credentials invalidates existing sessions. Explicit Basic Auth headers remain supported for API clients, but the server no longer opens a browser authentication popup.
+- The public admin uses a login page at `/login` with `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Choose a long unique password. Browser sessions use HttpOnly, Secure, SameSite cookies and expire after 12 hours. Session hashes are stored in persistent SQLite so a service restart or deployment does not sign users out. Signing out revokes the session; changing the credentials invalidates existing sessions. Passwords and reusable session tokens are not stored in the session table. Sessions created before this update require one new login. Explicit Basic Auth headers remain supported for API clients, but the server no longer opens a browser authentication popup.
 
 ## First Deployment
 

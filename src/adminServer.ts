@@ -48,7 +48,7 @@ import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-26-mifile-case-type-readiness-v46';
+const ADMIN_BUILD_ID = '2026-10-26-persistent-admin-sessions-v47';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -7158,7 +7158,7 @@ export function createAdminServer(
     };
 
     let accountTestRunning = false;
-    const authorize = createAdminAuth();
+    const authorize = createAdminAuth(Date.now, db.getAdminSessionStore());
     const excelPdf = createExcelPdfHandler();
     const server = http.createServer(async (req, res) => {
         try {

@@ -2507,6 +2507,13 @@ const migrations: Migration[] = [
                         WHERE newer.case_draft_id = j.case_draft_id AND newer.attempt_number > j.attempt_number))`).run(timestamp);
         },
     },
+    {
+        version: 27,
+        name: 'persistent_admin_sessions',
+        up: db => db.exec(`CREATE TABLE admin_sessions (
+            token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, credential_version TEXT NOT NULL
+        ); CREATE INDEX idx_admin_session_expiry ON admin_sessions(expires_at);`),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2524,6 +2531,28 @@ export class WorkflowDatabase {
 
     getPath(): string {
         return this.databasePath;
+    }
+
+    getAdminSessionStore(): import('./adminAuth').AdminSessionStore {
+        return {
+            get: tokenHash => {
+                const row = this.db.prepare('SELECT expires_at, credential_version FROM admin_sessions WHERE token_hash = ?')
+                    .get(tokenHash) as { expires_at: number; credential_version: string } | undefined;
+                return row ? { expires: row.expires_at, version: row.credential_version } : undefined;
+            },
+            set: (tokenHash, session) => {
+                this.db.prepare(`INSERT INTO admin_sessions(token_hash, expires_at, credential_version) VALUES (?, ?, ?)
+                    ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at, credential_version = excluded.credential_version`)
+                    .run(tokenHash, session.expires, session.version);
+            },
+            delete: tokenHash => { this.db.prepare('DELETE FROM admin_sessions WHERE token_hash = ?').run(tokenHash); },
+            prune: (time, keep) => {
+                this.db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').run(time);
+                this.db.prepare(`DELETE FROM admin_sessions WHERE token_hash IN
+                    (SELECT token_hash FROM admin_sessions ORDER BY expires_at DESC, token_hash DESC LIMIT -1 OFFSET ?)`)
+                    .run(keep);
+            },
+        };
     }
 
     getKnownCourtNames(): string[] {
