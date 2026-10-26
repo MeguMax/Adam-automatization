@@ -64,7 +64,7 @@ The stored source hashes identify the bytes used during preparation; they do not
 
 Controlled intake subjects starting with `NEW LT FILING - QA` are exposed as `testOnly` in release checks and visibly marked Do not submit to court. These fictional acceptance fixtures must not enter a future payment/submission rollout. The Review document summary displays Connected to Complaint when that relationship is selected, rather than misleadingly displaying its fallback Other label.
 
-The PDF preview starts navigation after its iframe is connected to the visible workspace. A load that remains at `about:blank` is retried once for that exact selected PDF; normal refreshes preserve the preview, and authentication/cross-origin failures are not bypassed. Browser smoke coverage includes opening a populated Prepared Draft from a fresh page and a deliberately blanked preview, with nonblank canvas checks on desktop and mobile layouts.
+The PDF preview starts navigation after its iframe is connected to the visible workspace. A load that remains at `about:blank` is retried once for that exact selected PDF, with a five-second fallback if no usable load event arrives. Normal refreshes preserve the preview, and authentication/cross-origin failures are not bypassed. Browser smoke coverage includes opening a populated Prepared Draft from a fresh page and a deliberately blanked preview with its load event suppressed, with nonblank canvas checks on desktop and mobile layouts.
 
 ### Remaining court-submission gate
 

@@ -50,7 +50,7 @@ import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-27-initial-preview-v57';
+const ADMIN_BUILD_ID = '2026-10-27-preview-watchdog-v58';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -5670,7 +5670,7 @@ const html = String.raw`<!doctype html>
             '/preview?v=' + encodeURIComponent(activeDocument.updatedAt || '');
           const frame = window.document.createElement('iframe');
           frame.title = activeDocument.currentFilename || activeDocument.documentType || 'PDF document';
-          frame.addEventListener('load', () => {
+          const recoverBlank = () => {
             if (!frame.isConnected || viewer.dataset.previewKey !== previewKey || frame.dataset.blankRecovered) return;
             try {
               if (frame.contentDocument && frame.contentDocument.URL === 'about:blank') {
@@ -5678,11 +5678,13 @@ const html = String.raw`<!doctype html>
                 frame.src = previewUrl;
               }
             } catch { /* Cross-origin/auth failures are not overridden. */ }
-          });
+          };
+          frame.addEventListener('load', recoverBlank);
           viewer.replaceChildren(frame);
           viewer.dataset.previewKey = previewKey;
           // Start navigation only after the browsing context is connected.
           frame.src = previewUrl;
+          setTimeout(recoverBlank, 5_000);
         }
       } else {
         delete viewer.dataset.previewKey;

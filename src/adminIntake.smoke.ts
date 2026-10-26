@@ -538,12 +538,13 @@ async function main() {
             const recovered = fresh.waitForEvent('framenavigated', {predicate:frame=>frame.url().includes('/api/documents/'+lockedDocument.id+'/preview')});
             await fresh.locator('#draftPdfViewer iframe').evaluate(frame=>{
                 delete (frame as HTMLElement).dataset.blankRecovered;
+                frame.addEventListener('load',event=>event.stopImmediatePropagation(),{once:true,capture:true});
                 (frame as HTMLIFrameElement).src='about:blank';
             });
             await recovered;
             await pdf.locator('canvas').waitFor({state:'visible'});
             await pdf.locator('#message').waitFor({state:'hidden'});
-            assert.equal(await nonblank(),true,'A stalled blank preview recovers once without changing the selected PDF');
+            assert.equal(await nonblank(),true,'A stalled blank preview recovers once even without a usable load event');
             await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-desktop.png'),fullPage:true});
             await fresh.setViewportSize({width:390,height:844});
             await fresh.waitForFunction(()=>{
