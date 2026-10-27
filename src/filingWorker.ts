@@ -44,7 +44,12 @@ export async function runFilingWorker(options: {
                 const {result,account} = await runner.inspect(inspection,job);
                 db.checkout().complete(inspection.id,result,account);
             } catch (error) {
-                db.checkout().fail(inspection.id, error instanceof Error ? error.message : 'MiFILE inspection failed.');
+                const message = error instanceof Error ? error.message : 'MiFILE inspection failed.';
+                const diagnostic = /\b(?:locator|page|browser|frame)\.|strict mode violation|Timeout \d+ms/i.test(message);
+                if (diagnostic) console.error(`[MiFILE checkout ${inspection.id}] Browser inspection could not complete:`,
+                    message.split('Call log:')[0].slice(0,500));
+                db.checkout().fail(inspection.id, diagnostic ?
+                    'MiFILE could not be read reliably. No payment or court submission was attempted. Refresh the check; contact support if it repeats.' : message);
             }
             continue;
         }

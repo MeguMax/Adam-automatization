@@ -181,3 +181,21 @@ test('unrecognized checkout notices are not accepted',async()=>{
         assert.equal(await page.evaluate(()=>Boolean((window as any).accepted)),false);
     } finally{await page.close();}
 });
+test('live nested MiFILE warning and checkout dialogs resolve to their inner content only',async()=>{
+    const {openCheckoutForInspection,readCheckoutForInspection}=require('./mifileCheckoutRunner') as typeof import('./mifileCheckoutRunner');
+    const page=await browser.newPage();
+    try {
+        await page.setContent(`<button onclick="document.getElementById('warning').hidden=false">Next</button>
+            <div role="dialog" id="warning" hidden><div role="dialog"><h3>Case Initiation Warning</h3>
+            <p>After submitting, you will no longer be able to file documents to this case until a case number has been assigned.</p>
+            <p>If you would like to file additional documents to this case immediately, please cancel and add them now.</p>
+            <button onclick="document.getElementById('warning').hidden=true;document.getElementById('checkout').hidden=false">Continue</button></div></div>
+            <div role="dialog" id="checkout" hidden><div role="dialog"><h3>Checkout</h3><table aria-label="Fees"><tbody>
+            ${fees.map(row=>'<tr><td>'+row[0]+'</td><td>'+row[1]+'</td></tr>').join('')}</tbody></table>
+            <fieldset><legend>Available Payment Accounts</legend></fieldset><p>No payment methods exist for your account.</p>
+            <button onclick="window.paid=true">Submit</button><button onclick="document.getElementById('checkout').hidden=true">Cancel</button></div></div>`);
+        await openCheckoutForInspection(page);
+        assert.equal((await readCheckoutForInspection(page)).rows.length,5);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);
+    }finally{await page.close();}
+});

@@ -18,8 +18,8 @@ export function getCheckoutAccount(): CheckoutAccount {
 // This allow-list contains navigation only. No payment, waiver or submission control is used.
 export async function openCheckoutForInspection(page: Page): Promise<void> {
     await page.getByRole('button', {name:'Next', exact:true}).click();
-    const checkout = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Checkout', exact:true})});
-    const warning = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Case Initiation Warning', exact:true})});
+    const checkout = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Checkout', exact:true})}).last();
+    const warning = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Case Initiation Warning', exact:true})}).last();
     await checkout.or(warning).first().waitFor({state:'visible'});
     if (!await checkout.isVisible()) {
         const text = (await warning.innerText()).replace(/\s+/g, ' ');
@@ -35,7 +35,7 @@ export async function openCheckoutForInspection(page: Page): Promise<void> {
 export async function readCheckoutForInspection(page: Page): Promise<{
     rows: string[][]; method: {state:CheckoutQuote['paymentMethodState']; fingerprint:string|null}
 }> {
-    const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Checkout', exact:true})});
+    const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Checkout', exact:true})}).last();
     const rows = await dialog.getByRole('table', {name:'Fees', exact:true}).locator('tbody tr').evaluateAll(elements =>
         elements.filter(element => element.getClientRects().length > 0).map(element =>
             Array.from(element.children).map(cell => (cell as HTMLElement).innerText.trim())));
@@ -75,7 +75,7 @@ export class MiFileCheckoutRunner {
                 const snapshot = await readCheckoutForInspection(page);
                 const quote = buildCheckoutQuote(job, account, snapshot.rows, snapshot.method,
                     source.packageDigest, source.sourceFeeSubtotalCents);
-                const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})});
+                const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})}).last();
                 await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
                 await dialog.waitFor({state:'hidden'});
                 result = {kind:'quote',quote};
