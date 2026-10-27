@@ -49,12 +49,14 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     const checkedAt = new Date().toISOString();
     if (!job.externalBundleId || typeof job.result?.url !== 'string') throw new Error('The saved bundle reference is missing.');
     const url = new URL(job.result.url);
-    if (url.origin !== 'https://mifile.courts.michigan.gov' ||
+    if (url.origin !== 'https://mifile.courts.michigan.gov' || url.username || url.password || url.search || url.hash ||
         url.pathname !== '/filing/create/' + job.externalBundleId) throw new Error('The saved MiFILE reference is not trusted.');
     await page.goto(url.href, {waitUntil:'domcontentloaded'});
     await page.locator('#documentTable').waitFor({state:'visible',timeout:15_000}).catch(() => {});
     await dismissMifilePreparationNotice(page);
-    if (await page.locator('#documentTable').isVisible() &&
+    if (page.url() === url.href && await page.locator('#documentTable').isVisible() &&
+        await page.getByRole('button',{name:'Save Progress',exact:true}).isVisible() &&
+        await page.getByRole('button',{name:'Save Progress',exact:true}).isEnabled() &&
         (await page.getByRole('banner').innerText()).toLowerCase().includes(account.username) &&
         (await page.locator('main').innerText()).includes(job.temporaryCaseNumber || '\u0000')) {
         return {kind:'receipts', state:'unsubmitted', checkedAt, issue:null, observations:[{
@@ -104,6 +106,7 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
         }
     }
     return {kind:'receipts',observations,state:observations.length ? 'found' : 'inconclusive',checkedAt,
-        issue:observations.length ? 'Status observed. An exact transaction receipt has not been verified; check MiFILE Status Updates.' :
+        issue:observations.some(item => item.kind === 'payment' || item.kind === 'refund') ? null : observations.length ?
+            'Status observed. An exact transaction receipt has not been verified; check MiFILE Status Updates.' :
             'The bundle could not be matched to a receipt with an exact reference. Check MiFILE History before any payment retry.'};
 }

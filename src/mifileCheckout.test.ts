@@ -8,7 +8,7 @@ import {WorkflowDatabase,type FilingJobView,type FilingPayload} from './database
 import {preparationDigest} from './mifilePreparationEvidence';
 import {buildCheckoutQuote,checkoutReviewIssues,digest,FINAL_MIFILE_ACTIONS_ENABLED,quoteDigest,
     receiptSummary,validateReceipt,type CheckoutAccount,type MiFileReceiptObservation} from './mifileCheckout';
-import {parseMiFileReceiptFields,parseMiFileReceiptPdf} from './mifileReceipts';
+import {parseMiFileReceiptFields,parseMiFileReceiptPdf,collectReceiptObservations} from './mifileReceipts';
 import {testPdfFixture} from './testPdfFixture';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
@@ -198,4 +198,29 @@ test('live nested MiFILE warning and checkout dialogs resolve to their inner con
         assert.equal((await readCheckoutForInspection(page)).rows.length,5);
         assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);
     }finally{await page.close();}
+});
+test('receipt collector recognizes only the exact editable saved bundle as Unsubmitted, never as Paid',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:`<header>${account.username}</header>
+            <main>Case Number: TEMP-QA<table id="documentTable"><tr><td>Complaint.pdf</td></tr></table><button>Save Progress</button></main>`}));
+        const result=await collectReceiptObservations(page,job,account);
+        assert.equal(result.kind,'receipts');
+        if(result.kind!=='receipts') throw new Error('Wrong fixture result');
+        assert.equal(result.state,'unsubmitted');
+        assert.equal(receiptSummary(result.observations).paymentReported,false);
+        assert.equal(result.observations[0].bundleId,job.externalBundleId);
+        assert.deepEqual(receiptSummary(result.observations).courtFiledDocumentIds,[]);
+    }finally{await page.close();}
+});
+test('checkout waits for asynchronous fee calculation instead of freezing the initial zero total',async()=>{
+    const {readVerifiedCheckoutQuote}=require('./mifileCheckoutRunner') as typeof import('./mifileCheckoutRunner');
+    const page=await browser.newPage(),job=prepared();
+    try {
+        await page.setContent(`<div role="dialog"><h3>Checkout</h3><table aria-label="Fees"><tbody><tr><td>Total</td><td>$0.00</td></tr></tbody></table>
+            <fieldset><legend>Available Payment Accounts</legend></fieldset><p>No payment methods exist for your account.</p>
+            <script>setTimeout(()=>document.querySelector('tbody').innerHTML=${JSON.stringify(fees.map(row=>'<tr><td>'+row[0]+'</td><td>'+row[1]+'</td></tr>').join(''))},750)</script></div>`);
+        const result=await readVerifiedCheckoutQuote(page,job,account,{packageDigest:(job.result!.savedBundleEvidence as any).packageDigest,sourceFeeSubtotalCents:10300});
+        assert.equal(result.totalCents,12669);
+    } finally{await page.close();}
 });

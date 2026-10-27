@@ -48,6 +48,27 @@ export async function readCheckoutForInspection(page: Page): Promise<{
         ? {state:'selected', fingerprint:digest(tokens[0])} : {state:'not_selected',fingerprint:null}};
 }
 
+export async function readVerifiedCheckoutQuote(page: Page, job: FilingJobView, account: CheckoutAccount,
+    source: {packageDigest:string;sourceFeeSubtotalCents:number}): Promise<CheckoutQuote> {
+    const deadline = Date.now()+15_000;
+    let signature = '', stableSince = 0;
+    let lastError: unknown = new Error('Checkout fees did not finish loading.');
+    do {
+        const snapshot = await readCheckoutForInspection(page);
+        try {
+            const quote = buildCheckoutQuote(job,account,snapshot.rows,snapshot.method,source.packageDigest,source.sourceFeeSubtotalCents);
+            const current = digest(snapshot);
+            if (signature === current && Date.now()-stableSince >= 500) return quote;
+            if (signature !== current) { signature=current;stableSince=Date.now(); }
+        } catch(error) {
+            if (!(error instanceof Error) || !error.message.includes('does not reconcile')) throw error;
+            signature=''; lastError=error;
+        }
+        await page.waitForTimeout(250);
+    } while(Date.now()<deadline);
+    throw lastError;
+}
+
 export class MiFileCheckoutRunner {
     constructor(private progress: (stage:string) => void = () => {}) {}
 
@@ -72,9 +93,7 @@ export class MiFileCheckoutRunner {
                 const source = await runner.inspectSavedForCheckout(page, job, account);
                 this.progress('reading_checkout');
                 await openCheckoutForInspection(page);
-                const snapshot = await readCheckoutForInspection(page);
-                const quote = buildCheckoutQuote(job, account, snapshot.rows, snapshot.method,
-                    source.packageDigest, source.sourceFeeSubtotalCents);
+                const quote = await readVerifiedCheckoutQuote(page, job, account, source);
                 const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})}).last();
                 await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
                 await dialog.waitFor({state:'hidden'});

@@ -110,7 +110,11 @@ export function buildCheckoutQuote(job: FilingJobView, account: CheckoutAccount,
         lines.reduce((sum, line) => sum + line.cents, 0) !== totalCents ||
         lines.filter(line => ['Filing Fee', 'Additional Payment'].includes(line.label))
             .reduce((sum, line) => sum + line.cents, 0) !== sourceFeeSubtotalCents) {
-        throw new Error('Checkout does not reconcile with its fee rows and the verified bundle.');
+        const componentTotal = lines.reduce((sum,line) => sum + line.cents,0);
+        const filingSubtotal = lines.filter(line => ['Filing Fee','Additional Payment'].includes(line.label)).reduce((sum,line) => sum + line.cents,0);
+        throw new Error('Checkout does not reconcile: displayed total ' + String(totalCents) +
+            ' cents, fee components ' + componentTotal + ' cents, filing/additional fees ' + filingSubtotal +
+            ' cents, verified bundle fees ' + sourceFeeSubtotalCents + ' cents. No amount was confirmed.');
     }
     if (method.state === 'selected' && !/^[a-f0-9]{64}$/.test(method.fingerprint || '')) {
         throw new Error('The selected payment method could not be identified safely.');

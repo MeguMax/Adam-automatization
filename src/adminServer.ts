@@ -51,7 +51,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-27-checkout-dialog-v60';
+const ADMIN_BUILD_ID = '2026-10-27-checkout-receipts-v61';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2365,7 +2365,7 @@ const html = String.raw`<!doctype html>
     .checkout-fees { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 7px 16px; margin: 4px 0; max-width: 460px; }
     .checkout-fees dt, .checkout-fees dd { margin: 0; }
     .checkout-fees dd { text-align: right; font-variant-numeric: tabular-nums; }
-    .checkout-fees .checkout-total { border-top: 1px solid var(--border); padding-top: 8px; font-weight: 600; color: var(--text); }
+    .checkout-fees .checkout-total { border-top: 1px solid var(--line); padding-top: 8px; font-weight: 600; color: var(--text); }
     [data-checkout-review] .draft-filing-job-actions { margin-top: 12px; }
     .draft-filing-job-error {
       margin-top: 8px;
