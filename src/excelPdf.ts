@@ -118,7 +118,7 @@ export async function generateExcelPdf(formId: unknown, input: unknown, python =
 
 function publicAsset(res: http.ServerResponse, filename: string, type: string): void {
     res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://appsforoffice.microsoft.com; style-src 'self'; img-src 'self' data:; font-src 'self' blob:; worker-src 'self' blob:; connect-src 'self' https://appsforoffice.microsoft.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self' https://*.officeapps.live.com https://*.office.com https://*.microsoft365.com https://*.cloud.microsoft https://*.sharepoint.com" });
+        'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://appsforoffice.microsoft.com; style-src 'self'; img-src 'self' data:; font-src 'self' blob:; worker-src 'self' blob:; connect-src 'self' https://appsforoffice.microsoft.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self' https://onedrive.live.com https://*.officeapps.live.com https://*.office.com https://*.microsoft365.com https://*.cloud.microsoft https://*.sharepoint.com" });
     res.end(fs.readFileSync(filename));
 }
 

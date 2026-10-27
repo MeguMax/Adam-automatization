@@ -91,6 +91,11 @@ across desktop and web, Adam's Microsoft 365 administrator can deploy the custom
 add-in through the Microsoft 365 admin center. Windows shared-folder sideloading
 is a testing option, not the production deployment method.
 
+Personal OneDrive's browser editor has two ancestor origins: `onedrive.live.com`
+and `excel.officeapps.live.com`. The public `/excel/*` shell allows both explicitly
+in its framing policy; it does not allow arbitrary `*.live.com` hosts. This policy
+does not apply to the main admin sign-in, which continues to reject framing.
+
 Official installation references:
 - https://learn.microsoft.com/en-us/office/dev/add-ins/testing/sideload-office-add-ins-for-testing
 - https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-deployment-of-add-ins
@@ -123,6 +128,21 @@ The first installation in Adam's Microsoft 365 tenant and Excel Online has not
 been verified yet. Automated browser QA uses an explicitly simulated Office API;
 it is separate from the native Windows checks and does not establish tenant or
 web-host compatibility. Optional OneDrive delivery must be configured separately.
+
+On 2026-10-28 the v66 pane was refreshed in Windows desktop Excel and signed in
+again before testing. DC105, both DC508 pages and MC202 were generated and
+downloaded for the second fictional case. **Back to form** kept the sign-in.
+Selecting the first case cleared the previous preview; MC202 regenerated and
+downloaded with the first case's values without reopening the pane. All four
+downloads passed canonical/widget value, checkbox state, editable-field and
+appearance checks (126 fields / five pages), followed by local visual review.
+The test changed selection only, not workbook data. This run is separate from
+the earlier native formula-edit test and from Excel Online verification.
+
+An already-open Office task pane keeps its loaded frontend through a server
+deployment. Before testing a new frontend, right-click inside the panel and use
+**Reload** (or close and reopen the pane), then sign in again. A successful PDF
+from the new server alone does not prove the panel's frontend was refreshed.
 
 ## Runtime and tests
 

@@ -162,6 +162,9 @@ test('Excel shell supports Office framing but never exposes templates or general
     const csp = shell.headers.get('content-security-policy')!;
     assert.ok(csp.includes('https://appsforoffice.microsoft.com'));
     assert.ok(csp.includes('https://*.officeapps.live.com'));
+    assert.ok(csp.includes('https://onedrive.live.com'));
+    assert.ok(!csp.includes('https://*.live.com'));
+    assert.equal(shell.headers.get('x-frame-options'),null);
     assert.ok(!csp.includes('unsafe-inline'));
     for (const asset of ['app.js', 'row.js', 'workbook.js', 'commands.html', 'commands.js', 'style.css', 'icon.png', 'icon-16.png', 'icon-32.png', 'icon-80.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
     assert.equal((await fetch(base + '/excel/pdfjs/standard_fonts/nonexistent')).status, 404);

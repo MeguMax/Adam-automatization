@@ -56,6 +56,25 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             else if (route.request().url().startsWith(base)) await route.continue();
             else await route.abort();
         });
+        // Exercise real browser ancestor checks without contacting Microsoft or a live workbook.
+        const framedPage = await browser.newPage();
+        const qaPaneOrigin = 'https://devlin-excel.example.test';
+        await framedPage.route('**/*', async route => {
+            const url = route.request().url();
+            if (url === 'https://onedrive.live.com/devlin-qa') {
+                await route.fulfill({contentType:'text/html',body:'<iframe src="https://excel.officeapps.live.com/devlin-qa"></iframe>'});
+            } else if (url === 'https://excel.officeapps.live.com/devlin-qa') {
+                await route.fulfill({contentType:'text/html',body:'<iframe src="'+qaPaneOrigin+'/excel/"></iframe>'});
+            } else if (url.startsWith(qaPaneOrigin+'/')) {
+                const source = await route.fetch({url:base+new URL(url).pathname});
+                await route.fulfill({response:source});
+            } else if (url.startsWith('https://appsforoffice.microsoft.com/')) {
+                await route.fulfill({contentType:'text/javascript',body:fake});
+            } else await route.abort();
+        });
+        await framedPage.goto('https://onedrive.live.com/devlin-qa');
+        await framedPage.frameLocator('iframe').frameLocator('iframe').getByRole('heading',{name:'Sign in',exact:true}).waitFor({state:'visible'});
+        await framedPage.close();
         await page.goto(base + '/excel/');
         await page.screenshot({ path: path.join(output, 'sign-in.png') });
         await page.fill('#username', 'excel-qa'); await page.fill('#password', 'excel-qa-only'); await page.click('#login');
