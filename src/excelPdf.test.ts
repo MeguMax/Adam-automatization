@@ -160,10 +160,30 @@ test('Excel shell supports Office framing but never exposes templates or general
     assert.ok(csp.includes('https://appsforoffice.microsoft.com'));
     assert.ok(csp.includes('https://*.officeapps.live.com'));
     assert.ok(!csp.includes('unsafe-inline'));
-    for (const asset of ['app.js', 'row.js', 'workbook.js', 'style.css', 'icon.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
+    for (const asset of ['app.js', 'row.js', 'workbook.js', 'commands.html', 'commands.js', 'style.css', 'icon.png', 'icon-16.png', 'icon-32.png', 'icon-80.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
     assert.equal((await fetch(base + '/excel/pdfjs/standard_fonts/nonexistent')).status, 404);
     assert.equal((await fetch(base + '/excel/templates/dc105.pdf')).status, 404);
     assert.equal((await post(base, 'generate', { form: 'dc105', values: {} }, await login(base))).status, 422);
+}));
+
+test('Excel ribbon opens the task pane without running generation or requiring new permissions', async () => fixture(async base => {
+    const manifest = await (await fetch(base + '/excel/manifest.xml')).text();
+    for (const required of ['<Version>1.2.0.0</Version>', '<OfficeTab id="TabHome">', '<Action xsi:type="ShowTaskpane">',
+        '<TaskpaneId>Devlin.PdfForms.Panel</TaskpaneId>', '<Permissions>ReadWriteDocument</Permissions>']) assert.ok(manifest.includes(required));
+    assert.ok(!manifest.includes('ExecuteFunction'));
+    assert.ok(!manifest.includes('https://localhost'));
+    for (const size of [16, 32, 80]) {
+        const response = await fetch(base + '/excel/icon-' + size + '.png');
+        assert.equal(response.headers.get('content-type'), 'image/png');
+        const metadata = await require('sharp')(Buffer.from(await response.arrayBuffer())).metadata();
+        assert.equal(metadata.width, size); assert.equal(metadata.height, size);
+    }
+    const commands = await (await fetch(base + '/excel/commands.html')).text();
+    assert.ok(commands.includes('/excel/commands.js'));
+    const init = await (await fetch(base + '/excel/commands.js')).text();
+    let calls = 0;
+    require('node:vm').runInNewContext(init, { Office: { onReady: (callback: () => void) => { calls++; callback(); } } });
+    assert.equal(calls, 1);
 }));
 
 test('oversized and malformed JSON requests are rejected without invoking the PDF worker', async () => {

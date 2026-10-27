@@ -18,13 +18,28 @@
     }
     function signedOut() { ++revision; token = ''; selectedData = null; clearResult(); $('workspace').hidden = true; $('signIn').hidden = false; $('logout').hidden = true; controls(); }
     async function api(url, data) {
-        const response = await fetch(url, { method:'POST', credentials:'omit', headers:{'Content-Type':'application/json', ...(token ? { Authorization:'Bearer ' + token } : {})}, body:JSON.stringify(data) });
-        if (!response.ok) {
-            const result = await response.json();
-            if (response.status === 401 && token) signedOut();
-            throw new Error(result.error || 'Request failed.');
-        }
-        return response;
+        const abort = new AbortController();
+        // Include response-body reads in the deadline, not only the HTTP headers.
+        const timer = setTimeout(() => abort.abort(), url === '/excel/generate' ? 45000 : 20000);
+        try {
+            const response = await fetch(url, { method:'POST', credentials:'omit', signal:abort.signal,
+                headers:{'Content-Type':'application/json', ...(token ? { Authorization:'Bearer ' + token } : {})}, body:JSON.stringify(data) });
+            if (!response.ok) {
+                let result;
+                try { result = await response.json(); } catch(error) { if (abort.signal.aborted) throw error; }
+                if (response.status === 401 && token) signedOut();
+                throw new Error(result?.error || (response.status >= 500 ? 'The PDF service is temporarily unavailable. Try again shortly.' : 'Request failed. Please try again.'));
+            }
+            if (url !== '/excel/generate') return await response.json();
+            if (!response.headers.get('content-type')?.includes('application/pdf')) throw new Error('The PDF service returned an unexpected response. Please try again.');
+            const blob = await response.blob();
+            if ((await blob.slice(0,5).text()) !== '%PDF-') throw new Error('The generated PDF is invalid. Please try again.');
+            return blob;
+        } catch(error) {
+            if (abort.signal.aborted) throw new Error('The request timed out. Check your connection, then try again.');
+            if (error instanceof TypeError) throw new Error('Could not reach the PDF service. Check your connection and try again.');
+            throw error;
+        } finally { clearTimeout(timer); }
     }
     async function readSelection(options = {}) {
         if (!officeReady) throw new Error('Excel connection unavailable.');
@@ -73,8 +88,8 @@
     $('loginForm').addEventListener('submit', async event => {
         event.preventDefault(); $('login').disabled = true; message('');
         try {
-            const response = await api('/excel/session', { username:$('username').value, password:$('password').value });
-            token = (await response.json()).token;
+            const session = await api('/excel/session', { username:$('username').value, password:$('password').value });
+            token = session.token;
             $('password').value = ''; $('signIn').hidden = true; $('workspace').hidden = false; $('logout').hidden = false;
             controls(); await refresh();
         } catch(error) { message(error.message); }
@@ -91,8 +106,7 @@
             // Read again here, never reuse a preview snapshot after a worksheet edit.
             const data = await readSelection(); showSelection(data);
             message('', 'Generating PDF...');
-            const response = await api('/excel/generate', { form:data.form, values:data.values });
-            const blob = await response.blob();
+            const blob = await api('/excel/generate', { form:data.form, values:data.values });
             if (!token) return;
             if (generationRevision !== revision) { message('The worksheet changed during generation. Generate the PDF again.'); return; }
             const currentData = await readSelection({recalculate:false});

@@ -114,11 +114,25 @@ export function excelManifest(base = process.env.EXCEL_PDF_PUBLIC_URL || 'https:
     const origin = url.origin.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
     return `<?xml version="1.0" encoding="UTF-8"?>
 <OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="TaskPaneApp">
-<Id>05cdad5d-041d-41c4-b8c9-9c33cf9d7c93</Id><Version>1.1.0.0</Version><ProviderName>Devlin Law PLLC</ProviderName><DefaultLocale>en-US</DefaultLocale>
+<Id>05cdad5d-041d-41c4-b8c9-9c33cf9d7c93</Id><Version>1.2.0.0</Version><ProviderName>Devlin Law PLLC</ProviderName><DefaultLocale>en-US</DefaultLocale>
 <DisplayName DefaultValue="Devlin Law PDF Forms"/><Description DefaultValue="Generate fillable court PDFs from the selected Excel row."/>
 <IconUrl DefaultValue="${origin}/excel/icon.png"/><SupportUrl DefaultValue="${origin}/excel/"/>
 <Hosts><Host Name="Workbook"/></Hosts><Requirements><Sets DefaultMinVersion="1.9"><Set Name="ExcelApi" MinVersion="1.9"/></Sets></Requirements>
-<DefaultSettings><SourceLocation DefaultValue="${origin}/excel/"/></DefaultSettings><Permissions>ReadWriteDocument</Permissions></OfficeApp>`;
+<DefaultSettings><SourceLocation DefaultValue="${origin}/excel/"/></DefaultSettings><Permissions>ReadWriteDocument</Permissions>
+<VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xsi:type="VersionOverridesV1_0">
+<Requirements><bt:Sets DefaultMinVersion="1.1"><bt:Set Name="ExcelApi" MinVersion="1.9"/><bt:Set Name="AddinCommands" MinVersion="1.1"/></bt:Sets></Requirements>
+<Hosts><Host xsi:type="Workbook"><DesktopFormFactor><FunctionFile resid="Devlin.Commands"/>
+<ExtensionPoint xsi:type="PrimaryCommandSurface"><OfficeTab id="TabHome"><Group id="Devlin.PdfForms.Group"><Label resid="Devlin.Group"/>
+<Icon><bt:Image size="16" resid="Devlin.Icon16"/><bt:Image size="32" resid="Devlin.Icon32"/><bt:Image size="80" resid="Devlin.Icon80"/></Icon>
+<Control xsi:type="Button" id="Devlin.PdfForms.Open"><Label resid="Devlin.Button"/><Supertip><Title resid="Devlin.Button"/><Description resid="Devlin.Tooltip"/></Supertip>
+<Icon><bt:Image size="16" resid="Devlin.Icon16"/><bt:Image size="32" resid="Devlin.Icon32"/><bt:Image size="80" resid="Devlin.Icon80"/></Icon>
+<Action xsi:type="ShowTaskpane"><TaskpaneId>Devlin.PdfForms.Panel</TaskpaneId><SourceLocation resid="Devlin.Taskpane"/></Action>
+</Control></Group></OfficeTab></ExtensionPoint></DesktopFormFactor></Host></Hosts>
+<Resources><bt:Images><bt:Image id="Devlin.Icon16" DefaultValue="${origin}/excel/icon-16.png"/><bt:Image id="Devlin.Icon32" DefaultValue="${origin}/excel/icon-32.png"/><bt:Image id="Devlin.Icon80" DefaultValue="${origin}/excel/icon-80.png"/></bt:Images>
+<bt:Urls><bt:Url id="Devlin.Commands" DefaultValue="${origin}/excel/commands.html"/><bt:Url id="Devlin.Taskpane" DefaultValue="${origin}/excel/"/></bt:Urls>
+<bt:ShortStrings><bt:String id="Devlin.Group" DefaultValue="Devlin Law"/><bt:String id="Devlin.Button" DefaultValue="PDF Forms"/></bt:ShortStrings>
+<bt:LongStrings><bt:String id="Devlin.Tooltip" DefaultValue="Open the selected case row and generate a fillable court PDF."/></bt:LongStrings></Resources>
+</VersionOverrides></OfficeApp>`;
 }
 
 export function createExcelPdfHandler(options: { now?: () => number; generate?: typeof generateExcelPdf } = {}) {
@@ -131,6 +145,8 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             '/excel/': ['taskpane.html', 'text/html; charset=utf-8'], '/excel': ['taskpane.html', 'text/html; charset=utf-8'],
             '/excel/app.js': ['app.js', 'text/javascript'], '/excel/row.js': ['row.js', 'text/javascript'],
             '/excel/workbook.js': ['workbook.js', 'text/javascript'],
+            '/excel/commands.html': ['commands.html', 'text/html; charset=utf-8'], '/excel/commands.js': ['commands.js', 'text/javascript'],
+            '/excel/icon-16.png': ['icon-16.png', 'image/png'], '/excel/icon-32.png': ['icon-32.png', 'image/png'], '/excel/icon-80.png': ['icon-80.png', 'image/png'],
             '/excel/style.css': ['style.css', 'text/css'], '/excel/icon.png': ['icon.png', 'image/png'],
         };
         if (req.method === 'GET' && assets[pathname]) {

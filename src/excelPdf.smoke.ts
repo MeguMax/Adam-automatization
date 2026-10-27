@@ -112,13 +112,40 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         page.off('download',rejectDownload);
         await page.evaluate(()=>{const qa=(window as any).qa;qa.sheetName='New case worksheet';qa.rowIndex=3;qa.events[3]();});
         await page.waitForFunction(()=>document.getElementById('selection')?.textContent?.includes('New case worksheet / Row 4'));
+        for (const failure of ['html-error', 'network', 'wrong-type', 'invalid-pdf']) {
+            await page.route('**/excel/generate', async route => {
+                if (failure === 'network') await route.abort('failed');
+                else await route.fulfill({status:failure === 'html-error' ? 502 : 200,
+                    contentType:failure === 'invalid-pdf' ? 'application/pdf' : 'text/html', body:'<html>Not a PDF</html>'});
+            });
+            await page.click('#generate');
+            const expected = failure === 'html-error' ? 'temporarily unavailable' : failure === 'network' ? 'Could not reach' : failure === 'wrong-type' ? 'unexpected response' : 'PDF is invalid';
+            await page.waitForFunction(text=>document.getElementById('error')?.textContent?.includes(text), expected);
+            assert.equal(await page.locator('#generate').isEnabled(), true);
+            assert.equal(await page.locator('#result').isVisible(), false);
+            await page.unroute('**/excel/generate');
+        }
+        await page.clock.install();
+        let release: (() => void) | undefined;
+        await page.route('**/excel/generate', route => new Promise<void>(resolve => {
+            release = () => { route.abort().catch(() => {}).finally(resolve); };
+        }));
+        const stalled = page.waitForRequest(req=>req.url().endsWith('/excel/generate'));
+        await page.click('#generate'); await stalled;
+        await page.clock.fastForward(45_001);
+        await page.clock.resume();
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('request timed out'));
+        release!(); await page.unroute('**/excel/generate');
+        assert.equal(await page.locator('#generate').isEnabled(), true);
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
         assert.equal(overflow, false);
         assert.equal(await page.evaluate(() => localStorage.length), 0);
         await page.click('#logout'); await page.waitForSelector('#signIn:visible');
         assert.equal(await page.locator('#password').inputValue(), '');
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: 3 real fillable PDF downloads, case filenames, nonblank responsive previews, delayed calculation, changed/silent edits during generation, stale-download rejection, new worksheet events, multi-row guard and logout.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: 3 real fillable PDF downloads, case filenames, nonblank responsive previews, delayed calculation, changed/silent edits during generation, stale-download rejection, new worksheet events, network/HTML/invalid-PDF errors, timeout recovery, multi-row guard and logout.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

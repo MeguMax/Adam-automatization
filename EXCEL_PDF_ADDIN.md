@@ -7,6 +7,7 @@ sends email, modifies case records, pays fees or submits a filing.
 
 - Office.js task pane for Microsoft 365 Excel desktop and Excel Online, requiring ExcelApi 1.9 (including calculation-state and worksheet-collection events).
 - Three approved templates: DC105 Judgment, DC508 Conditional Dismissal (both pages), MC202 Certification of Records.
+- A **PDF Forms** button in the **Devlin Law** group on Excel's **Home** ribbon opens the panel. It does not generate or upload anything by itself.
 - Current selected row is recalculated and read from the open workbook immediately before generation. No XLSX cache or workbook upload is used.
 - Generation waits up to 15 seconds for Excel to finish calculating. If calculation does not finish, no PDF is generated from cached values.
 - The selected sheet, row, case identity and mapped field values are checked again after generation and immediately before download. A changed case or formula invalidates the PDF and requires regeneration.
@@ -16,6 +17,7 @@ sends email, modifies case records, pays fees or submits a filing.
 - Same admin credentials, but a separate, 30-minute PDF-only session. Tokens remain in task-pane memory; no third-party cookies or browser storage are required.
 - PDF.js preview and explicit download. All PDF fields remain fillable. Temporary server files are deleted after the worker returns; there is no generated-PDF archive in SQLite.
 - Download names include the form, court, case number and parties when available, with Windows-unsafe characters removed.
+- Login requests have a 20-second deadline; PDF generation/download responses have a 45-second deadline. Network failures, HTML gateway errors and invalid PDF responses leave generation retryable without exposing a broken download.
 
 The current save action is a download. It does **not** silently write to
 `C:\Users\adamj\OneDrive\Documents` or upload through Graph. The user can choose
@@ -35,8 +37,9 @@ row, sign in with admin credentials, choose a form and select **Generate PDF**.
 Inspect the preview and download the result. Closing/reloading the panel or a
 server redeployment requires signing in again.
 
-Use manifest version 1.1.0.0 or later. Reimport the manifest if an older test
-installation still declares ExcelApi 1.7. The workbook's first row must contain
+Use manifest version 1.2.0.0 or later for the Home ribbon command. Reimport the
+manifest if an older test installation still declares ExcelApi 1.7 or lacks the
+command. The workbook's first row must contain
 the exact form column headers and a nonempty `Defendant` case-identity column.
 Optional filename context uses `Landlord`, `Court_Name` (or `Court`) and
 `Case_Number`. Missing or duplicate mapped form columns are not guessed.
@@ -52,6 +55,14 @@ Official installation references:
 - https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-deployment-of-add-ins
 - https://learn.microsoft.com/en-us/javascript/api/excel/excel.application?view=excel-js-1.9
 
+The panel loaded successfully in the local Windows Excel host after a full Excel
+restart, using a fictional workbook. No security settings or recovery files were
+changed. Registration while Excel was already running did not load the panel;
+for development testing, close Excel completely after saving open work before
+registering and reopening the add-in. A successful registration command alone is
+not evidence that Office loaded the panel.
+
+Native generation/download verification still requires signing in to the panel.
 The first installation in Adam's real Excel host has not been verified yet.
 Browser QA uses an explicitly simulated Office API; it is not proof of native
 Office or tenant deployment compatibility. Download behavior and Office host
@@ -79,7 +90,8 @@ npx.cmd office-addin-manifest validate output/devlin-law-excel.xml
 `test:excel-pdf` runs a local, isolated task-pane server, a simulated Office host,
 real PDF generation/downloads, mobile/desktop screenshots and nonblank canvas
 checks. It also tests delayed calculation, silent formula changes during
-generation, stale downloads and newly added worksheets. It never connects to
+generation, stale downloads, newly added worksheets, HTTP/network failures,
+invalid PDF responses and timeout recovery. It never connects to
 Microsoft Graph, MiFILE or a live workbook.
 
 Architecture: `src/excelPdf.ts` owns only `/excel/*`; `excel-addin/` contains the
