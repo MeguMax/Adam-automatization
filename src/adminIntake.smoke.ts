@@ -695,7 +695,8 @@ async function main() {
         assert.equal(db.getDraftDetail(notificationDraftId)?.caseDraft?.filingEligible, false);
         assert.deepEqual(errors, []);
         await page.locator('#signOutBtn').click();
-        await page.waitForURL(url + '/login');
+        await page.locator('#loginForm').waitFor();
+        assert.equal(page.url(), url + '/login');
         assert.equal((await context.request.get(`${url}/api/settings`)).status(), 401);
         await page.goto(url);
         await page.locator('#loginForm').waitFor();

@@ -17,14 +17,51 @@ sends email, modifies case records, pays fees or submits a filing.
 - Same admin credentials, but a separate, 30-minute PDF-only session. Tokens remain in task-pane memory; no third-party cookies or browser storage are required.
 - PDF.js preview and explicit download. All PDF fields remain fillable. Temporary server files are deleted after the worker returns; there is no generated-PDF archive in SQLite.
 - Successful generation scrolls to the result. Preview height adapts to short Office task panes so the download action stays reachable.
+- **Back to form** returns to the form selector without reopening Office's panel or signing in again.
 - Download names include the form, court, case number and parties when available, with Windows-unsafe characters removed.
 - Login requests have a 20-second deadline; PDF generation/download responses have a 45-second deadline. Network failures, HTML gateway errors and invalid PDF responses leave generation retryable without exposing a broken download.
 
-The current save action is a download. It does **not** silently write to
-`C:\Users\adamj\OneDrive\Documents` or upload through Graph. The user can choose
-that OneDrive-synced folder in the browser/Excel download workflow. Automatic
-OneDrive delivery is a separate integration requiring explicit target-folder and
-Microsoft account authorization.
+Downloads remain available independently of OneDrive. The panel does **not**
+silently write to `C:\Users\adamj\OneDrive\Documents`; that local path cannot
+identify the correct cloud folder on Render.
+
+## Optional OneDrive delivery
+
+The current rollout remains **download-only**, as requested. No Excel delivery
+folder or new Microsoft permissions have been configured.
+
+Set `EXCEL_PDF_ONEDRIVE_SHARE_URL` to an approved **folder** sharing URL, such as
+Adam's intended Documents folder. The existing `TENANT_ID`, `CLIENT_ID` and
+`CLIENT_SECRET` application must already have access to that folder. The module
+does not grant permissions or create sharing links. It never falls back to the
+court worker's `ONEDRIVE_ROOT_SHARE_URL`.
+
+When configured and accessible, the authenticated panel shows the destination
+folder, **Save to OneDrive**, and **Save to OneDrive automatically**. Automatic
+delivery is off until the user checks it for the current sign-in. A successful
+save exposes an **Open saved OneDrive file** link. Failed saves leave the PDF
+available for download and retry. Without this setting, only download controls
+are shown. Do not enable it until the actual target folder is confirmed.
+
+Only the exact server-generated PDF shown in the preview can be saved. It is
+bound to the PDF-only session; arbitrary file bytes and caller-supplied paths
+are not accepted. A bounded memory cache retains at most eight PDFs / 16 MiB for
+five minutes, not a disk or database archive. The panel rechecks the selected
+row and mapped values immediately before sending the save request.
+
+Saved names include a content-hash suffix. Upload sessions fail on name conflict;
+existing files are never blindly replaced. Both a successful upload and a retry
+after an uncertain result are checked by downloading the target file and comparing
+its SHA-256 hash, parent folder and byte count. A mismatched existing file stops
+the save. One cloud save runs at a time, with a 40-second operation deadline.
+
+API/adapter tests and browser QA exercise this flow without writing real cloud
+files. Live delivery to Adam's destination is still pending the folder link and
+an authorized pilot. Excel Online and Adam's tenant installation remain unverified.
+
+Protocol references:
+- https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession?view=graph-rest-1.0
+- https://learn.microsoft.com/en-us/graph/api/driveitem-get-content?view=graph-rest-1.0
 
 ## Installation and first live test
 
@@ -82,7 +119,7 @@ separate evidence.
 The first installation in Adam's Microsoft 365 tenant and Excel Online has not
 been verified yet. Automated browser QA uses an explicitly simulated Office API;
 it is separate from the native Windows checks and does not establish tenant or
-web-host compatibility. Automatic OneDrive delivery is not implemented.
+web-host compatibility. Optional OneDrive delivery must be configured separately.
 
 ## Runtime and tests
 
@@ -109,6 +146,12 @@ checks. It also tests delayed calculation, silent formula changes during
 generation, stale downloads, newly added worksheets, HTTP/network failures,
 invalid PDF responses and timeout recovery. It never connects to
 Microsoft Graph, MiFILE or a live workbook.
+
+The edited-formula scenario changes a source value, generates again without
+reopening the panel, downloads the real PDF and verifies its canonical field
+value. Additional coverage checks manual/automatic delivery, identical saved
+bytes, failed-save retry, stale-save rejection and the download-only layout.
+Cloud storage in these tests is an injected adapter, not Adam's real OneDrive.
 
 Architecture: `src/excelPdf.ts` owns only `/excel/*`; `excel-addin/` contains the
 task pane and row reader; `tools/excel_pdf/http_worker.py` invokes the verified

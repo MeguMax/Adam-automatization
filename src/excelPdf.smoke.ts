@@ -3,6 +3,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { once } from 'node:events';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
 import { createExcelPdfHandler, EXCEL_FORMS } from './excelPdf';
 
@@ -11,7 +13,16 @@ async function main() {
     fs.mkdirSync(output, { recursive: true });
     process.env.ADMIN_USERNAME = 'excel-qa'; process.env.ADMIN_PASSWORD = 'excel-qa-only';
     process.env.NODE_ENV = 'test';
-    const handler = createExcelPdfHandler();
+    const savedCopies: { name: string; hash: string }[] = [];
+    let deliveryFails = false;
+    const handler = createExcelPdfHandler({ delivery:{
+        destination:async()=>({name:'Fictional QA Forms'}),
+        save:async(name,pdf)=>{
+            if(deliveryFails) throw new Error('OneDrive test outage. Retry saving.');
+            savedCopies.push({name,hash:createHash('sha256').update(pdf).digest('hex')});
+            return {name,url:'https://example.sharepoint.com/forms/fictional.pdf'};
+        },
+    } });
     const server = http.createServer(async (req, res) => {
         if (!await handler(req, res, new URL(req.url!, 'http://localhost').pathname)) { res.statusCode = 404; res.end(); }
     });
@@ -32,7 +43,7 @@ const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(cal
 const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'},load(){return this},
  getUsedRange(){return {columnIndex:0,columnCount:qa.headers.length,load(){return this}}},
  getRangeByIndexes(row){return {get values(){return [row===0?qa.headers:qa.values]},get valueTypes(){return [qa.values.map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}}}}};
-window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++},load(){}},workbook:{
+window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const field of ['dc105_05','dc508_06','mc202_08']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Defendant')];},load(){}},workbook:{
  getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
  worksheets:{onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
  functions:{text(){return {value:qa.date || '10/5/2026',load(){return this}}}}
@@ -49,6 +60,8 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.screenshot({ path: path.join(output, 'sign-in.png') });
         await page.fill('#username', 'excel-qa'); await page.fill('#password', 'excel-qa-only'); await page.click('#login');
         await page.waitForFunction(() => document.getElementById('caseName')?.textContent === 'Morgan Tenant');
+        await page.waitForSelector('#deliveryOptions:visible');
+        assert.equal(await page.locator('#autoSave').isChecked(),false);
         await page.screenshot({ path: path.join(output, 'selected-row.png') });
         for (const form of EXCEL_FORMS) {
             await page.selectOption('#form', form.id);
@@ -71,13 +84,55 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             await download.saveAs(path.join(output, download.suggestedFilename()));
             await page.screenshot({ path: path.join(output, form.id + '-mobile.png'), fullPage: true });
         }
+        // A new form/edited formula must not require reopening Office or logging in again.
+        await page.click('#back');
+        assert.equal(await page.locator('#result').isVisible(),false);
+        assert.equal(await page.locator('#signIn').isVisible(),false);
+        await page.evaluate(()=>{
+            const qa=(window as any).qa;qa.values[qa.headers.indexOf('Landlord')]='Updated Example LLC';qa.events[1]();
+        });
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        const editedRequest=page.waitForRequest(request=>request.url().endsWith('/excel/generate'));
+        await page.click('#generate');
+        assert.equal((await editedRequest).postDataJSON().values.mc202_08,'Updated Example LLC');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
+        const editedDownloadEvent=page.waitForEvent('download');await page.click('#save');
+        const editedDownload=await editedDownloadEvent;
+        const editedPath=path.join(output,editedDownload.suggestedFilename());await editedDownload.saveAs(editedPath);
+        const editedCheck=spawnSync(process.env.EXCEL_PDF_PYTHON||'python3',['-c',
+            'import sys; from pypdf import PdfReader; assert PdfReader(sys.argv[1]).get_fields()["mc202_08"]["/V"] == "Updated Example LLC"',editedPath],{windowsHide:true});
+        assert.equal(editedCheck.status,0,editedCheck.stderr.toString());
+        await page.click('#saveCloud');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('saved to OneDrive'));
+        assert.equal(savedCopies.length,1);assert.equal(savedCopies[0].name,editedDownload.suggestedFilename());
+        assert.equal(savedCopies[0].hash,createHash('sha256').update(fs.readFileSync(editedPath)).digest('hex'));
+        assert.equal(await page.locator('#saveCloud').isDisabled(),true);
+        assert.equal(await page.locator('#openCloud').getAttribute('href'),'https://example.sharepoint.com/forms/fictional.pdf');
+        await page.check('#autoSave');deliveryFails=true;
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('OneDrive test outage'));
+        assert.equal(await page.locator('#result').isVisible(),true);assert.equal(await page.locator('#saveCloud').isEnabled(),true);
+        deliveryFails=false;await page.click('#saveCloud');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('saved to OneDrive'));
+        assert.equal(savedCopies.length,2);
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('saved to OneDrive'));
+        assert.equal(savedCopies.length,3);
+        await page.uncheck('#autoSave');
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('mc202_08')]='Stale without an event';});
+        await page.click('#saveCloud');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since this PDF'));
+        assert.equal(savedCopies.length,3);assert.equal(await page.locator('#result').isVisible(),false);
         await page.setViewportSize({ width: 340, height: 450 });
         await page.click('#generate');
         await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
         await page.waitForFunction(() => {
             const result = document.querySelector('#result h2')!.getBoundingClientRect();
             const save = document.getElementById('save')!.getBoundingClientRect();
-            return result.top >= 0 && save.bottom <= innerHeight;
+            const cloud=document.getElementById('cloudActions')!.getBoundingClientRect();
+            return result.top >= 0 && save.bottom <= innerHeight && cloud.bottom <= innerHeight;
         });
         await page.screenshot({ path:path.join(output,'generated-short-taskpane.png') });
         await page.setViewportSize({ width: 900, height: 900 });
@@ -90,7 +145,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.click('#generate');
         await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
-        assert.ok((await page.locator('#resultName').innerText()).includes('Example Property LLC v Second Tenant.pdf'));
+        assert.ok((await page.locator('#resultName').innerText()).includes('Updated Example LLC v Second Tenant.pdf'));
         await page.route('**/excel/generate', async route => { await new Promise(resolve => setTimeout(resolve, 250)); await route.continue(); });
         const pending = page.waitForRequest(req => req.url().endsWith('/excel/generate'));
         await page.click('#generate'); await pending;
@@ -155,8 +210,20 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.equal(await page.evaluate(() => localStorage.length), 0);
         await page.click('#logout'); await page.waitForSelector('#signIn:visible');
         assert.equal(await page.locator('#password').inputValue(), '');
+        assert.equal(await page.locator('#autoSave').isChecked(),false);
+        const previousSaves=savedCopies.length;
+        await page.route('**/excel/delivery',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({available:false})}));
+        await page.fill('#username','excel-qa');await page.fill('#password','excel-qa-only');await page.click('#login');
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(await page.locator('#deliveryOptions').isVisible(),false);
+        await page.setViewportSize({width:340,height:450});await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
+        assert.equal(await page.locator('#cloudActions').isVisible(),false);assert.equal(savedCopies.length,previousSaves);
+        await page.screenshot({path:path.join(output,'download-only-short-taskpane.png')});
+        await page.click('#logout');await page.waitForSelector('#signIn:visible');
+        assert.equal(await page.evaluate(()=>sessionStorage.length),0);
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: 3 real fillable PDF downloads, case filenames, nonblank responsive previews, delayed calculation, changed/silent edits during generation, stale-download rejection, new worksheet events, network/HTML/invalid-PDF errors, timeout recovery, multi-row guard and logout.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: fillable downloads, edited-formula PDF readback without relogin, manual/automatic OneDrive adapter saves, exact saved-byte hashes, failed-save retry, stale-save rejection, responsive previews, calculation/change guards, network errors and logout. Cloud storage was simulated; no real OneDrive uploads.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

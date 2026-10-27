@@ -4,6 +4,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { credentialsMatch } from './adminAuth';
+import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery, ExcelPdfSavedCopy } from './excelPdfDelivery';
 
 const ROOT = path.resolve(__dirname, '..');
 const SESSION_MS = 30 * 60_000;
@@ -135,10 +136,14 @@ export function excelManifest(base = process.env.EXCEL_PDF_PUBLIC_URL || 'https:
 </VersionOverrides></OfficeApp>`;
 }
 
-export function createExcelPdfHandler(options: { now?: () => number; generate?: typeof generateExcelPdf } = {}) {
+export function createExcelPdfHandler(options: { now?: () => number; generate?: typeof generateExcelPdf; delivery?: ExcelPdfDelivery | null } = {}) {
     const now = options.now || Date.now;
     const sessions = new Map<string, { expires: number; version: string }>();
-    let attempts = 0, windowStart = now(), running = false;
+    const delivery = options.delivery === undefined ? createExcelOneDriveDelivery() : options.delivery;
+    const copies = new Map<string, { owner: string; pdf: Buffer; filename: string; expires: number; timer: NodeJS.Timeout; saved?: ExcelPdfSavedCopy; saving?: Promise<ExcelPdfSavedCopy> }>();
+    const forget = (id: string) => { const copy = copies.get(id); if (copy) clearTimeout(copy.timer); copies.delete(id); };
+    const prune = () => { for (const [id, copy] of copies) if (copy.expires <= now() || !sessions.has(copy.owner)) forget(id); };
+    let attempts = 0, windowStart = now(), running = false, saving = false;
     return async (req: http.IncomingMessage, res: http.ServerResponse, pathname: string): Promise<boolean> => {
         if (!pathname.startsWith('/excel/') && pathname !== '/excel') return false;
         const assets: Record<string, [string, string]> = {
@@ -169,13 +174,14 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             res.end(excelManifest()); return true;
         }
         if (req.method === 'GET' && pathname === '/excel/catalog') { json(res, 200, EXCEL_FORMS); return true; }
-        if (req.method !== 'POST' || !['/excel/session', '/excel/logout', '/excel/generate'].includes(pathname)) {
+        if (req.method !== 'POST' || !['/excel/session', '/excel/logout', '/excel/generate', '/excel/delivery', '/excel/save'].includes(pathname)) {
             json(res, 404, { error: 'Not found.' }); return true;
         }
         if (!sameOrigin(req) || !req.headers['content-type']?.startsWith('application/json')) {
             json(res, 403, { error: 'A same-origin JSON request is required.' }); return true;
         }
         for (const [token, session] of sessions) if (session.expires <= now() || session.version !== credentialVersion()) sessions.delete(token);
+        prune();
         if (pathname === '/excel/session') {
             if (now() - windowStart >= 60_000) { attempts = 0; windowStart = now(); }
             if (++attempts > 20) { res.setHeader('Retry-After', '60'); json(res, 429, { error: 'Too many sign-in attempts. Wait one minute.' }); return true; }
@@ -190,15 +196,53 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
         const authorization = req.headers.authorization || '';
         const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
         if (!sessions.has(token)) { json(res, 401, { error: 'Sign in to the Excel panel again.' }); return true; }
-        if (pathname === '/excel/logout') { sessions.delete(token); json(res, 200, { ok: true }); return true; }
+        if (pathname === '/excel/logout') { sessions.delete(token); prune(); json(res, 200, { ok: true }); return true; }
+        if (pathname === '/excel/delivery') {
+            try { json(res, 200, delivery ? { available: true, ...(await delivery.destination()) } : { available: false }); }
+            catch { json(res, 503, { error: 'OneDrive is unavailable. PDF downloads still work.' }); }
+            return true;
+        }
+        if (pathname === '/excel/save') {
+            if (!delivery) { json(res, 409, { error: 'Excel OneDrive delivery is not configured.' }); return true; }
+            try {
+                const input = await body(req);
+                const copy = typeof input?.generationId === 'string' ? copies.get(input.generationId) : undefined;
+                if (!copy || copy.owner !== token) { json(res, 410, { error: 'This PDF is no longer available for OneDrive. Generate it again.' }); return true; }
+                if (!copy.saved) {
+                    if (!copy.saving) {
+                        if (saving) { json(res, 503, { error: 'Another PDF is being saved. Retry in a moment.' }); return true; }
+                        saving = true;
+                        copy.saving = Promise.resolve().then(() => delivery.save(copy.filename, copy.pdf)).finally(() => { saving = false; });
+                    }
+                    try { copy.saved = await copy.saving; } finally { copy.saving = undefined; }
+                }
+                json(res, 200, copy.saved);
+            } catch (error) { json(res, 503, { error: (error as Error).message }); }
+            return true;
+        }
         if (running) { res.setHeader('Retry-After', '3'); json(res, 503, { error: 'Another PDF is being generated. Retry in a moment.' }); return true; }
         running = true;
         try {
             const input = await body(req);
             validateExcelValues(input?.form, input?.values);
+            const filename = excelPdfFilename(input.form, input.filename);
             const pdf = await (options.generate || generateExcelPdf)(input.form, input.values);
+            let generationId = '';
+            if (delivery && sessions.has(token)) {
+                if (!pdf.subarray(0, 5).equals(Buffer.from('%PDF-')) || pdf.length > 5 * 1024 * 1024) throw new Error('Invalid PDF generation result.');
+                let bytes = [...copies.values()].reduce((sum, copy) => sum + copy.pdf.length, 0);
+                for (const [id, copy] of copies) {
+                    if (copies.size < 8 && bytes + pdf.length <= 16 * 1024 * 1024) break;
+                    bytes -= copy.pdf.length; forget(id);
+                }
+                generationId = randomBytes(24).toString('hex');
+                const id = generationId;
+                copies.set(id, { owner: token, pdf, filename, expires: now() + 5 * 60_000,
+                    timer: setTimeout(() => forget(id), 5 * 60_000).unref() });
+            }
             res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': pdf.length, 'Cache-Control': 'no-store',
-                'Content-Disposition': `attachment; filename="${input.form}.pdf"`, 'X-Content-Type-Options': 'nosniff' });
+                'Content-Disposition': `attachment; filename="${input.form}.pdf"`, 'X-Content-Type-Options': 'nosniff',
+                ...(generationId ? { 'X-Excel-Generation-Id': generationId } : {}) });
             res.end(pdf);
         } catch (error) { json(res, 422, { error: (error as Error).message }); }
         finally { running = false; }
