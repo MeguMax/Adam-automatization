@@ -20,6 +20,9 @@ sends email, modifies case records, pays fees or submits a filing.
 - **Back to form** returns to the form selector without reopening Office's panel or signing in again.
 - Download names include the form, court, case number and parties when available, with Windows-unsafe characters removed.
 - Login requests have a 20-second deadline; PDF generation/download responses have a 45-second deadline. Network failures, HTML gateway errors and invalid PDF responses leave generation retryable without exposing a broken download.
+- Long text is measured against its actual PDF widget. The original font size is retained when it fits; otherwise it is reduced to a minimum of 7 pt. Explicit line breaks are preserved in multiline fields. Values are never truncated, abbreviated or silently wrapped.
+- Text that cannot fit legibly, unsupported font characters, control characters, or line breaks in a single-line field stop generation. Field-specific errors identify the original worksheet and cell; correct that value/formula in Excel and generate again.
+- Export reopens the PDF and verifies canonical values, widget values, appearances and checkbox states. The source templates are never modified and existing output files are never overwritten.
 
 Downloads remain available independently of OneDrive. The panel does **not**
 silently write to `C:\Users\adamj\OneDrive\Documents`; that local path cannot
@@ -137,6 +140,7 @@ downloaded manifest; it must not include a path, credentials or query string.
 npm.cmd test
 npm.cmd run test:excel-pdf
 python tools/excel_pdf/check_install.py
+python -m unittest discover -s tools/excel_pdf -p test_core.py -v
 npx.cmd office-addin-manifest validate output/devlin-law-excel.xml
 ```
 
@@ -152,6 +156,22 @@ reopening the panel, downloads the real PDF and verifies its canonical field
 value. Additional coverage checks manual/automatic delivery, identical saved
 bytes, failed-save retry, stale-save rejection and the download-only layout.
 Cloud storage in these tests is an injected adapter, not Adam's real OneDrive.
+
+The appearance-quality regression also renders all 31 checkboxes through PDF.js
+in both states and compares pixels inside each widget. It tests visible marks,
+not merely nonempty appearance streams. Oversized text must produce a source-cell
+error, no partial download, and successful regeneration after correction.
+Python round-trip coverage fills and clears all 101 fields, checks long captions,
+multiline addresses, date/money/zero values, and rejects unreadable text without
+leaving a pending file. The normal `npm test` regression also runs this Python
+suite when the configured PDF runtime is available. The PDF core uses pinned ReportLab standard-font metrics
+and pypdf for the interactive output; it does not flatten the forms.
+
+Local acceptance on 2026-10-27 regenerated all three forms for each of the three
+supplied examples. All 303 saved-cache field comparisons had no material
+differences from the supplied PDFs. The customer workbook and generated customer
+samples stayed local and were not uploaded to the test service. This does not
+replace a live Excel calculation test or establish Excel Online compatibility.
 
 Architecture: `src/excelPdf.ts` owns only `/excel/*`; `excel-addin/` contains the
 task pane and row reader; `tools/excel_pdf/http_worker.py` invokes the verified

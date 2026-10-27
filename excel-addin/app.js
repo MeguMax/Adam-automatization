@@ -34,7 +34,9 @@
                 let result;
                 try { result = await response.json(); } catch(error) { if (abort.signal.aborted) throw error; }
                 if (response.status === 401 && token) signedOut();
-                throw new Error(result?.error || (response.status >= 500 ? 'The PDF service is temporarily unavailable. Try again shortly.' : 'Request failed. Please try again.'));
+                const error = new Error(result?.error || (response.status >= 500 ? 'The PDF service is temporarily unavailable. Try again shortly.' : 'Request failed. Please try again.'));
+                if (typeof result?.field === 'string') error.field = result.field;
+                throw error;
             }
             if (url !== '/excel/generate') return await response.json();
             if (!response.headers.get('content-type')?.includes('application/pdf')) throw new Error('The PDF service returned an unexpected response. Please try again.');
@@ -58,6 +60,13 @@
         $('selection').textContent = data.sheet + ' / Row ' + data.row;
         $('caseName').textContent = data.name;
         $('caseContext').textContent = [data.metadata.plaintiff,data.metadata.court,data.metadata.caseNumber].filter(Boolean).join(' / ');
+    }
+    function sourceError(error, data) {
+        const index = data?.columns?.[error.field];
+        if (!Number.isInteger(index) || index < 0) return error.message;
+        let column = '', number = index + 1;
+        while (number > 0) { number--; column = String.fromCharCode(65 + number % 26) + column; number = Math.floor(number / 26); }
+        return error.message + '. Source: ' + data.sheet + ' / ' + column + data.row + '.';
     }
     async function renderPreview(blob) {
         const expectedRevision = revision;
@@ -149,10 +158,11 @@
         if (busy) return;
         clearTimeout(refreshTimer);
         const generationRevision = ++revision;
+        let source = null;
         busy = true; controls(); clearResult(); message('', 'Reading selected row...');
         try {
             // Read again here, never reuse a preview snapshot after a worksheet edit.
-            const data = await readSelection(); showSelection(data);
+            const data = await readSelection(); source = data; showSelection(data);
             message('', 'Generating PDF...');
             const generated = await api('/excel/generate', { form:data.form, values:data.values, filename:DevlinExcelRow.pdfFilename(data) });
             const blob = generated.blob;
@@ -177,7 +187,7 @@
                 try { await saveToCloud(); }
                 catch(error) { message(error.message, pdfUrl ? 'PDF ready. You can still download it or retry saving.' : ''); }
             }
-        } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else message(error.message); }
+        } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else message(sourceError(error, source)); }
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
     async function download(event) {

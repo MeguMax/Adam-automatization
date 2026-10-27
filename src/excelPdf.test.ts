@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import path from 'node:path';
 import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import { createAdminAuth } from './adminAuth';
-import { createExcelPdfHandler, EXCEL_FORMS, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
+import { createExcelPdfHandler, EXCEL_FORMS, ExcelPdfFieldError, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
 import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery } from './excelPdfDelivery';
 
 const row = require('../excel-addin/row.js');
@@ -41,6 +42,7 @@ test('Excel adapter waits for calculation, reads the current row and lets Excel 
     assert.equal(state.calculations,1);assert.equal(state.waits,2);
     assert.equal(data.values.dc105_24,'10/5/2026');assert.equal(data.row,36);assert.equal(data.sheetId,'sheet-1');
     assert.equal(data.metadata.plaintiff,'Example Property LLC');
+    assert.equal(data.columns.dc105_24,state.headers.indexOf('dc105_24'));
 });
 test('Excel adapter times out busy calculation without reading cached field values',async()=>{
     const {state,form,excel,sleep}=officeFixture();state.states=['Calculating'];
@@ -373,7 +375,32 @@ test('OneDrive never overwrites mismatched content and rejects unexpected hosts 
     await assert.rejects(malicious.delivery.save('DC105 - Example.pdf',malicious.pdf),/unavailable/);
     assert.equal(malicious.state.uploads,0);
 });
-const pythonAvailable = spawnSync(python, ['-c', 'import pypdf,openpyxl'], { windowsHide: true }).status === 0;
+const pythonAvailable = spawnSync(python, ['-c', 'import pypdf,openpyxl,reportlab'], { windowsHide: true }).status === 0;
+test('the Python PDF quality suite runs with the normal project regression', { skip:!pythonAvailable }, () => {
+    const result=spawnSync(python,['-m','unittest','discover','-s',path.resolve(__dirname,'../tools/excel_pdf'),'-p','test_core.py','-v'],
+        {windowsHide:true,timeout:30_000});
+    assert.equal(result.status,0,result.stderr.toString());
+});
+test('field validation errors retain the field identifier without returning a partial PDF', async () => fixture(async base => {
+    const response = await post(base, 'generate', { form:'dc105', values:values() }, await login(base));
+    assert.equal(response.status,422);
+    assert.deepEqual(await response.json(),{error:'Text is too long.',field:'dc105_06'});
+    assert.equal(response.headers.has('x-excel-generation-id'),false);
+},async()=>{throw new ExcelPdfFieldError('Text is too long.','dc105_06');}));
+
+test('the isolated PDF worker rejects clipped text with an actionable field error and recovers', { skip:!pythonAvailable }, async () => {
+    for (const input of [{dc105_06:'W'.repeat(100)},{dc105_06:'First\nSecond'},{dc105_19:true}]) {
+        await assert.rejects(generateExcelPdf('dc105',{...values(),...input},python),error=>{
+            assert.ok(error instanceof ExcelPdfFieldError);
+            assert.equal(error.field,Object.keys(input)[0]);
+            assert.ok(!error.message.startsWith('{'));
+            return true;
+        });
+    }
+    const pdf=await generateExcelPdf('dc105',{...values(),dc105_06:'Corrected Tenant'},python);
+    assert.ok(pdf.subarray(0,5).equals(Buffer.from('%PDF-')));
+});
+
 test('all three packaged templates generate verified interactive PDFs through the isolated worker', { skip: !pythonAvailable && 'Set EXCEL_PDF_PYTHON to the installed Python runtime' }, async () => {
     for (const form of EXCEL_FORMS) {
         const input = values(form.id);

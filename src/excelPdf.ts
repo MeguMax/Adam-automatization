@@ -9,6 +9,9 @@ import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery, ExcelP
 const ROOT = path.resolve(__dirname, '..');
 const SESSION_MS = 30 * 60_000;
 const BODY_LIMIT = 96 * 1024;
+export class ExcelPdfFieldError extends Error {
+    constructor(message: string, public readonly field: string) { super(message); }
+}
 export const EXCEL_FORMS = [
     { id: 'dc105', title: 'DC105 Judgment', count: 48, pages: 1, dates: [24, 26, 41, 45, 47, 48] },
     { id: 'dc508', title: 'DC508 Conditional Dismissal', count: 28, pages: 2, dates: [13, 15] },
@@ -94,7 +97,17 @@ export async function generateExcelPdf(formId: unknown, input: unknown, python =
         child.once('error', () => { clearTimeout(timer); reject(new Error('The PDF generation runtime is unavailable.')); });
         child.once('close', code => {
             clearTimeout(timer);
-            if (code !== 0) return reject(new Error(code === 2 ? errors.trim().slice(0, 1000) : 'PDF generation failed. Please contact support.'));
+            if (code !== 0) {
+                if (code === 2) {
+                    try {
+                        const detail = JSON.parse(errors);
+                        if (typeof detail?.error === 'string' && form.fields.includes(detail?.field)) {
+                            return reject(new ExcelPdfFieldError(detail.error.slice(0, 1000), detail.field));
+                        }
+                    } catch { /* Older/local workers can still return a plain validation message. */ }
+                }
+                return reject(new Error(code === 2 ? errors.trim().slice(0, 1000) : 'PDF generation failed. Please contact support.'));
+            }
             const output = Buffer.concat(chunks);
             if (!output.subarray(0, 5).equals(Buffer.from('%PDF-'))) return reject(new Error('Invalid PDF generation result.'));
             resolve(output);
@@ -244,7 +257,8 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
                 'Content-Disposition': `attachment; filename="${input.form}.pdf"`, 'X-Content-Type-Options': 'nosniff',
                 ...(generationId ? { 'X-Excel-Generation-Id': generationId } : {}) });
             res.end(pdf);
-        } catch (error) { json(res, 422, { error: (error as Error).message }); }
+        } catch (error) { json(res, 422, { error: (error as Error).message,
+            ...(error instanceof ExcelPdfFieldError ? { field: error.field } : {}) }); }
         finally { running = false; }
         return true;
     };

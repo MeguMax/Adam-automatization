@@ -59,7 +59,7 @@
                 context.application.calculationState !== excel.CalculationState.done) {
                 throw new Error('The worksheet changed while reading the case. Select the row and try again.');
             }
-            return {form:form.id, values:data.values, sheet:sheet.name, sheetId:sheet.id,
+            return {form:form.id, values:data.values, columns:data.columns, sheet:sheet.name, sheetId:sheet.id,
                 row:selection.rowIndex+1, name:metadata.defendant, metadata};
         });
     }

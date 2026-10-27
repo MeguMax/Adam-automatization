@@ -11,10 +11,18 @@ import math
 from openpyxl import load_workbook
 from openpyxl.utils.escape import unescape
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import DictionaryObject, NameObject
+from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 FORMS = ("dc105", "dc508", "mc202")
 EXCEL_ERRORS = {"#REF!", "#VALUE!", "#DIV/0!", "#N/A", "#NAME?", "#NUM!", "#NULL!", "#SPILL!", "#CALC!"}
+MIN_TEXT_SIZE = 7
+
+
+class FieldValueError(ValueError):
+    def __init__(self, field, message):
+        super().__init__(message)
+        self.field = field
 
 
 def text(value):
@@ -141,10 +149,10 @@ def pdf_values(writer, fields, values):
     widgets = {name: (widget, field) for page in writer.pages for name, widget, field in page_widgets(page)}
     for name, field in fields.items():
         if name not in values:
-            raise ValueError(f"Missing Excel column: {name}")
+            raise FieldValueError(name, f"Missing Excel column: {name}")
         value = values[name]
         if isinstance(value, str) and value in EXCEL_ERRORS:
-            raise ValueError(f"Excel error in {name}: {value}")
+            raise FieldValueError(name, f"Excel error in {name}: {value}")
         if field.get("/FT") == "/Btn":
             widget, _ = widgets[name]
             states = set(str(key) for key in widget.get("/AP", {}).get("/N", {})) - {"/Off"}
@@ -155,16 +163,65 @@ def pdf_values(writer, fields, values):
             elif value in (True, "On", "/On", "Yes", "/Yes", "True", "TRUE"):
                 result[name] = next(iter(states))
             else:
-                raise ValueError(f"Unrecognized checkbox value in {name}: {value}")
+                raise FieldValueError(name, f"Unrecognized checkbox value in {name}; use Yes/No or On/Off")
         else:
             if isinstance(value, bool):
-                raise ValueError(f"Boolean value in text field {name}; confirm its formatting")
-            result[name] = text(value)
+                raise FieldValueError(name, f"Boolean value in text field {name}; confirm its formatting")
+            try:
+                result[name] = text(value)
+            except ValueError as error:
+                raise FieldValueError(name, f"Invalid value in {name}: {error}") from error
             try:
                 result[name].encode('cp1252')
             except UnicodeEncodeError as error:
-                raise ValueError(f'Template text font cannot represent the value in {name}') from error
+                raise FieldValueError(name, f'Template text font cannot represent the value in {name}') from error
+            if any(ord(char) < 32 and char != '\n' or ord(char) == 127 for char in result[name]):
+                raise FieldValueError(name, f'Unsupported control character in {name}')
     return result
+
+
+def fit_text_widgets(writer, values):
+    """Keep exact field values while preventing fixed-font appearance clipping."""
+    acroform = writer.root_object['/AcroForm']
+    for page in writer.pages:
+        for name, widget, field in page_widgets(page):
+            if widget.get('/FT', field.get('/FT')) != '/Tx' or not values[name]:
+                continue
+            value = values[name]
+            multiline = bool(int(widget.get('/Ff', field.get('/Ff', 0))) & 4096)
+            if '\n' in value and not multiline:
+                raise FieldValueError(name, f'{name} is a single-line PDF field; remove line breaks in Excel')
+            appearance = str(widget.get('/DA', field.get('/DA', acroform.get('/DA', ''))))
+            fonts = list(re.finditer(r'(/[^\s]+)\s+([\d.]+)\s+Tf\b', appearance))
+            if not fonts:
+                raise ValueError(f'Missing template text font: {name}')
+            font = fonts[-1]
+            resource = widget['/DR']['/Font'][font[1]].get_object()
+            family = str(resource.get('/BaseFont', '')).lstrip('/')
+            if family not in ('Times-Roman', 'Helvetica', 'Courier'):
+                raise ValueError(f'Unsupported template text font: {name}')
+            size = float(font[2])
+            if not math.isfinite(size) or size < MIN_TEXT_SIZE:
+                raise ValueError(f'Unsupported template font size: {name}')
+            rect = widget['/Rect']
+            width = float(rect[2]) - float(rect[0]) - 4
+            height = float(rect[3]) - float(rect[1]) - 2
+            if width <= 0 or height <= 0:
+                raise ValueError(f'Invalid template field dimensions: {name}')
+            lines = value.split('\n')
+            # Fixed-size pypdf appearances preserve explicit line breaks without wrapping.
+            widest = max(stringWidth(line, family, size) for line in lines)
+            fitted = min(size, size * width / widest) if widest else size
+            if multiline:
+                # Reserve full line boxes, including descenders on the last line.
+                fitted = min(fitted, height / (1.2 * len(lines)))
+            # Round down so PDF decimal precision cannot reintroduce clipping.
+            fitted = math.floor(fitted * 100) / 100
+            if fitted < MIN_TEXT_SIZE:
+                raise FieldValueError(name, f'Text in {name} is too long to display legibly; '
+                                      'shorten it in Excel' + (' or add line breaks' if multiline else ''))
+            widget[NameObject('/DA')] = TextStringObject(
+                appearance[:font.start(2)] + format(fitted, '.2f') + appearance[font.end(2):])
 
 
 def generate(template, form, values, output):
@@ -173,6 +230,7 @@ def generate(template, form, values, output):
         raise ValueError("Refusing to overwrite an existing file")
     writer, fields, pages = template_form(template, form)
     expected = pdf_values(writer, fields, values)
+    fit_text_widgets(writer, expected)
     writer.update_page_form_field_values(None, expected, auto_regenerate=False, flatten=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".pending.pdf")
@@ -196,6 +254,10 @@ def generate(template, form, values, output):
                     raise ValueError(f"Widget value mismatch: {name}")
                 if not widget.get("/AP", {}).get("/N"):
                     raise ValueError(f"Missing widget appearance: {name}")
+                if widget.get('/FT', field.get('/FT')) == '/Btn':
+                    # The supplied templates omit /Off from /N to render an unchecked box blank.
+                    if str(widget.get('/AS')) != expected[name] or (expected[name] != '/Off' and expected[name] not in widget['/AP']['/N']):
+                        raise ValueError(f'Checkbox appearance mismatch: {name}')
         if count < len(expected):
             raise ValueError("Export lost interactive widgets")
         os.link(temporary, output)

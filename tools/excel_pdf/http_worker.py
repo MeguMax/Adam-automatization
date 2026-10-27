@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from core import generate
+from core import FieldValueError, generate
 
 
 def main():
@@ -19,6 +19,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except FieldValueError as error:
+        print(json.dumps({'error': str(error), 'field': error.field}), file=sys.stderr)
+        sys.exit(2)
     except ValueError as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)

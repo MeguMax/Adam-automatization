@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { chromium } from 'playwright';
-import { createExcelPdfHandler, EXCEL_FORMS } from './excelPdf';
+import { createExcelPdfHandler, EXCEL_FORMS, generateExcelPdf } from './excelPdf';
 
 async function main() {
     const output = path.resolve('output/excel-addin-qa');
@@ -84,6 +84,53 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             await download.saveAs(path.join(output, download.suggestedFilename()));
             await page.screenshot({ path: path.join(output, form.id + '-mobile.png'), fullPage: true });
         }
+        // Verify visible marks, not only stored checkbox values or nonempty appearances.
+        await page.evaluate('import("/excel/pdfjs/pdf.mjs").then(module => { window.qaPdfjs = module; })');
+        let checkedWidgets = 0;
+        for (const form of EXCEL_FORMS) {
+            const buttons = spawnSync(process.env.EXCEL_PDF_PYTHON || 'python3', ['-c',
+                'import sys,json; from pypdf import PdfReader; print(json.dumps([n for n,f in PdfReader(sys.argv[1]).get_fields().items() if f.get("/FT")=="/Btn"]))',
+                path.resolve('assets/excel-pdf', form.id + '.pdf')], { windowsHide:true });
+            assert.equal(buttons.status,0,buttons.stderr.toString());
+            const names = JSON.parse(buttons.stdout.toString()) as string[];
+            const off = Object.fromEntries(form.fields.map(name=>[name,'']));
+            const on = {...off,...Object.fromEntries(names.map(name=>[name,true]))};
+            const offPdf = await generateExcelPdf(form.id,off);
+            const onPdf = await generateExcelPdf(form.id,on);
+            const comparison = await page.evaluate(async ({off,on})=>{
+                const pdfjs = (window as any).qaPdfjs;
+                const read = async(bytes:number[],capture=false)=>{
+                    const task=pdfjs.getDocument({data:new Uint8Array(bytes),isEvalSupported:false,
+                        standardFontDataUrl:'/excel/pdfjs/standard_fonts/',cMapUrl:'/excel/pdfjs/cmaps/',cMapPacked:true});
+                    const pdf=await task.promise;
+                    const patches:Record<string,number[]>={},images:string[]=[];
+                    for(let number=1;number<=pdf.numPages;number++) {
+                        const pdfPage=await pdf.getPage(number),viewport=pdfPage.getViewport({scale:3});
+                        const canvas=document.createElement('canvas');canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
+                        const context=canvas.getContext('2d')!;
+                        await pdfPage.render({canvas,canvasContext:context,viewport}).promise;
+                        if(capture) images.push(canvas.toDataURL('image/png').split(',')[1]);
+                        for(const annotation of await pdfPage.getAnnotations()) if(annotation.checkBox) {
+                            const rect=[...viewport.convertToViewportPoint(annotation.rect[0],annotation.rect[1]),
+                                ...viewport.convertToViewportPoint(annotation.rect[2],annotation.rect[3])];
+                            const x=Math.floor(Math.min(rect[0],rect[2]))+2,y=Math.floor(Math.min(rect[1],rect[3]))+2;
+                            const width=Math.ceil(Math.abs(rect[2]-rect[0]))-4,height=Math.ceil(Math.abs(rect[3]-rect[1]))-4;
+                            patches[annotation.fieldName]=Array.from(context.getImageData(x,y,width,height).data);
+                        }
+                    }
+                    await task.destroy();return {patches,images};
+                };
+                const blank=(await read(off)).patches,marked=await read(on,true);
+                return {fields:Object.keys(marked.patches).map(name=>({name,
+                    changed:marked.patches[name].reduce((sum,value,i)=>sum+(Math.abs(value-blank[name][i])>25?1:0),0)})),images:marked.images};
+            },{off:Array.from(offPdf),on:Array.from(onPdf)});
+            assert.equal(comparison.fields.length,names.length);
+            for(const checkbox of comparison.fields) assert.ok(checkbox.changed>8,'Checkbox must render visibly: '+checkbox.name);
+            checkedWidgets+=comparison.fields.length;
+            fs.writeFileSync(path.join(output,form.id+'-checkbox-render.json'),JSON.stringify(comparison.fields,null,2));
+            comparison.images.forEach((image,index)=>fs.writeFileSync(path.join(output,form.id+'-checkboxes-page-'+(index+1)+'.png'),Buffer.from(image,'base64')));
+        }
+        assert.equal(checkedWidgets,31);
         // A new form/edited formula must not require reopening Office or logging in again.
         await page.click('#back');
         assert.equal(await page.locator('#result').isVisible(),false);
@@ -125,6 +172,20 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.click('#saveCloud');
         await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since this PDF'));
         assert.equal(savedCopies.length,3);assert.equal(await page.locator('#result').isVisible(),false);
+        await page.evaluate(()=>{
+            const qa=(window as any).qa;qa.values[qa.headers.indexOf('Landlord')]='W'.repeat(200);qa.events[1]();
+        });
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('Source: Working Document / CJ36.'));
+        assert.ok((await page.locator('#error').innerText()).includes('too long to display legibly'));
+        assert.equal(await page.locator('#result').isVisible(),false);
+        assert.equal(savedCopies.length,3);
+        await page.screenshot({path:path.join(output,'source-field-error.png'),fullPage:true});
+        await page.evaluate(()=>{
+            const qa=(window as any).qa;qa.values[qa.headers.indexOf('Landlord')]='Updated Example LLC';qa.events[1]();
+        });
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.setViewportSize({ width: 340, height: 450 });
         await page.click('#generate');
         await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
@@ -223,7 +284,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.click('#logout');await page.waitForSelector('#signIn:visible');
         assert.equal(await page.evaluate(()=>sessionStorage.length),0);
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: fillable downloads, edited-formula PDF readback without relogin, manual/automatic OneDrive adapter saves, exact saved-byte hashes, failed-save retry, stale-save rejection, responsive previews, calculation/change guards, network errors and logout. Cloud storage was simulated; no real OneDrive uploads.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: fillable downloads, all 31 checkbox marks rendered and compared on/off, field-error source cells and recovery, edited-formula PDF readback without relogin, manual/automatic OneDrive adapter saves, exact saved-byte hashes, failed-save retry, stale-save rejection, responsive previews, calculation/change guards, network errors and logout. Cloud storage was simulated; no real OneDrive uploads.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });
