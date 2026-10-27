@@ -99,6 +99,10 @@ If the service restarts while **Save Progress** is completing, the Draft becomes
 
 ## Notes
 
+- Migration 28 adds persistent read-only checkout inspections, exact-amount review confirmations and deduplicated receipt events. They share the existing filing worker, never run alongside preparation, and prevent account changes/database deletion while active. An interrupted inspection fails safely; it never retries a payment.
+- Prepared Drafts expose Activity > Checkout & receipts. Quotes expire after 15 minutes and are bound to source PDF hashes, the current account revision and selected payment-method token. Only opaque fingerprints are stored; no card data is collected. Confirmation records review only. Payment and final submission remain hard-disabled, not environment-toggleable.
+- Live checkout was inspected without payment on the alternate account. Actual paid/refunded receipt handling still requires an authorized pilot with a real receipt; fixtures are not a paid end-to-end test. Unknown receipt formats remain explicitly inconclusive.
+
 - Render provides `PORT`; the admin binds to it automatically on `0.0.0.0`.
 - `/healthz` is public for Render health checks. `/login` and the sign-in endpoint are public; the dashboard and all `/api/*` endpoints require admin authentication. Sign-in attempts are rate-limited, and cookie-authenticated changes require a same-origin request. Use the Sign out button to end a session.
 - `DOCUMENT_IMMEDIATE_DOWNLOAD_ATTEMPTS=3` keeps a bad file from monopolizing the worker. Failed documents are retried later up to `DOCUMENT_AUTO_RETRY_LIMIT`, two due retry jobs per poll.

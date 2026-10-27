@@ -514,6 +514,50 @@ async function main() {
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
         await page.screenshot({path:path.join(screenshots,'draft-release-checks-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
+        const {getCheckoutAccount}=require('./mifileCheckoutRunner') as typeof import('./mifileCheckoutRunner');
+        const {preparationDigest}=require('./mifilePreparationEvidence') as typeof import('./mifilePreparationEvidence');
+        const {buildCheckoutQuote,digest}=require('./mifileCheckout') as typeof import('./mifileCheckout');
+        const checkoutAccount=getCheckoutAccount();
+        const bundleId='fd2c1ad4-633d-429a-0166-08df32c555de';
+        const sources=job.payload!.documents.map(document=>({documentId:document.id,sha256:'ab'.repeat(32),bytes:200}));
+        const packageDigest=preparationDigest(job.payload!,sources);
+        db.completeFilingJob({filingJobId:job.id,status:'prepared',checkpoint:'saved_unsubmitted',externalBundleId:bundleId,temporaryCaseNumber:'TEMP-QA',result:{
+            ...diagnosticJob.result,url:'https://mifile.courts.michigan.gov/filing/create/'+bundleId,
+            documentManifest:job.payload!.documents.map(document=>({documentId:document.id,filingName:document.filingName,
+                filingType:document.filingRelation==='connected_to_complaint'?'CONNECTED FILING':document.filingType,
+                filingRelation:document.filingRelation,parentDocumentId:document.filingRelation==='connected_to_complaint'?job.payload!.documents.find(doc=>doc.isPrimary)!.id:null})),
+            savedBundleEvidence:{version:1,verifiedAt:new Date().toISOString(),sourcePdfCount:sources.length,generatedPdfCount:1,
+                connectedPdfCount:0,courtName:job.payload!.courtName,externalBundleId:bundleId,temporaryCaseNumber:'TEMP-QA',
+                filer:'Devlin, Adam (P72877)',accountEmail:checkoutAccount.username,sources,packageDigest},
+        }});
+        const quoteJob=db.getFilingJob(job.id)!;
+        const quoted=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
+            ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
+            {state:'selected',fingerprint:digest('fixture-token')},packageDigest,10300);
+        const inspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
+        db.checkout().complete(inspection.id,{kind:'quote',quote:quoted},checkoutAccount);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        await page.locator('[data-checkout-review] summary').click();
+        assert.match(await page.locator('[data-checkout-review]').innerText(),/Checkout total:\s+\$126.69 USD/);
+        const denied=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/pay`,{headers:{Origin:url},data:{}});
+        assert.equal(denied.status(),403);
+        const wrongAmount=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/confirm`,{headers:{Origin:url},
+            data:{quoteId:quoted.id,quoteDigest:quoted.quoteDigest,totalCents:12668}});
+        assert.equal(wrongAmount.status(),409);
+        await page.locator('[data-checkout-action="confirm"]').click();
+        assert.match(await page.locator('#draftConfirmDialog').innerText(),/does not authorize payment/);
+        await page.locator('#draftConfirmAccept').click();
+        await page.locator('[data-checkout-action="confirm"]').waitFor({state:'visible'});
+        await page.waitForFunction(()=>document.querySelector('[data-checkout-review]')?.textContent?.includes('Amount reviewed:'));
+        assert.ok(db.checkout().state(job.id,checkoutAccount).confirmedAt);
+        assert.equal(db.checkout().state(job.id,checkoutAccount).paymentExecutionEnabled,false);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.equal(await page.locator('[data-checkout-review]').evaluate(element=>(element as HTMLDetailsElement).open),true);
+        await page.screenshot({path:path.join(screenshots,'draft-checkout-review-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-checkout-review-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#draftReviewTab').click();
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;

@@ -1,6 +1,7 @@
 import { getWorkflowDatabase } from './database';
 import { MiFileFilingError, MiFileFilingRunner } from './mifileFilingRunner';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
+import { MiFileCheckoutRunner } from './mifileCheckoutRunner';
 
 function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return Promise.resolve();
@@ -23,6 +24,7 @@ export async function runFilingWorker(options: {
         60_000,
     );
     const recovered = db.recoverInterruptedFilingJobs();
+    db.checkout().recover();
     if (recovered > 0) {
         console.warn(`Marked ${recovered} interrupted MiFILE job(s) as failed for safe retry.`);
     }
@@ -32,6 +34,19 @@ export async function runFilingWorker(options: {
         if (process.env.MIFILE_AUTO_PREPARE_ENABLED !== 'false' && getMiFileRuntimeConfig().ready) {
             try { db.queueValidatedIntakes(); }
             catch (error) { console.error('Automatic Unsubmitted preparation could not be queued:', error); }
+        }
+        const inspection = db.checkout().claim();
+        if (inspection) {
+            try {
+                const job = db.getFilingJob(inspection.filingJobId);
+                if (!job) throw new Error('The prepared MiFILE job no longer exists.');
+                const runner = new MiFileCheckoutRunner(stage => db.checkout().progress(inspection.id, stage));
+                const {result,account} = await runner.inspect(inspection,job);
+                db.checkout().complete(inspection.id,result,account);
+            } catch (error) {
+                db.checkout().fail(inspection.id, error instanceof Error ? error.message : 'MiFILE inspection failed.');
+            }
+            continue;
         }
         const job = db.claimNextFilingJob();
         if (!job) {

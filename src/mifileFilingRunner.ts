@@ -15,7 +15,7 @@ import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
 import { authenticateMifilePage, dismissMifilePreparationNotice } from './mifileSession';
-import { isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
+import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
     type FilingSourceFingerprint, type MiFileFeeObservation, type MiFileSavedBundleEvidence } from './mifilePreparationEvidence';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -394,7 +394,7 @@ export class MiFileFilingRunner {
         return materialized;
     }
 
-    private async login(page: Page, credentials: MiFileCredentials): Promise<void> {
+    async login(page: Page, credentials: MiFileCredentials): Promise<void> {
         await authenticateMifilePage(page, credentials, { strictNotices: true });
         // The identity cookie can arrive just before MiFILE finishes its own
         // redirect to /cases. Let that navigation settle before opening /file.
@@ -703,7 +703,7 @@ export class MiFileFilingRunner {
         await this.log('info', 'case_form', 'Confirmed Complaint answers, claim amount and mailing request in the MiFILE form.');
     }
 
-    private async verifyAccount(page: Page, username: string): Promise<void> {
+    async verifyAccount(page: Page, username: string): Promise<void> {
         const header = await page.getByRole('banner').innerText();
         if (!header.toLowerCase().split(/\s+/).includes(username.trim().toLowerCase())) {
             throw new MiFileFilingError('The signed-in MiFILE account does not match the configured login.',
@@ -746,6 +746,30 @@ export class MiFileFilingRunner {
         }
         await this.log('info', 'verify_saved_bundle', 'Reopened bundle matches the expected court, account, filer and complete PDF manifest.',
             { externalBundleId: bundleId, temporaryCaseNumber, sourcePdfCount: receipts.length });
+    }
+
+    async inspectSavedForCheckout(page: Page, job: FilingJobView, account: {
+        username: string; accountEnvironment: string; productionConfirmed: boolean;
+    }): Promise<{ packageDigest: string; sourceFeeSubtotalCents: number }> {
+        if (!filingReleaseChecks(job, account).sameAccount || !job.payload || !job.externalBundleId || !job.temporaryCaseNumber) {
+            throw new Error('Checkout requires a verified Prepared bundle in the same MiFILE account.');
+        }
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mifile-checkout-'));
+        try {
+            const documents = await this.materializeDocuments(job.payload, directory);
+            const packageDigest = preparationDigest(job.payload, documents.map(document => document.fingerprint));
+            if (packageDigest !== (job.result?.savedBundleEvidence as MiFileSavedBundleEvidence).packageDigest) {
+                throw new Error('A source PDF changed in OneDrive after preparation. Review the package before checkout.');
+            }
+            await page.goto(String(job.result!.url), {waitUntil:'domcontentloaded', timeout:this.timeoutMs});
+            await page.locator('#documentTable').waitFor({state:'visible', timeout:this.timeoutMs});
+            await dismissMifilePreparationNotice(page);
+            await this.verifySavedBundle(page, job.payload, job.result!.documentManifest as MiFileDocumentReceipt[],
+                account.username, job.externalBundleId, job.temporaryCaseNumber);
+            const fees = await this.observeFees(page);
+            if (fees.displayedSubtotalCents === null) throw new Error('The current bundle fees could not be read unambiguously.');
+            return {packageDigest, sourceFeeSubtotalCents:fees.displayedSubtotalCents};
+        } finally { fs.rmSync(directory, {recursive:true, force:true}); }
     }
 
     private async observeFees(page: Page): Promise<MiFileFeeObservation> {

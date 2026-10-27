@@ -159,6 +159,20 @@ The complete account record is encrypted using AES-256-GCM before storage in SQL
 
 ## Verification and rollout
 
+### Checkout and receipt review (October 27)
+
+Prepared packages expose **Activity > Checkout & receipts**. **Check checkout** queues a serialized read-only MiFILE inspection. It checks the account, downloads and hashes the source PDFs again, reopens the bundle, verifies its PDF manifest and Connected relationships, reads the actual fee table, then cancels checkout. It never selects a payment method, requests a waiver, pays or submits. Unknown notices stop the check.
+
+Fee components must add up exactly in integer USD cents, and filing/additional-payment fees must match the reopened bundle. The live fictional QA bundle showed $103.00 before checkout but $126.69 at checkout ($90 filing + $20 eFiling + $3.69 processing + $13 additional payment). No fixed processing percentage is assumed.
+
+**Confirm amount** records review only, not payment authorization. It binds the exact quote ID, digest, total, package and account credential revision. Quotes expire after 15 minutes. A changed account/PDF, newer failed check or unverified selected payment account prevents confirmation. Accounts without a payment method can display fees, but cannot confirm payment readiness. The owner manages payment methods directly in MiFILE; this admin does not collect card numbers or security codes.
+
+**Refresh receipts** records read-only bundle status. A verified editable bundle is Unsubmitted, never Paid or Filed. Receipt parsers require the exact bundle reference, transaction/receipt number and exact USD amount. Events are deduplicated; conflicting totals block reconciliation instead of overwriting evidence. Unrecognized/unlinked history is inconclusive and requires checking MiFILE before any future retry. PDF/structured receipt parsing has fixture coverage; no real paid/refunded receipt was generated or verified during this no-payment rollout. A new receipt format must be verified before its adapter is trusted.
+
+MiFILE **Accepted** and **Paid** are not proof of clerk filing. Only **Filed** is treated as official filing; **Rejected**, **Payment Rejected** and **Refunded** remain distinct. See the [official filer guide](https://info.courts.mi.gov/hubfs/01.MiFILE_FilerExperience_MiFile_6.17.2022.pdf). Receipt checks do not turn the original Prepared job into Filed or retry payments.
+
+Final payment and court submission are hard-disabled, with no environment switch to enable them. A later release needs an expressly authorized live payment pilot, verified receipt adapters, fresh checkout/review immediately before execution, duplicate-safe recovery and a separate final authorization flow. QA packages must never be submitted.
+
 ```powershell
 npm.cmd test
 npm.cmd run test:admin-intake

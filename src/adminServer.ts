@@ -48,9 +48,10 @@ import { recognizeDocumentPdf } from './documentRecognition';
 import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
+import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-27-preview-watchdog-v58';
+const ADMIN_BUILD_ID = '2026-10-27-checkout-review-v59';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2359,6 +2360,13 @@ const html = String.raw`<!doctype html>
     }
     .draft-filing-job-heading strong { font-size: 12px; }
     .draft-filing-job-meta { color: var(--muted); font-size: 11px; }
+    .checkout-review-body { display: grid; gap: 9px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .checkout-review-body p { margin: 0; }
+    .checkout-fees { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 7px 16px; margin: 4px 0; max-width: 460px; }
+    .checkout-fees dt, .checkout-fees dd { margin: 0; }
+    .checkout-fees dd { text-align: right; font-variant-numeric: tabular-nums; }
+    .checkout-fees .checkout-total { border-top: 1px solid var(--border); padding-top: 8px; font-weight: 600; color: var(--text); }
+    [data-checkout-review] .draft-filing-job-actions { margin-top: 12px; }
     .draft-filing-job-error {
       margin-top: 8px;
       color: var(--bad);
@@ -4622,10 +4630,56 @@ const html = String.raw`<!doctype html>
     });
 
 
+    function renderCheckoutReview(job, open) {
+      const checkout = job.checkout;
+      const quote = checkout.quote;
+      const money = cents => new Intl.NumberFormat('en-US', {style:'currency',currency:'USD'}).format(cents / 100);
+      return '<details class="draft-optional" data-checkout-review' + (open ? ' open' : '') + '><summary>Checkout & receipts' +
+        (quote ? ' · ' + escapeHtml(money(quote.totalCents)) : '') + '</summary>' +
+        '<div class="checkout-review-body"><strong>No payment or court submission is enabled.</strong>' +
+        (checkout.active ? '<span role="status">Checking MiFILE: ' + escapeHtml(checkout.inspection.stage.replace(/_/g,' ')) + '</span>' : '') +
+        (quote ? '<span>MiFILE account: ' + escapeHtml(quote.accountEmail) + '</span>' +
+          '<dl class="checkout-fees">' + quote.lines.map(line => '<dt>' + escapeHtml(line.label) + '</dt><dd>' + escapeHtml(money(line.cents)) + '</dd>').join('') +
+          '<dt class="checkout-total">Checkout total:</dt><dd class="checkout-total">' + escapeHtml(money(quote.totalCents)) + ' USD</dd></dl>' +
+          '<span>Quote expires: ' + escapeHtml(fmtDate(quote.expiresAt)) + '</span>' : '<span>Check checkout to retrieve the exact total, including MiFILE processing fees.</span>') +
+        (checkout.confirmedAt ? '<span>Amount reviewed: ' + escapeHtml(fmtDate(checkout.confirmedAt)) + ' (review only)</span>' : '') +
+        checkout.issues.map(issue => '<span class="draft-filing-job-error">' + escapeHtml(issue) + '</span>').join('') +
+        (checkout.inspection?.error ? '<span class="draft-filing-job-error">' + escapeHtml(checkout.inspection.error) + '</span>' : '') +
+        '<span>Receipt check: ' + escapeHtml(checkout.receiptCheckState || 'Not checked') + '</span>' +
+        (checkout.receiptCheckIssue ? '<span>' + escapeHtml(checkout.receiptCheckIssue) + '</span>' : '') +
+        (checkout.receipts.length ? '<ul>' + checkout.receipts.map(receipt => '<li>' + escapeHtml(receipt.status) +
+          (receipt.totalCents !== null ? ' · ' + escapeHtml(money(receipt.totalCents)) : '') +
+          ' · ' + escapeHtml(fmtDate(receipt.occurredAt || receipt.observedAt)) + '</li>').join('') + '</ul>' : '<span>No verified payment receipt recorded.</span>') +
+        '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active ? ' disabled' : '') + '>' +
+        icon('refresh-cw') + 'Check checkout</button>' +
+        '<button type="button" data-checkout-action="confirm"' + (!checkout.canConfirm || checkout.confirmedAt ? ' disabled' : '') + '>' +
+        icon('check') + 'Confirm amount</button>' +
+        '<button type="button" data-checkout-action="receipts"' + (checkout.active ? ' disabled' : '') + '>' +
+        icon('receipt') + 'Refresh receipts</button></div></details>';
+    }
+
+    async function checkoutAction(job, action) {
+      let payload = {};
+      if (action === 'confirm') {
+        const quote = job.checkout.quote;
+        if (!quote || !job.checkout.canConfirm) throw new Error('Refresh checkout before confirming the amount.');
+        const amount = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(quote.totalCents / 100);
+        if (!await confirmDraftAction('Review exact checkout amount?',
+          'Total: ' + amount + ' USD\\nAccount: ' + quote.accountEmail + '\\nTemporary case: ' + job.temporaryCaseNumber +
+          '\\nThis records your review only. It does not authorize payment or submission to court.', 'Confirm ' + amount)) return;
+        payload = {quoteId:quote.id,quoteDigest:quote.quoteDigest,totalCents:quote.totalCents};
+      }
+      await api('/api/filing-jobs/' + encodeURIComponent(job.id) + '/checkout/' + action,
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' + encodeURIComponent(state.selectedDraftId));
+      renderDraftFilingJobs();
+    }
+
     function renderDraftFilingJobs() {
       const root = document.getElementById('draftFilingJobPanel');
       const logWasOpen = Boolean(root.querySelector('[data-filing-log]')?.open);
       const releaseWasOpen = Boolean(root.querySelector('[data-release-checks]')?.open);
+      const checkoutWasOpen = Boolean(root.querySelector('[data-checkout-review]')?.open);
       const previousChecklist = root.querySelector('[data-upload-checklist]');
       const jobs = state.draftFilingJobs || [];
       const config = state.mifileConfig || {
@@ -4702,9 +4756,10 @@ const html = String.raw`<!doctype html>
           '<span>Primary account: ' + (job.releaseChecks.primaryAccountConfirmed ? 'Confirmed' : 'Not confirmed for this bundle') + '</span>' +
           '<span>Displayed fees before checkout: ' + (job.releaseChecks.displayedSubtotalCents === null ? 'Not recorded' :
             escapeHtml(new Intl.NumberFormat('en-US', {style:'currency',currency:'USD'}).format(job.releaseChecks.displayedSubtotalCents / 100))) + '</span>' +
-          '<span>Checkout total and processing fee: Not verified</span>' +
+          '<span>Checkout total and processing fee: ' + (job.checkout?.checkoutVerified ? 'Checked separately below' : 'Not verified') + '</span>' +
           '<span>Payment and final court submission: Disabled</span>' +
           '</div></details>' : '') +
+        (job.status === 'prepared' && job.checkout ? renderCheckoutReview(job, checkoutWasOpen) : '') +
         (job.errorMessage ? '<div class="draft-filing-job-error">' +
           escapeHtml((job.errorCode ? job.errorCode + ': ' : '') + job.errorMessage) + '</div>' : '') +
         (job.debugArtifactPath && job.errorMessage ? '<div class="draft-filing-job-actions"><a target="_blank" rel="noopener" href="/api/filing-jobs/' +
@@ -4725,6 +4780,9 @@ const html = String.raw`<!doctype html>
           '</span><strong>' + escapeHtml(entry.checkpoint) + '</strong><span>' +
           escapeHtml(entry.message) + '</span></div>').join('') + '</div></details>' : '') +
       '</div>';
+      root.querySelectorAll('[data-checkout-action]').forEach(button => {
+        button.addEventListener('click', () => checkoutAction(job, button.dataset.checkoutAction).catch(showDraftError));
+      });
       root.querySelectorAll('[data-retry-filing-job]').forEach(button => {
         button.addEventListener('click', () => {
           queueDraftFiling(true).catch(showDraftError);
@@ -7204,6 +7262,14 @@ export function createAdminServer(
     };
 
     let accountTestRunning = false;
+    const decorateFilingJob = (job: NonNullable<ReturnType<typeof db.getFilingJob>>) => {
+        let account = null;
+        try { account = getCheckoutAccount(); } catch { /* Settings are shown separately. */ }
+        const checkout = account ? db.checkout().state(job.id, account) : null;
+        return { ...job, checkout, releaseChecks: {...filingReleaseChecks(job, account),
+            checkoutVerified: checkout?.checkoutVerified || false,
+            currentSourceContentVerified: checkout?.checkoutVerified || false} };
+    };
     const authorize = createAdminAuth(Date.now, db.getAdminSessionStore());
     const excelPdf = createExcelPdfHandler();
     const server = http.createServer(async (req, res) => {
@@ -7506,7 +7572,7 @@ export function createAdminServer(
                     db.listFilingJobs(
                         caseDraftId,
                         Number(url.searchParams.get('limit') || 100),
-                    ).map(job => ({ ...job, releaseChecks: filingReleaseChecks(job, account) })),
+                    ).map(decorateFilingJob),
                 );
                 return;
             }
@@ -7539,7 +7605,37 @@ export function createAdminServer(
                 }
                 let account = null;
                 try { account = getMiFileCredentials(); } catch { /* Saved credentials need attention. */ }
-                sendJson(res, 200, { ...job, releaseChecks: filingReleaseChecks(job, account) });
+                sendJson(res, 200, decorateFilingJob(job));
+                return;
+            }
+
+            const checkoutMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/checkout\/([^/]+)$/);
+            if (req.method === 'POST' && checkoutMatch) {
+                const action = checkoutMatch[2];
+                if (!['inspect','confirm','receipts'].includes(action)) {
+                    sendJson(res, 403, {error:'Payment and final court submission are disabled in this release.'});
+                    return;
+                }
+                try {
+                    const body = await readRequestBody(req);
+                    const input = body ? JSON.parse(body) : {};
+                    const allowed = action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] : [];
+                    if (!input || Array.isArray(input) || Object.keys(input).some(key => !allowed.includes(key))) {
+                        throw new Error('Only a read-only checkout inspection or amount review is allowed.');
+                    }
+                    if (accountTestRunning || !getMiFileRuntimeConfig().ready) throw new Error('Verify the MiFILE account and wait for the current account check to finish.');
+                    const id = decodeURIComponent(checkoutMatch[1]), account = getCheckoutAccount();
+                    if (!db.getFilingJob(id)) { sendJson(res,404,{error:'MiFILE job not found'}); return; }
+                    if (action === 'confirm') {
+                        db.checkout().confirm(id, input, account, process.env.ADMIN_USERNAME || 'admin');
+                    } else {
+                        if (['false','0','no','off'].includes((process.env.MIFILE_FILING_WORKER_ENABLED || 'true').toLowerCase())) {
+                            throw new Error('The MiFILE worker must be enabled to run read-only inspections.');
+                        }
+                        db.checkout().queue(id, action === 'inspect' ? 'quote' : 'receipts', account);
+                    }
+                    sendJson(res, action === 'confirm' ? 200 : 202, db.checkout().state(id,account));
+                } catch (error) { sendJson(res,409,{error:(error as Error).message}); }
                 return;
             }
 

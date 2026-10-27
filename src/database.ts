@@ -10,6 +10,7 @@ import { resolveCourt, districtCode } from './courtForms';
 import { changedFieldPaths, mergeExtractedField, protectedFieldPaths } from './draftFieldMerge';
 import { ADAM_OFFICE, ADAM_ATTORNEY, ADAM_FILING_POLICY_VERSION, approvedSupportingRelation } from './adamFilingPolicy';
 import { filingPreparationProgress, type FilingPreparationProgress } from './filingProgress';
+import { CheckoutStore } from './checkoutStore';
 import {
     ComplaintExtractionResult,
     CURRENT_COMPLAINT_EXTRACTOR_VERSION,
@@ -2514,6 +2515,36 @@ const migrations: Migration[] = [
             token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, credential_version TEXT NOT NULL
         ); CREATE INDEX idx_admin_session_expiry ON admin_sessions(expires_at);`),
     },
+    {
+        version: 28,
+        name: 'mifile_checkout_reviews_and_receipts',
+        up: db => db.exec(`
+            CREATE TABLE mifile_checkout_inspections (
+                id TEXT PRIMARY KEY, filing_job_id TEXT NOT NULL REFERENCES filing_jobs(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('quote','receipts')),
+                status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
+                stage TEXT NOT NULL DEFAULT 'queued',
+                account_identity TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                result_json TEXT, error_message TEXT
+            );
+            CREATE UNIQUE INDEX idx_checkout_one_active ON mifile_checkout_inspections(filing_job_id)
+                WHERE status IN ('queued','running');
+            CREATE INDEX idx_checkout_work ON mifile_checkout_inspections(status, created_at);
+            CREATE TABLE mifile_checkout_confirmations (
+                quote_id TEXT PRIMARY KEY, filing_job_id TEXT NOT NULL REFERENCES filing_jobs(id) ON DELETE CASCADE,
+                quote_digest TEXT NOT NULL, total_cents INTEGER NOT NULL CHECK(total_cents >= 0),
+                account_identity TEXT NOT NULL, confirmed_at TEXT NOT NULL, confirmed_by TEXT NOT NULL
+            );
+            CREATE TABLE mifile_receipt_events (
+                event_key TEXT PRIMARY KEY, filing_job_id TEXT NOT NULL REFERENCES filing_jobs(id) ON DELETE CASCADE,
+                account_identity TEXT NOT NULL, observed_at TEXT NOT NULL, event_json TEXT NOT NULL,
+                external_reference TEXT NOT NULL, receipt_kind TEXT NOT NULL, remote_status TEXT NOT NULL,
+                document_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(filing_job_id, external_reference, receipt_kind, remote_status, document_id)
+            );
+            CREATE INDEX idx_receipts_job ON mifile_receipt_events(filing_job_id, observed_at);
+        `),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2914,7 +2945,13 @@ export class WorkflowDatabase {
     }
 
     hasActiveFilingJobs(): boolean {
-        return Boolean(this.db.prepare("SELECT 1 FROM filing_jobs WHERE status IN ('queued', 'running') LIMIT 1").get());
+        return Boolean(this.db.prepare("SELECT 1 FROM filing_jobs WHERE status IN ('queued', 'running') LIMIT 1").get() ||
+            this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status IN ('queued','running') LIMIT 1").get());
+    }
+
+    checkout(): CheckoutStore {
+        return new CheckoutStore(this.db, id => this.getFilingJob(id),
+            (_id, action, details) => this.insertAuditLog('filing_job', String(details.filingJobId), action, details));
     }
 
     close(): void {
@@ -4888,6 +4925,9 @@ export class WorkflowDatabase {
                     WHERE d.email_id = e.id
                       AND d.status IN ('retry_queued', 'retrying')
                   )
+                  AND NOT EXISTS (SELECT 1 FROM case_drafts c JOIN filing_jobs f ON f.case_draft_id = c.id
+                    WHERE c.email_id = e.id AND (f.status IN ('queued','running') OR EXISTS
+                      (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running'))))
             `)
             .get(cutoff) as { count: number };
         return Number(row.count ?? 0);
@@ -4920,6 +4960,11 @@ export class WorkflowDatabase {
         if (activeRetry) {
             throw new Error('An email with an active document retry cannot be deleted');
         }
+        if (this.db.prepare(`SELECT 1 FROM case_drafts c JOIN filing_jobs f ON f.case_draft_id = c.id
+            WHERE c.email_id = ? AND (f.status IN ('queued','running') OR EXISTS
+              (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running'))) LIMIT 1`).get(emailId)) {
+            throw new Error('An email with an active MiFILE job or checkout inspection cannot be deleted');
+        }
 
         return this.runInTransaction(() =>
             this.deleteEmailRecordInternal(emailId, email.external_message_id),
@@ -4945,6 +4990,9 @@ export class WorkflowDatabase {
                     WHERE d.email_id = e.id
                       AND d.status IN ('retry_queued', 'retrying')
                   )
+                  AND NOT EXISTS (SELECT 1 FROM case_drafts c JOIN filing_jobs f ON f.case_draft_id = c.id
+                    WHERE c.email_id = e.id AND (f.status IN ('queued','running') OR EXISTS
+                      (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running'))))
                 ORDER BY COALESCE(e.received_at, e.created_at)
             `)
             .all(cutoff) as Array<{ id: string; external_message_id: string }>;
@@ -5525,6 +5573,7 @@ export class WorkflowDatabase {
 
     claimNextFilingJob(): FilingJobView | null {
         const jobId = this.runInTransaction(() => {
+            if (this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status = 'running' LIMIT 1").get()) return null;
             const queued = this.db.prepare(`
                 SELECT id, case_draft_id
                 FROM filing_jobs
