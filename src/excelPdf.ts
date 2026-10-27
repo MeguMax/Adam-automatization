@@ -114,10 +114,10 @@ export function excelManifest(base = process.env.EXCEL_PDF_PUBLIC_URL || 'https:
     const origin = url.origin.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
     return `<?xml version="1.0" encoding="UTF-8"?>
 <OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="TaskPaneApp">
-<Id>05cdad5d-041d-41c4-b8c9-9c33cf9d7c93</Id><Version>1.0.0.0</Version><ProviderName>Devlin Law PLLC</ProviderName><DefaultLocale>en-US</DefaultLocale>
+<Id>05cdad5d-041d-41c4-b8c9-9c33cf9d7c93</Id><Version>1.1.0.0</Version><ProviderName>Devlin Law PLLC</ProviderName><DefaultLocale>en-US</DefaultLocale>
 <DisplayName DefaultValue="Devlin Law PDF Forms"/><Description DefaultValue="Generate fillable court PDFs from the selected Excel row."/>
 <IconUrl DefaultValue="${origin}/excel/icon.png"/><SupportUrl DefaultValue="${origin}/excel/"/>
-<Hosts><Host Name="Workbook"/></Hosts><Requirements><Sets DefaultMinVersion="1.7"><Set Name="ExcelApi" MinVersion="1.7"/></Sets></Requirements>
+<Hosts><Host Name="Workbook"/></Hosts><Requirements><Sets DefaultMinVersion="1.9"><Set Name="ExcelApi" MinVersion="1.9"/></Sets></Requirements>
 <DefaultSettings><SourceLocation DefaultValue="${origin}/excel/"/></DefaultSettings><Permissions>ReadWriteDocument</Permissions></OfficeApp>`;
 }
 
@@ -130,6 +130,7 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
         const assets: Record<string, [string, string]> = {
             '/excel/': ['taskpane.html', 'text/html; charset=utf-8'], '/excel': ['taskpane.html', 'text/html; charset=utf-8'],
             '/excel/app.js': ['app.js', 'text/javascript'], '/excel/row.js': ['row.js', 'text/javascript'],
+            '/excel/workbook.js': ['workbook.js', 'text/javascript'],
             '/excel/style.css': ['style.css', 'text/css'], '/excel/icon.png': ['icon.png', 'image/png'],
         };
         if (req.method === 'GET' && assets[pathname]) {

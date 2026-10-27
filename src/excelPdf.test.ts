@@ -7,7 +7,79 @@ import { createAdminAuth } from './adminAuth';
 import { createExcelPdfHandler, EXCEL_FORMS, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
 
 const row = require('../excel-addin/row.js');
+const workbook = require('../excel-addin/workbook.js');
 const values = (id = 'dc105'): Record<string, unknown> => Object.fromEntries(EXCEL_FORMS.find(form => form.id === id)!.fields.map(field => [field, '']));
+
+function officeFixture() {
+    const form=EXCEL_FORMS[0];
+    const state={headers:['Defendant','Landlord','Court_Name','Case_Number',...form.fields],
+        values:['Morgan Tenant','Example Property LLC','29th','26-00001-LT',...form.fields.map(()=>'' as string|number|boolean|null)],
+        rowIndex:35,rowCount:1,width:form.fields.length+4,calculations:0,waits:0,reads:0,selectionReads:0,
+        states:['Done'],date:'10/5/2026',moveSelection:false,moveSheet:false};
+    let currentState='Done';
+    const sheet={id:'sheet-1',name:'Working Document',load(){return this;},getUsedRange(){return {
+        columnIndex:0,get columnCount(){return state.width;},load(){return this;}};},
+        getRangeByIndexes(index:number){return {get values(){state.reads++;return [index===0?state.headers:[...state.values]];},
+            get valueTypes(){return [state.values.map(value=>typeof value==='number'?'Double':'String')];},
+            getCell(){return {};},load(){return this;}};}};
+    const excel={CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async(callback:any)=>callback({
+        sync:async()=>{},application:{calculate(){state.calculations++;},get calculationState(){return currentState;},
+            load(){if(state.states.length) currentState=state.states.shift()!;}},
+        workbook:{getSelectedRange(){state.selectionReads++;return {rowIndex:state.rowIndex+(state.moveSelection&&state.selectionReads>1?1:0),
+            rowCount:state.rowCount,worksheet:state.moveSheet&&state.selectionReads>1?{...sheet,id:'sheet-2'}:sheet,load(){return this;}};},
+            functions:{text(){return {get value(){return state.date;},load(){return this;}};}}},
+    })};
+    return {state,form,excel,sleep:async()=>{state.waits++;}};
+}
+
+test('Excel adapter waits for calculation, reads the current row and lets Excel format date serials',async()=>{
+    const {state,form,excel,sleep}=officeFixture();
+    state.states=['Calculating','Calculating','Done','Done','Done'];
+    state.values[state.headers.indexOf('dc105_24')]=46300;
+    const data=await workbook.readSelection(excel,form,{sleep});
+    assert.equal(state.calculations,1);assert.equal(state.waits,2);
+    assert.equal(data.values.dc105_24,'10/5/2026');assert.equal(data.row,36);assert.equal(data.sheetId,'sheet-1');
+    assert.equal(data.metadata.plaintiff,'Example Property LLC');
+});
+test('Excel adapter times out busy calculation without reading cached field values',async()=>{
+    const {state,form,excel,sleep}=officeFixture();state.states=['Calculating'];
+    await assert.rejects(workbook.readSelection(excel,form,{sleep,timeoutMs:0}),/still calculating/);
+    assert.equal(state.reads,0);
+});
+test('snapshot rechecks do not force another recalculation and reject row or sheet changes',async()=>{
+    const first=officeFixture();
+    await workbook.readSelection(first.excel,first.form,{recalculate:false,sleep:first.sleep});
+    assert.equal(first.state.calculations,0);
+    for(const key of ['moveSelection','moveSheet'] as const) {
+        const fixture=officeFixture();fixture.state[key]=true;
+        await assert.rejects(workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep}),/worksheet changed/);
+    }
+});
+test('selection, duplicate case identity and invalid date values stop the Office adapter',async()=>{
+    for(const input of [{rowIndex:0},{rowIndex:1.5},{rowCount:2},{width:2049}]) {
+        const fixture=officeFixture();Object.assign(fixture.state,input);
+        await assert.rejects(workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep}));
+    }
+    const duplicate=officeFixture();duplicate.state.headers.push('Defendant');duplicate.state.values.push('Different person');duplicate.state.width++;
+    await assert.rejects(workbook.readSelection(duplicate.excel,duplicate.form,{sleep:duplicate.sleep}),/Duplicate case column/);
+    for(const value of [46300.5,46300]) {
+        const fixture=officeFixture();fixture.state.values[fixture.state.headers.indexOf('dc105_24')]=value;fixture.state.date='2/29/1900';
+        await assert.rejects(workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep}));
+    }
+});
+test('case snapshots and filenames bind PDF values and identity without unsafe path characters',async()=>{
+    const fixture=officeFixture();
+    const data=await workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep});
+    assert.equal(workbook.sameSnapshot(data,structuredClone(data)),true);
+    for(const change of [{row:37},{sheetId:'another-sheet'},{form:'dc508'},{values:{...data.values,dc105_05:'Changed'}},
+        {metadata:{...data.metadata,caseNumber:'Different'}}]) assert.equal(workbook.sameSnapshot(data,{...data,...change}),false);
+    assert.equal(row.pdfFilename(data),'DC105 - 29th - 26-00001-LT - Example Property LLC v Morgan Tenant.pdf');
+    const unsafe=row.pdfFilename({...data,metadata:{...data.metadata,defendant:'A/B:C*D?"E<F>G|H\\I\n'},name:'Tenant'});
+    assert.ok(!/[<>:"/\\|?*\x00-\x1f]/.test(unsafe));
+    assert.ok(row.pdfFilename({...data,metadata:{defendant:'a'.repeat(400)}}).length<=174);
+    assert.equal(row.isCalendarDate('2/29/2024'),true);
+    for(const date of ['2/29/1900','2/30/2026','13/1/2026','1/0/2026','#VALUE!']) assert.equal(row.isCalendarDate(date),false);
+});
 
 async function fixture(run: (base: string, advance: (ms: number) => void) => Promise<void>, generate?: typeof generateExcelPdf) {
     const saved = { ADMIN_USERNAME: process.env.ADMIN_USERNAME, ADMIN_PASSWORD: process.env.ADMIN_PASSWORD, NODE_ENV: process.env.NODE_ENV };
@@ -60,6 +132,8 @@ test('generation input cannot choose a path, introduce extra fields, or send amb
     }
     validateExcelValues('dc105', { ...values(), dc105_24: '10/5/2026', dc105_11: true });
     assert.ok(excelManifest().includes('ExcelApi'));
+    assert.ok(excelManifest().includes('MinVersion="1.9"'));
+    assert.equal(workbook.MIN_EXCEL_API,'1.9');
     assert.throws(() => excelManifest('http://untrusted.example'), /HTTPS/);
     assert.throws(() => excelManifest('https://example.com/other'), /HTTPS/);
 });
@@ -86,7 +160,7 @@ test('Excel shell supports Office framing but never exposes templates or general
     assert.ok(csp.includes('https://appsforoffice.microsoft.com'));
     assert.ok(csp.includes('https://*.officeapps.live.com'));
     assert.ok(!csp.includes('unsafe-inline'));
-    for (const asset of ['app.js', 'row.js', 'style.css', 'icon.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
+    for (const asset of ['app.js', 'row.js', 'workbook.js', 'style.css', 'icon.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
     assert.equal((await fetch(base + '/excel/pdfjs/standard_fonts/nonexistent')).status, 404);
     assert.equal((await fetch(base + '/excel/templates/dc105.pdf')).status, 404);
     assert.equal((await post(base, 'generate', { form: 'dc105', values: {} }, await login(base))).status, 422);

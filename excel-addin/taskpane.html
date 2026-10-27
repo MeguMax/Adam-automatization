@@ -9,6 +9,7 @@
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <script defer src="/excel/lucide.js"></script>
   <script defer src="/excel/row.js"></script>
+  <script defer src="/excel/workbook.js"></script>
   <script defer src="/excel/app.js"></script>
 </head>
 <body>
@@ -28,6 +29,7 @@
       <div class="section-heading"><h1>Selected case</h1><button id="refresh" class="icon" title="Refresh selected row" aria-label="Refresh selected row"><i data-lucide="refresh-cw"></i></button></div>
       <p id="selection" class="secondary">Connecting to Excel...</p>
       <p id="caseName" class="case-name"></p>
+      <p id="caseContext" class="secondary"></p>
       <label for="form">Court form</label>
       <select id="form" disabled><option value="">Loading forms...</option></select>
       <button id="generate" class="primary" disabled><i data-lucide="file-plus-2"></i><span>Generate PDF</span></button>

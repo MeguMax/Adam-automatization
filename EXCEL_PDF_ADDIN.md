@@ -5,13 +5,17 @@ sends email, modifies case records, pays fees or submits a filing.
 
 ## Current implementation
 
-- Office.js task pane for Microsoft 365 Excel desktop and Excel Online, requiring ExcelApi 1.7.
+- Office.js task pane for Microsoft 365 Excel desktop and Excel Online, requiring ExcelApi 1.9 (including calculation-state and worksheet-collection events).
 - Three approved templates: DC105 Judgment, DC508 Conditional Dismissal (both pages), MC202 Certification of Records.
 - Current selected row is recalculated and read from the open workbook immediately before generation. No XLSX cache or workbook upload is used.
+- Generation waits up to 15 seconds for Excel to finish calculating. If calculation does not finish, no PDF is generated from cached values.
+- The selected sheet, row, case identity and mapped field values are checked again after generation and immediately before download. A changed case or formula invalidates the PDF and requires regeneration.
+- Changes and selections are tracked across the worksheet collection, including newly added sheets. Rechecks still protect downloads when host change events are unavailable.
 - Exact matching column names; missing/duplicate columns and mapped Excel errors stop generation. Errors in unrelated columns do not block a valid form.
 - Known date fields use Excel's own TEXT function with m/d/yyyy. No guessed serial-date epoch or date mutation.
 - Same admin credentials, but a separate, 30-minute PDF-only session. Tokens remain in task-pane memory; no third-party cookies or browser storage are required.
 - PDF.js preview and explicit download. All PDF fields remain fillable. Temporary server files are deleted after the worker returns; there is no generated-PDF archive in SQLite.
+- Download names include the form, court, case number and parties when available, with Windows-unsafe characters removed.
 
 The current save action is a download. It does **not** silently write to
 `C:\Users\adamj\OneDrive\Documents` or upload through Graph. The user can choose
@@ -31,6 +35,12 @@ row, sign in with admin credentials, choose a form and select **Generate PDF**.
 Inspect the preview and download the result. Closing/reloading the panel or a
 server redeployment requires signing in again.
 
+Use manifest version 1.1.0.0 or later. Reimport the manifest if an older test
+installation still declares ExcelApi 1.7. The workbook's first row must contain
+the exact form column headers and a nonempty `Defendant` case-identity column.
+Optional filename context uses `Landlord`, `Court_Name` (or `Court`) and
+`Case_Number`. Missing or duplicate mapped form columns are not guessed.
+
 For an initial Excel Online test, upload the XML manifest through Office's
 **Upload My Add-in** flow, when permitted by the tenant. For regular deployment
 across desktop and web, Adam's Microsoft 365 administrator can deploy the custom
@@ -40,6 +50,7 @@ is a testing option, not the production deployment method.
 Official installation references:
 - https://learn.microsoft.com/en-us/office/dev/add-ins/testing/sideload-office-add-ins-for-testing
 - https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-deployment-of-add-ins
+- https://learn.microsoft.com/en-us/javascript/api/excel/excel.application?view=excel-js-1.9
 
 The first installation in Adam's real Excel host has not been verified yet.
 Browser QA uses an explicitly simulated Office API; it is not proof of native
@@ -67,7 +78,9 @@ npx.cmd office-addin-manifest validate output/devlin-law-excel.xml
 
 `test:excel-pdf` runs a local, isolated task-pane server, a simulated Office host,
 real PDF generation/downloads, mobile/desktop screenshots and nonblank canvas
-checks. It never connects to Microsoft Graph, MiFILE or a live workbook.
+checks. It also tests delayed calculation, silent formula changes during
+generation, stale downloads and newly added worksheets. It never connects to
+Microsoft Graph, MiFILE or a live workbook.
 
 Architecture: `src/excelPdf.ts` owns only `/excel/*`; `excel-addin/` contains the
 task pane and row reader; `tools/excel_pdf/http_worker.py` invokes the verified

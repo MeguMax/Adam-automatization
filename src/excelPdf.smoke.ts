@@ -20,18 +20,22 @@ async function main() {
     const browser = await chromium.launch({ headless: true });
     try {
         const page = await browser.newPage({ viewport: { width: 380, height: 850 } });
-        const headers = ['Defendant', ...EXCEL_FORMS.flatMap(form => form.fields)];
-        const values = headers.map(header => header === 'Defendant' ? 'Morgan Tenant' : header === 'dc105_05' ? 'Example Property LLC' : header === 'dc105_06' ? 'Morgan Tenant' : header === 'dc105_24' ? 46300 : '');
+        const headers = ['Defendant','Landlord','Court_Name','Case_Number', ...EXCEL_FORMS.flatMap(form => form.fields)];
+        const values = headers.map(header => header === 'Defendant' ? 'Morgan Tenant' : header === 'Landlord' ? 'Example Property LLC' :
+            header === 'Court_Name' ? '29th' : header === 'Case_Number' ? '26-00001-LT' :
+            header === 'dc105_05' ? 'Example Property LLC' : header === 'dc105_06' ? 'Morgan Tenant' : header === 'dc105_24' ? 46300 : '');
         const fake = `window.qa = ${JSON.stringify({ headers, values, rowIndex: 35, rowCount: 1 })};
-window.qa.events = [];
-const event = {add: callback => window.qa.events.push(callback)};
-const sheet = {name:'Working Document',load(){return this},onChanged:event,onSelectionChanged:event,onActivated:event,
+window.qa.events = []; window.qa.calculations = 0; window.qa.pending = 0;
+const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(callback)}};
+const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'},load(){return this},
  getUsedRange(){return {columnIndex:0,columnCount:qa.headers.length,load(){return this}}},
  getRangeByIndexes(row){return {get values(){return [row===0?qa.headers:qa.values]},get valueTypes(){return [qa.values.map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}}}}};
-window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{calculationState:'Done',calculate(){},load(){}},workbook:{
- getSelectedRange(){return {get rowIndex(){return qa.rowIndex},get rowCount(){return qa.rowCount},worksheet:sheet,load(){return this}}},worksheets:{items:[sheet],load(){}},functions:{text(){return {value:'10/5/2026',load(){return this}}}}
+window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++},load(){}},workbook:{
+ getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
+ worksheets:{onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
+ functions:{text(){return {value:qa.date || '10/5/2026',load(){return this}}}}
 }})};
-window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:()=>true}},onReady:callback=>Promise.resolve().then(()=>callback({host:'Excel'}))};`;
+window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:(_api,version)=>version==='1.9'&&!qa.unsupported}},onReady:callback=>Promise.resolve().then(()=>callback({host:'Excel'}))};`;
         const errors: string[] = [];
         page.on('pageerror', error => errors.push(error.message));
         await page.route('**/*', async route => {
@@ -61,7 +65,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             assert.equal(nonblank, true);
             const downloadEvent = page.waitForEvent('download'); await page.click('#save');
             const download = await downloadEvent;
-            assert.equal(download.suggestedFilename(), form.id.toUpperCase() + '-row-36.pdf');
+            assert.equal(download.suggestedFilename(), form.id.toUpperCase() + ' - 29th - 26-00001-LT - Example Property LLC v Morgan Tenant.pdf');
             await download.saveAs(path.join(output, download.suggestedFilename()));
             await page.screenshot({ path: path.join(output, form.id + '-mobile.png'), fullPage: true });
         }
@@ -71,10 +75,11 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.evaluate(() => { const qa = (window as any).qa; qa.rowCount = 2; qa.events[0](); });
         await page.waitForFunction(() => document.getElementById('error')?.textContent?.includes('multiple rows'));
         assert.equal(await page.locator('#result').isVisible(), false);
-        await page.evaluate(() => { const qa = (window as any).qa; qa.rowCount = 1; qa.rowIndex = 53; qa.values[0] = 'Second Tenant'; });
+        await page.evaluate(() => { const qa = (window as any).qa; qa.rowCount = 1; qa.rowIndex = 53; qa.values[0] = 'Second Tenant'; qa.events[0](); });
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.click('#generate');
         await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
-        assert.ok((await page.locator('#resultName').innerText()).includes('Second Tenant / MC202-row-54.pdf'));
+        assert.ok((await page.locator('#resultName').innerText()).includes('Example Property LLC v Second Tenant.pdf'));
         await page.route('**/excel/generate', async route => { await new Promise(resolve => setTimeout(resolve, 250)); await route.continue(); });
         const pending = page.waitForRequest(req => req.url().endsWith('/excel/generate'));
         await page.click('#generate'); await pending;
@@ -82,13 +87,38 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(() => document.getElementById('error')?.textContent?.includes('worksheet changed'));
         assert.equal(await page.locator('#result').isVisible(), false);
         await page.unroute('**/excel/generate');
+        // Silent formula changes must be caught even if Office event delivery is unavailable.
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        const slow = page.waitForRequest(req=>req.url().endsWith('/excel/generate'));
+        await page.route('**/excel/generate', async route => { await new Promise(resolve=>setTimeout(resolve,250));await route.continue(); });
+        await page.click('#generate');await slow;
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('mc202_05')]='Changed without an event';});
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('worksheet changed'));
+        assert.equal(await page.locator('#result').isVisible(),false);
+        await page.unroute('**/excel/generate');
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        await page.evaluate(()=>{(window as any).qa.pending=4;});
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
+        assert.equal(await page.locator('#result').isVisible(),true);
+        let unexpectedDownload = false;
+        const rejectDownload = () => {unexpectedDownload=true;};
+        page.on('download',rejectDownload);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('mc202_05')]='Edited after preview';});
+        await page.click('#save');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since this PDF'));
+        assert.equal(unexpectedDownload,false);
+        assert.equal(await page.locator('#result').isVisible(),false);
+        page.off('download',rejectDownload);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.sheetName='New case worksheet';qa.rowIndex=3;qa.events[3]();});
+        await page.waitForFunction(()=>document.getElementById('selection')?.textContent?.includes('New case worksheet / Row 4'));
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
         assert.equal(overflow, false);
         assert.equal(await page.evaluate(() => localStorage.length), 0);
         await page.click('#logout'); await page.waitForSelector('#signIn:visible');
         assert.equal(await page.locator('#password').inputValue(), '');
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Office host: login, selected row, 3 real PDF downloads, nonblank PDF.js previews, date formatting boundary, changed selection during generation, multi-row guard, logout and responsive layouts.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: 3 real fillable PDF downloads, case filenames, nonblank responsive previews, delayed calculation, changed/silent edits during generation, stale-download rejection, new worksheet events, multi-row guard and logout.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

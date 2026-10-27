@@ -2,10 +2,21 @@
     'use strict';
     const $ = id => document.getElementById(id);
     let token = '', forms = [], officeReady = false, busy = false, pdfUrl = '', revision = 0, pdfTask = null, previewBlob = null, previewWidth = 0;
+    let selectedData = null, resultSnapshot = null, refreshTimer;
     function message(error, status = '') { $('error').textContent = error; $('status').textContent = status; }
-    function controls() { $('generate').disabled = busy || !officeReady || !token || !forms.length; $('refresh').disabled = busy || !officeReady; $('form').disabled = busy || !forms.length; }
-    function clearResult() { if (pdfUrl) URL.revokeObjectURL(pdfUrl); pdfUrl = ''; previewBlob = null; if (pdfTask) pdfTask.destroy().catch(() => {}); pdfTask = null; $('preview').replaceChildren(); $('result').hidden = true; }
-    function signedOut() { ++revision; token = ''; clearResult(); $('workspace').hidden = true; $('signIn').hidden = false; $('logout').hidden = true; controls(); }
+    function controls() {
+        $('generate').disabled = busy || !officeReady || !token || !forms.length || !selectedData;
+        $('refresh').disabled = busy || !officeReady; $('form').disabled = busy || !forms.length;
+        for (const id of ['download','save']) $(id).setAttribute('aria-disabled',String(busy || !pdfUrl));
+    }
+    function clearResult() {
+        if (pdfUrl) URL.revokeObjectURL(pdfUrl);
+        pdfUrl = ''; previewBlob = null; resultSnapshot = null;
+        if (pdfTask) pdfTask.destroy().catch(() => {});
+        pdfTask = null; $('preview').replaceChildren(); $('result').hidden = true;
+        for (const id of ['download','save']) { $(id).removeAttribute('href'); $(id).removeAttribute('download'); }
+    }
+    function signedOut() { ++revision; token = ''; selectedData = null; clearResult(); $('workspace').hidden = true; $('signIn').hidden = false; $('logout').hidden = true; controls(); }
     async function api(url, data) {
         const response = await fetch(url, { method:'POST', credentials:'omit', headers:{'Content-Type':'application/json', ...(token ? { Authorization:'Bearer ' + token } : {})}, body:JSON.stringify(data) });
         if (!response.ok) {
@@ -15,46 +26,18 @@
         }
         return response;
     }
-    async function readSelection() {
+    async function readSelection(options = {}) {
         if (!officeReady) throw new Error('Excel connection unavailable.');
         const form = forms.find(item => item.id === $('form').value);
         if (!form) throw new Error('Select a court form.');
-        return Excel.run(async context => {
-            const selection = context.workbook.getSelectedRange();
-            selection.load('rowIndex,rowCount');
-            const sheet = selection.worksheet;
-            sheet.load('name');
-            const used = sheet.getUsedRange();
-            used.load('columnIndex,columnCount');
-            context.application.calculate(Excel.CalculationType.recalculate);
-            await context.sync();
-            DevlinExcelRow.assertSelection(selection);
-            const width = used.columnIndex + used.columnCount;
-            if (width > 2048) throw new Error('The worksheet has more than 2,048 used columns.');
-            const headers = sheet.getRangeByIndexes(0, 0, 1, width);
-            const row = sheet.getRangeByIndexes(selection.rowIndex, 0, 1, width);
-            headers.load('values'); row.load('values,valueTypes'); context.application.load('calculationState');
-            await context.sync();
-            if (context.application.calculationState !== Excel.CalculationState.done) throw new Error('Excel is still calculating. Retry when calculation finishes.');
-            const data = DevlinExcelRow.selectedFields(headers.values[0], row.values[0], row.valueTypes[0], form);
-            const dates = [];
-            for (const field of form.dateFields) if (typeof data.values[field] === 'number') {
-                if (!Number.isInteger(data.values[field])) throw new Error('Time-bearing date in ' + field + ' requires review.');
-                const formatted = context.workbook.functions.text(row.getCell(0, data.columns[field]), 'm/d/yyyy');
-                formatted.load('value'); dates.push({ field, formatted });
-            }
-            if (dates.length) await context.sync();
-            for (const date of dates) {
-                if (!/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(date.formatted.value)) throw new Error('Excel could not format ' + date.field + ' as a date.');
-                data.values[date.field] = date.formatted.value;
-            }
-            const defendant = headers.values[0].indexOf('Defendant');
-            const name = defendant >= 0 ? String(row.values[0][defendant] || '') : '';
-            if (!name.trim()) throw new Error('The selected row has no Defendant.');
-            return { form:form.id, values:data.values, sheet:sheet.name, row:selection.rowIndex + 1, name };
-        });
+        return DevlinExcelWorkbook.readSelection(Excel,form,options);
     }
-    function showSelection(data) { $('selection').textContent = data.sheet + ' / Row ' + data.row; $('caseName').textContent = data.name; }
+    function showSelection(data) {
+        selectedData = data;
+        $('selection').textContent = data.sheet + ' / Row ' + data.row;
+        $('caseName').textContent = data.name;
+        $('caseContext').textContent = [data.metadata.plaintiff,data.metadata.court,data.metadata.caseNumber].filter(Boolean).join(' / ');
+    }
     async function renderPreview(blob) {
         const expectedRevision = revision;
         if (pdfTask) await pdfTask.destroy();
@@ -79,11 +62,13 @@
             await page.render({ canvasContext:canvas.getContext('2d'), canvas, viewport }).promise;
         }
     }
-    async function refresh() {
+    async function refresh(keepMessage = false) {
         const current = ++revision;
-        clearResult(); message('');
+        selectedData = null; clearResult(); controls();
+        if (keepMessage !== true) message('');
         try { const data = await readSelection(); if (current === revision) showSelection(data); }
-        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; message(error.message); } }
+        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; message(error.message); } }
+        finally { controls(); }
     }
     $('loginForm').addEventListener('submit', async event => {
         event.preventDefault(); $('login').disabled = true; message('');
@@ -110,37 +95,63 @@
             const blob = await response.blob();
             if (!token) return;
             if (generationRevision !== revision) { message('The worksheet changed during generation. Generate the PDF again.'); return; }
+            const currentData = await readSelection({recalculate:false});
+            if (generationRevision !== revision || !DevlinExcelWorkbook.sameSnapshot(data,currentData)) {
+                selectedData = null; message('The worksheet changed during generation. Generate the PDF again.'); return;
+            }
             pdfUrl = URL.createObjectURL(blob);
             previewBlob = blob;
-            const filename = data.form.toUpperCase() + '-row-' + data.row + '.pdf';
+            resultSnapshot = data;
+            const filename = DevlinExcelRow.pdfFilename(data);
             for (const id of ['download', 'save']) { $(id).href = pdfUrl; $(id).download = filename; }
             $('resultName').textContent = data.name + ' / ' + filename; $('result').hidden = false;
             await renderPreview(blob);
             if (generationRevision !== revision) { clearResult(); message('The worksheet changed during generation. Generate the PDF again.'); return; }
             message('', 'PDF generated. Fillable fields retained.');
         } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else message(error.message); }
-        finally { busy = false; controls(); }
+        finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
+    async function download(event) {
+        event.preventDefault();
+        if (busy || !pdfUrl || !resultSnapshot) return;
+        const source = resultSnapshot, url = pdfUrl, current = revision;
+        busy = true; controls(); message('', 'Checking current row...');
+        try {
+            const latest = await readSelection({recalculate:false});
+            if (!token || current !== revision || url !== pdfUrl || !DevlinExcelWorkbook.sameSnapshot(source,latest)) {
+                clearResult(); selectedData = null;
+                throw new Error('The worksheet changed since this PDF was generated. Generate the PDF again.');
+            }
+            const link = document.createElement('a'); link.href = url; link.download = DevlinExcelRow.pdfFilename(source);
+            document.body.append(link); link.click(); link.remove();
+            message('', 'PDF download requested. Fillable fields retained.');
+        } catch(error) { clearResult(); message(error.message); }
+        finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
+    }
+    $('download').addEventListener('click',download);
+    $('save').addEventListener('click',download);
     fetch('/excel/catalog').then(response => { if (!response.ok) throw new Error('Forms are unavailable.'); return response.json(); }).then(data => {
-        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; })); controls();
+        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; })); controls(); if (token) refresh();
     }).catch(error => message(error.message));
     if (window.lucide) lucide.createIcons();
     if (window.Office) Office.onReady(info => {
-        officeReady = info.host === Office.HostType.Excel && Office.context.requirements.isSetSupported('ExcelApi', '1.7');
+        officeReady = info.host === Office.HostType.Excel && Office.context.requirements.isSetSupported('ExcelApi', DevlinExcelWorkbook.MIN_EXCEL_API);
         controls();
-        if (!officeReady) $('selection').textContent = 'Excel connection unavailable.';
+        if (!officeReady) message('This panel requires Excel with Excel API '+DevlinExcelWorkbook.MIN_EXCEL_API+' or newer.');
         if (token) refresh();
         if (officeReady) Excel.run(async context => {
             const sheets = context.workbook.worksheets;
-            sheets.load('items'); await context.sync();
-            const changed = () => { ++revision; clearResult(); if (!busy && token) refresh(); };
-            for (const sheet of sheets.items) {
-                sheet.onSelectionChanged.add(changed);
-                sheet.onChanged.add(changed);
-                sheet.onActivated.add(changed);
-            }
+            const changed = () => {
+                ++revision; selectedData = null; clearResult(); controls(); clearTimeout(refreshTimer);
+                if (!busy && token) refreshTimer = setTimeout(() => refresh(),150);
+            };
+            sheets.onSelectionChanged.add(changed);
+            sheets.onChanged.add(changed);
+            sheets.onActivated.add(changed);
+            sheets.onAdded.add(changed);
+            sheets.onDeleted.add(changed);
             await context.sync();
-        }).catch(() => { /* Generate always reads the current selection even if host events are unavailable. */ });
+        }).catch(() => { /* Before/after generation and download rechecks also protect hosts without change events. */ });
     });
     window.addEventListener('beforeunload', () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); });
     let resizeTimer;
