@@ -69,6 +69,16 @@ invalidation and a second case after changing a formula input. Reopened download
 files matched the case data and date produced by Excel. The fictional input was
 restored after the recalculation test.
 
+The v64 desktop repeat downloaded all three forms from an ordinary fictional
+workbook through Render. The downloaded files were reopened and checked for 101
+canonical fields, matching widget values, editable fields and nonempty
+appearances; all four pages were rendered and visually reviewed. Party names,
+case numbers and the Excel-formatted DC105 date matched their source columns.
+Selection changes invalidated the old result. Post-edit regeneration was not
+completed in this repeat: reopening the panel required a new sign-in. The earlier
+desktop recalculation check and automated change-during-generation checks remain
+separate evidence.
+
 The first installation in Adam's Microsoft 365 tenant and Excel Online has not
 been verified yet. Automated browser QA uses an explicitly simulated Office API;
 it is separate from the native Windows checks and does not establish tenant or
