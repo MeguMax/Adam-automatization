@@ -122,6 +122,7 @@
             await renderPreview(blob);
             if (generationRevision !== revision) { clearResult(); message('The worksheet changed during generation. Generate the PDF again.'); return; }
             message('', 'PDF generated. Fillable fields retained.');
+            $('result').scrollIntoView({block:'start'});
         } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else message(error.message); }
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });

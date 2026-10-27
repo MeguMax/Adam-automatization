@@ -23,7 +23,9 @@ async function main() {
         const headers = ['Defendant','Landlord','Court_Name','Case_Number', ...EXCEL_FORMS.flatMap(form => form.fields)];
         const values = headers.map(header => header === 'Defendant' ? 'Morgan Tenant' : header === 'Landlord' ? 'Example Property LLC' :
             header === 'Court_Name' ? '29th' : header === 'Case_Number' ? '26-00001-LT' :
-            header === 'dc105_05' ? 'Example Property LLC' : header === 'dc105_06' ? 'Morgan Tenant' : header === 'dc105_24' ? 46300 : '');
+            ['dc105_05','dc508_06','mc202_08'].includes(header) ? 'Example Property LLC' :
+            ['dc105_06','dc508_08','mc202_10'].includes(header) ? 'Morgan Tenant' :
+            ['dc105_02','dc508_02','mc202_04'].includes(header) ? '26-00001-LT' : header === 'dc105_24' ? 46300 : '');
         const fake = `window.qa = ${JSON.stringify({ headers, values, rowIndex: 35, rowCount: 1 })};
 window.qa.events = []; window.qa.calculations = 0; window.qa.pending = 0;
 const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(callback)}};
@@ -69,6 +71,15 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             await download.saveAs(path.join(output, download.suggestedFilename()));
             await page.screenshot({ path: path.join(output, form.id + '-mobile.png'), fullPage: true });
         }
+        await page.setViewportSize({ width: 340, height: 450 });
+        await page.click('#generate');
+        await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
+        await page.waitForFunction(() => {
+            const result = document.querySelector('#result h2')!.getBoundingClientRect();
+            const save = document.getElementById('save')!.getBoundingClientRect();
+            return result.top >= 0 && save.bottom <= innerHeight;
+        });
+        await page.screenshot({ path:path.join(output,'generated-short-taskpane.png') });
         await page.setViewportSize({ width: 900, height: 900 });
         await page.waitForFunction(() => (document.querySelector('#preview canvas') as HTMLCanvasElement)?.width > 600);
         await page.screenshot({ path: path.join(output, 'generated-desktop.png'), fullPage: true });

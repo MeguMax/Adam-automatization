@@ -16,6 +16,7 @@ sends email, modifies case records, pays fees or submits a filing.
 - Known date fields use Excel's own TEXT function with m/d/yyyy. No guessed serial-date epoch or date mutation.
 - Same admin credentials, but a separate, 30-minute PDF-only session. Tokens remain in task-pane memory; no third-party cookies or browser storage are required.
 - PDF.js preview and explicit download. All PDF fields remain fillable. Temporary server files are deleted after the worker returns; there is no generated-PDF archive in SQLite.
+- Successful generation scrolls to the result. Preview height adapts to short Office task panes so the download action stays reachable.
 - Download names include the form, court, case number and parties when available, with Windows-unsafe characters removed.
 - Login requests have a 20-second deadline; PDF generation/download responses have a 45-second deadline. Network failures, HTML gateway errors and invalid PDF responses leave generation retryable without exposing a broken download.
 
@@ -62,11 +63,16 @@ for development testing, close Excel completely after saving open work before
 registering and reopening the add-in. A successful registration command alone is
 not evidence that Office loaded the panel.
 
-Native generation/download verification still requires signing in to the panel.
-The first installation in Adam's real Excel host has not been verified yet.
-Browser QA uses an explicitly simulated Office API; it is not proof of native
-Office or tenant deployment compatibility. Download behavior and Office host
-events must be confirmed in both desktop and Excel Online before production use.
+Windows desktop QA also verified sign-in, live row reads, all three generated
+fillable PDF downloads (48/28/25 fields and 1/2/1 pages), selection-change
+invalidation and a second case after changing a formula input. Reopened downloaded
+files matched the case data and date produced by Excel. The fictional input was
+restored after the recalculation test.
+
+The first installation in Adam's Microsoft 365 tenant and Excel Online has not
+been verified yet. Automated browser QA uses an explicitly simulated Office API;
+it is separate from the native Windows checks and does not establish tenant or
+web-host compatibility. Automatic OneDrive delivery is not implemented.
 
 ## Runtime and tests
 

@@ -216,9 +216,10 @@ const pythonAvailable = spawnSync(python, ['-c', 'import pypdf,openpyxl'], { win
 test('all three packaged templates generate verified interactive PDFs through the isolated worker', { skip: !pythonAvailable && 'Set EXCEL_PDF_PYTHON to the installed Python runtime' }, async () => {
     for (const form of EXCEL_FORMS) {
         const input = values(form.id);
-        input[form.id + '_05'] = 'Example Property LLC';
+        const plaintiffField = {dc105:'dc105_05',dc508:'dc508_06',mc202:'mc202_08'}[form.id]!;
+        input[plaintiffField] = 'Example Property LLC';
         const pdf = await generateExcelPdf(form.id, input, python);
-        const check = spawnSync(python, ['-c', 'import sys,io,json; from pypdf import PdfReader; r=PdfReader(io.BytesIO(sys.stdin.buffer.read())); f=r.get_fields(); print(json.dumps({"fields":len(f),"pages":len(r.pages),"value":f[sys.argv[1]]["/V"],"blank":sum(bool(x.get("/V")) and str(x.get("/V")) != "/Off" for x in f.values())}))', form.id + '_05'], { input: pdf, windowsHide: true });
+        const check = spawnSync(python, ['-c', 'import sys,io,json; from pypdf import PdfReader; r=PdfReader(io.BytesIO(sys.stdin.buffer.read())); f=r.get_fields(); print(json.dumps({"fields":len(f),"pages":len(r.pages),"value":f[sys.argv[1]]["/V"],"blank":sum(bool(x.get("/V")) and str(x.get("/V")) != "/Off" for x in f.values())}))', plaintiffField], { input: pdf, windowsHide: true });
         assert.equal(check.status, 0, check.stderr.toString());
         const result = JSON.parse(check.stdout.toString());
         assert.equal(result.fields, form.count); assert.equal(result.pages, form.pages);
