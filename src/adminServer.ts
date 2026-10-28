@@ -44,6 +44,7 @@ import {
 } from './mifileAccountSettings';
 import { invalidateMifileSession, testMiFileCredentials } from './mifileSession';
 import { pdfPreviewHtml } from './pdfPreview';
+import { PDF_PREVIEW_SCRIPT, PDF_PREVIEW_STYLE } from './pdfPreviewClient';
 import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 import { ensureDraftComplaintExtraction } from './draftExtraction';
@@ -52,7 +53,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-28-preview-fallback-v72';
+const ADMIN_BUILD_ID = '2026-10-28-inline-preview-v73';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3189,6 +3190,8 @@ const html = String.raw`<!doctype html>
       #libraryList td { display: block; padding: 4px 8px; border: 0; grid-column: 1; }
       #libraryList td:last-child { grid-column: 2; grid-row: 1 / 4; padding: 4px 0; }
     }
+    ${PDF_PREVIEW_STYLE}
+    .draft-pdf-viewer > .pdf-preview { min-height: 320px; }
   </style>
 </head>
 <body>
@@ -3664,6 +3667,7 @@ const html = String.raw`<!doctype html>
   </main>
   <div id="toastRegion" class="toast-region" aria-live="polite"></div>
   <script src="/assets/lucide.js"></script>
+  <script src="/assets/pdf-preview.js"></script>
   <script>
     const state = {
       summary: null,
@@ -4495,6 +4499,9 @@ const html = String.raw`<!doctype html>
       state.draftFilingJobs = [];
       state.activeDraftDocumentId = null;
       state.draftDirty = false;
+      if (draftPdfPreview) draftPdfPreview.destroy();
+      draftPdfPreview = null;
+      delete document.getElementById('draftPdfViewer').dataset.previewKey;
       document.getElementById('draftWorkspaceView').classList.add('hidden');
       document.body.classList.remove('draft-editing');
       document.getElementById('toastRegion').classList.remove('draft-toast-region');
@@ -5713,6 +5720,7 @@ const html = String.raw`<!doctype html>
       renderActiveDraftDocument(documents);
     }
 
+    let draftPdfPreview = null;
     function renderActiveDraftDocument(documents) {
       const activeDocument = documents.find(
         item => item.id === state.activeDraftDocumentId,
@@ -5782,43 +5790,23 @@ const html = String.raw`<!doctype html>
       if (activeDocument && activeDocument.oneDriveUrl) {
         const previewKey = activeDocument.id + ':' + (activeDocument.updatedAt || '');
         if (viewer.dataset.previewKey !== previewKey) {
-          const previewUrl = '/api/documents/' + encodeURIComponent(activeDocument.id) +
-            '/preview?v=' + encodeURIComponent(activeDocument.updatedAt || '');
-          const frame = window.document.createElement('iframe');
-          frame.title = activeDocument.currentFilename || activeDocument.documentType || 'PDF document';
-          const recoverBlank = () => {
-            if (!frame.isConnected || viewer.dataset.previewKey !== previewKey || frame.dataset.blankRecovered) return;
-            try {
-              if (frame.contentDocument && frame.contentDocument.URL === 'about:blank') {
-                frame.dataset.blankRecovered = 'true';
-                frame.src = previewUrl;
-              }
-            } catch { /* Cross-origin/auth failures are not overridden. */ }
-          };
-          frame.addEventListener('load', recoverBlank);
-          viewer.replaceChildren(frame);
+          const baseUrl = '/api/documents/' + encodeURIComponent(activeDocument.id);
+          const version = '?v=' + encodeURIComponent(activeDocument.updatedAt || '');
+          if (draftPdfPreview) draftPdfPreview.destroy();
+          draftPdfPreview = null;
           viewer.dataset.previewKey = previewKey;
-          // Start navigation only after the browsing context is connected.
-          frame.src = previewUrl;
-          setTimeout(recoverBlank, 5_000);
-          setTimeout(() => {
-            if (!frame.isConnected || viewer.dataset.previewKey !== previewKey) return;
-            try {
-              if (!frame.contentDocument || frame.contentDocument.URL !== 'about:blank') return;
-            } catch { return; }
+          try {
+            draftPdfPreview = window.DevlinPdfPreview.create(viewer, {source:baseUrl + '/content' + version,
+              label:activeDocument.currentFilename || activeDocument.documentType || 'PDF document'});
+          } catch {
             viewer.innerHTML = '<div class="draft-preview-empty">' + icon('file-warning') +
-              '<strong>PDF preview did not open</strong>' +
-              '<div class="draft-preview-actions"><button type="button" data-retry-preview>' + icon('refresh-cw') +
-              'Retry preview</button><a class="button-link" href="' + escapeHtml(previewUrl) +
-              '" target="_blank" rel="noopener noreferrer">' + icon('external-link') + 'Open PDF</a></div></div>';
-            viewer.querySelector('[data-retry-preview]').addEventListener('click', () => {
-              delete viewer.dataset.previewKey;
-              renderActiveDraftDocument((state.draftDetail && state.draftDetail.documents) || []);
-            });
-            renderIcons();
-          }, 15_000);
+              '<strong>Unable to start PDF preview</strong><a class="button-link" href="' + escapeHtml(baseUrl + '/preview' + version) +
+              '" target="_blank" rel="noopener noreferrer">' + icon('external-link') + 'Open PDF</a></div>';
+          }
         }
       } else {
+        if (draftPdfPreview) draftPdfPreview.destroy();
+        draftPdfPreview = null;
         delete viewer.dataset.previewKey;
         viewer.innerHTML = '<div class="draft-preview-empty">' + icon('file-question') +
           '<strong>PDF preview is not available</strong>' +
@@ -7372,6 +7360,10 @@ export function createAdminServer(
 
             if (req.method === 'GET' && url.pathname === '/assets/lucide.js') {
                 sendJavascript(res, LUCIDE_BROWSER_SCRIPT);
+                return;
+            }
+            if (req.method === 'GET' && url.pathname === '/assets/pdf-preview.js') {
+                sendJavascript(res, Buffer.from(PDF_PREVIEW_SCRIPT));
                 return;
             }
 

@@ -259,7 +259,7 @@ async function main() {
         const response = await context.request.get(`${url}/api/documents/${added.id}/content`);
         assert.equal(response.status(), 200);
         assert.ok((await response.body()).includes(Buffer.from('%PDF-')));
-        const canvas = page.frameLocator('#draftPdfViewer iframe').locator('canvas');
+        const canvas = page.locator('#draftPdfViewer canvas');
         await canvas.waitFor({ state: 'visible' });
         assert.ok(await canvas.evaluate(element => {
             const canvas = element as HTMLCanvasElement;
@@ -268,17 +268,17 @@ async function main() {
             for (let index = 0; index < data.length; index += 4) if (data[index] < 180 && data[index + 3] > 0) ink++;
             return ink > 20;
         }), 'PDF canvas must contain rendered document content');
-        const zoomControl = page.frameLocator('#draftPdfViewer iframe').locator('#zoom');
+        const zoomControl = page.locator('#draftPdfViewer').getByRole('combobox',{name:'PDF zoom'});
         await zoomControl.selectOption('1.5');
         await page.evaluate(() => (window as any).renderDraftWorkspace());
         assert.equal(await zoomControl.inputValue(), '1.5', 'Live updates must preserve PDF navigation');
         await zoomControl.selectOption('fit');
         await page.screenshot({ path: path.join(screenshots, 'draft-desktop.png'), fullPage: true });
         await page.setViewportSize({ width: 390, height: 844 });
-        const preview = page.frames().find(frame => frame.url().includes('/preview'))!;
-        await preview.waitForFunction(() => {
-            const canvas = document.querySelector('canvas');
-            return canvas && canvas.getBoundingClientRect().width <= document.documentElement.clientWidth;
+        await page.waitForFunction(() => {
+            const canvas = document.querySelector('#draftPdfViewer canvas');
+            const pages = document.querySelector('#draftPdfViewer .pdf-preview-pages');
+            return canvas && pages && canvas.getBoundingClientRect().width <= pages.clientWidth;
         });
         await page.screenshot({ path: path.join(screenshots, 'draft-mobile.png'), fullPage: true });
         const linkBox = await page.locator('#draftOneDriveLink').boundingBox();
@@ -392,8 +392,8 @@ async function main() {
         assert.match(await plaintiffAddress.locator('..').innerText(), /Manual/);
         await page.locator('[data-complaint-source]').first().click();
         assert.equal(await page.locator('#draftDocumentSelect').inputValue(), extracted.primaryDocumentId);
-        await page.frameLocator('#draftPdfViewer iframe').locator('canvas').waitFor({state:'visible'});
-        await page.frameLocator('#draftPdfViewer iframe').locator('#message').waitFor({state:'hidden'});
+        await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
+        await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
         await page.screenshot({path:path.join(screenshots,'complaint-fields-desktop.png'),fullPage:true});
         await page.setViewportSize({width:390,height:844});
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),true);
@@ -403,10 +403,10 @@ async function main() {
             return rect.left>=0 && rect.right<=window.innerWidth && button.clientWidth>=button.scrollWidth;
         })),true,'Every mobile document action must fit its panel');
         await page.locator('#draftDocumentTools summary').click();
-        const complaintPreview=page.frames().find(frame=>frame.url().includes('/preview'))!;
-        await complaintPreview.waitForFunction(() => {
-            const canvas=document.querySelector('canvas');
-            return canvas && canvas.getBoundingClientRect().width<=document.documentElement.clientWidth;
+        await page.waitForFunction(() => {
+            const canvas=document.querySelector('#draftPdfViewer canvas');
+            const pages=document.querySelector('#draftPdfViewer .pdf-preview-pages');
+            return canvas && pages && canvas.getBoundingClientRect().width<=pages.clientWidth;
         });
         await page.screenshot({path:path.join(screenshots,'complaint-fields-mobile.png'),fullPage:true});
         await page.locator('[data-draft-mobile-mode="fields"]').click();
@@ -461,8 +461,8 @@ async function main() {
         await page.locator('#draftReviewTab').click();
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.reviewedAt,null);
         assert.equal(await page.locator('#draftReviewTab').getAttribute('aria-selected'),'true');
-        await page.frameLocator('#draftPdfViewer iframe').locator('canvas').waitFor({state:'visible'});
-        await page.frameLocator('#draftPdfViewer iframe').locator('#message').waitFor({state:'hidden'});
+        await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
+        await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
         await page.screenshot({path:path.join(screenshots,'draft-guided-review-desktop.png'),fullPage:true});
         await page.setViewportSize({width:390,height:844});
         await page.locator('[data-draft-mobile-mode="fields"]').click();
@@ -631,9 +631,9 @@ async function main() {
             await fresh.goto(url);
             await fresh.locator('#draftsTab').click();
             await fresh.locator('[data-open-draft="'+draftId+'"]').click();
-            const pdf = fresh.frameLocator('#draftPdfViewer iframe');
+            const pdf = fresh.locator('#draftPdfViewer');
             await pdf.locator('canvas').waitFor({state:'visible'});
-            await pdf.locator('#message').waitFor({state:'hidden'});
+            await pdf.locator('.pdf-preview-message').waitFor({state:'hidden'});
             const nonblank = () => pdf.locator('canvas').evaluate(canvas => {
                 const c = canvas as HTMLCanvasElement;
                 const pixels = c.getContext('2d')!.getImageData(0,0,c.width,c.height).data;
@@ -641,39 +641,34 @@ async function main() {
                 return false;
             });
             assert.equal(await nonblank(),true,'Initial prepared-Draft preview renders without switching documents');
-            const recovered = fresh.waitForEvent('framenavigated', {predicate:frame=>frame.url().includes('/api/documents/'+lockedDocument.id+'/preview')});
-            await fresh.locator('#draftPdfViewer iframe').evaluate(frame=>{
-                delete (frame as HTMLElement).dataset.blankRecovered;
-                frame.addEventListener('load',event=>event.stopImmediatePropagation(),{once:true,capture:true});
-                (frame as HTMLIFrameElement).src='about:blank';
-            });
-            await recovered;
-            await pdf.locator('canvas').waitFor({state:'visible'});
-            await pdf.locator('#message').waitFor({state:'hidden'});
-            assert.equal(await nonblank(),true,'A stalled blank preview recovers once even without a usable load event');
-            await fresh.locator('#draftPdfViewer iframe').evaluate(frame=>{
-                (frame as HTMLElement).dataset.blankRecovered='true';
-                (frame as HTMLIFrameElement).src='about:blank';
-            });
-            await fresh.locator('[data-retry-preview]').waitFor({state:'visible',timeout:20000});
             assert.equal(await fresh.locator('#draftPdfViewer iframe').count(),0);
-            assert.ok((await fresh.locator('#draftPdfViewer a').getAttribute('href'))?.includes('/api/documents/'+lockedDocument.id+'/preview'));
+            await fresh.locator('#draftPdfViewer canvas').evaluate(canvas=>canvas.setAttribute('data-qa-preserved','true'));
+            await fresh.evaluate(()=>(window as any).refreshDraftFilingState());
+            assert.equal(await fresh.locator('#draftPdfViewer canvas').getAttribute('data-qa-preserved'),'true');
+            await fresh.route('**/api/documents/'+lockedDocument.id+'/content?*',route=>route.fulfill({status:502,contentType:'text/html',body:'QA gateway failure'}));
+            await fresh.reload();
+            await fresh.locator('#draftsTab').click();
+            await fresh.locator('[data-open-draft="'+draftId+'"]').click();
+            await pdf.getByRole('button',{name:'Retry preview',exact:true}).waitFor({state:'visible'});
+            assert.ok((await pdf.locator('.pdf-preview-message').innerText()).includes('temporarily unavailable'));
+            assert.ok((await fresh.locator('#draftPdfViewer a').getAttribute('href'))?.includes('/api/documents/'+lockedDocument.id+'/content'));
             assert.equal(await fresh.locator('#draftPdfViewer a').getAttribute('target'),'_blank');
-            await fresh.screenshot({path:path.join(screenshots,'draft-blank-preview-fallback.png'),fullPage:true});
+            await fresh.screenshot({path:path.join(screenshots,'draft-inline-preview-error.png'),fullPage:true});
             await fresh.setViewportSize({width:390,height:844});
             assert.equal(await fresh.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
-            await fresh.screenshot({path:path.join(screenshots,'draft-blank-preview-fallback-mobile.png'),fullPage:true});
+            await fresh.screenshot({path:path.join(screenshots,'draft-inline-preview-error-mobile.png'),fullPage:true});
             await fresh.setViewportSize({width:1440,height:1000});
-            await fresh.locator('[data-retry-preview]').click();
+            await fresh.unroute('**/api/documents/'+lockedDocument.id+'/content?*');
+            await pdf.getByRole('button',{name:'Retry preview',exact:true}).click();
             await pdf.locator('canvas').waitFor({state:'visible'});
-            await pdf.locator('#message').waitFor({state:'hidden'});
-            assert.equal(await nonblank(),true,'Manual retry replaces the stalled frame and restores a nonblank PDF');
+            await pdf.locator('.pdf-preview-message').waitFor({state:'hidden'});
+            assert.equal(await nonblank(),true,'Manual retry restores a nonblank inline PDF after a temporary server error');
             await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-desktop.png'),fullPage:true});
             await fresh.setViewportSize({width:390,height:844});
             await fresh.waitForFunction(()=>{
-                const frame=document.querySelector<HTMLIFrameElement>('#draftPdfViewer iframe');
-                const canvas=frame?.contentDocument?.querySelector('canvas');
-                return Boolean(frame&&canvas&&canvas.getBoundingClientRect().width<=frame.clientWidth-20);
+                const pages=document.querySelector<HTMLElement>('#draftPdfViewer .pdf-preview-pages');
+                const canvas=pages?.querySelector('canvas');
+                return Boolean(pages&&canvas&&canvas.getBoundingClientRect().width<=pages.clientWidth-20);
             });
             assert.equal(await fresh.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
             await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-mobile.png'),fullPage:true});
