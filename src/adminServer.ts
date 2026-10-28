@@ -52,7 +52,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-28-excel-usability-v71';
+const ADMIN_BUILD_ID = '2026-10-28-preview-fallback-v72';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2244,6 +2244,16 @@ const html = String.raw`<!doctype html>
     }
     .draft-preview-empty strong {
       color: #fff;
+    }
+    .draft-preview-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+    }
+    .draft-preview-actions svg {
+      width: 14px;
+      height: 14px;
     }
     .draft-fields-panel {
       display: flex;
@@ -5791,6 +5801,22 @@ const html = String.raw`<!doctype html>
           // Start navigation only after the browsing context is connected.
           frame.src = previewUrl;
           setTimeout(recoverBlank, 5_000);
+          setTimeout(() => {
+            if (!frame.isConnected || viewer.dataset.previewKey !== previewKey) return;
+            try {
+              if (!frame.contentDocument || frame.contentDocument.URL !== 'about:blank') return;
+            } catch { return; }
+            viewer.innerHTML = '<div class="draft-preview-empty">' + icon('file-warning') +
+              '<strong>PDF preview did not open</strong>' +
+              '<div class="draft-preview-actions"><button type="button" data-retry-preview>' + icon('refresh-cw') +
+              'Retry preview</button><a class="button-link" href="' + escapeHtml(previewUrl) +
+              '" target="_blank" rel="noopener noreferrer">' + icon('external-link') + 'Open PDF</a></div></div>';
+            viewer.querySelector('[data-retry-preview]').addEventListener('click', () => {
+              delete viewer.dataset.previewKey;
+              renderActiveDraftDocument((state.draftDetail && state.draftDetail.documents) || []);
+            });
+            renderIcons();
+          }, 15_000);
         }
       } else {
         delete viewer.dataset.previewKey;

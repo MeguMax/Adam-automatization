@@ -271,3 +271,37 @@ These checks do not claim a new real-Office acceptance run for v70 or a 12-hour
 wall-clock soak. Earlier real desktop/web tests above identify their actual
 versions. Browser storage restrictions can still require an initial connection
 per Office/browser profile; the server never authorizes another user by IP alone.
+
+## Usability acceptance (2026-10-28, v71)
+
+The new filename and remembered-form behavior passed the browser smoke test and
+all 212 automated project tests. Unsafe names are rejected before generation;
+editing a name hides the old result; reset and same-case refresh are covered.
+
+In real Excel Online, one initial connection was followed by closing/reopening
+the pane and a Render deployment from v70 to v71. Access restored without another
+credential entry. DC105, DC508 and MC202 were generated for the fictional row 3
+with edited filenames and downloaded locally. Reopening retained MC202, while the
+custom name was not persisted. Selecting row 2 retained the form, refreshed the
+case-specific filename, and generated a separate MC202. All 126 fields in the
+four actual downloads, their five pages, widget appearances and fillable flags
+were verified; all five pages were rendered and visually inspected.
+
+Separately, local generation from the customer workbook's saved cache produced
+nine PDFs. All 303 fields matched the three supplied completed examples, allowing
+only equivalent numeric formatting and equivalent checkbox on/off states. The
+customer workbook and examples were read-only and were not uploaded. This is not
+a new live recalculation of Adam's workbook. Evidence is under
+`output/excel-usability-2026-10-28/`.
+
+The main production QA Draft TEMP-MJKS6DER was checked without reprocessing or
+creating a second filing: Prepared, seven documents, two Connected to Complaint,
+Unsubmitted-only. A blank embedded-preview navigation was observed. The v72
+fallback adds Retry preview and a separate Open PDF link when the initial blank
+frame persists after its automatic recovery. The admin smoke tests both the
+fallback and successful retry, including the mobile layout. It changes no case
+data, preparation status, payment setting or court-submission permission.
+
+The desktop Excel windows could not be reliably inspected in this run. New
+desktop v71 acceptance and installation in Adam's own Microsoft 365 tenant remain
+pending; previous real desktop evidence above applies to its stated versions.

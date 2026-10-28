@@ -651,6 +651,23 @@ async function main() {
             await pdf.locator('canvas').waitFor({state:'visible'});
             await pdf.locator('#message').waitFor({state:'hidden'});
             assert.equal(await nonblank(),true,'A stalled blank preview recovers once even without a usable load event');
+            await fresh.locator('#draftPdfViewer iframe').evaluate(frame=>{
+                (frame as HTMLElement).dataset.blankRecovered='true';
+                (frame as HTMLIFrameElement).src='about:blank';
+            });
+            await fresh.locator('[data-retry-preview]').waitFor({state:'visible',timeout:20000});
+            assert.equal(await fresh.locator('#draftPdfViewer iframe').count(),0);
+            assert.ok((await fresh.locator('#draftPdfViewer a').getAttribute('href'))?.includes('/api/documents/'+lockedDocument.id+'/preview'));
+            assert.equal(await fresh.locator('#draftPdfViewer a').getAttribute('target'),'_blank');
+            await fresh.screenshot({path:path.join(screenshots,'draft-blank-preview-fallback.png'),fullPage:true});
+            await fresh.setViewportSize({width:390,height:844});
+            assert.equal(await fresh.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+            await fresh.screenshot({path:path.join(screenshots,'draft-blank-preview-fallback-mobile.png'),fullPage:true});
+            await fresh.setViewportSize({width:1440,height:1000});
+            await fresh.locator('[data-retry-preview]').click();
+            await pdf.locator('canvas').waitFor({state:'visible'});
+            await pdf.locator('#message').waitFor({state:'hidden'});
+            assert.equal(await nonblank(),true,'Manual retry replaces the stalled frame and restores a nonblank PDF');
             await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-desktop.png'),fullPage:true});
             await fresh.setViewportSize({width:390,height:844});
             await fresh.waitForFunction(()=>{
