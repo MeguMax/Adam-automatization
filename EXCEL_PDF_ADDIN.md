@@ -310,3 +310,9 @@ not a claim that the underlying embedded-navigation issue is fully resolved.
 The desktop Excel windows could not be reliably inspected in this run. New
 desktop v71 acceptance and installation in Adam's own Microsoft 365 tenant remain
 pending; previous real desktop evidence above applies to its stated versions.
+
+Follow-up: the local fictional `qa-cases.xlsx` workbook is now open and maximized
+in desktop Excel, with the existing Home ribbon command and current task pane
+loaded. Its initial **Connect for 12 hours** sign-in is awaiting the user; no
+claim is made yet for a new desktop generation/restoration acceptance run.
+The v73 main Draft-preview change does not modify Excel generation or its session.
