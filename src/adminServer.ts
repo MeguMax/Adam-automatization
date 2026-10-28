@@ -52,7 +52,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-28-microsoft-check-v68';
+const ADMIN_BUILD_ID = '2026-10-28-microsoft-check-v69';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3814,14 +3814,20 @@ const html = String.raw`<!doctype html>
         throw new Error('Please sign in again.');
       }
       const text = await res.text();
+      const fallback = [502,503,504].includes(res.status)
+        ? 'Service temporarily unavailable. Please try again shortly.'
+        : res.ok ? 'Unexpected server response. Refresh this page and try again.'
+        : 'Request failed (HTTP ' + res.status + '). Please try again.';
       let payload = null;
       try {
         payload = text ? JSON.parse(text) : null;
       } catch {
-        payload = text;
+        throw new Error(fallback);
       }
       if (!res.ok) {
-        throw new Error(payload && payload.error ? payload.error : String(payload || res.statusText));
+        const message = payload && typeof payload.error === 'string' && !/<!doctype|<html[\s>]/i.test(payload.error)
+          ? payload.error : fallback;
+        throw new Error(message);
       }
       return payload;
     }

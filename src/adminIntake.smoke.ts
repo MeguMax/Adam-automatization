@@ -152,6 +152,17 @@ async function main() {
         try { assert.equal((await unsigned.request.post(checkUrl, { headers: checkHeaders, data: {} })).status(), 401); }
         finally { await unsigned.close(); }
         assert.equal(microsoftChecks, 0);
+        for (const status of [502, 503, 504, 200]) {
+            await context.route(checkUrl, route => route.fulfill({ status, contentType: 'text/html',
+                body: '<!DOCTYPE html><html><body>private gateway diagnostic</body></html>' }));
+            await page.locator('#microsoftCheck').click();
+            const expected = status === 200 ? 'Unexpected server response. Refresh this page and try again.'
+                : 'Service temporarily unavailable. Please try again shortly.';
+            await page.waitForFunction(value => document.getElementById('microsoftCheckMessage')?.textContent === value, expected);
+            assert.equal(await page.locator('#microsoftCheck').isEnabled(), true);
+            assert.equal(microsoftChecks, 0, 'HTML gateway failures must not start or automatically retry a connection check');
+            await context.unroute(checkUrl);
+        }
         await page.locator('#microsoftCheck').click();
         await microsoftRequested;
         assert.equal(await page.locator('#microsoftCheck').isDisabled(), true);
