@@ -4,6 +4,7 @@ import { URL } from 'url';
 import { randomUUID } from 'crypto';
 import { createAdminAuth, hasAdminCredentials } from './adminAuth';
 import { createExcelPdfHandler } from './excelPdf';
+import { checkMicrosoftAccess, MicrosoftAccessReport } from './microsoftAccess';
 import {
     CaseDraftStatus,
     EmailDetail,
@@ -51,7 +52,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-28-excel-web-framing-v67';
+const ADMIN_BUILD_ID = '2026-10-28-microsoft-check-v68';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3492,6 +3493,19 @@ const html = String.raw`<!doctype html>
         </div>
       </section>
       <section class="settings-section">
+        <h2>Microsoft connection</h2>
+        <div class="settings-grid">
+          <div class="field"><span class="field-label">Server sign-in</span><div id="microsoftAuthStatus" class="settings-value">Not checked</div></div>
+          <div class="field"><span class="field-label">Inbox access</span><div id="microsoftInboxStatus" class="settings-value">Not checked</div></div>
+          <div class="field"><span class="field-label">Worker OneDrive folder</span><div id="microsoftDriveStatus" class="settings-value">Not checked</div></div>
+          <div class="field"><span class="field-label">File upload permission</span><div id="microsoftWriteStatus" class="settings-value">Not checked</div></div>
+          <div class="field"><span class="field-label">Email sending permission</span><div id="microsoftSendStatus" class="settings-value">Not checked</div></div>
+          <div class="field"><span class="field-label">Excel PDF destination</span><div id="microsoftExcelSaving" class="settings-value"></div></div>
+        </div>
+        <div class="settings-actions"><button id="microsoftCheck" type="button"><i data-lucide="plug-zap"></i>Check connection</button></div>
+        <p id="microsoftCheckMessage" role="status" aria-live="polite"></p>
+      </section>
+      <section class="settings-section">
         <h2>Form library</h2>
         <form id="libraryUploadForm">
           <div class="settings-grid">
@@ -3856,6 +3870,33 @@ const html = String.raw`<!doctype html>
     }
 
     let accountSettingsBusy = false;
+    function renderMicrosoftAccess(report, saving) {
+      const reasons = {access_denied:'Access denied',not_found:'Not found',not_a_folder:'Configured link is not a folder',
+        invalid_configuration:'Check server configuration',sign_in_failed:'Microsoft sign-in failed',
+        timeout:'Timed out; try again',invalid_response:'Invalid Microsoft response; try again',unavailable:'Temporarily unavailable'};
+      const checkLabel = value => !value ? 'Not checked' : value.status === 'ok' ? 'Connected' :
+        value.status === 'not_configured' ? 'Not configured' : reasons[value.reason] || 'Check failed';
+      const permissionLabel = value => value === 'granted_not_tested' ? 'Granted (not tested)' :
+        value === 'not_granted' ? 'Not granted' : report ? 'Not verified' : 'Not checked';
+      document.getElementById('microsoftAuthStatus').textContent = checkLabel(report && report.authentication);
+      document.getElementById('microsoftInboxStatus').textContent = checkLabel(report && report.inbox);
+      document.getElementById('microsoftDriveStatus').textContent = checkLabel(report && report.oneDrive);
+      document.getElementById('microsoftWriteStatus').textContent = permissionLabel(report && report.fileWritePermission);
+      document.getElementById('microsoftSendStatus').textContent = permissionLabel(report && report.mailSendPermission);
+      document.getElementById('microsoftExcelSaving').textContent = saving === 'onedrive' ? 'Separate OneDrive folder configured' : 'Download to computer';
+      if (report) document.getElementById('microsoftCheckMessage').textContent = 'Read-only check: ' + fmtDate(report.checkedAt);
+    }
+    document.getElementById('microsoftCheck').addEventListener('click', async () => {
+      const button = document.getElementById('microsoftCheck');
+      if (button.disabled) return;
+      button.disabled = true;
+      document.getElementById('microsoftCheckMessage').textContent = 'Checking Microsoft connection...';
+      try {
+        const result = await api('/api/settings/microsoft/check',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Action':'microsoft-access'},body:'{}'});
+        renderMicrosoftAccess(result.report,result.excelSaving);
+      } catch(error) { document.getElementById('microsoftCheckMessage').textContent = error.message; }
+      finally { button.disabled = false; }
+    });
     function courtRuleOptions(selected) {
       return [['manual_review','Manual review'],['separate','Other - separate filing'],['connected_to_complaint','Connected to Complaint']]
         .map(([value,label]) => '<option value="' + value + '"' + (value === selected ? ' selected' : '') + '>' + label + '</option>').join('');
@@ -3972,6 +4013,7 @@ const html = String.raw`<!doctype html>
     });
     async function loadAccountSettings() {
       const data = await api('/api/settings');
+      renderMicrosoftAccess(data.microsoft.report,data.microsoft.excelSaving);
       document.getElementById('intakeMailbox').textContent = data.intake.mailbox || 'Not configured';
       document.getElementById('intakeSubject').textContent = data.intake.subjectPrefix + ' - [case reference]';
       document.getElementById('intakeSenders').textContent = data.intake.allowedSenders.join(', ');
@@ -7272,6 +7314,9 @@ export function createAdminServer(
     };
     const authorize = createAdminAuth(Date.now, db.getAdminSessionStore());
     const excelPdf = createExcelPdfHandler();
+    let microsoftReport: MicrosoftAccessReport | null = null;
+    let microsoftCheck: Promise<MicrosoftAccessReport> | null = null;
+    const microsoftSettings = () => ({report:microsoftReport,excelSaving:process.env.EXCEL_PDF_ONEDRIVE_SHARE_URL ? 'onedrive' : 'local'});
     const server = http.createServer(async (req, res) => {
         try {
             const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -7346,8 +7391,26 @@ export function createAdminServer(
                 sendJson(res, 200, {
                     intake: getFilingIntakeConfig(),
                     account: { ...account, editable: account.editable && hasAdminCredentials() },
+                    microsoft: microsoftSettings(),
                 });
                 return;
+            }
+            if (req.method === 'POST' && url.pathname === '/api/settings/microsoft/check') {
+                let originAllowed = !req.headers.origin;
+                try { if (req.headers.origin) originAllowed = new URL(req.headers.origin).host === req.headers.host; } catch { /* Reject malformed origins. */ }
+                if (!hasAdminCredentials() || !originAllowed || req.headers['sec-fetch-site'] === 'cross-site' ||
+                    req.headers['x-admin-action'] !== 'microsoft-access' || !req.headers['content-type']?.startsWith('application/json')) {
+                    sendJson(res,403,{error:'Use the authenticated Settings connection check.'}); return;
+                }
+                try {
+                    const input=JSON.parse((await readRequestBuffer(req,1024)).toString('utf8'));
+                    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length) throw new Error();
+                } catch { sendJson(res,400,{error:'The connection check accepts no account or folder changes.'}); return; }
+                if (!microsoftReport || Date.now()-Date.parse(microsoftReport.checkedAt) >= 30_000) {
+                    if (!microsoftCheck) microsoftCheck = checkMicrosoftAccess().then(report=>microsoftReport=report).finally(()=>{microsoftCheck=null;});
+                    await microsoftCheck;
+                }
+                sendJson(res,200,microsoftSettings()); return;
             }
             if (req.method === 'GET' && url.pathname === '/api/form-library') {
                 sendJson(res, 200, db.listLibraryForms()); return;

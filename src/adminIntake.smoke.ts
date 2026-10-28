@@ -39,6 +39,23 @@ async function main() {
     drive.downloadDriveItemBuffer = async (_driveId: string, itemId: string) => storedFiles.get(itemId);
     drive.replaceDriveItemContent = async (_driveId:string,itemId:string,buffer:Buffer) => { storedFiles.set(itemId,buffer); };
     const session = require('./mifileSession');
+    const microsoft = require('./microsoftAccess');
+    let microsoftChecks = 0;
+    let releaseMicrosoftCheck!: () => void;
+    let microsoftStarted!: () => void;
+    const microsoftGate = new Promise<void>(resolve => { releaseMicrosoftCheck = resolve; });
+    const microsoftRequested = new Promise<void>(resolve => { microsoftStarted = resolve; });
+    microsoft.checkMicrosoftAccess = async () => {
+        microsoftChecks++;
+        microsoftStarted();
+        await microsoftGate;
+        return {
+            checkedAt: new Date().toISOString(), readOnly: true,
+            authentication: { status: 'ok' }, inbox: { status: 'failed', reason: 'access_denied', http: 403 },
+            oneDrive: { status: 'ok', host: 'fixture-my.sharepoint.com' },
+            fileWritePermission: 'granted_not_tested', mailSendPermission: 'granted_not_tested',
+        };
+    };
     let signInTests = 0;
     session.testMiFileCredentials = async (credentials: { password: string }) => {
         signInTests++;
@@ -123,6 +140,40 @@ async function main() {
         await page.setViewportSize({ width: 1440, height: 1000 });
         await page.locator('#settingsTab').click();
         await page.waitForFunction(() => document.getElementById('intakeMailbox')?.textContent === 'intake@example.com');
+        assert.equal(microsoftChecks, 0, 'Opening Settings must not request Microsoft resources');
+        assert.equal(await page.locator('#microsoftAuthStatus').textContent(), 'Not checked');
+        assert.equal(await page.locator('#microsoftExcelSaving').textContent(), 'Download to computer');
+        const checkUrl = `${url}/api/settings/microsoft/check`;
+        const checkHeaders = { 'X-Admin-Action': 'microsoft-access', Origin: url };
+        assert.equal((await context.request.post(checkUrl, { data: {} })).status(), 403);
+        assert.equal((await context.request.post(checkUrl, { headers: { ...checkHeaders, Origin: 'https://foreign.example' }, data: {} })).status(), 403);
+        assert.equal((await context.request.post(checkUrl, { headers: checkHeaders, data: { folder: 'https://foreign.example' } })).status(), 400);
+        const unsigned = await browser.newContext();
+        try { assert.equal((await unsigned.request.post(checkUrl, { headers: checkHeaders, data: {} })).status(), 401); }
+        finally { await unsigned.close(); }
+        assert.equal(microsoftChecks, 0);
+        await page.locator('#microsoftCheck').click();
+        await microsoftRequested;
+        assert.equal(await page.locator('#microsoftCheck').isDisabled(), true);
+        const concurrentCheck = context.request.post(checkUrl, { headers: checkHeaders, data: {} });
+        releaseMicrosoftCheck();
+        const checked = await concurrentCheck;
+        assert.equal(checked.status(), 200);
+        assert.equal((await checked.json()).report.readOnly, true);
+        await page.waitForFunction(() => document.getElementById('microsoftDriveStatus')?.textContent === 'Connected');
+        assert.equal(await page.locator('#microsoftAuthStatus').textContent(), 'Connected');
+        assert.equal(await page.locator('#microsoftInboxStatus').textContent(), 'Access denied');
+        assert.equal(await page.locator('#microsoftWriteStatus').textContent(), 'Granted (not tested)');
+        assert.equal(await page.locator('#microsoftSendStatus').textContent(), 'Granted (not tested)');
+        assert.equal(await page.locator('#microsoftCheck').isEnabled(), true);
+        await page.locator('#microsoftCheck').click();
+        await page.waitForFunction(() => document.getElementById('microsoftCheckMessage')?.textContent?.startsWith('Read-only check:'));
+        assert.equal(microsoftChecks, 1, 'Concurrent/repeated checks must share the recent read-only result');
+        await page.locator('#microsoftCheck').locator('..').locator('..').screenshot({ path: path.join(screenshots, 'microsoft-connection-desktop.png') });
+        await page.setViewportSize({ width: 390, height: 844 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
+        await page.locator('#microsoftCheck').locator('..').locator('..').screenshot({ path: path.join(screenshots, 'microsoft-connection-mobile.png') });
+        await page.setViewportSize({ width: 1440, height: 1000 });
         await page.locator('#courtRuleCourt').fill(ruleCourt);
         await page.locator('#courtRuleRelation').selectOption('connected_to_complaint');
         await page.locator('#courtRuleNotes').fill('Attorney-confirmed example rule');
