@@ -302,6 +302,11 @@ frame persists after its automatic recovery. The admin smoke tests both the
 fallback and successful retry, including the mobile layout. It changes no case
 data, preparation status, payment setting or court-submission permission.
 
+Live v72 readback confirmed that the recovery controls replace the persistent
+blank iframe and the same PDF renders correctly in a separate tab. Retrying the
+embedded frame in this Edge session still stalled; this is a tested fallback,
+not a claim that the underlying embedded-navigation issue is fully resolved.
+
 The desktop Excel windows could not be reliably inspected in this run. New
 desktop v71 acceptance and installation in Adam's own Microsoft 365 tenant remain
 pending; previous real desktop evidence above applies to its stated versions.
