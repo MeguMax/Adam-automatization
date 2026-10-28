@@ -60,7 +60,7 @@ the save. One cloud save runs at a time, with a 40-second operation deadline.
 
 API/adapter tests and browser QA exercise this flow without writing real cloud
 files. Live delivery to Adam's destination is still pending the folder link and
-an authorized pilot. Excel Online and Adam's tenant installation remain unverified.
+an authorized pilot. Installation in Adam's Microsoft 365 tenant remains unverified.
 
 Protocol references:
 - https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession?view=graph-rest-1.0
@@ -124,10 +124,11 @@ completed in this repeat: reopening the panel required a new sign-in. The earlie
 desktop recalculation check and automated change-during-generation checks remain
 separate evidence.
 
-The first installation in Adam's Microsoft 365 tenant and Excel Online has not
-been verified yet. Automated browser QA uses an explicitly simulated Office API;
-it is separate from the native Windows checks and does not establish tenant or
-web-host compatibility. Optional OneDrive delivery must be configured separately.
+The first installation in Adam's Microsoft 365 tenant has not been verified yet.
+Automated browser QA uses an explicitly simulated Office API; it is separate
+from the real Windows and Excel Online checks below and does not establish
+compatibility with every tenant policy. Optional OneDrive delivery must be
+configured separately.
 
 On 2026-10-28 the v66 pane was refreshed in Windows desktop Excel and signed in
 again before testing. DC105, both DC508 pages and MC202 were generated and
@@ -138,6 +139,27 @@ downloads passed canonical/widget value, checkbox state, editable-field and
 appearance checks (126 fields / five pages), followed by local visual review.
 The test changed selection only, not workbook data. This run is separate from
 the earlier native formula-edit test and from Excel Online verification.
+
+On 2026-10-28 the version 1.2.0.0 manifest was installed through Excel Online's
+Upload My Add-in dialog in a personal OneDrive test workbook containing only
+fictional cases. The Home ribbon command opened the live Render v69 panel.
+After signing in once, DC105, DC508 (both pages) and MC202 were generated and
+downloaded from row 3. All 101 canonical fields, including intentionally blank
+values and unchecked boxes, matched the fixture; widget values, appearances,
+checkbox states and editable flags also passed readback. All four PDF pages
+were rendered locally and visually reviewed.
+
+Selecting row 2 cleared the previous PDF and download action. MC202 regenerated
+and downloaded with the second case's values without reopening the pane or
+signing in again. This brought the real web-host check to four downloads,
+126 field comparisons and five visually reviewed pages. The header-row guard
+was observed before selection. Workbook values/formulas were not edited in this
+run; formula-edit coverage remains a separate native/automated check. All PDF
+delivery was local downloads. No Excel PDFs were saved to OneDrive, and no
+email, MiFILE preparation, payment or court submission was performed by this QA.
+This confirms the tested personal OneDrive web host, not deployment in Adam's
+Microsoft 365 tenant. Local evidence is under
+`output/qa-excel-online-2026-10-28/`.
 
 An already-open Office task pane keeps its loaded frontend through a server
 deployment. Before testing a new frontend, right-click inside the panel and use

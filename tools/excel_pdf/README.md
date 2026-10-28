@@ -37,8 +37,9 @@ python tools/excel_pdf/generate.py --template "forms.pdf" --form dc105 --values-
 The Office.js task-pane adapter now lives in `excel-addin/` and uses calculated
 values from the running Excel host, not XLSX caches. See `EXCEL_PDF_ADDIN.md` for
 installation, runtime boundaries and verification status. Its current save action
-is an explicit download. Automatic OneDrive delivery and the first native Office
-installation still need verification/integration.
+is an explicit download. All three forms have been checked in real Windows Excel
+and Excel Online with fictional cases. Installation in Adam's tenant and optional
+delivery to his separately approved OneDrive destination remain to be verified.
 
 Microsoft's selected-range API reference:
 https://learn.microsoft.com/en-us/office/dev/add-ins/excel/excel-add-ins-workbooks#get-the-active-cell-or-selected-range
