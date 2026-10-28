@@ -14,7 +14,10 @@ sends email, modifies case records, pays fees or submits a filing.
 - Changes and selections are tracked across the worksheet collection, including newly added sheets. Rechecks still protect downloads when host change events are unavailable.
 - Exact matching column names; missing/duplicate columns and mapped Excel errors stop generation. Errors in unrelated columns do not block a valid form.
 - Known date fields use Excel's own TEXT function with m/d/yyyy. No guessed serial-date epoch or date mutation.
-- Same admin credentials, but a separate, 30-minute PDF-only session. Tokens remain in task-pane memory; no third-party cookies or browser storage are required.
+- One initial connection with admin credentials creates a separate, fixed 12-hour PDF-only session. The panel restores it automatically after reload/reopening; restarting Render does not revoke it. No password is stored in the pane, manifest, workbook or browser storage.
+- The browser stores only an opaque Excel access token and its expiry. SQLite stores only its hash and credential version in a separate `excel_sessions` table. This token cannot open the admin panel or MiFILE. Disconnect, expiry and credential changes revoke access; reconnecting never extends the original deadline.
+- Sessions belong to the Office/browser profile, not its IP address. Desktop Excel and Excel Online can use separate storage partitions and may each need an initial connection. If browser storage is disabled, generation still works for the current pane but closing it requires reconnecting. Third-party cookies are not required.
+- A temporary server/network failure while restoring access keeps the connection and exposes **Reconnect**, without asking for the password again. PDF generation remains disabled until the server verifies access.
 - PDF.js preview and explicit download. All PDF fields remain fillable. Temporary server files are deleted after the worker returns; there is no generated-PDF archive in SQLite.
 - Successful generation scrolls to the result. Preview height adapts to short Office task panes so the download action stays reachable.
 - **Back to form** returns to the form selector without reopening Office's panel or signing in again.
@@ -74,9 +77,12 @@ Task pane: https://legal-workflow-admin.onrender.com/excel/
 
 Opening the task-pane URL in a normal browser does not connect it to a workbook.
 Install the manifest in Excel, open the supplied workbook, select a single case
-row, sign in with admin credentials, choose a form and select **Generate PDF**.
-Inspect the preview and download the result. Closing/reloading the panel or a
-server redeployment requires signing in again.
+row, connect once with admin credentials, choose a form and select **Generate PDF**.
+Inspect the preview and download the result. For the next 12 hours the same
+Office/browser profile reconnects automatically when the panel is reopened or
+the server redeploys. **Disconnect** clears local access and revokes the server
+session. An expired connection requires a new sign-in. No credentials are embedded
+for automatic login, and neither PDF generation nor the admin API is public.
 
 Use manifest version 1.2.0.0 or later for the Home ribbon command. Reimport the
 manifest if an older test installation still declares ExcelApi 1.7 or lacks the
@@ -219,3 +225,27 @@ Architecture: `src/excelPdf.ts` owns only `/excel/*`; `excel-addin/` contains th
 task pane and row reader; `tools/excel_pdf/http_worker.py` invokes the verified
 Python core. Templates under `assets/excel-pdf/` are attorney-provided blank forms
 with all interactive values cleared. They are not exposed as public downloads.
+
+## Twelve-hour connection acceptance (2026-10-28)
+
+The v70 change retains server-side generation. It does not enable anonymous
+generation, cloud delivery, payments or court submission. No new environment
+variables or manifest permissions are required. Migration 29 creates the separate
+SQLite session table on the existing persistent Render disk.
+
+All 211 automated project tests passed. Session integration tests close and reopen
+SQLite and recreate the HTTP handler to verify restart recovery, fixed expiry,
+hashed tokens, logout and credential revocation, same-origin checks and isolation
+from admin authentication. The 27 Excel-specific tests also passed separately.
+
+The browser smoke test uses an explicit simulated Excel host, real PDF generation,
+and screenshots. It verifies automatic restoration after reload/navigation, no
+additional credential POST, temporary 502 recovery without losing access, expired
+session cleanup, the active 12-hour expiry timer, storage-disabled fallback, all
+three forms and all 31 visible checkbox marks. The admin desktop/mobile smoke
+also passed. Screenshots are in `output/excel-addin-qa/`.
+
+These checks do not claim a new real-Office acceptance run for v70 or a 12-hour
+wall-clock soak. Earlier real desktop/web tests above identify their actual
+versions. Browser storage restrictions can still require an initial connection
+per Office/browser profile; the server never authorizes another user by IP alone.

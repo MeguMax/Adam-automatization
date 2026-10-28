@@ -4,9 +4,13 @@
     let token = '', forms = [], officeReady = false, busy = false, pdfUrl = '', revision = 0, pdfTask = null, previewBlob = null, previewWidth = 0;
     let selectedData = null, resultSnapshot = null, refreshTimer;
     let generationId = '', deliveryAvailable = false, savedCopy = null;
+    let storage;
+    try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
+    const sessions = DevlinExcelSession.create(storage);
+    let connecting = false, connectionRevision = 0, expiryTimer;
     function message(error, status = '') { $('error').textContent = error; $('status').textContent = status; }
     function controls() {
-        $('generate').disabled = busy || !officeReady || !token || !forms.length || !selectedData;
+        $('generate').disabled = busy || connecting || !officeReady || !token || !forms.length || !selectedData;
         $('refresh').disabled = busy || !officeReady; $('form').disabled = busy || !forms.length;
         for (const id of ['download','save']) $(id).setAttribute('aria-disabled',String(busy || !pdfUrl));
         $('back').disabled = busy;
@@ -22,8 +26,18 @@
         pdfTask = null; $('preview').replaceChildren(); $('result').hidden = true;
         for (const id of ['download','save']) { $(id).removeAttribute('href'); $(id).removeAttribute('download'); }
     }
-    function signedOut() { ++revision; token = ''; selectedData = null; deliveryAvailable = false; $('autoSave').checked = false; $('deliveryOptions').hidden = true; $('cloudActions').hidden = true; clearResult(); $('workspace').hidden = true; $('signIn').hidden = false; $('logout').hidden = true; controls(); }
+    function signedOut() {
+        ++revision; ++connectionRevision; token = ''; connecting = false; sessions.clear(); clearTimeout(expiryTimer);
+        selectedData = null; deliveryAvailable = false; $('autoSave').checked = false; $('deliveryOptions').hidden = true;
+        $('cloudActions').hidden = true; clearResult(); $('workspace').hidden = true; $('connection').hidden = true;
+        $('signIn').hidden = false; $('logout').hidden = true; controls();
+    }
+    function watchExpiry(expiresAt) {
+        clearTimeout(expiryTimer);
+        expiryTimer = setTimeout(() => { signedOut(); message('Your 12-hour Excel connection expired. Connect again.'); }, Math.max(0, expiresAt - Date.now()));
+    }
     async function api(url, data) {
+        const owner = token;
         const abort = new AbortController();
         // Include response-body reads in the deadline, not only the HTTP headers.
         const timer = setTimeout(() => abort.abort(), url === '/excel/generate' ? 45000 : url === '/excel/save' ? 55000 : 20000);
@@ -33,8 +47,9 @@
             if (!response.ok) {
                 let result;
                 try { result = await response.json(); } catch(error) { if (abort.signal.aborted) throw error; }
-                if (response.status === 401 && token) signedOut();
+                if (response.status === 401 && token && token === owner) signedOut();
                 const error = new Error(result?.error || (response.status >= 500 ? 'The PDF service is temporarily unavailable. Try again shortly.' : 'Request failed. Please try again.'));
+                error.status = response.status;
                 if (typeof result?.field === 'string') error.field = result.field;
                 throw error;
             }
@@ -137,17 +152,43 @@
         savedCopy = saved; $('openCloud').href = url.href; $('openCloud').hidden = false;
         message('', 'PDF saved to OneDrive. Fillable fields retained.');
     }
+    async function connected(value, expiresIn) {
+        const saved = sessions.write(value, expiresIn);
+        token = saved.token; connecting = false; watchExpiry(saved.expiresAt);
+        $('password').value = ''; $('signIn').hidden = true; $('connection').hidden = true;
+        $('workspace').hidden = false; $('logout').hidden = false;
+        message(''); controls(); await refresh(); await loadDelivery();
+    }
+    async function reconnect() {
+        const saved = sessions.read();
+        if (!saved) { signedOut(); return; }
+        const attempt = ++connectionRevision;
+        token = saved.token; connecting = true; watchExpiry(saved.expiresAt);
+        $('signIn').hidden = true; $('workspace').hidden = true; $('connection').hidden = false;
+        $('logout').hidden = false; $('reconnect').disabled = true;
+        controls(); message('', 'Restoring connection...');
+        try {
+            const session = await api('/excel/resume', {});
+            if (attempt !== connectionRevision || token !== saved.token) return;
+            await connected(saved.token, session.expiresIn);
+        } catch(error) {
+            if (error.status === 401 || attempt === connectionRevision) message(error.message);
+        } finally { $('reconnect').disabled = false; }
+    }
     $('loginForm').addEventListener('submit', async event => {
         event.preventDefault(); $('login').disabled = true; message('');
         try {
             const session = await api('/excel/session', { username:$('username').value, password:$('password').value });
-            token = session.token;
-            $('password').value = ''; $('signIn').hidden = true; $('workspace').hidden = false; $('logout').hidden = false;
-            controls(); await refresh(); await loadDelivery();
+            await connected(session.token, session.expiresIn);
         } catch(error) { message(error.message); }
         finally { $('login').disabled = false; }
     });
-    $('logout').addEventListener('click', async () => { try { await api('/excel/logout', {}); } finally { signedOut(); message(''); } });
+    $('logout').addEventListener('click', async () => {
+        const request = api('/excel/logout', {});
+        signedOut(); message('');
+        try { await request; } catch { /* Local access is already cleared if the network is unavailable. */ }
+    });
+    $('reconnect').addEventListener('click', reconnect);
     $('refresh').addEventListener('click', refresh);
     $('form').addEventListener('change', refresh);
     $('back').addEventListener('click', () => {
@@ -217,19 +258,19 @@
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
     fetch('/excel/catalog').then(response => { if (!response.ok) throw new Error('Forms are unavailable.'); return response.json(); }).then(data => {
-        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; })); controls(); if (token) refresh();
+        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; })); controls(); if (token && !connecting) refresh();
     }).catch(error => message(error.message));
     if (window.lucide) lucide.createIcons();
     if (window.Office) Office.onReady(info => {
         officeReady = info.host === Office.HostType.Excel && Office.context.requirements.isSetSupported('ExcelApi', DevlinExcelWorkbook.MIN_EXCEL_API);
         controls();
         if (!officeReady) message('This panel requires Excel with Excel API '+DevlinExcelWorkbook.MIN_EXCEL_API+' or newer.');
-        if (token) refresh();
+        if (token && !connecting) refresh();
         if (officeReady) Excel.run(async context => {
             const sheets = context.workbook.worksheets;
             const changed = () => {
                 ++revision; selectedData = null; clearResult(); controls(); clearTimeout(refreshTimer);
-                if (!busy && token) refreshTimer = setTimeout(() => refresh(),150);
+                if (!busy && token && !connecting) refreshTimer = setTimeout(() => refresh(),150);
             };
             sheets.onSelectionChanged.add(changed);
             sheets.onChanged.add(changed);
@@ -239,6 +280,7 @@
             await context.sync();
         }).catch(() => { /* Before/after generation and download rechecks also protect hosts without change events. */ });
     });
+    reconnect();
     window.addEventListener('beforeunload', () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); });
     let resizeTimer;
     window.addEventListener('resize', () => {

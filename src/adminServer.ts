@@ -52,7 +52,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-28-microsoft-check-v69';
+const ADMIN_BUILD_ID = '2026-10-28-excel-session-v70';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -7319,7 +7319,7 @@ export function createAdminServer(
             currentSourceContentVerified: checkout?.checkoutVerified || false} };
     };
     const authorize = createAdminAuth(Date.now, db.getAdminSessionStore());
-    const excelPdf = createExcelPdfHandler();
+    const excelPdf = createExcelPdfHandler({ sessions: db.getExcelSessionStore() });
     let microsoftReport: MicrosoftAccessReport | null = null;
     let microsoftCheck: Promise<MicrosoftAccessReport> | null = null;
     const microsoftSettings = () => ({report:microsoftReport,excelSaving:process.env.EXCEL_PDF_ONEDRIVE_SHARE_URL ? 'onedrive' : 'local'});

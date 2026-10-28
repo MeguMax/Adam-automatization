@@ -2,14 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import { createAdminAuth } from './adminAuth';
-import { createExcelPdfHandler, EXCEL_FORMS, ExcelPdfFieldError, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
+import { createExcelPdfHandler, EXCEL_FORMS, EXCEL_SESSION_MS, ExcelSessionStore, ExcelPdfFieldError, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
+import { WorkflowDatabase } from './database';
 import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery } from './excelPdfDelivery';
 
 const row = require('../excel-addin/row.js');
 const workbook = require('../excel-addin/workbook.js');
+const clientSessions = require('../excel-addin/session.js');
 const values = (id = 'dc105'): Record<string, unknown> => Object.fromEntries(EXCEL_FORMS.find(form => form.id === id)!.fields.map(field => [field, '']));
 
 function officeFixture() {
@@ -84,11 +90,12 @@ test('case snapshots and filenames bind PDF values and identity without unsafe p
     for(const date of ['2/29/1900','2/30/2026','13/1/2026','1/0/2026','#VALUE!']) assert.equal(row.isCalendarDate(date),false);
 });
 
-async function fixture(run: (base: string, advance: (ms: number) => void) => Promise<void>, generate?: typeof generateExcelPdf, delivery: ExcelPdfDelivery | null = null) {
+async function fixture(run: (base: string, advance: (ms: number) => void, restart: () => void) => Promise<void>, generate?: typeof generateExcelPdf, delivery: ExcelPdfDelivery | null = null, store?: () => ExcelSessionStore) {
     const saved = { ADMIN_USERNAME: process.env.ADMIN_USERNAME, ADMIN_PASSWORD: process.env.ADMIN_PASSWORD, NODE_ENV: process.env.NODE_ENV };
     Object.assign(process.env, { ADMIN_USERNAME: 'admin', ADMIN_PASSWORD: 'test-password', NODE_ENV: 'test' });
     let clock = Date.now();
-    const handler = createExcelPdfHandler({ now: () => clock, generate, delivery });
+    const createHandler = () => createExcelPdfHandler({ now: () => clock, generate, delivery, sessions: store?.() });
+    let handler = createHandler();
     const admin = createAdminAuth();
     const server = http.createServer(async (req, res) => {
         if (await handler(req, res, new URL(req.url!, 'http://localhost').pathname)) return;
@@ -96,7 +103,7 @@ async function fixture(run: (base: string, advance: (ms: number) => void) => Pro
     });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    try { await run(base, ms => { clock += ms; }); }
+    try { await run(base, ms => { clock += ms; }, () => { handler = createHandler(); }); }
     finally {
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });
         for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -110,7 +117,9 @@ async function login(base: string): Promise<string> {
     const response = await post(base, 'session', { username: 'admin', password: 'test-password' });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('set-cookie'), null);
-    return (await response.json()).token;
+    const session = await response.json();
+    assert.equal(session.expiresIn, EXCEL_SESSION_MS / 1000);
+    return session.token;
 }
 
 test('Excel row mapping uses exact headers, rejects errors/duplicates, and ignores unrelated formula errors', () => {
@@ -150,11 +159,86 @@ test('Excel sessions are scoped, cookie-independent, revoked on password change,
     assert.equal((await post(base, 'generate', { form: 'dc105', values: values() }, token)).status, 200);
     assert.equal((await post(base, 'logout', {}, token)).status, 200);
     assert.equal((await post(base, 'generate', { form: 'dc105', values: values() }, token)).status, 401);
-    const expired = await login(base); advance(30 * 60_000 + 1);
+    const expired = await login(base); advance(EXCEL_SESSION_MS - 1);
+    assert.equal((await post(base, 'resume', {}, expired)).status, 200);
+    advance(1);
     assert.equal((await post(base, 'generate', { form: 'dc105', values: values() }, expired)).status, 401);
     const changed = await login(base); process.env.ADMIN_PASSWORD = 'new-password';
     assert.equal((await post(base, 'generate', { form: 'dc105', values: values() }, changed)).status, 401);
 }, async () => Buffer.from('%PDF-fixture')));
+
+test('Excel resume verifies access without refreshing the 12-hour deadline or accepting another device on the same IP', async () => fixture(async (base, advance) => {
+    const token = await login(base);
+    const first = await (await post(base, 'resume', {}, token)).json();
+    advance(6 * 60 * 60_000);
+    const resumed = await (await post(base, 'resume', {}, token)).json();
+    assert.equal(resumed.expiresAt, first.expiresAt);
+    assert.equal(resumed.expiresIn, 6 * 60 * 60);
+    assert.equal((await post(base, 'resume', {})).status, 401);
+    assert.equal((await post(base, 'resume', {}, token, 'https://untrusted.example')).status, 403);
+    assert.equal((await post(base, 'resume', {}, 'a'.repeat(64))).status, 401);
+    advance(6 * 60 * 60_000);
+    assert.equal((await post(base, 'resume', {}, token)).status, 401);
+}));
+
+test('Excel client remembers only a scoped token and expiry, handles disabled storage, and clears invalid sessions', () => {
+    let clock = Date.now();
+    const values = new Map<string, string>();
+    const storage = {getItem: (key: string) => values.get(key) || null,
+        setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); }};
+    const first = clientSessions.create(storage, () => clock), token = 'a'.repeat(64);
+    first.write(token, EXCEL_SESSION_MS / 1000);
+    const second = clientSessions.create(storage, () => clock);
+    assert.deepEqual(second.read(), {token, expiresAt: clock + EXCEL_SESSION_MS});
+    assert.deepEqual(Object.keys(JSON.parse(values.get(clientSessions.KEY)!)), ['token', 'expiresAt']);
+    clock += EXCEL_SESSION_MS;
+    assert.equal(second.read(), null); assert.equal(values.size, 0);
+    for (const invalid of ['{', JSON.stringify({token, expiresAt: clock + EXCEL_SESSION_MS + 2000}), JSON.stringify({token:'bad', expiresAt:clock + 1000})]) {
+        values.set(clientSessions.KEY, invalid);
+        assert.equal(clientSessions.create(storage, () => clock).read(), null);
+    }
+    for (const blocked of [undefined, {getItem(){throw Error();},setItem(){throw Error();},removeItem(){throw Error();}},
+        {getItem(){return null;},setItem(){throw Error();},removeItem(){}}]) {
+        const memory = clientSessions.create(blocked, () => clock);
+        memory.write(token, 3600); assert.equal(memory.read().token, token);
+        memory.clear(); assert.equal(memory.read(), null);
+    }
+    assert.throws(() => first.write(token, 13 * 60 * 60));
+    first.write(token, 3600); first.clear(); assert.equal(second.read(), null);
+});
+
+test('SQLite Excel sessions survive restart, store no reusable token or password, and remain separate from admin access', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'excel-session-qa-'));
+    const filename = path.join(directory, 'workflow.sqlite');
+    let db = new WorkflowDatabase(filename);
+    try {
+        await fixture(async (base, advance, restart) => {
+            const token = await login(base);
+            const hash = createHash('sha256').update(token).digest('hex');
+            const inspection = new DatabaseSync(filename, {readOnly:true});
+            try {
+                const rows = inspection.prepare('SELECT * FROM excel_sessions').all();
+                assert.equal(rows.length, 1); assert.equal(rows[0].token_hash, hash);
+                assert.ok(!JSON.stringify(rows).includes(token)); assert.ok(!JSON.stringify(rows).includes('test-password'));
+                assert.equal(inspection.prepare('SELECT COUNT(*) AS n FROM admin_sessions').get()!.n, 0);
+            } finally { inspection.close(); }
+            const reboot = () => { db.close(); db = new WorkflowDatabase(filename); restart(); };
+            reboot();
+            assert.equal((await post(base, 'resume', {}, token)).status, 200);
+            assert.equal((await post(base, 'generate', {form:'dc105', values:values()}, token)).status, 200);
+            assert.equal((await post(base, 'resume', {}, hash)).status, 401);
+            assert.equal((await fetch(base + '/api/protected', {headers:{Cookie:'legal_admin_session=' + token}})).status, 401);
+            await post(base, 'logout', {}, token); reboot();
+            assert.equal((await post(base, 'resume', {}, token)).status, 401);
+            const expired = await login(base); advance(EXCEL_SESSION_MS); reboot();
+            assert.equal((await post(base, 'resume', {}, expired)).status, 401);
+            const revoked = await login(base); process.env.ADMIN_PASSWORD = 'changed-password'; reboot();
+            assert.equal((await post(base, 'resume', {}, revoked)).status, 401);
+            process.env.ADMIN_PASSWORD = 'test-password'; reboot();
+            assert.equal((await post(base, 'resume', {}, revoked)).status, 401);
+        }, async () => Buffer.from('%PDF-fixture'), null, () => db.getExcelSessionStore());
+    } finally { db.close(); fs.rmSync(directory, {recursive:true, force:true}); }
+});
 
 test('Excel shell supports Office framing but never exposes templates or general admin sessions', async () => fixture(async base => {
     const shell = await fetch(base + '/excel/');
@@ -166,7 +250,7 @@ test('Excel shell supports Office framing but never exposes templates or general
     assert.ok(!csp.includes('https://*.live.com'));
     assert.equal(shell.headers.get('x-frame-options'),null);
     assert.ok(!csp.includes('unsafe-inline'));
-    for (const asset of ['app.js', 'row.js', 'workbook.js', 'commands.html', 'commands.js', 'style.css', 'icon.png', 'icon-16.png', 'icon-32.png', 'icon-80.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
+    for (const asset of ['app.js', 'row.js', 'workbook.js', 'session.js', 'commands.html', 'commands.js', 'style.css', 'icon.png', 'icon-16.png', 'icon-32.png', 'icon-80.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
     assert.equal((await fetch(base + '/excel/pdfjs/standard_fonts/nonexistent')).status, 404);
     assert.equal((await fetch(base + '/excel/templates/dc105.pdf')).status, 404);
     assert.equal((await post(base, 'generate', { form: 'dc105', values: {} }, await login(base))).status, 422);

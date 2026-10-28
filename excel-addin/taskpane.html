@@ -10,20 +10,25 @@
   <script defer src="/excel/lucide.js"></script>
   <script defer src="/excel/row.js"></script>
   <script defer src="/excel/workbook.js"></script>
+  <script defer src="/excel/session.js"></script>
   <script defer src="/excel/app.js"></script>
 </head>
 <body>
   <header><img src="/excel/icon.png" width="32" height="32" alt=""><div><strong>PDF Forms</strong><span>Devlin Law PLLC</span></div>
-    <button id="logout" class="icon" title="Sign out" aria-label="Sign out" hidden><i data-lucide="log-out"></i></button>
+    <button id="logout" class="icon" title="Disconnect" aria-label="Disconnect" hidden><i data-lucide="log-out"></i></button>
   </header>
   <main>
-    <section id="signIn">
-      <h1>Sign in</h1>
+    <section id="signIn" hidden>
+      <h1>Connect Excel</h1>
       <form id="loginForm">
         <label for="username">Admin username</label><input id="username" autocomplete="username" maxlength="254" required>
         <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" maxlength="1024" required>
-        <button id="login" class="primary" type="submit">Sign in</button>
+        <button id="login" class="primary" type="submit">Connect for 12 hours</button>
       </form>
+    </section>
+    <section id="connection" hidden>
+      <h1>Reconnecting</h1>
+      <button id="reconnect" class="primary" type="button"><i data-lucide="refresh-cw"></i><span>Reconnect</span></button>
     </section>
     <section id="workspace" hidden>
       <div class="section-heading"><h1>Selected case</h1><button id="refresh" class="icon" title="Refresh selected row" aria-label="Refresh selected row"><i data-lucide="refresh-cw"></i></button></div>

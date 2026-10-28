@@ -2545,6 +2545,13 @@ const migrations: Migration[] = [
             CREATE INDEX idx_receipts_job ON mifile_receipt_events(filing_job_id, observed_at);
         `),
     },
+    {
+        version: 29,
+        name: 'persistent_excel_sessions',
+        up: db => db.exec(`CREATE TABLE excel_sessions (
+            token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, credential_version TEXT NOT NULL
+        ); CREATE INDEX idx_excel_session_expiry ON excel_sessions(expires_at);`),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2581,6 +2588,28 @@ export class WorkflowDatabase {
                 this.db.prepare('DELETE FROM admin_sessions WHERE expires_at <= ?').run(time);
                 this.db.prepare(`DELETE FROM admin_sessions WHERE token_hash IN
                     (SELECT token_hash FROM admin_sessions ORDER BY expires_at DESC, token_hash DESC LIMIT -1 OFFSET ?)`)
+                    .run(keep);
+            },
+        };
+    }
+
+    getExcelSessionStore(): import('./excelPdf').ExcelSessionStore {
+        return {
+            get: hash => {
+                const row = this.db.prepare('SELECT expires_at, credential_version FROM excel_sessions WHERE token_hash = ?')
+                    .get(hash) as { expires_at: number; credential_version: string } | undefined;
+                return row ? { expires: row.expires_at, version: row.credential_version } : undefined;
+            },
+            set: (hash, session) => {
+                this.db.prepare(`INSERT INTO excel_sessions(token_hash, expires_at, credential_version) VALUES (?, ?, ?)
+                    ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at, credential_version = excluded.credential_version`)
+                    .run(hash, session.expires, session.version);
+            },
+            delete: hash => { this.db.prepare('DELETE FROM excel_sessions WHERE token_hash = ?').run(hash); },
+            prune: (time, keep) => {
+                this.db.prepare('DELETE FROM excel_sessions WHERE expires_at <= ?').run(time);
+                this.db.prepare(`DELETE FROM excel_sessions WHERE token_hash IN
+                    (SELECT token_hash FROM excel_sessions ORDER BY expires_at DESC, token_hash DESC LIMIT -1 OFFSET ?)`)
                     .run(keep);
             },
         };

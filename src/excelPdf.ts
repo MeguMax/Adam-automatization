@@ -7,8 +7,31 @@ import { credentialsMatch } from './adminAuth';
 import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery, ExcelPdfSavedCopy } from './excelPdfDelivery';
 
 const ROOT = path.resolve(__dirname, '..');
-const SESSION_MS = 30 * 60_000;
+export const EXCEL_SESSION_MS = 12 * 60 * 60_000;
 const BODY_LIMIT = 96 * 1024;
+export interface ExcelSessionStore {
+    get(hash: string): { expires: number; version: string } | undefined;
+    set(hash: string, session: { expires: number; version: string }): void;
+    delete(hash: string): void;
+    prune(now: number, keep: number): void;
+}
+
+function memorySessions(): ExcelSessionStore {
+    const sessions = new Map<string, { expires: number; version: string }>();
+    return {
+        get: hash => sessions.get(hash),
+        set: (hash, session) => { sessions.set(hash, session); },
+        delete: hash => { sessions.delete(hash); },
+        prune: (time, keep) => {
+            for (const [hash, session] of sessions) if (session.expires <= time) sessions.delete(hash);
+            while (sessions.size > keep) sessions.delete(sessions.keys().next().value!);
+        },
+    };
+}
+
+function tokenHash(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+}
 export class ExcelPdfFieldError extends Error {
     constructor(message: string, public readonly field: string) { super(message); }
 }
@@ -21,8 +44,8 @@ export const EXCEL_FORMS = [
     dateFields: form.dates.map(index => `${form.id}_${String(index).padStart(2, '0')}`),
 }));
 
-function credentialVersion(): string {
-    return createHash('sha256').update(JSON.stringify([process.env.ADMIN_USERNAME, process.env.ADMIN_PASSWORD])).digest('hex');
+function credentialVersion(hash: string): string {
+    return createHash('sha256').update(JSON.stringify(['excel-pdf', process.env.ADMIN_USERNAME, process.env.ADMIN_PASSWORD, hash])).digest('hex');
 }
 
 function sameOrigin(req: http.IncomingMessage): boolean {
@@ -149,13 +172,21 @@ export function excelManifest(base = process.env.EXCEL_PDF_PUBLIC_URL || 'https:
 </VersionOverrides></OfficeApp>`;
 }
 
-export function createExcelPdfHandler(options: { now?: () => number; generate?: typeof generateExcelPdf; delivery?: ExcelPdfDelivery | null } = {}) {
+export function createExcelPdfHandler(options: { now?: () => number; generate?: typeof generateExcelPdf; delivery?: ExcelPdfDelivery | null; sessions?: ExcelSessionStore } = {}) {
     const now = options.now || Date.now;
-    const sessions = new Map<string, { expires: number; version: string }>();
+    const sessions = options.sessions || memorySessions();
+    const sessionFor = (token: string) => {
+        if (!/^[a-f0-9]{64}$/.test(token)) return undefined;
+        const hash = tokenHash(token);
+        const session = sessions.get(hash);
+        if (session && session.expires > now() && session.version === credentialVersion(hash)) return session;
+        if (session) sessions.delete(hash);
+        return undefined;
+    };
     const delivery = options.delivery === undefined ? createExcelOneDriveDelivery() : options.delivery;
     const copies = new Map<string, { owner: string; pdf: Buffer; filename: string; expires: number; timer: NodeJS.Timeout; saved?: ExcelPdfSavedCopy; saving?: Promise<ExcelPdfSavedCopy> }>();
     const forget = (id: string) => { const copy = copies.get(id); if (copy) clearTimeout(copy.timer); copies.delete(id); };
-    const prune = () => { for (const [id, copy] of copies) if (copy.expires <= now() || !sessions.has(copy.owner)) forget(id); };
+    const prune = () => { for (const [id, copy] of copies) if (copy.expires <= now() || !sessionFor(copy.owner)) forget(id); };
     let attempts = 0, windowStart = now(), running = false, saving = false;
     return async (req: http.IncomingMessage, res: http.ServerResponse, pathname: string): Promise<boolean> => {
         if (!pathname.startsWith('/excel/') && pathname !== '/excel') return false;
@@ -163,6 +194,7 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             '/excel/': ['taskpane.html', 'text/html; charset=utf-8'], '/excel': ['taskpane.html', 'text/html; charset=utf-8'],
             '/excel/app.js': ['app.js', 'text/javascript'], '/excel/row.js': ['row.js', 'text/javascript'],
             '/excel/workbook.js': ['workbook.js', 'text/javascript'],
+            '/excel/session.js': ['session.js', 'text/javascript'],
             '/excel/commands.html': ['commands.html', 'text/html; charset=utf-8'], '/excel/commands.js': ['commands.js', 'text/javascript'],
             '/excel/icon-16.png': ['icon-16.png', 'image/png'], '/excel/icon-32.png': ['icon-32.png', 'image/png'], '/excel/icon-80.png': ['icon-80.png', 'image/png'],
             '/excel/style.css': ['style.css', 'text/css'], '/excel/icon.png': ['icon.png', 'image/png'],
@@ -187,13 +219,13 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             res.end(excelManifest()); return true;
         }
         if (req.method === 'GET' && pathname === '/excel/catalog') { json(res, 200, EXCEL_FORMS); return true; }
-        if (req.method !== 'POST' || !['/excel/session', '/excel/logout', '/excel/generate', '/excel/delivery', '/excel/save'].includes(pathname)) {
+        if (req.method !== 'POST' || !['/excel/session', '/excel/resume', '/excel/logout', '/excel/generate', '/excel/delivery', '/excel/save'].includes(pathname)) {
             json(res, 404, { error: 'Not found.' }); return true;
         }
         if (!sameOrigin(req) || !req.headers['content-type']?.startsWith('application/json')) {
             json(res, 403, { error: 'A same-origin JSON request is required.' }); return true;
         }
-        for (const [token, session] of sessions) if (session.expires <= now() || session.version !== credentialVersion()) sessions.delete(token);
+        sessions.prune(now(), 100);
         prune();
         if (pathname === '/excel/session') {
             if (now() - windowStart >= 60_000) { attempts = 0; windowStart = now(); }
@@ -201,15 +233,20 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             let input;
             try { input = await body(req); } catch (error) { json(res, 400, { error: (error as Error).message }); return true; }
             if (!credentialsMatch(input?.username, input?.password)) { json(res, 401, { error: 'Incorrect admin username or password.' }); return true; }
-            if (sessions.size >= 100) sessions.delete(sessions.keys().next().value!);
+            sessions.prune(now(), 99);
             const token = randomBytes(32).toString('hex');
-            sessions.set(token, { expires: now() + SESSION_MS, version: credentialVersion() });
-            json(res, 200, { token, expiresIn: SESSION_MS / 1000 }); return true;
+            const hash = tokenHash(token), expiresAt = now() + EXCEL_SESSION_MS;
+            sessions.set(hash, { expires: expiresAt, version: credentialVersion(hash) });
+            json(res, 200, { token, expiresAt, expiresIn: EXCEL_SESSION_MS / 1000 }); return true;
         }
         const authorization = req.headers.authorization || '';
         const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-        if (!sessions.has(token)) { json(res, 401, { error: 'Sign in to the Excel panel again.' }); return true; }
-        if (pathname === '/excel/logout') { sessions.delete(token); prune(); json(res, 200, { ok: true }); return true; }
+        const session = sessionFor(token);
+        if (!session) { json(res, 401, { error: 'Your Excel connection expired. Connect again.' }); return true; }
+        if (pathname === '/excel/resume') {
+            json(res, 200, { expiresAt: session.expires, expiresIn: Math.ceil((session.expires - now()) / 1000) }); return true;
+        }
+        if (pathname === '/excel/logout') { sessions.delete(tokenHash(token)); prune(); json(res, 200, { ok: true }); return true; }
         if (pathname === '/excel/delivery') {
             try { json(res, 200, delivery ? { available: true, ...(await delivery.destination()) } : { available: false }); }
             catch { json(res, 503, { error: 'OneDrive is unavailable. PDF downloads still work.' }); }
@@ -241,7 +278,7 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             const filename = excelPdfFilename(input.form, input.filename);
             const pdf = await (options.generate || generateExcelPdf)(input.form, input.values);
             let generationId = '';
-            if (delivery && sessions.has(token)) {
+            if (delivery && sessionFor(token)) {
                 if (!pdf.subarray(0, 5).equals(Buffer.from('%PDF-')) || pdf.length > 5 * 1024 * 1024) throw new Error('Invalid PDF generation result.');
                 let bytes = [...copies.values()].reduce((sum, copy) => sum + copy.pdf.length, 0);
                 for (const [id, copy] of copies) {
