@@ -90,6 +90,22 @@ test('case snapshots and filenames bind PDF values and identity without unsafe p
     for(const date of ['2/29/1900','2/30/2026','13/1/2026','1/0/2026','#VALUE!']) assert.equal(row.isCalendarDate(date),false);
 });
 
+test('editable download names retain the form prefix, PDF extension, Windows safety and server validation', () => {
+    for (const form of EXCEL_FORMS) {
+        const expected = form.id.toUpperCase() + ' - reviewed copy.pdf';
+        assert.equal(row.downloadFilename(form.id, 'reviewed copy'), expected);
+        assert.equal(row.downloadFilename(form.id, 'reviewed copy.PDF'), expected);
+        assert.equal(row.downloadFilename(form.id, '  ' + expected + '  '), expected);
+        assert.equal(excelPdfFilename(form.id, row.downloadFilename(form.id, expected)), expected);
+        for (const name of ['', '../copy.pdf', 'copy/other.pdf', 'copy\\other.pdf', 'copy?.pdf', 'copy\u007f.pdf',
+            'copy.pdf.exe', 'a'.repeat(175), form.id.toUpperCase() + ' - .pdf']) {
+            assert.throws(() => row.downloadFilename(form.id, name));
+        }
+    }
+    assert.throws(() => row.downloadFilename('dc105', 'DC508 - different form.pdf'), /different court form/);
+    assert.throws(() => row.downloadFilename('unknown', 'copy.pdf'));
+});
+
 async function fixture(run: (base: string, advance: (ms: number) => void, restart: () => void) => Promise<void>, generate?: typeof generateExcelPdf, delivery: ExcelPdfDelivery | null = null, store?: () => ExcelSessionStore) {
     const saved = { ADMIN_USERNAME: process.env.ADMIN_USERNAME, ADMIN_PASSWORD: process.env.ADMIN_PASSWORD, NODE_ENV: process.env.NODE_ENV };
     Object.assign(process.env, { ADMIN_USERNAME: 'admin', ADMIN_PASSWORD: 'test-password', NODE_ENV: 'test' });

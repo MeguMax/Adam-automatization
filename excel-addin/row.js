@@ -51,7 +51,24 @@
             .normalize('NFC').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').replace(/\s+/g,' ').trim().replace(/[. ]+$/g,'');
         return stem.slice(0,170).replace(/[. ]+$/g,'')+'.pdf';
     }
-    const api = {selectedFields, assertSelection, caseMetadata, isCalendarDate, pdfFilename};
+    function downloadFilename(form, value) {
+        if (!['dc105','dc508','mc202'].includes(form) || typeof value !== 'string') throw new Error('Enter a PDF file name.');
+        let name = value.normalize('NFC').trim();
+        if (!name || /[<>:"/\\|?*\x00-\x1f\x7f]/.test(name)) throw new Error('The file name is empty or contains characters that Windows cannot use.');
+        if (/^(DC105|DC508|MC202)(?: - |\.pdf$)/i.test(name) && !name.toUpperCase().startsWith(form.toUpperCase() + ' - ')) {
+            throw new Error('The file name refers to a different court form.');
+        }
+        if (/\.pdf$/i.test(name)) name = name.slice(0,-4) + '.pdf';
+        else if (/\.[a-z0-9]{1,5}$/i.test(name)) throw new Error('The file must have a .pdf extension.');
+        else name += '.pdf';
+        if (name.slice(0,form.length + 3).toUpperCase() === form.toUpperCase() + ' - ') name = form.toUpperCase() + name.slice(form.length);
+        else name = form.toUpperCase() + ' - ' + name;
+        if (name.length > 174 || !name.slice(form.length + 3,-4).trim() || /[. ]\.pdf$/.test(name)) {
+            throw new Error('The file name is too long or has an invalid ending.');
+        }
+        return name;
+    }
+    const api = {selectedFields, assertSelection, caseMetadata, isCalendarDate, pdfFilename, downloadFilename};
     if (typeof module !== 'undefined' && module.exports) module.exports = api;
     else root.DevlinExcelRow = api;
 })(globalThis);

@@ -22,6 +22,8 @@ sends email, modifies case records, pays fees or submits a filing.
 - Successful generation scrolls to the result. Preview height adapts to short Office task panes so the download action stays reachable.
 - **Back to form** returns to the form selector without reopening Office's panel or signing in again.
 - Download names include the form, court, case number and parties when available, with Windows-unsafe characters removed.
+- The last chosen form is remembered per Office/browser profile. No case data or custom filenames are saved in preferences.
+- **File name** can be edited before generation. A missing form prefix and `.pdf` extension are added; unsafe paths, other form names and overlong names are rejected before a PDF request. The reset icon restores the automatic name. Editing the name invalidates the old result; changing cases resets it, while refreshing the same case retains the custom name. The download and optional OneDrive delivery use the same generated name.
 - Login requests have a 20-second deadline; PDF generation/download responses have a 45-second deadline. Network failures, HTML gateway errors and invalid PDF responses leave generation retryable without exposing a broken download.
 - Long text is measured against its actual PDF widget. The original font size is retained when it fits; otherwise it is reduced to a minimum of 7 pt. Explicit line breaks are preserved in multiline fields. Values are never truncated, abbreviated or silently wrapped.
 - Text that cannot fit legibly, unsupported font characters, control characters, or line breaks in a single-line field stop generation. Field-specific errors identify the original worksheet and cell; correct that value/formula in Excel and generate again.
@@ -96,6 +98,26 @@ For an initial Excel Online test, upload the XML manifest through Office's
 across desktop and web, Adam's Microsoft 365 administrator can deploy the custom
 add-in through the Microsoft 365 admin center. Windows shared-folder sideloading
 is a testing option, not the production deployment method.
+
+### Adam's Microsoft 365 installation
+
+1. Download the XML manifest from the link above.
+2. Sign in to the Microsoft 365 admin center with Adam's organizational administrator account.
+3. Open **Settings > Integrated apps**, then the **Add-ins** link and **Deploy Add-in**.
+4. Choose the custom add-in option and upload the XML manifest (or use its public HTTPS URL).
+5. Assign the initial rollout to **Just me** or specifically to Adam, not the entire organization.
+6. Adam reviews the existing workbook read/write permission and completes deployment himself.
+7. Open Excel with that organizational account. Find **Devlin Law > PDF Forms** on **Home**; use **More Options** if the ribbon is narrow.
+8. Select a case row, connect for 12 hours, choose a form, optionally adjust **File name**, and generate/download the fillable PDF.
+
+The downloaded file goes to the browser/Excel download location or the location
+chosen in its save dialog, not automatically to Adam's OneDrive folder. Customer
+workbooks and source PDF templates stay unchanged. Updating the hosted panel does
+not require reinstalling this unchanged manifest. Deployment in Adam's tenant is
+still his administrator-controlled step, not something verified on our personal
+test account.
+
+Official installation reference: [Microsoft 365 add-in deployment](https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-deployment-of-add-ins?view=o365-worldwide).
 
 Personal OneDrive's browser editor has two ancestor origins: `onedrive.live.com`
 and `excel.officeapps.live.com`. The public `/excel/*` shell allows both explicitly

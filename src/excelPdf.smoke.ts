@@ -106,6 +106,12 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(() => !(document.getElementById('generate') as HTMLButtonElement).disabled);
         assert.equal(loginRequests, 1);
         await page.screenshot({path:path.join(output,'auto-reconnected.png')});
+        await page.selectOption('#form', 'mc202');
+        await page.waitForFunction(() => !(document.getElementById('generate') as HTMLButtonElement).disabled);
+        await page.reload();
+        await page.waitForFunction(() => !(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(await page.locator('#form').inputValue(), 'mc202');
+        assert.equal(loginRequests, 1);
         await page.screenshot({ path: path.join(output, 'selected-row.png') });
         for (const form of EXCEL_FORMS) {
             await page.selectOption('#form', form.id);
@@ -128,6 +134,32 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             await download.saveAs(path.join(output, download.suggestedFilename()));
             await page.screenshot({ path: path.join(output, form.id + '-mobile.png'), fullPage: true });
         }
+        await page.click('#back');
+        await page.fill('#filename', 'reviewed copy');
+        await page.click('#refresh');
+        await page.waitForFunction(() => !(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(await page.locator('#filename').inputValue(), 'reviewed copy');
+        const namedRequest = page.waitForRequest(req => req.url().endsWith('/excel/generate'));
+        await page.click('#generate');
+        assert.equal((await namedRequest).postDataJSON().filename, 'MC202 - reviewed copy.pdf');
+        await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
+        const namedDownloadEvent = page.waitForEvent('download'); await page.click('#save');
+        const namedDownload = await namedDownloadEvent;
+        assert.equal(namedDownload.suggestedFilename(), 'MC202 - reviewed copy.pdf');
+        await namedDownload.saveAs(path.join(output, namedDownload.suggestedFilename()));
+        await page.fill('#filename', '../invalid.pdf');
+        assert.equal(await page.locator('#result').isVisible(), false);
+        let invalidNameRequests = 0;
+        const countInvalid = (request: any) => { if (request.url().endsWith('/excel/generate')) invalidNameRequests++; };
+        page.on('request', countInvalid); await page.click('#generate');
+        await page.waitForFunction(() => document.getElementById('error')?.textContent?.includes('Windows cannot use'));
+        page.off('request', countInvalid);
+        assert.equal(invalidNameRequests, 0);
+        assert.equal(await page.locator('#filename').getAttribute('aria-invalid'), 'true');
+        await page.click('#resetFilename');
+        assert.ok((await page.locator('#filename').inputValue()).includes('Example Property LLC v Morgan Tenant.pdf'));
+        await page.click('#generate');
+        await page.waitForFunction(() => document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
         // Verify visible marks, not only stored checkbox values or nonempty appearances.
         await page.evaluate('import("/excel/pdfjs/pdf.mjs").then(module => { window.qaPdfjs = module; })');
         let checkedWidgets = 0;
@@ -312,9 +344,10 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
         assert.equal(overflow, false);
-        assert.equal(await page.evaluate(() => localStorage.length), 1);
+        assert.equal(await page.evaluate(() => localStorage.getItem('devlin.excel.session.v1') !== null), true);
         await page.click('#logout'); await page.waitForSelector('#signIn:visible');
-        assert.equal(await page.evaluate(() => localStorage.length), 0);
+        assert.equal(await page.evaluate(() => localStorage.getItem('devlin.excel.session.v1')), null);
+        assert.equal(await page.evaluate(() => localStorage.getItem('devlin.excel.form.v1')), 'mc202');
         await page.reload(); await page.waitForSelector('#signIn:visible');
         assert.equal(await page.locator('#password').inputValue(), '');
         assert.equal(await page.locator('#autoSave').isChecked(),false);
@@ -331,7 +364,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.equal(await page.evaluate(()=>sessionStorage.length),0);
         await page.evaluate(token => localStorage.setItem('devlin.excel.session.v1', JSON.stringify({token,expiresAt:Date.now()-1})), remembered.token);
         await page.reload(); await page.waitForSelector('#signIn:visible');
-        assert.equal(await page.evaluate(() => localStorage.length), 0);
+        assert.equal(await page.evaluate(() => localStorage.getItem('devlin.excel.session.v1')), null);
         await page.addInitScript(() => Object.defineProperty(window, 'localStorage', {get(){throw new Error('Storage disabled for QA');}}));
         await page.reload(); await page.waitForSelector('#signIn:visible');
         await page.fill('#username','excel-qa'); await page.fill('#password','excel-qa-only'); await page.click('#login');

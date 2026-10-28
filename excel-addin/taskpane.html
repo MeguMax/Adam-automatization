@@ -37,6 +37,10 @@
       <p id="caseContext" class="secondary"></p>
       <label for="form">Court form</label>
       <select id="form" disabled><option value="">Loading forms...</option></select>
+      <div id="fileNaming" hidden>
+        <label for="filename">File name</label>
+        <div class="filename-field"><input id="filename" maxlength="174" autocomplete="off" spellcheck="false" disabled><button id="resetFilename" type="button" class="icon" title="Restore automatic file name" aria-label="Restore automatic file name" disabled><i data-lucide="rotate-ccw"></i></button></div>
+      </div>
       <div id="deliveryOptions" hidden><label class="check-label"><input id="autoSave" type="checkbox">Save to OneDrive automatically</label><p id="destination" class="secondary"></p></div>
       <button id="generate" class="primary" disabled><i data-lucide="file-plus-2"></i><span>Generate PDF</span></button>
       <section id="result" hidden>

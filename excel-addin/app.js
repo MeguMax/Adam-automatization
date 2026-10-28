@@ -4,6 +4,8 @@
     let token = '', forms = [], officeReady = false, busy = false, pdfUrl = '', revision = 0, pdfTask = null, previewBlob = null, previewWidth = 0;
     let selectedData = null, resultSnapshot = null, refreshTimer;
     let generationId = '', deliveryAvailable = false, savedCopy = null;
+    let filenameOwner = '', resultFilename = '';
+    const FORM_KEY = 'devlin.excel.form.v1';
     let storage;
     try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
     const sessions = DevlinExcelSession.create(storage);
@@ -12,6 +14,7 @@
     function controls() {
         $('generate').disabled = busy || connecting || !officeReady || !token || !forms.length || !selectedData;
         $('refresh').disabled = busy || !officeReady; $('form').disabled = busy || !forms.length;
+        $('filename').disabled = busy || !selectedData; $('resetFilename').disabled = busy || !selectedData;
         for (const id of ['download','save']) $(id).setAttribute('aria-disabled',String(busy || !pdfUrl));
         $('back').disabled = busy;
         $('autoSave').disabled = busy;
@@ -20,7 +23,7 @@
     }
     function clearResult() {
         if (pdfUrl) URL.revokeObjectURL(pdfUrl);
-        pdfUrl = ''; previewBlob = null; resultSnapshot = null;
+        pdfUrl = ''; previewBlob = null; resultSnapshot = null; resultFilename = '';
         generationId = ''; savedCopy = null; $('openCloud').hidden = true; $('openCloud').removeAttribute('href');
         if (pdfTask) pdfTask.destroy().catch(() => {});
         pdfTask = null; $('preview').replaceChildren(); $('result').hidden = true;
@@ -29,6 +32,7 @@
     function signedOut() {
         ++revision; ++connectionRevision; token = ''; connecting = false; sessions.clear(); clearTimeout(expiryTimer);
         selectedData = null; deliveryAvailable = false; $('autoSave').checked = false; $('deliveryOptions').hidden = true;
+        filenameOwner = ''; $('filename').value = ''; $('fileNaming').hidden = true;
         $('cloudActions').hidden = true; clearResult(); $('workspace').hidden = true; $('connection').hidden = true;
         $('signIn').hidden = false; $('logout').hidden = true; controls();
     }
@@ -72,6 +76,11 @@
     }
     function showSelection(data) {
         selectedData = data;
+        const owner = JSON.stringify([data.sheetId, data.row, data.form, data.metadata]);
+        if (owner !== filenameOwner) {
+            filenameOwner = owner; $('filename').value = DevlinExcelRow.pdfFilename(data); $('filename').removeAttribute('aria-invalid');
+        }
+        $('fileNaming').hidden = false;
         $('selection').textContent = data.sheet + ' / Row ' + data.row;
         $('caseName').textContent = data.name;
         $('caseContext').textContent = [data.metadata.plaintiff,data.metadata.court,data.metadata.caseNumber].filter(Boolean).join(' / ');
@@ -112,7 +121,7 @@
         selectedData = null; clearResult(); controls();
         if (keepMessage !== true) message('');
         try { const data = await readSelection(); if (current === revision) showSelection(data); }
-        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; message(error.message); } }
+        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true; message(error.message); } }
         finally { controls(); }
     }
     async function loadDelivery() {
@@ -190,7 +199,16 @@
     });
     $('reconnect').addEventListener('click', reconnect);
     $('refresh').addEventListener('click', refresh);
-    $('form').addEventListener('change', refresh);
+    $('form').addEventListener('change', () => {
+        try { storage?.setItem(FORM_KEY, $('form').value); } catch { /* Form selection remains usable without browser storage. */ }
+        refresh();
+    });
+    $('filename').addEventListener('input', () => { ++revision; clearResult(); $('filename').removeAttribute('aria-invalid'); message(''); controls(); });
+    $('resetFilename').addEventListener('click', () => {
+        if (!selectedData) return;
+        ++revision; clearResult(); $('filename').value = DevlinExcelRow.pdfFilename(selectedData);
+        $('filename').removeAttribute('aria-invalid'); message(''); controls();
+    });
     $('back').addEventListener('click', () => {
         clearResult(); message(''); controls();
         $('workspace').scrollIntoView({block:'start'}); $('form').focus({preventScroll:true});
@@ -204,8 +222,12 @@
         try {
             // Read again here, never reuse a preview snapshot after a worksheet edit.
             const data = await readSelection(); source = data; showSelection(data);
+            let filename;
+            try { filename = DevlinExcelRow.downloadFilename(data.form, $('filename').value); }
+            catch(error) { $('filename').setAttribute('aria-invalid','true'); throw error; }
+            $('filename').value = filename;
             message('', 'Generating PDF...');
-            const generated = await api('/excel/generate', { form:data.form, values:data.values, filename:DevlinExcelRow.pdfFilename(data) });
+            const generated = await api('/excel/generate', { form:data.form, values:data.values, filename });
             const blob = generated.blob;
             if (!token) return;
             if (generationRevision !== revision) { message('The worksheet changed during generation. Generate the PDF again.'); return; }
@@ -216,8 +238,8 @@
             pdfUrl = URL.createObjectURL(blob);
             previewBlob = blob;
             resultSnapshot = data;
+            resultFilename = filename;
             generationId = generated.generationId;
-            const filename = DevlinExcelRow.pdfFilename(data);
             for (const id of ['download', 'save']) { $(id).href = pdfUrl; $(id).download = filename; }
             $('resultName').textContent = data.name + ' / ' + filename; $('result').hidden = false;
             await renderPreview(blob);
@@ -242,7 +264,7 @@
                 clearResult(); selectedData = null;
                 throw new Error('The worksheet changed since this PDF was generated. Generate the PDF again.');
             }
-            const link = document.createElement('a'); link.href = url; link.download = DevlinExcelRow.pdfFilename(source);
+            const link = document.createElement('a'); link.href = url; link.download = resultFilename;
             document.body.append(link); link.click(); link.remove();
             message('', 'PDF download requested. Fillable fields retained.');
         } catch(error) { clearResult(); message(error.message); }
@@ -258,7 +280,9 @@
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
     fetch('/excel/catalog').then(response => { if (!response.ok) throw new Error('Forms are unavailable.'); return response.json(); }).then(data => {
-        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; })); controls(); if (token && !connecting) refresh();
+        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; }));
+        try { const previous = storage?.getItem(FORM_KEY); if (forms.some(form => form.id === previous)) $('form').value = previous; } catch { /* Use the first available form. */ }
+        controls(); if (token && !connecting) refresh();
     }).catch(error => message(error.message));
     if (window.lucide) lucide.createIcons();
     if (window.Office) Office.onReady(info => {
