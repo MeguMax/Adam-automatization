@@ -311,8 +311,38 @@ The desktop Excel windows could not be reliably inspected in this run. New
 desktop v71 acceptance and installation in Adam's own Microsoft 365 tenant remain
 pending; previous real desktop evidence above applies to its stated versions.
 
-Follow-up: the local fictional `qa-cases.xlsx` workbook is now open and maximized
-in desktop Excel, with the existing Home ribbon command and current task pane
-loaded. Its initial **Connect for 12 hours** sign-in is awaiting the user; no
-claim is made yet for a new desktop generation/restoration acceptance run.
+The desktop acceptance gap recorded above was closed by the following run.
 The v73 main Draft-preview change does not modify Excel generation or its session.
+
+## Windows desktop acceptance (2026-10-29, v73)
+
+After one initial user sign-in, the current production pane generated DC105,
+DC508 and MC202 from row 3 of the local fictional `qa-cases.xlsx` workbook.
+Each PDF was downloaded locally with a custom filename. Selecting row 2 removed
+the old preview, retained MC202, reset the case-specific filename and generated
+a separate PDF for Morgan Example. Refreshing the same row preserved its edited
+filename. No workbook cells or formulas were changed during this run.
+
+Closing the task pane and reopening it through Home > PDF Forms restored the
+connection without another sign-in. MC202 remained selected and the custom
+filename was not persisted; the current case's automatic filename was restored.
+This verifies reopening within a valid session, not a 12-hour wall-clock soak.
+
+All 126 fields in the four actual downloads matched the fixture, including the
+fixed `DATE(2026,10,27)` formula result. Canonical field values, page widgets,
+appearance streams, checkbox states, page counts and editable flags passed.
+All five pages were rendered and visually inspected. Poppler reported missing
+display fonts for retained Symbol/ArialUnicode resources; the reviewed populated
+appearances rendered correctly without clipping or missing values.
+
+Evidence is in `output/desktop-excel-2026-10-29/`, including the field-verification
+JSON, rendered pages and reopened-pane screenshot. Excel PDF delivery remains
+local-only. No customer workbook was uploaded, no cloud copy was created and no
+MiFILE preparation, payment or court submission was performed by this run.
+Installation and a first pilot in Adam's own Microsoft 365 tenant remain separate
+rollout steps. No new runtime code, manifest permissions or deployment variables
+were needed for this acceptance run.
+
+The full project regression was rerun on 2026-10-29: all 218 tests passed, with
+zero failures, cancellations or skipped tests. Production health reported
+`2026-10-28-inline-preview-v73`, ready, with `unsubmitted_only` preparation.
