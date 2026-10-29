@@ -53,7 +53,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-29-standard-upload-v74';
+const ADMIN_BUILD_ID = '2026-10-29-checkout-preflight-v75';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2380,6 +2380,11 @@ const html = String.raw`<!doctype html>
     .checkout-fees dt, .checkout-fees dd { margin: 0; }
     .checkout-fees dd { text-align: right; font-variant-numeric: tabular-nums; }
     .checkout-fees .checkout-total { border-top: 1px solid var(--line); padding-top: 8px; font-weight: 600; color: var(--text); }
+    .checkout-account-choice { display: grid; gap: 7px; max-width: 460px; margin: 4px 0; }
+    .checkout-account-choice select { min-width: 0; width: 100%; }
+    .checkout-preflight { list-style: none; padding: 0; margin: 0; display: grid; gap: 7px; }
+    .checkout-preflight li { display: flex; align-items: flex-start; gap: 7px; }
+    .checkout-preflight svg { width: 15px; height: 15px; flex: 0 0 15px; margin-top: 1px; }
     [data-checkout-review] .draft-filing-job-actions { margin-top: 12px; }
     .draft-filing-job-error {
       margin-top: 8px;
@@ -4734,6 +4739,8 @@ const html = String.raw`<!doctype html>
       const checkout = job.checkout;
       const quote = checkout.quote;
       const money = cents => new Intl.NumberFormat('en-US', {style:'currency',currency:'USD'}).format(cents / 100);
+      const methods = quote?.availablePaymentMethods || [];
+      const canChoose = checkout.checkoutVerified && !checkout.active && !checkout.receiptSummary.submissionObserved && quote?.totalCents > 0;
       return '<details class="draft-optional" data-checkout-review' + (open ? ' open' : '') + '><summary>Checkout & receipts' +
         (quote ? ' · ' + escapeHtml(money(quote.totalCents)) : '') + '</summary>' +
         '<div class="checkout-review-body"><strong>No payment or court submission is enabled.</strong>' +
@@ -4742,6 +4749,16 @@ const html = String.raw`<!doctype html>
           '<dl class="checkout-fees">' + quote.lines.map(line => '<dt>' + escapeHtml(line.label) + '</dt><dd>' + escapeHtml(money(line.cents)) + '</dd>').join('') +
           '<dt class="checkout-total">Checkout total:</dt><dd class="checkout-total">' + escapeHtml(money(quote.totalCents)) + ' USD</dd></dl>' +
           '<span>Quote expires: ' + escapeHtml(fmtDate(quote.expiresAt)) + '</span>' : '<span>Check checkout to retrieve the exact total, including MiFILE processing fees.</span>') +
+        (quote?.totalCents > 0 ? '<span>Payment account: ' + escapeHtml(checkout.selectedPaymentMethodLabel ||
+          (quote.paymentMethodState === 'selected' ? 'Selected in MiFILE' : 'Not selected')) + '</span>' : '') +
+        (methods.length && quote?.totalCents > 0 ? '<div class="checkout-account-choice"><label for="checkoutPaymentMethod">Payment account for fee check</label>' +
+          '<select id="checkoutPaymentMethod"' + (!canChoose ? ' disabled' : '') + '><option value="">Choose an account</option>' +
+          methods.map(method => '<option value="' + escapeHtml(method.fingerprint) + '"' +
+            (checkout.paymentMethodChoice === method.fingerprint ? ' selected' : '') + '>' + escapeHtml(method.label) + '</option>').join('') + '</select>' +
+          '<div class="draft-filing-job-actions"><button type="button" data-checkout-action="payment-method"' + (!canChoose || !checkout.paymentMethodChoice ? ' disabled' : '') + '>' +
+          icon('credit-card') + 'Use for fee check</button></div></div>' : '') +
+        (checkout.paymentMethodChoice ? '<div class="draft-filing-job-actions"><button type="button" data-checkout-action="clear-method"' +
+          (checkout.active || checkout.receiptSummary.submissionObserved ? ' disabled' : '') + '>' + icon('x') + 'Clear account choice</button></div>' : '') +
         (checkout.confirmedAt ? '<span>Amount reviewed: ' + escapeHtml(fmtDate(checkout.confirmedAt)) + ' (review only)</span>' : '') +
         checkout.issues.map(issue => '<span class="draft-filing-job-error">' + escapeHtml(issue) + '</span>').join('') +
         (checkout.inspection?.error ? '<span class="draft-filing-job-error">' + escapeHtml(checkout.inspection.error) + '</span>' : '') +
@@ -4750,6 +4767,10 @@ const html = String.raw`<!doctype html>
         (checkout.receipts.length ? '<ul>' + checkout.receipts.map(receipt => '<li>' + escapeHtml(receipt.status) +
           (receipt.totalCents !== null ? ' · ' + escapeHtml(money(receipt.totalCents)) : '') +
           ' · ' + escapeHtml(fmtDate(receipt.occurredAt || receipt.observedAt)) + '</li>').join('') + '</ul>' : '<span>No verified payment receipt recorded.</span>') +
+        (checkout.preflight ? '<strong>Submission preflight</strong><ul class="checkout-preflight">' + checkout.preflight.checks.map(check =>
+          '<li>' + icon(check.passed ? 'circle-check' : 'circle') + '<span>' + escapeHtml(check.label) + '</span></li>').join('') + '</ul>' +
+          (checkout.preflight.complete ? '<span>Preflight complete. Live submission remains disabled.</span>' : '') +
+          (checkout.preflight.recordedAt ? '<span>Preflight recorded: ' + escapeHtml(fmtDate(checkout.preflight.recordedAt)) + '</span>' : '') : '') +
         '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active ? ' disabled' : '') + '>' +
         icon('refresh-cw') + 'Check checkout</button>' +
         '<button type="button" data-checkout-action="confirm"' + (!checkout.canConfirm || checkout.confirmedAt ? ' disabled' : '') + '>' +
@@ -4766,8 +4787,14 @@ const html = String.raw`<!doctype html>
         const amount = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(quote.totalCents / 100);
         if (!await confirmDraftAction('Review exact checkout amount?',
           'Total: ' + amount + ' USD\\nAccount: ' + quote.accountEmail + '\\nTemporary case: ' + job.temporaryCaseNumber +
+          '\\nPayment account: ' + (job.checkout.selectedPaymentMethodLabel || (quote.totalCents ? 'Selected in MiFILE' : 'Not required')) +
           '\\nThis records your review only. It does not authorize payment or submission to court.', 'Confirm ' + amount)) return;
         payload = {quoteId:quote.id,quoteDigest:quote.quoteDigest,totalCents:quote.totalCents};
+      } else if (action === 'payment-method') {
+        const quote = job.checkout.quote;
+        const fingerprint = document.getElementById('checkoutPaymentMethod')?.value;
+        if (!quote || !fingerprint) throw new Error('Choose an available payment account for the fee check.');
+        payload = {quoteId:quote.id,quoteDigest:quote.quoteDigest,paymentMethodFingerprint:fingerprint};
       }
       await api('/api/filing-jobs/' + encodeURIComponent(job.id) + '/checkout/' + action,
         {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -4780,6 +4807,8 @@ const html = String.raw`<!doctype html>
       const logWasOpen = Boolean(root.querySelector('[data-filing-log]')?.open);
       const releaseWasOpen = Boolean(root.querySelector('[data-release-checks]')?.open);
       const checkoutWasOpen = Boolean(root.querySelector('[data-checkout-review]')?.open);
+      const pendingMethod = root.querySelector('#checkoutPaymentMethod')?.value;
+      const previousJobId = root.dataset.jobId;
       const previousChecklist = root.querySelector('[data-upload-checklist]');
       const jobs = state.draftFilingJobs || [];
       const config = state.mifileConfig || {
@@ -4825,6 +4854,7 @@ const html = String.raw`<!doctype html>
         return;
       }
       const job = jobs[0];
+      root.dataset.jobId = job.id;
       const log = (job.executionLog || []).slice(-12).reverse();
       const progress = job.progress;
       const checklistOpen = previousChecklist?.dataset.jobStatus === job.status ? previousChecklist.open : ['failed','reconciliation_required'].includes(job.status);
@@ -4880,6 +4910,15 @@ const html = String.raw`<!doctype html>
           '</span><strong>' + escapeHtml(entry.checkpoint) + '</strong><span>' +
           escapeHtml(entry.message) + '</span></div>').join('') + '</div></details>' : '') +
       '</div>';
+      const methodSelect = root.querySelector('#checkoutPaymentMethod');
+      if (methodSelect && previousJobId === job.id && pendingMethod !== undefined &&
+          Array.from(methodSelect.options).some(option => option.value === pendingMethod)) methodSelect.value = pendingMethod;
+      if (methodSelect) {
+        const choiceButton = root.querySelector('[data-checkout-action="payment-method"]');
+        const updateChoiceButton = () => { choiceButton.disabled = methodSelect.disabled || !methodSelect.value; };
+        methodSelect.addEventListener('change', updateChoiceButton);
+        updateChoiceButton();
+      }
       root.querySelectorAll('[data-checkout-action]').forEach(button => {
         button.addEventListener('click', () => checkoutAction(job, button.dataset.checkoutAction).catch(showDraftError));
       });
@@ -7746,15 +7785,16 @@ export function createAdminServer(
             const checkoutMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/checkout\/([^/]+)$/);
             if (req.method === 'POST' && checkoutMatch) {
                 const action = checkoutMatch[2];
-                if (!['inspect','confirm','receipts'].includes(action)) {
+                if (!['inspect','confirm','receipts','payment-method','clear-method'].includes(action)) {
                     sendJson(res, 403, {error:'Payment and final court submission are disabled in this release.'});
                     return;
                 }
                 try {
                     const body = await readRequestBody(req);
                     const input = body ? JSON.parse(body) : {};
-                    const allowed = action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] : [];
-                    if (!input || Array.isArray(input) || Object.keys(input).some(key => !allowed.includes(key))) {
+                    const allowed = action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] :
+                        action === 'payment-method' ? ['quoteId','quoteDigest','paymentMethodFingerprint'] : [];
+                    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !allowed.includes(key))) {
                         throw new Error('Only a read-only checkout inspection or amount review is allowed.');
                     }
                     if (accountTestRunning || !getMiFileRuntimeConfig().ready) throw new Error('Verify the MiFILE account and wait for the current account check to finish.');
@@ -7766,7 +7806,10 @@ export function createAdminServer(
                         if (['false','0','no','off'].includes((process.env.MIFILE_FILING_WORKER_ENABLED || 'true').toLowerCase())) {
                             throw new Error('The MiFILE worker must be enabled to run read-only inspections.');
                         }
-                        db.checkout().queue(id, action === 'inspect' ? 'quote' : 'receipts', account);
+                        if (action === 'payment-method') db.checkout().choosePaymentMethod(id,
+                            {quoteId:input.quoteId,quoteDigest:input.quoteDigest,fingerprint:input.paymentMethodFingerprint},account,process.env.ADMIN_USERNAME || 'admin');
+                        if (action === 'clear-method') db.checkout().clearPaymentMethod(id,account,process.env.ADMIN_USERNAME || 'admin');
+                        db.checkout().queue(id, action === 'receipts' ? 'receipts' : 'quote', account);
                     }
                     sendJson(res, action === 'confirm' ? 200 : 202, db.checkout().state(id,account));
                 } catch (error) { sendJson(res,409,{error:(error as Error).message}); }

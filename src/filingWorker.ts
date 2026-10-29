@@ -1,7 +1,7 @@
 import { getWorkflowDatabase } from './database';
 import { MiFileFilingError, MiFileFilingRunner } from './mifileFilingRunner';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
-import { MiFileCheckoutRunner } from './mifileCheckoutRunner';
+import { MiFileCheckoutRunner, getCheckoutAccount } from './mifileCheckoutRunner';
 
 function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return Promise.resolve();
@@ -41,7 +41,8 @@ export async function runFilingWorker(options: {
                 const job = db.getFilingJob(inspection.filingJobId);
                 if (!job) throw new Error('The prepared MiFILE job no longer exists.');
                 const runner = new MiFileCheckoutRunner(stage => db.checkout().progress(inspection.id, stage));
-                const {result,account} = await runner.inspect(inspection,job);
+                const choice = db.checkout().paymentMethodChoice(job.id,getCheckoutAccount());
+                const {result,account} = await runner.inspect(inspection,job,choice);
                 db.checkout().complete(inspection.id,result,account);
             } catch (error) {
                 const message = error instanceof Error ? error.message : 'MiFILE inspection failed.';

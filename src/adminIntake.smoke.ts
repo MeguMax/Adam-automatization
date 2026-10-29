@@ -593,9 +593,11 @@ async function main() {
                 filer:'Devlin, Adam (P72877)',accountEmail:checkoutAccount.username,sources,packageDigest},
         }});
         const quoteJob=db.getFilingJob(job.id)!;
+        const paymentMethods=[{fingerprint:digest('fixture-token'),label:'Card ending 1234'},
+            {fingerprint:digest('fixture-token-2'),label:'Bank account ending 5678'}];
         const quoted=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
             ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
-            {state:'selected',fingerprint:digest('fixture-token')},packageDigest,10300);
+            {state:'selected',fingerprint:digest('fixture-token'),available:paymentMethods},packageDigest,10300);
         const inspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
         db.checkout().complete(inspection.id,{kind:'quote',quote:quoted},checkoutAccount);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
@@ -622,6 +624,32 @@ async function main() {
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
         await page.screenshot({path:path.join(screenshots,'draft-checkout-review-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
+        await page.locator('#checkoutPaymentMethod').selectOption(paymentMethods[1].fingerprint);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.equal(await page.locator('#checkoutPaymentMethod').inputValue(),paymentMethods[1].fingerprint);
+        const invalidMethod=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/payment-method`,{headers:{Origin:url},
+            data:{quoteId:quoted.id,quoteDigest:quoted.quoteDigest,paymentMethodFingerprint:digest('not-available')}});
+        assert.equal(invalidMethod.status(),409);
+        await page.locator('[data-checkout-action="payment-method"]').click();
+        await page.waitForFunction(()=>document.querySelector('[data-checkout-review]')?.textContent?.includes('Checking MiFILE:'));
+        assert.equal(db.checkout().state(job.id,checkoutAccount).confirmedAt,null);
+        assert.equal(db.checkout().paymentMethodChoice(job.id,checkoutAccount),paymentMethods[1].fingerprint);
+        const nextInspection=db.checkout().claim()!;
+        const switchedQuote=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
+            ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
+            {state:'selected',fingerprint:paymentMethods[1].fingerprint,available:paymentMethods},packageDigest,10300);
+        db.checkout().complete(nextInspection.id,{kind:'quote',quote:switchedQuote},checkoutAccount);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('[data-checkout-review]').innerText(),/Payment account: Bank account ending 5678/);
+        assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),true);
+        assert.equal(db.checkout().state(job.id,checkoutAccount).preflight.executionEnabled,false);
+        await page.locator('[data-checkout-action="clear-method"]').click();
+        await page.waitForFunction(()=>document.querySelector('[data-checkout-review]')?.textContent?.includes('Checking MiFILE:'));
+        const clearInspection=db.checkout().claim()!;
+        assert.equal(db.checkout().paymentMethodChoice(job.id,checkoutAccount),null);
+        db.checkout().fail(clearInspection.id,'QA refresh interrupted; nothing charged');
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),false);
         await page.locator('#draftReviewTab').click();
         assert.match(await page.locator('#draftValidationSummary').innerText(), /Package saved in MiFILE Unsubmitted/);
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});

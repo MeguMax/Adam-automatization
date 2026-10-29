@@ -10,6 +10,7 @@ import {buildCheckoutQuote,checkoutReviewIssues,digest,FINAL_MIFILE_ACTIONS_ENAB
     receiptSummary,validateReceipt,type CheckoutAccount,type MiFileReceiptObservation} from './mifileCheckout';
 import {parseMiFileReceiptFields,parseMiFileReceiptPdf,collectReceiptObservations} from './mifileReceipts';
 import {testPdfFixture} from './testPdfFixture';
+import {readPaymentMethods,selectPaymentMethodForQuote} from './mifilePaymentMethods';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -152,7 +153,10 @@ test('receipt events deduplicate, reject conflicting totals and remain scoped to
         const work=store.queue(job.id,'receipts',account);store.claim();
         assert.throws(()=>store.complete(work.id,{kind:'receipts',observations:[{...observation,totalCents:1}],state:'found',checkedAt:new Date().toISOString(),issue:null},account),/Conflicting/);
         store.fail(work.id,'Conflicting receipt');
-        assert.equal(store.state(job.id,{...account,identity:digest('other-account')}).receipts.length,0);
+        const rotated={...account,identity:digest('other-revision')};
+        assert.equal(store.state(job.id,rotated).receipts.length,1);
+        assert.equal(store.state(job.id,rotated).receiptSummary.submissionObserved,true);
+        assert.equal(store.state(job.id,{...rotated,username:'different@example.com'}).receipts.length,0);
     } finally{db.close();}
 });
 test('checkout browser adapter reads fees and cancels without clicking Submit or adding payment methods',async()=>{
@@ -223,4 +227,187 @@ test('checkout waits for asynchronous fee calculation instead of freezing the in
         const result=await readVerifiedCheckoutQuote(page,job,account,{packageDigest:(job.result!.savedBundleEvidence as any).packageDigest,sourceFeeSubtotalCents:10300});
         assert.equal(result.totalCents,12669);
     } finally{await page.close();}
+});
+
+const accountTokenA='11111111-2222-3333-4444-555555555555';
+const accountTokenB='aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+const available=[{fingerprint:digest(accountTokenA),label:'Card ending 1234'},
+    {fingerprint:digest(accountTokenB),label:'Bank account ending 5678'}];
+
+test('saved payment accounts expose masked labels only and require an exact explicit choice',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent(`<div role="dialog"><h2>Checkout</h2><fieldset><legend>Available Payment Accounts</legend>
+            <label><input type="radio" name="method" value="${accountTokenA}">Visa ending in 1234, Private Owner 4111111111111234</label>
+            <label><input type="radio" name="method" value="${accountTokenB}">Bank account **5678 Private Bank 123456785678</label></fieldset>
+            <button onclick="window.paid=true">Submit</button><button onclick="window.added=true">Add Payment Account</button></div>`);
+        const before=await readPaymentMethods(page);
+        assert.equal(before.state,'not_selected');assert.equal(before.fingerprint,null);
+        assert.deepEqual(before.available,available);
+        assert.ok(!JSON.stringify(before).includes('Private'));assert.ok(!JSON.stringify(before).includes(accountTokenA));
+        await assert.rejects(selectPaymentMethodForQuote(page,digest('unknown')),/no longer available/);
+        assert.equal((await readPaymentMethods(page)).state,'not_selected');
+        await selectPaymentMethodForQuote(page,available[1].fingerprint);
+        assert.equal((await readPaymentMethods(page)).fingerprint,available[1].fingerprint);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).paid || (window as any).added)),false);
+    }finally{await page.close();}
+});
+
+test('payment account selection supports visible labels for hidden radios and native selectors',async()=>{
+    const page=await browser.newPage();
+    try {
+        for (const control of [`<input id="methodA" type="radio" style="display:none" value="${accountTokenA}"><label for="methodA">Card ending 1234</label>`,
+            `<select aria-label="Payment account"><option value="">Select</option><option value="${accountTokenA}">Card ending 1234</option></select>`]) {
+            await page.setContent(`<div role="dialog"><h2>Checkout</h2><fieldset><legend>Available Payment Accounts</legend>${control}</fieldset></div>`);
+            await selectPaymentMethodForQuote(page,available[0].fingerprint);
+            assert.equal((await readPaymentMethods(page)).fingerprint,available[0].fingerprint);
+        }
+    }finally{await page.close();}
+});
+
+test('unknown, duplicate, contradictory and multiple selected payment controls fail closed',async()=>{
+    const page=await browser.newPage();
+    try {
+        const radio=(value:string)=>`<label><input type="radio" checked value="${value}">Card ending 1234</label>`;
+        for(const controls of [radio('4111111111111111'),radio(accountTokenA)+radio(accountTokenA),
+            radio(accountTokenA)+radio(accountTokenB),radio(accountTokenA)+'<p>No payment methods exist for your account</p>']) {
+            await page.setContent(`<div role="dialog"><h2>Checkout</h2><fieldset><legend>Available Payment Accounts</legend>${controls}</fieldset></div>`);
+            await assert.rejects(readPaymentMethods(page));
+        }
+        await page.setContent(`<div role="dialog"><h2>Checkout</h2><fieldset><legend>Available Payment Accounts</legend>
+            <select disabled><option value="${accountTokenA}">Card ending 1234</option></select></fieldset></div>`);
+        assert.deepEqual((await readPaymentMethods(page)).available,[]);
+    }finally{await page.close();}
+});
+
+function completeQuote(fixture:ReturnType<typeof storeFixture>,methodState:'selected'|'not_selected'='selected',now=Date.now(),
+    currentAccount=account,amounts=fees) {
+    const q=buildCheckoutQuote(fixture.job,currentAccount,amounts,{state:methodState,
+        fingerprint:methodState==='selected'?available[0].fingerprint:null,available},
+        (fixture.job.result!.savedBundleEvidence as any).packageDigest,10300,now);
+    const work=fixture.store.queue(fixture.job.id,'quote',currentAccount);fixture.store.claim();
+    fixture.store.complete(work.id,{kind:'quote',quote:q},currentAccount);
+    return q;
+}
+
+function completeUnsubmitted(fixture:ReturnType<typeof storeFixture>,currentAccount=account) {
+    const work=fixture.store.queue(fixture.job.id,'receipts',currentAccount);fixture.store.claim();
+    fixture.store.complete(work.id,{kind:'receipts',observations:[receipt()],state:'unsubmitted',
+        checkedAt:new Date().toISOString(),issue:null},currentAccount);
+}
+
+test('payment choice is persistent, account-scoped and never accepts an arbitrary fingerprint',()=>{
+    const f=storeFixture();
+    try {
+        const q=completeQuote(f,'not_selected'),input={quoteId:q.id,quoteDigest:q.quoteDigest,fingerprint:available[0].fingerprint};
+        assert.throws(()=>f.store.choosePaymentMethod(f.job.id,{...input,fingerprint:digest('injected')},account,'qa'));
+        assert.throws(()=>f.store.choosePaymentMethod(f.job.id,input,{...account,identity:digest('other-revision')},'qa'));
+        assert.throws(()=>f.store.choosePaymentMethod(f.job.id,input,account,'qa',Date.now()+900001));
+        f.store.choosePaymentMethod(f.job.id,input,account,'qa');
+        const {CheckoutStore}=require('./checkoutStore') as typeof import('./checkoutStore');
+        const reopened=new CheckoutStore(f.sql,()=>f.job,()=>{});
+        assert.equal(reopened.paymentMethodChoice(f.job.id,account),input.fingerprint);
+        assert.equal(reopened.paymentMethodChoice(f.job.id,{...account,identity:digest('revision-2')}),null);
+        assert.equal(f.store.state(f.job.id,account).canConfirm,false);
+        const work=f.store.queue(f.job.id,'quote',account);
+        assert.throws(()=>f.store.choosePaymentMethod(f.job.id,input,account,'qa'));
+        assert.throws(()=>f.store.clearPaymentMethod(f.job.id,account));
+        f.store.claim();f.store.fail(work.id,'Account removed');
+        f.store.clearPaymentMethod(f.job.id,account);
+        assert.equal(f.store.paymentMethodChoice(f.job.id,account),null);
+        assert.equal(f.store.state(f.job.id,account).canConfirm,false);
+    }finally{f.db.close();}
+});
+
+test('changing or clearing payment choice invalidates earlier amount review and requires new quote',()=>{
+    const f=storeFixture();
+    try {
+        const q=completeQuote(f),review={quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents};
+        f.store.confirm(f.job.id,review,account,'qa');assert.ok(f.store.state(f.job.id,account).confirmedAt);
+        const changedAt=Date.now();
+        f.store.choosePaymentMethod(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,fingerprint:available[0].fingerprint},account,'qa',changedAt);
+        assert.equal(f.store.state(f.job.id,account).confirmedAt,null);
+        assert.throws(()=>f.store.confirm(f.job.id,review,account,'qa'));
+        const fresh=completeQuote(f,'selected',changedAt+1);
+        assert.equal(f.store.state(f.job.id,account).canConfirm,true);
+        f.store.confirm(f.job.id,{quoteId:fresh.id,quoteDigest:fresh.quoteDigest,totalCents:fresh.totalCents},account,'qa');
+        f.store.clearPaymentMethod(f.job.id,account,'qa',changedAt+2);
+        assert.equal(f.store.state(f.job.id,account).confirmedAt,null);
+        completeQuote(f,'not_selected',changedAt+3);
+        assert.equal(f.store.state(f.job.id,account).checkoutVerified,true);
+        assert.equal(f.store.state(f.job.id,account).canConfirm,false);
+    }finally{f.db.close();}
+});
+
+test('a changed or missing chosen account cannot complete the quote inspection',()=>{
+    const f=storeFixture();
+    try {
+        const q=completeQuote(f,'not_selected');
+        f.store.choosePaymentMethod(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,fingerprint:available[1].fingerprint},account,'qa');
+        assert.throws(()=>completeQuote(f),/did not retain/);
+        const active=f.store.state(f.job.id,account).inspection!;f.store.fail(active.id,'Chosen method not retained');
+        f.store.clearPaymentMethod(f.job.id,account);
+        assert.equal(f.store.paymentMethodChoice(f.job.id,account),null);
+    }finally{f.db.close();}
+});
+
+test('preflight records a primary-account real package only after fresh quote, exact review and receipt check',()=>{
+    const f=storeFixture(),primary={...account,accountEnvironment:'production',productionConfirmed:true};
+    try {
+        f.job.payload!.subject='NEW LT FILING - Example Plaintiff v Example Defendant';
+        const evidence=f.job.result!.savedBundleEvidence as any;
+        evidence.packageDigest=preparationDigest(f.job.payload!,evidence.sources);
+        const q=completeQuote(f,'selected',Date.now(),primary),input={quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents};
+        f.store.confirm(f.job.id,input,primary,'qa');
+        assert.equal(f.store.state(f.job.id,primary).preflight.complete,false);
+        completeUnsubmitted(f,primary);
+        assert.ok(f.store.state(f.job.id,primary).preflight.recordedAt);
+        f.store.confirm(f.job.id,input,primary,'qa');
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_submission_preflights').get().n,1);
+        const snapshot=JSON.parse(f.sql.prepare('SELECT snapshot_json FROM mifile_submission_preflights').get().snapshot_json);
+        assert.equal(snapshot.paymentMethodFingerprint,available[0].fingerprint);
+        assert.equal(snapshot.paymentAuthorized,false);assert.equal(snapshot.courtSubmissionAuthorized,false);
+        assert.equal(snapshot.executionKey,digest([primary.identity,f.job.externalBundleId]));
+        assert.equal(f.store.state(f.job.id,primary,Date.now()+900001).preflight.complete,false);
+        assert.equal(f.store.state(f.job.id,account).preflight.complete,false);
+        assert.equal(f.store.state(f.job.id,primary).preflight.executionEnabled,false);
+    }finally{f.db.close();}
+});
+
+test('QA packages cannot produce live preflight records and corrupt receipt evidence blocks checkout',()=>{
+    const f=storeFixture(),primary={...account,accountEnvironment:'production',productionConfirmed:true};
+    try {
+        const q=completeQuote(f,'selected',Date.now(),primary);completeUnsubmitted(f,primary);
+        f.store.confirm(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents},primary,'qa');
+        assert.equal(f.store.state(f.job.id,primary).preflight.complete,false);
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_submission_preflights').get().n,0);
+        f.sql.prepare("UPDATE mifile_receipt_events SET event_json = '{invalid'").run();
+        assert.equal(f.store.state(f.job.id,primary).canConfirm,false);
+        assert.throws(()=>f.store.queue(f.job.id,'quote',primary),/Reconcile/);
+    }finally{f.db.close();}
+});
+
+test('reported submission, payment failure or payment blocks new checkout and amount confirmation',()=>{
+    for(const status of ['Submitted','Paid','Payment Rejected'] as const) {
+        const f=storeFixture();
+        try {
+            const q=completeQuote(f),work=f.store.queue(f.job.id,'receipts',account);f.store.claim();
+            f.store.complete(work.id,{kind:'receipts',observations:[receipt(status)],state:'found',checkedAt:new Date().toISOString(),issue:null},account);
+            assert.equal(f.store.state(f.job.id,account).canConfirm,false);
+            assert.throws(()=>f.store.confirm(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents},account,'qa'));
+            assert.throws(()=>f.store.queue(f.job.id,'quote',account),/Reconcile/);
+            assert.throws(()=>f.store.choosePaymentMethod(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,fingerprint:available[0].fingerprint},account,'qa'));
+            assert.equal(f.store.state(f.job.id,account).receiptSummary.retryPaymentAllowed,false);
+            assert.equal(f.store.queue(f.job.id,'receipts',account).kind,'receipts');
+        }finally{f.db.close();}
+    }
+});
+
+test('invalid public payment choices and mismatched state cannot form an actionable quote',()=>{
+    const job=prepared(),q=quote(job);
+    assert.throws(()=>buildCheckoutQuote(job,account,fees,{state:'not_selected',fingerprint:method.fingerprint},q.packageDigest,10300));
+    for(const unsafe of [[{fingerprint:available[0].fingerprint,label:'Visa 4111111111111234'}],[available[0],available[0]],'bad']) {
+        const bad={...q,availablePaymentMethods:unsafe} as any;bad.quoteDigest=quoteDigest(bad);
+        assert.ok(checkoutReviewIssues(bad,job,account).some(issue=>issue.includes('invalid')));
+    }
 });

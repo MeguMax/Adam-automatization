@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FilingJobView } from './database';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
-import { checkoutReviewIssues, receiptEventKey, receiptSummary, validateReceipt,
+import { checkoutReviewIssues, digest, receiptEventKey, receiptSummary, validateReceipt,
     type CheckoutAccount, type CheckoutInspection, type CheckoutInspectionResult, type CheckoutQuote,
     type MiFileReceiptObservation } from './mifileCheckout';
 
@@ -14,6 +14,53 @@ export class CheckoutStore {
         this.db.exec('BEGIN IMMEDIATE');
         try { const result = action(); this.db.exec('COMMIT'); return result; }
         catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    }
+
+    private methodChoiceRecord(filingJobId: string, account: CheckoutAccount) {
+        return this.db.prepare(`SELECT method_fingerprint, chosen_at FROM mifile_payment_method_choices
+            WHERE filing_job_id = ? AND account_identity = ?`).get(filingJobId, account.identity) as
+            {method_fingerprint:string|null;chosen_at:string} | undefined;
+    }
+
+    paymentMethodChoice(filingJobId: string, account: CheckoutAccount): string | null {
+        return this.methodChoiceRecord(filingJobId,account)?.method_fingerprint || null;
+    }
+
+    choosePaymentMethod(filingJobId: string, input: {quoteId:string;quoteDigest:string;fingerprint:string},
+        account: CheckoutAccount, chosenBy: string, now = Date.now()): void {
+        this.transaction(() => {
+            const state = this.state(filingJobId, account, now), quote = state.quote;
+            if (!state.checkoutVerified || state.active || state.receiptSummary.submissionObserved || !quote ||
+                quote.id !== input.quoteId || quote.quoteDigest !== input.quoteDigest ||
+                !/^[a-f0-9]{64}$/.test(input.fingerprint) ||
+                quote.availablePaymentMethods?.filter(method => method.fingerprint === input.fingerprint).length !== 1) {
+                throw new Error('Refresh checkout and choose one of the verified available payment accounts. No payment was authorized.');
+            }
+            const current = this.paymentMethodChoice(filingJobId, account);
+            if (current === input.fingerprint) return;
+            this.db.prepare(`INSERT INTO mifile_payment_method_choices
+                (filing_job_id, account_identity, method_fingerprint, chosen_at, chosen_by) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(filing_job_id) DO UPDATE SET account_identity = excluded.account_identity,
+                method_fingerprint = excluded.method_fingerprint, chosen_at = excluded.chosen_at, chosen_by = excluded.chosen_by`)
+                .run(filingJobId,account.identity,input.fingerprint,new Date(now).toISOString(),chosenBy);
+            this.audit(quote.id,'checkout_payment_account_chosen',{filingJobId,purpose:'quote_only',
+                paymentAuthorized:false,courtSubmissionAuthorized:false});
+        });
+    }
+
+    clearPaymentMethod(filingJobId: string, account: CheckoutAccount, chosenBy = 'admin', now = Date.now()): void {
+        this.transaction(() => {
+            const job = this.getFilingJob(filingJobId), state = this.state(filingJobId,account);
+            if (!job || !filingReleaseChecks(job,account).sameAccount || state.active || state.receiptSummary.submissionObserved) {
+                throw new Error('The verified bundle must be idle and Unsubmitted before changing its payment account choice.');
+            }
+            if (!this.paymentMethodChoice(filingJobId,account)) return;
+            // Retain the change time so clearing a choice cannot revive an older reviewed quote.
+            this.db.prepare(`UPDATE mifile_payment_method_choices SET method_fingerprint = NULL, chosen_at = ?, chosen_by = ?
+                WHERE filing_job_id = ? AND account_identity = ?`)
+                .run(new Date(now).toISOString(),chosenBy,filingJobId,account.identity);
+            this.audit(filingJobId,'checkout_payment_account_cleared',{purpose:'quote_only'});
+        });
     }
 
     get(id: string): CheckoutInspection | null {
@@ -31,6 +78,10 @@ export class CheckoutStore {
         return this.transaction(() => {
             const job = this.getFilingJob(filingJobId);
             if (!job || !filingReleaseChecks(job, account).sameAccount) throw new Error('A verified Prepared bundle in the current account is required.');
+            const state = this.state(filingJobId,account);
+            if (kind === 'quote' && (state.receiptSummary.submissionObserved || state.issues.some(issue => issue.startsWith('Stored receipt evidence')))) {
+                throw new Error('Reconcile the reported submission or payment in MiFILE before another checkout check. Do not retry payment.');
+            }
             const active = this.db.prepare("SELECT id FROM mifile_checkout_inspections WHERE filing_job_id = ? AND status IN ('queued','running')")
                 .get(filingJobId) as { id: string } | undefined;
             if (active) return this.get(active.id)!;
@@ -76,6 +127,10 @@ export class CheckoutStore {
             }
             if (result.kind === 'quote') {
                 const issues = checkoutReviewIssues(result.quote, job, account);
+                const choice = this.paymentMethodChoice(job.id,account);
+                if (choice && result.quote.totalCents > 0 && result.quote.paymentMethodFingerprint !== choice) {
+                    throw new Error('MiFILE did not retain the chosen payment account. Clear the choice and refresh checkout.');
+                }
                 // An exact displayed quote is retained even when payment setup is incomplete.
                 if (issues.some(issue => !/^(Add a payment method|Select the intended payment method)/.test(issue))) {
                     throw new Error(issues.join(' '));
@@ -98,11 +153,17 @@ export class CheckoutStore {
                         .run(key, job.id, account.identity, observation.observedAt, JSON.stringify(observation),
                             observation.externalReference, observation.kind, observation.status, observation.documentId || '');
                 }
+                if (!Number.isFinite(Date.parse(result.checkedAt)) || result.state === 'unsubmitted' &&
+                    (!result.observations.some(item => item.kind === 'bundle_status' && item.status === 'Unsubmitted') ||
+                        receiptSummary(result.observations).submissionObserved)) {
+                    throw new Error('Unsubmitted status could not be verified from the receipt observations.');
+                }
             }
             this.db.prepare("UPDATE mifile_checkout_inspections SET status = 'completed', stage = 'completed', finished_at = ?, result_json = ?, error_message = NULL WHERE id = ?")
                 .run(new Date().toISOString(), JSON.stringify(result), id);
             this.audit(id, 'checkout_inspection_completed', { filingJobId: job.id, kind: result.kind,
                 paymentAttempted: false, courtSubmissionAttempted: false });
+            this.recordPreflight(job.id,account);
         });
     }
 
@@ -128,23 +189,66 @@ export class CheckoutStore {
         if (active) issues.push('Wait for the current MiFILE inspection to finish.');
         const confirmation = quote ? this.db.prepare('SELECT confirmed_at, confirmed_by, quote_digest FROM mifile_checkout_confirmations WHERE quote_id = ?')
             .get(quote.id) as { confirmed_at: string; confirmed_by: string; quote_digest: string } | undefined : undefined;
-        const receipts = (this.db.prepare('SELECT event_json, observed_at FROM mifile_receipt_events WHERE filing_job_id = ? AND account_identity = ? ORDER BY observed_at DESC, rowid DESC LIMIT 200')
-            .all(filingJobId, account.identity) as Array<{ event_json: string; observed_at: string }>).map(row =>
-                ({ ...JSON.parse(row.event_json), observedAt: row.observed_at }) as MiFileReceiptObservation);
+        const receipts: MiFileReceiptObservation[] = [];
+        let receiptEvidenceInvalid = false;
+        const receiptRows = this.db.prepare('SELECT event_json, observed_at FROM mifile_receipt_events WHERE filing_job_id = ? ORDER BY observed_at DESC, rowid DESC LIMIT 201')
+            .all(filingJobId) as Array<{event_json:string;observed_at:string}>;
+        if (receiptRows.length > 200) receiptEvidenceInvalid = true;
+        for (const row of receiptRows.slice(0,200)) {
+            try {
+                const observation = {...JSON.parse(row.event_json),observedAt:row.observed_at} as MiFileReceiptObservation;
+                // Password rotation must not hide a payment already observed in the same MiFILE account.
+                if (observation.accountEmail && observation.accountEmail !== account.username.trim().toLowerCase()) continue;
+                if (!job) throw new Error('Missing prepared bundle');
+                validateReceipt(observation,job,account);
+                receipts.push(observation);
+            } catch { receiptEvidenceInvalid = true; }
+        }
+        if (receiptEvidenceInvalid) issues.push('Stored receipt evidence needs reconciliation. Check MiFILE; do not retry payment.');
+        const summary = receiptSummary(receipts);
+        const choiceRecord = this.methodChoiceRecord(filingJobId,account);
+        const choice = choiceRecord?.method_fingerprint || null;
+        if (quote && choiceRecord && (!Number.isFinite(Date.parse(choiceRecord.chosen_at)) ||
+            Date.parse(quote.quotedAt) <= Date.parse(choiceRecord.chosen_at) ||
+            choice && quote.totalCents > 0 && quote.paymentMethodFingerprint !== choice)) {
+            issues.push('The chosen payment account needs a fresh checkout check.');
+        }
+        if (summary.submissionObserved) issues.push('MiFILE has already reported submission or payment activity. Reconcile receipts; do not retry payment.');
         const publicQuote = quote && !issues.includes('The stored checkout snapshot is invalid.')
             ? (({ accountIdentity: privateIdentity, paymentMethodFingerprint: privateMethod, ...rest }) => rest)(quote) : null;
         const last = inspections[0];
         const receiptCheck = inspections.find(item => item.kind === 'receipts');
-        const receiptResult = receiptCheck?.result?.kind === 'receipts' ? receiptCheck.result : null;
+        const receiptResult = receiptCheck?.status === 'completed' && receiptCheck.result?.kind === 'receipts' ? receiptCheck.result : null;
+        const recentUnsubmitted = receiptResult?.state === 'unsubmitted' &&
+            Number.isFinite(Date.parse(receiptResult.checkedAt)) && Date.parse(receiptResult.checkedAt) <= now &&
+            now - Date.parse(receiptResult.checkedAt) < 15 * 60_000;
+        const reviewedAt = !issues.length && confirmation && confirmation.quote_digest === quote?.quoteDigest ? confirmation.confirmed_at : null;
+        const checks = job ? filingReleaseChecks(job,account) : null;
+        const preflightChecks = [
+            {id:'bundle',label:'Saved bundle and source PDFs verified',passed:Boolean(checks?.savedBundleVerified && checks.sameAccount && quote?.sourceContentVerified)},
+            {id:'primary',label:'Primary account confirmed',passed:Boolean(checks?.primaryAccountConfirmed)},
+            {id:'real_case',label:'Not a QA test package',passed:Boolean(checks && !checks.testOnly)},
+            {id:'quote',label:'Fresh exact quote and payment account verified',passed:Boolean(quote && !issues.length)},
+            {id:'review',label:'Exact amount reviewed for this package',passed:Boolean(reviewedAt)},
+            {id:'receipt',label:'Recent Unsubmitted status checked; no prior payment reported',
+                passed:Boolean(recentUnsubmitted && !summary.submissionObserved && !receiptEvidenceInvalid)},
+        ];
+        const preflight = quote ? this.db.prepare(`SELECT created_at FROM mifile_submission_preflights
+            WHERE quote_id = ? AND account_identity = ?`).get(quote.id,account.identity) as {created_at:string} | undefined : undefined;
         return {
             inspection: last ? { id: last.id, kind: last.kind, status: last.status, stage: last.stage, createdAt: last.createdAt,
                 startedAt: last.startedAt, finishedAt: last.finishedAt, error: last.error } : null,
             active: Boolean(active), quote: publicQuote, issues,
             canConfirm: Boolean(quote && !issues.length),
-            confirmedAt: !issues.length && confirmation && confirmation.quote_digest === quote?.quoteDigest ? confirmation.confirmed_at : null,
+            confirmedAt: reviewedAt,
             checkoutVerified: Boolean(quote && job && latestQuote?.id === quoteInspection?.id &&
                 issues.every(issue => /^(Add a payment method|Select the intended payment method)/.test(issue))),
-            receipts, receiptSummary: receiptSummary(receipts), receiptCheckState: receiptResult?.state || null,
+            paymentMethodChoice:choice,
+            selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
+            preflight:{checks:preflightChecks,complete:preflightChecks.every(check=>check.passed),
+                recordedAt:preflightChecks.every(check=>check.passed) ? preflight?.created_at || null : null,
+                executionEnabled:false as const},
+            receipts, receiptSummary:summary, receiptCheckState: receiptResult?.state || null,
             receiptCheckIssue: quote && receipts.some(receipt => receipt.kind === 'payment' && receipt.status === 'Paid' && receipt.totalCents !== quote.totalCents)
                 ? 'The payment receipt amount differs from the reviewed checkout quote. Check MiFILE; do not retry payment.' : receiptResult?.issue || null,
             confirmationPurpose: 'review_only', paymentExecutionEnabled: false, courtSubmissionEnabled: false,
@@ -165,6 +269,31 @@ export class CheckoutStore {
                 .run(quote.id, filingJobId, quote.quoteDigest, quote.totalCents, account.identity, new Date(now).toISOString(), confirmedBy);
             if (Number(change.changes)) this.audit(quote.id, 'checkout_amount_reviewed', { filingJobId, totalCents: quote.totalCents,
                 purpose: 'review_only', paymentAuthorized: false, courtSubmissionAuthorized: false });
+            this.recordPreflight(filingJobId,account,now);
         });
+    }
+
+    private recordPreflight(filingJobId: string, account: CheckoutAccount, now = Date.now()): void {
+            const ready = this.state(filingJobId,account,now), quote = ready.quote;
+            if (quote && ready.preflight.complete) {
+                const rows = this.db.prepare(`SELECT id FROM mifile_checkout_inspections WHERE filing_job_id = ?
+                    AND kind = 'quote' AND status = 'completed' ORDER BY created_at DESC, rowid DESC LIMIT 25`)
+                    .all(filingJobId) as Array<{id:string}>;
+                const fullQuote = rows.map(row => this.get(row.id)?.result)
+                    .find(result => result?.kind === 'quote' && result.quote.id === quote.id);
+                const privateQuote = fullQuote?.kind === 'quote' ? fullQuote.quote : null;
+                if (!privateQuote || privateQuote.totalCents > 0 && !/^[a-f0-9]{64}$/.test(privateQuote.paymentMethodFingerprint || '')) {
+                    throw new Error('The reviewed payment account could not be verified. Refresh checkout.');
+                }
+                const snapshot = {version:1,filingJobId,bundleId:quote.bundleId,quoteId:quote.id,
+                    quoteDigest:quote.quoteDigest,packageDigest:quote.packageDigest,totalCents:quote.totalCents,
+                    currency:quote.currency,accountIdentity:account.identity,
+                    paymentMethodFingerprint:privateQuote.paymentMethodFingerprint,
+                    expiresAt:quote.expiresAt,executionKey:digest([account.identity,quote.bundleId]),
+                    paymentAuthorized:false,courtSubmissionAuthorized:false};
+                this.db.prepare(`INSERT INTO mifile_submission_preflights
+                    (quote_id,filing_job_id,account_identity,created_at,snapshot_json) VALUES(?,?,?,?,?) ON CONFLICT(quote_id) DO NOTHING`)
+                    .run(quote.id,filingJobId,account.identity,new Date(now).toISOString(),JSON.stringify(snapshot));
+            }
     }
 }

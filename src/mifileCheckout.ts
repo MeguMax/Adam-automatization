@@ -12,6 +12,18 @@ export interface CheckoutAccount {
     productionConfirmed: boolean;
 }
 
+export interface CheckoutPaymentMethod {
+    fingerprint: string;
+    label: string;
+}
+
+export function validPaymentMethods(value: unknown): value is CheckoutPaymentMethod[] {
+    return Array.isArray(value) && value.length <= 20 && value.every(item => item &&
+        typeof item === 'object' && /^[a-f0-9]{64}$/.test(item.fingerprint) &&
+        /^(?:Card|Bank account|Payment account)(?: ending \d{4}| [a-f0-9]{8})$/.test(item.label)) &&
+        new Set(value.map(item => item.fingerprint)).size === value.length;
+}
+
 export interface CheckoutQuote {
     version: 1;
     id: string;
@@ -28,6 +40,7 @@ export interface CheckoutQuote {
     processingFeeCents: number;
     paymentMethodState: 'missing' | 'not_selected' | 'selected' | 'not_required';
     paymentMethodFingerprint: string | null;
+    availablePaymentMethods?: CheckoutPaymentMethod[];
     sourceContentVerified: true;
     quoteDigest: string;
     paymentAuthorized: false;
@@ -83,7 +96,7 @@ export function quoteDigest(quote: Omit<CheckoutQuote, 'quoteDigest'> | Checkout
 const feeLabels = new Set(['Filing Fee', 'eFiling System Fee', 'Processing Service Fee', 'Additional Payment', 'Tax']);
 
 export function buildCheckoutQuote(job: FilingJobView, account: CheckoutAccount,
-    rows: string[][], method: { state: CheckoutQuote['paymentMethodState']; fingerprint: string | null },
+    rows: string[][], method: { state: CheckoutQuote['paymentMethodState']; fingerprint: string | null; available?: CheckoutPaymentMethod[] },
     currentPackageDigest: string, sourceFeeSubtotalCents: number, now = Date.now()): CheckoutQuote {
     const checks = filingReleaseChecks(job, account);
     const prepared = job.result?.savedBundleEvidence as MiFileSavedBundleEvidence | undefined;
@@ -119,6 +132,14 @@ export function buildCheckoutQuote(job: FilingJobView, account: CheckoutAccount,
     if (method.state === 'selected' && !/^[a-f0-9]{64}$/.test(method.fingerprint || '')) {
         throw new Error('The selected payment method could not be identified safely.');
     }
+    if (!['missing','not_selected','selected'].includes(method.state) ||
+        method.state !== 'selected' && method.fingerprint !== null) {
+        throw new Error('The payment account state is inconsistent. Refresh checkout.');
+    }
+    if (method.available !== undefined && (!validPaymentMethods(method.available) ||
+        method.state === 'selected' && !method.available.some(item => item.fingerprint === method.fingerprint))) {
+        throw new Error('The available payment accounts could not be verified safely.');
+    }
     const snapshot: Omit<CheckoutQuote, 'quoteDigest'> = {
         version: 1, id: randomUUID(), filingJobId: job.id, bundleId: job.externalBundleId!,
         accountEmail: account.username.trim().toLowerCase(), accountIdentity: account.identity,
@@ -127,6 +148,7 @@ export function buildCheckoutQuote(job: FilingJobView, account: CheckoutAccount,
         processingFeeCents: lines.find(line => line.label === 'Processing Service Fee')?.cents || 0,
         paymentMethodState: totalCents === 0 ? 'not_required' : method.state,
         paymentMethodFingerprint: totalCents === 0 ? null : method.fingerprint,
+        ...(method.available !== undefined ? {availablePaymentMethods:method.available} : {}),
         sourceContentVerified: true, paymentAuthorized: false, courtSubmissionAuthorized: false,
     };
     return { ...snapshot, quoteDigest: quoteDigest(snapshot) };
@@ -144,6 +166,14 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
         new Set(quote.lines.map(line => line.label)).size !== quote.lines.length ||
         quote.processingFeeCents !== (quote.lines.find(line => line.label === 'Processing Service Fee')?.cents || 0) ||
         quote.paymentAuthorized !== false || quote.courtSubmissionAuthorized !== false) issues.push('The stored checkout snapshot is invalid.');
+    if (!['missing','not_selected','selected','not_required'].includes(quote.paymentMethodState) ||
+        quote.totalCents === 0 && (quote.paymentMethodState !== 'not_required' || quote.paymentMethodFingerprint !== null) ||
+        quote.totalCents > 0 && quote.paymentMethodState === 'not_required' ||
+        quote.paymentMethodState !== 'selected' && quote.paymentMethodFingerprint !== null ||
+        quote.availablePaymentMethods !== undefined && (!validPaymentMethods(quote.availablePaymentMethods) ||
+            quote.paymentMethodState === 'selected' && !quote.availablePaymentMethods.some(item => item.fingerprint === quote.paymentMethodFingerprint))) {
+        issues.push('The stored checkout snapshot is invalid.');
+    }
     try {
         if (!filingReleaseChecks(job, account).sameAccount || quote.filingJobId !== job.id || quote.bundleId !== job.externalBundleId ||
             !prepared || !job.payload || quote.packageDigest !== prepared.packageDigest ||
@@ -158,7 +188,8 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
     if (quote.sourceContentVerified !== true) issues.push('Source PDFs have not been checked against the preparation snapshot.');
     if (quote.totalCents > 0 && (quote.paymentMethodState !== 'selected' || !/^[a-f0-9]{64}$/.test(quote.paymentMethodFingerprint || ''))) {
         issues.push(quote.paymentMethodState === 'missing' ? 'Add a payment method in MiFILE, then refresh checkout. Nothing has been charged.' :
-            'Select the intended payment method in MiFILE, then refresh checkout. Nothing has been charged.');
+            (quote.availablePaymentMethods?.length ? 'Select the intended payment method below for a new fee check. Nothing has been charged.' :
+                'Select the intended payment method in MiFILE, then refresh checkout. Nothing has been charged.'));
     }
     return issues;
 }

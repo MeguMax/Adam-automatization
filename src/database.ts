@@ -2553,6 +2553,18 @@ const migrations: Migration[] = [
             token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, credential_version TEXT NOT NULL
         ); CREATE INDEX idx_excel_session_expiry ON excel_sessions(expires_at);`),
     },
+    {
+        version: 30,
+        name: 'checkout_payment_account_choices',
+        up: db => db.exec(`CREATE TABLE mifile_payment_method_choices (
+            filing_job_id TEXT PRIMARY KEY REFERENCES filing_jobs(id) ON DELETE CASCADE,
+            account_identity TEXT NOT NULL, method_fingerprint TEXT,
+            chosen_at TEXT NOT NULL, chosen_by TEXT NOT NULL
+        ); CREATE TABLE mifile_submission_preflights (
+            quote_id TEXT PRIMARY KEY, filing_job_id TEXT NOT NULL REFERENCES filing_jobs(id) ON DELETE CASCADE,
+            account_identity TEXT NOT NULL, created_at TEXT NOT NULL, snapshot_json TEXT NOT NULL
+        );`),
+    },
 ];
 
 export class WorkflowDatabase {

@@ -6,6 +6,7 @@ import { MiFileFilingRunner } from './mifileFilingRunner';
 import { buildCheckoutQuote, digest, type CheckoutAccount, type CheckoutInspection,
     type CheckoutInspectionResult, type CheckoutQuote } from './mifileCheckout';
 import { collectReceiptObservations } from './mifileReceipts';
+import { readPaymentMethods, selectPaymentMethodForQuote } from './mifilePaymentMethods';
 
 export function getCheckoutAccount(): CheckoutAccount {
     const credentials = getMiFileCredentials();
@@ -33,19 +34,13 @@ export async function openCheckoutForInspection(page: Page): Promise<void> {
 }
 
 export async function readCheckoutForInspection(page: Page): Promise<{
-    rows: string[][]; method: {state:CheckoutQuote['paymentMethodState']; fingerprint:string|null}
+    rows: string[][]; method: Awaited<ReturnType<typeof readPaymentMethods>>
 }> {
     const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Checkout', exact:true})}).last();
     const rows = await dialog.getByRole('table', {name:'Fees', exact:true}).locator('tbody tr').evaluateAll(elements =>
         elements.filter(element => element.getClientRects().length > 0).map(element =>
             Array.from(element.children).map(cell => (cell as HTMLElement).innerText.trim())));
-    const group = dialog.getByRole('group', {name:'Available Payment Accounts', exact:true});
-    const missing = (await dialog.innerText()).includes('No payment methods exist for your account');
-    // Only an already selected opaque account token is read. Never select or save a payment method.
-    const tokens = await group.locator('input[type="radio"]:checked, select').evaluateAll(elements => elements.map(element =>
-        (element as HTMLInputElement).value).filter(value => /^[a-f0-9-]{32,36}$/i.test(value)));
-    return {rows, method: missing ? {state:'missing',fingerprint:null} : tokens.length === 1
-        ? {state:'selected', fingerprint:digest(tokens[0])} : {state:'not_selected',fingerprint:null}};
+    return {rows, method:await readPaymentMethods(page)};
 }
 
 export async function readVerifiedCheckoutQuote(page: Page, job: FilingJobView, account: CheckoutAccount,
@@ -72,7 +67,7 @@ export async function readVerifiedCheckoutQuote(page: Page, job: FilingJobView, 
 export class MiFileCheckoutRunner {
     constructor(private progress: (stage:string) => void = () => {}) {}
 
-    async inspect(inspection: CheckoutInspection, job: FilingJobView): Promise<{result:CheckoutInspectionResult; account:CheckoutAccount}> {
+    async inspect(inspection: CheckoutInspection, job: FilingJobView, paymentMethodFingerprint?: string | null): Promise<{result:CheckoutInspectionResult; account:CheckoutAccount}> {
         const account = getCheckoutAccount(), runtime = getMiFileRuntimeConfig();
         if (!runtime.ready || account.identity !== inspection.accountIdentity || job.id !== inspection.filingJobId) {
             throw new Error('The configured MiFILE account changed or is not ready. Start a new read-only check.');
@@ -93,6 +88,10 @@ export class MiFileCheckoutRunner {
                 const source = await runner.inspectSavedForCheckout(page, job, account);
                 this.progress('reading_checkout');
                 await openCheckoutForInspection(page);
+                if (paymentMethodFingerprint) {
+                    this.progress('selecting_reviewed_account_for_quote');
+                    await selectPaymentMethodForQuote(page, paymentMethodFingerprint);
+                }
                 const quote = await readVerifiedCheckoutQuote(page, job, account, source);
                 const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})}).last();
                 await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
