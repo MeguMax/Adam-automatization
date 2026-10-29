@@ -1479,7 +1479,8 @@ function isManualFilingPackage(data: unknown): boolean {
         !Array.isArray(root.intake)
         ? root.intake as Record<string, unknown>
         : {};
-    return root.sourceKind === 'new_filing_intake' && intake.manual === true;
+    return root.sourceKind === 'new_filing_intake' && intake.manual === true &&
+        intake.packageMode !== 'standard_lt';
 }
 
 function validateManualDraftDocuments(

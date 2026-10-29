@@ -53,7 +53,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-28-inline-preview-v73';
+const ADMIN_BUILD_ID = '2026-10-29-standard-upload-v74';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -123,9 +123,11 @@ function manualFilingData(source?: EmailDetail | null): Record<string, unknown> 
     };
 }
 
-function buildManualDraft(message: any, source?: EmailDetail | null): any {
+function buildManualDraft(message: any, source?: EmailDetail | null,
+    packageMode: 'standard_lt' | 'custom' = 'standard_lt'): any {
     const parsed = buildFilingIntake(message, []);
     parsed.intake!.manual = true;
+    parsed.intake!.packageMode = packageMode;
     parsed.intake!.issues = [];
     const sourceFields = source?.caseDraft?.editableData;
     Object.assign(parsed, {
@@ -3091,6 +3093,27 @@ const html = String.raw`<!doctype html>
     .draft-workspace { grid-template-columns: minmax(0, 1.15fr) minmax(440px, 1fr); }
     .draft-workspace-header { grid-template-columns: auto minmax(0, 1fr) auto auto; }
     .draft-workspace-actions { flex-wrap: nowrap; }
+    .draft-create-actions { display: flex; align-items: center; gap: 8px; }
+    @media (max-width: 620px) {
+      #draftList table, #draftList tbody { display: block; width: 100%; min-width: 0; }
+      #draftList thead { display: none; }
+      #draftList tr[data-open-draft] {
+        display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 10px 14px; padding: 12px; border-bottom: 1px solid var(--line);
+      }
+      #draftList tr[data-open-draft] td {
+        display: block !important; width: auto; min-width: 0; padding: 0; border: 0;
+      }
+      #draftList td:nth-child(2), #draftList td:nth-child(3), #draftList td:nth-child(7) { grid-column: 1 / -1; }
+      #draftList td:nth-child(2) { order: -2; }
+      #draftList td:nth-child(3) { order: -1; }
+      #draftList .draft-parties { white-space: normal; overflow-wrap: anywhere; }
+      #draftList td[data-label]::before {
+        display: block; margin-bottom: 3px; content: attr(data-label);
+        color: var(--muted); font-size: 9px; font-weight: 700; text-transform: uppercase;
+      }
+      #draftList td:nth-child(2)::before, #draftList td:nth-child(3)::before { display: none; }
+    }
     .draft-tools-menu { position: relative; }
     .draft-tools-menu > summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); background: #fff; }
     .draft-tools-menu > summary::-webkit-details-marker { display: none; }
@@ -3326,7 +3349,15 @@ const html = String.raw`<!doctype html>
             <h2><i data-lucide="file-pen-line"></i>Case drafts</h2>
             <span id="draftMeta">Loading drafts...</span>
           </div>
-          <button id="newDraftBtn" class="primary" type="button"><i data-lucide="plus"></i>New case</button>
+          <div class="draft-create-actions">
+            <button id="newDraftBtn" class="primary" type="button"><i data-lucide="plus"></i>New case</button>
+            <details class="draft-tools-menu" id="newDraftOptions">
+              <summary class="icon-button" title="New case options" aria-label="New case options"><i data-lucide="ellipsis"></i></summary>
+              <div class="draft-tools-items">
+                <button id="newCustomDraftBtn" type="button"><i data-lucide="files"></i>New custom package</button>
+              </div>
+            </details>
+          </div>
         </div>
         <div class="filter-bar draft-filter-bar">
           <label class="field">
@@ -4323,22 +4354,22 @@ const html = String.raw`<!doctype html>
         '<th style="width: 118px;">Updated</th>' +
         '</tr></thead><tbody>' +
         state.drafts.map(item => '<tr data-open-draft="' + escapeHtml(item.draftId) + '">' +
-          '<td><span class="cell-secondary">' + escapeHtml(fmtDate(item.receivedAt)) + '</span></td>' +
-          '<td><span class="draft-case">' + escapeHtml(item.caseNumber || 'Unassigned') + '</span>' +
+          '<td data-label="Received"><span class="cell-secondary">' + escapeHtml(fmtDate(item.receivedAt)) + '</span></td>' +
+          '<td data-label="Case"><span class="draft-case">' + escapeHtml(item.caseNumber || 'Unassigned') + '</span>' +
             '<span class="cell-secondary">' + escapeHtml(item.subject || '(no subject)') + '</span></td>' +
-          '<td><span class="draft-parties">' + escapeHtml(
+          '<td data-label="Parties"><span class="draft-parties">' + escapeHtml(
             [item.plaintiff, item.defendant].filter(Boolean).join(' v. ') ||
             item.caseTitle ||
             'Parties not extracted',
           ) + '</span><span class="cell-secondary">' + escapeHtml(item.sender || '') + '</span></td>' +
-          '<td><span class="draft-doc-count">' + icon('files') +
+          '<td data-label="Documents"><span class="draft-doc-count">' + icon('files') +
             escapeHtml(item.viewableDocumentCount + ' / ' + item.documentCount) + '</span>' +
             (item.failedDocumentCount
               ? '<span class="cell-secondary error-text">' + escapeHtml(item.failedDocumentCount) + ' failed</span>'
               : '<span class="cell-secondary">viewable</span>') + '</td>' +
-          '<td>' + validationPill(item.validationStatus) + '</td>' +
-          '<td>' + statusPill(item.status) + '</td>' +
-          '<td><span class="cell-secondary">' + escapeHtml(fmtDate(item.updatedAt)) + '</span></td>' +
+          '<td data-label="Validation">' + validationPill(item.validationStatus) + '</td>' +
+          '<td data-label="Status">' + statusPill(item.status) + '</td>' +
+          '<td data-label="Updated"><span class="cell-secondary">' + escapeHtml(fmtDate(item.updatedAt)) + '</span></td>' +
         '</tr>').join('') +
         '</tbody></table>';
 
@@ -4684,15 +4715,19 @@ const html = String.raw`<!doctype html>
       });
     }
 
-    document.getElementById('newDraftBtn').addEventListener('click', async () => {
-      const button = document.getElementById('newDraftBtn');
-      button.disabled = true;
+    async function createDraft(packageMode) {
+      const buttons = ['newDraftBtn','newCustomDraftBtn'].map(id => document.getElementById(id));
+      buttons.forEach(button => { button.disabled = true; });
+      document.getElementById('newDraftOptions').open = false;
       try {
-        const detail = await api('/api/drafts', {method:'POST'});
+        const detail = await api('/api/drafts', {method:'POST',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify({packageMode})});
         await openDraft(detail.caseDraft.id);
       } catch (error) { showDraftError(error); }
-      finally { button.disabled = false; }
-    });
+      finally { buttons.forEach(button => { button.disabled = false; }); }
+    }
+    document.getElementById('newDraftBtn').addEventListener('click', () => createDraft('standard_lt'));
+    document.getElementById('newCustomDraftBtn').addEventListener('click', () => createDraft('custom'));
 
 
     function renderCheckoutReview(job, open) {
@@ -4821,7 +4856,7 @@ const html = String.raw`<!doctype html>
           '<span>Primary account: ' + (job.releaseChecks.primaryAccountConfirmed ? 'Confirmed' : 'Not confirmed for this bundle') + '</span>' +
           '<span>Displayed fees before checkout: ' + (job.releaseChecks.displayedSubtotalCents === null ? 'Not recorded' :
             escapeHtml(new Intl.NumberFormat('en-US', {style:'currency',currency:'USD'}).format(job.releaseChecks.displayedSubtotalCents / 100))) + '</span>' +
-          '<span>Checkout total and processing fee: ' + (job.checkout?.checkoutVerified ? 'Checked separately below' : 'Not verified') + '</span>' +
+          '<span>Checkout total and processing fee: ' + (job.checkout?.quote ? 'Read from MiFILE' : 'Not checked') + '</span>' +
           '<span>Payment and final court submission: Disabled</span>' +
           '</div></details>' : '') +
         (job.status === 'prepared' && job.checkout ? renderCheckoutReview(job, checkoutWasOpen) : '') +
@@ -5029,8 +5064,9 @@ const html = String.raw`<!doctype html>
       } else {
         validationRoot.innerHTML = '<div class="draft-validation is-ready">' +
           '<div class="draft-validation-row">' + icon('circle-check') +
-          '<span>' + escapeHtml(draft.manualPackage
-            ? 'Manual package is complete and ready for confirmation.'
+          '<span>' + escapeHtml(draft.status === 'filing_prepared'
+            ? 'Package saved in MiFILE Unsubmitted.'
+            : draft.manualPackage ? 'Custom package is ready for confirmation.'
             : 'Landlord-tenant package passed validation.') +
           '</span></div></div>';
       }
@@ -7461,8 +7497,19 @@ export function createAdminServer(
                 catch(error){sendJson(res,409,{error:(error as Error).message});} return;
             }
             if (req.method === 'POST' && url.pathname === '/api/drafts') {
-                const message = {id:'manual-intake:' + randomUUID(), subject:'New case - manual upload', receivedDateTime:new Date().toISOString()};
-                const parsed = buildManualDraft(message);
+                const body = await readRequestBody(req);
+                let input;
+                try { input = body ? JSON.parse(body) : {}; }
+                catch { sendJson(res, 400, {error:'Invalid Draft request'}); return; }
+                if (!input || typeof input !== 'object' || Array.isArray(input) ||
+                    !['standard_lt','custom'].includes(input.packageMode ?? 'standard_lt')) {
+                    sendJson(res, 400, {error:'Select a standard LT case or custom package'}); return;
+                }
+                const packageMode = input.packageMode ?? 'standard_lt';
+                const message = {id:'manual-intake:' + randomUUID(),
+                    subject:packageMode === 'custom' ? 'Custom filing package - PDF upload' : 'New LT case - PDF upload',
+                    receivedDateTime:new Date().toISOString()};
+                const parsed = buildManualDraft(message, null, packageMode);
                 const email = db.registerEmail(message);
                 const draftId = db.createCaseDraft(email.id, parsed);
                 db.markEmailProcessed(email.id);

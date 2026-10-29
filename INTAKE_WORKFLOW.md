@@ -6,6 +6,16 @@ One authorized email creates one new Draft and one OneDrive folder. The worker p
 
 The Draft editor displays the PDF with page navigation and zoom beside the editable fields. On mobile, switch between Document and Fields. Missing data, unreadable files, ambiguous document roles, and incomplete packages require review.
 
+**New case** uses the full standard LT checks even when the PDFs are uploaded rather
+than emailed. The Complaint remains required and authoritative; Advice, Local,
+Summons, Request and supporting-document requirements cannot be waived by excluding
+a core PDF. Recognition, extraction and available library forms run automatically.
+Uploaded cases wait for **Confirm & prepare**, so processing cannot start halfway
+through selecting files. **New case options > New custom package** preserves the
+explicit arbitrary-package workflow. Existing manual packages retain their original
+rules; a deployment does not reclassify or modify a prepared bundle. API creation
+defaults to `packageMode: standard_lt`; only `standard_lt` and `custom` are accepted.
+
 Completed email packages with no validation issues and no previous filing job are queued automatically when the preparation worker is enabled and ready. No Sync, extraction, confirmation or preparation button is needed for this path. Manual packages and corrected packages use **Confirm & prepare** after resolving their review items. The only destination is **History > Unsubmitted**. Final submission and payment remain disabled. Both the alternate and primary accounts access live MiFILE; "alternate" does not mean sandbox. The only permitted filer is **Devlin, Adam**.
 
 ## Sending a package
@@ -86,7 +96,7 @@ The trash icon removes the selected PDF from the Draft only. Its OneDrive copy i
 
 During replacement the document is reserved, preparation is blocked, and its original attachment retry is retired. An interrupted or failed replacement requires another local replacement; neither the delayed retry worker nor email reprocessing restores the old attachment over the correction. Replacing or removing the primary Complaint clears its automatic fields and extraction result. Explicit manual corrections are preserved. A replacement Complaint is read automatically; review the refreshed result. **Re-read Complaint** is available for troubleshooting.
 
-Manual document additions, removals and replacements disable automatic preparation for that Draft. After correcting the package, use **Confirm package** and **Prepare in MiFILE**. Unchanged incoming packages can still use the existing automatic Unsubmitted preparation path. Queued, running, reconciliation-required, prepared and court-notification records cannot be modified through these document controls.
+Manual document additions, removals and replacements disable automatic preparation for that Draft. After correcting the package, use **Confirm & prepare**. Unchanged incoming packages can still use the existing automatic Unsubmitted preparation path. Queued, running, reconciliation-required, prepared and court-notification records cannot be modified through these document controls.
 
 ### Court Filing Rules
 
@@ -161,6 +171,27 @@ The complete account record is encrypted using AES-256-GCM before storage in SQL
 
 ## Verification and rollout
 
+### Primary-account preparation and upload defaults (October 29)
+
+An attorney-supplied real package was uploaded through the production Draft Editor
+without entering case facts manually. The system recognized the Complaint,
+Summons, Request and scanned ancillary PDF, extracted the populated Complaint,
+selected the exact court, applied attorney contact defaults and added the active
+Advice/Local library forms. The primary-account worker prepared all six source
+PDFs in Unsubmitted in 29 seconds and reopened the saved bundle for verification.
+A separate read-only checkout inspection rechecked source hashes and returned the
+itemized fees. Receipt inspection independently returned Unsubmitted, not Paid or
+Filed. No payment method was selected and no financial or court submission action
+was executed. Private identifiers and screenshots remain in the local QA output,
+not this repository.
+
+Version 74 makes standard LT validation the default for new uploaded cases, keeps
+custom/legacy manual packages available, clarifies saved/checkout status text and
+repairs narrow-screen Draft rows so party/sender text does not collapse into a
+single-character column. All 220 automated tests and the desktop/mobile admin
+smoke passed before deployment. This does not claim a live paid receipt or a
+completed final-submission module.
+
 ### Checkout and receipt review (October 27)
 
 Prepared packages expose **Activity > Checkout & receipts**. **Check checkout** queues a serialized read-only MiFILE inspection. It checks the account, downloads and hashes the source PDFs again, reopens the bundle, verifies its PDF manifest and Connected relationships, reads the actual fee table, then cancels checkout. It never selects a payment method, requests a waiver, pays or submits. Unknown notices stop the check.
@@ -194,7 +225,7 @@ Before inviting live client packages, deploy the update, confirm the inbox and a
 # September 24: intake recovery and scanned documents
 
 - Drafts defaults to new filing packages. Existing court notifications remain in Queue and in the optional All records view; they are not new cases.
-- New case creates an editable manual package without sending an email. Add PDFs there; manual packages are never automatically queued while the user is still assembling them.
+- New case creates an editable standard LT package without sending an email. Add PDFs there; uploaded packages are never automatically queued while the user is still assembling them.
 - Report emails, failure notifications and replies/forwards of our reports are correspondence, not attachment sources. Migration 23 stops their synthetic attachment retries without deleting audit history or OneDrive files.
 - Scanned PDFs use offline English Tesseract OCR in a separate process, serialized with a 120-second deadline, at most 12 pages and 8 million render pixels per page. Models ship in the Docker image through npm; documents are not sent to an OCR service. Original bytes are retained.
 - OCR can populate Complaint parties and addresses. Paragraph 2/10 answers and scan-derived party data require review; absence of an OCR checkbox is never interpreted as No. Poor scans remain editable and do not invalidate successful downloads.

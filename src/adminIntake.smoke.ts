@@ -601,6 +601,8 @@ async function main() {
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         await page.locator('[data-checkout-review] summary').click();
         assert.match(await page.locator('[data-checkout-review]').innerText(),/Checkout total:\s+\$126.69 USD/);
+        assert.match(await page.locator('[data-release-checks]').textContent() || '',
+            /Checkout total and processing fee: Read from MiFILE/);
         const denied=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/pay`,{headers:{Origin:url},data:{}});
         assert.equal(denied.status(),403);
         const wrongAmount=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/confirm`,{headers:{Origin:url},
@@ -621,6 +623,7 @@ async function main() {
         await page.screenshot({path:path.join(screenshots,'draft-checkout-review-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
         await page.locator('#draftReviewTab').click();
+        assert.match(await page.locator('#draftValidationSummary').innerText(), /Package saved in MiFILE Unsubmitted/);
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;
         assert.equal((await context.request.put(`${url}/api/documents/${lockedDocument.id}/content`,{headers:{Origin:url},data:testComplaintFormFixture()})).status(),409);
@@ -682,10 +685,34 @@ async function main() {
         assert.equal(db.listLibraryForms().find(form => form.id === localForm.id)?.active, 0);
         await page.locator('#draftsTab').click();
         await page.locator('#closeDraftBtn').click();
-        const created = page.waitForResponse(response => response.url().endsWith('/api/drafts') && response.request().method() === 'POST');
+        for (const invalid of [{packageMode:'unknown'}, [], null]) {
+            const rejected = await context.request.post(`${url}/api/drafts`, {headers:{Origin:url},data:invalid});
+            assert.equal(rejected.status(), 400);
+        }
+        const standardCreated = page.waitForResponse(response => response.url().endsWith('/api/drafts') && response.request().method() === 'POST');
         await page.locator('#newDraftBtn').click();
+        const standard = await (await standardCreated).json();
+        assert.equal(JSON.parse(standard.caseDraft.normalizedDataJson).intake.packageMode, 'standard_lt');
+        assert.equal(standard.caseDraft.manualPackage, false);
+        assert.ok(standard.caseDraft.validationIssues.some((issue: {field:string}) => issue.field === 'package.request'));
+        assert.equal((await context.request.post(`${url}/api/drafts/${standard.caseDraft.id}/filing-jobs`,
+            {headers:{Origin:url},data:{mode:'prepare'}})).status(), 409);
+        await page.locator('#draftWorkspaceView').waitFor({state:'visible'});
+        await page.screenshot({path:path.join(screenshots,'draft-standard-upload-desktop.png'),fullPage:true});
+        await page.locator('#closeDraftBtn').click();
+        const created = page.waitForResponse(response => response.url().endsWith('/api/drafts') && response.request().method() === 'POST');
+        await page.locator('#newDraftOptions summary').click();
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
+        const mobileParties = await page.locator('#draftList [data-open-draft] td:nth-child(3)').evaluateAll(cells =>
+            cells.map(cell => cell.getBoundingClientRect().width));
+        assert.ok(mobileParties.length && mobileParties.every(width => width > 300), 'party columns must remain readable');
+        await page.screenshot({path:path.join(screenshots,'draft-create-options-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+        await page.locator('#newCustomDraftBtn').click();
         const manual = await (await created).json();
         assert.equal(JSON.parse(manual.caseDraft.normalizedDataJson).intake.manual, true);
+        assert.equal(JSON.parse(manual.caseDraft.normalizedDataJson).intake.packageMode, 'custom');
         assert.equal(manual.caseDraft.manualPackage, true);
         assert.equal(manual.caseDraft.filingData.attorney.barNumber, 'P72877');
         assert.ok(!manual.caseDraft.validationIssues.some((issue: { message: string }) =>

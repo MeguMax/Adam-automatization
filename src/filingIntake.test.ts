@@ -34,11 +34,16 @@ const extraction: ComplaintExtractionResult = {
     }, fieldConfidence: {}, warnings: [],
 };
 
-function fixture(names: string[]) {
+function fixture(names: string[], packageMode?: 'standard_lt' | 'custom') {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'filing-intake-'));
     const db = new WorkflowDatabase(path.join(directory, 'test.sqlite'));
     const email = db.registerEmail(message);
     const parsed = buildFilingIntake(message, names.map(name => attachment(name)));
+    if (packageMode) {
+        parsed.intake!.manual = true;
+        parsed.intake!.packageMode = packageMode;
+        parsed.intake!.issues = [];
+    }
     const draftId = db.createCaseDraft(email.id, parsed);
     const uploaded: string[] = [];
     const dependencies = {
@@ -351,7 +356,38 @@ test('email pipeline reads PDF fields, inserts library forms, connects both supp
     } finally { f.close(); }
 });
 
-test('manual Drafts can prepare a reviewed arbitrary PDF package without a Complaint', () => {
+test('standard LT uploads cannot waive required documents and still require explicit preparation', () => {
+    const f = fixture([], 'standard_lt');
+    try {
+        const ids = ['Complaint', 'Advice', 'Local', 'Summons', 'Demand'].map(role => f.db.addDocument({
+            emailId:f.email.id,caseDraftId:f.draftId,currentFilename:role+'.pdf',documentType:role,
+            oneDriveUrl:'https://onedrive.example/'+role,mimeType:'application/pdf',uploadSource:'admin_draft_upload',status:'uploaded',
+        }));
+        f.db.applyComplaintExtraction(f.draftId, ids[0], extraction);
+        const incomplete = f.db.updateCaseDraft(f.draftId, {courtName:'25th District Court'}, undefined,
+            undefined, [{id:ids[4],filingRelation:'separate',filingType:'Other'}]);
+        assert.equal(incomplete.caseDraft!.manualPackage, false);
+        assert.ok(incomplete.caseDraft!.validationIssues.some(issue => issue.field === 'package.request'));
+        assert.throws(() => f.db.reviewCaseDraft(f.draftId, 'approve'), /Request/);
+        assert.throws(() => f.db.buildFilingPayload(f.draftId), /Request/);
+        const requestId = f.db.addDocument({emailId:f.email.id,caseDraftId:f.draftId,
+            currentFilename:'Request.pdf',documentType:'Request',oneDriveUrl:'https://onedrive.example/request',
+            mimeType:'application/pdf',uploadSource:'admin_draft_upload',status:'uploaded'});
+        const complete = f.db.updateCaseDraft(f.draftId, {}, undefined, undefined,
+            [{id:requestId,filingRelation:'connected_to_complaint',requiredForFiling:false}]);
+        const request = complete.documents.find(document => document.id === requestId)!;
+        assert.equal(request.requiredForFiling, true);
+        assert.equal(request.filingRelation, 'separate');
+        assert.deepEqual(complete.caseDraft!.validationIssues, []);
+        assert.equal(f.db.queueValidatedIntakes(), 0, 'uploaded packages wait for explicit confirmation');
+        f.db.reviewCaseDraft(f.draftId, 'approve');
+        const job = f.db.queueFilingJob(f.draftId);
+        assert.equal(job.payload!.documents.length, 6);
+    } finally { f.close(); }
+});
+
+for (const packageMode of [undefined, 'custom'] as const) {
+test(`${packageMode || 'legacy manual'} Drafts can prepare a reviewed arbitrary PDF package without a Complaint`, () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-filing-'));
     const db = new WorkflowDatabase(path.join(directory, 'test.sqlite'));
     try {
@@ -364,6 +400,7 @@ test('manual Drafts can prepare a reviewed arbitrary PDF package without a Compl
         const email = db.registerEmail(manualMessage);
         const parsed = buildFilingIntake(manualMessage, []);
         parsed.intake!.manual = true;
+        parsed.intake!.packageMode = packageMode;
         parsed.intake!.issues = [];
         const draftId = db.createCaseDraft(email.id, parsed);
         const documentId = db.addDocument({
@@ -432,3 +469,4 @@ test('manual Drafts can prepare a reviewed arbitrary PDF package without a Compl
         fs.rmSync(directory, { recursive: true, force: true });
     }
 });
+}
