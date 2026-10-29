@@ -11,6 +11,7 @@ import {buildCheckoutQuote,checkoutReviewIssues,digest,FINAL_MIFILE_ACTIONS_ENAB
 import {parseMiFileReceiptFields,parseMiFileReceiptPdf,collectReceiptObservations} from './mifileReceipts';
 import {testPdfFixture} from './testPdfFixture';
 import {readPaymentMethods,selectPaymentMethodForQuote} from './mifilePaymentMethods';
+import {mifileOutcome} from './mifileOutcome';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -56,7 +57,8 @@ function storeFixture() {
         VALUES(?, ?, 1, 'prepare','prepared',?,?)`).run(job.id,draftId,new Date().toISOString(),new Date().toISOString());
     const {CheckoutStore}=require('./checkoutStore') as typeof import('./checkoutStore');
     const audit:Array<string>=[];
-    return {db,sql,job,store:new CheckoutStore(sql,()=>job,(_id,action)=>{audit.push(action);}),audit,email};
+    const jobs=new Map([[job.id,job]]);
+    return {db,sql,job,jobs,store:new CheckoutStore(sql,id=>jobs.get(id)||null,(_id,action)=>{audit.push(action);}),audit,email};
 }
 
 test('live checkout fee fixture reconciles exact USD total, not pre-checkout subtotal',()=>{
@@ -437,4 +439,222 @@ test('invalid public payment choices and mismatched state cannot form an actiona
         const bad={...q,availablePaymentMethods:unsafe} as any;bad.quoteDigest=quoteDigest(bad);
         assert.ok(checkoutReviewIssues(bad,job,account).some(issue=>issue.includes('invalid')));
     }
+});
+
+test('remote outcome keeps payment, bundle filing and individual court results separate',()=>{
+    const checkedAt=new Date().toISOString(),check={status:'completed',state:'found' as const,checkedAt};
+    const reported=mifileOutcome([receipt('Paid')],['doc-1'],check);
+    assert.equal(reported.code,'payment_reported');assert.equal(reported.paymentReceiptVerified,false);
+    assert.equal(reported.filedDocuments,0);assert.match(reported.message,/not court acceptance/);
+    const payment={...receipt('Paid'),kind:'payment' as const,totalCents:12669,currency:'USD' as const};
+    assert.equal(mifileOutcome([payment],['doc-1'],check).paymentReceiptVerified,true);
+    assert.equal(mifileOutcome([receipt('Filed')],['doc-1'],check).code,'bundle_filed');
+    const filed={...receipt('Filed'),kind:'filing_status' as const,documentId:'doc-1'};
+    assert.equal(mifileOutcome([filed],['doc-1','doc-2'],check).code,'partially_filed');
+    assert.equal(mifileOutcome([filed],['doc-1'],check).code,'filed');
+    assert.equal(mifileOutcome([receipt('Accepted')],['doc-1'],check).code,'submitted');
+    assert.equal(mifileOutcome([receipt('Rejected')],['doc-1'],check).code,'rejected');
+    assert.match(mifileOutcome([receipt('Rejected')],['doc-1'],check).message,/does not prove a refund/);
+    assert.equal(mifileOutcome([receipt('Refunded')],['doc-1'],check).code,'refunded');
+});
+
+test('unknown, failed, running and stale status checks never claim a fresh successful filing',()=>{
+    const now=Date.now(),checkedAt=new Date(now).toISOString();
+    assert.equal(mifileOutcome([],['doc-1'],null).code,'unknown');
+    const ok={status:'completed',state:'unsubmitted' as const,checkedAt};
+    assert.equal(mifileOutcome([receipt()],['doc-1'],ok).code,'unsubmitted');
+    assert.equal(mifileOutcome([receipt()],['doc-1'],ok,false,now+900001).fresh,false);
+    const failed=mifileOutcome([receipt('Paid')],['doc-1'],{status:'failed',state:null,checkedAt:null});
+    assert.equal(failed.code,'review_required');assert.equal(failed.submissionObserved,true);
+    assert.match(failed.message,/do not repeat/);
+    assert.equal(mifileOutcome([receipt()],['doc-1'],{status:'running',state:null,checkedAt:null}).code,'checking');
+    assert.equal(mifileOutcome([receipt()],['doc-1'],ok,true).code,'review_required');
+});
+
+test('later per-document Filed evidence supersedes the old rejection without erasing history',()=>{
+    const old={...receipt('Rejected'),documentId:'doc-1',occurredAt:'2026-10-28T10:00:00Z'};
+    const newer={...receipt('Filed'),documentId:'doc-1',occurredAt:'2026-10-28T11:00:00Z'};
+    const result=mifileOutcome([newer,old],['doc-1'],{status:'completed',state:'found',checkedAt:new Date().toISOString()});
+    assert.equal(result.code,'filed');assert.equal(result.rejectedDocuments,0);assert.equal(result.submissionObserved,true);
+});
+
+function makePrimaryFixture() {
+    const f=storeFixture(),primary={...account,accountEnvironment:'production',productionConfirmed:true};
+    f.job.payload!.subject='NEW LT FILING - Example Owner v Example Tenant';
+    const evidence=f.job.result!.savedBundleEvidence as any;
+    evidence.packageDigest=preparationDigest(f.job.payload!,evidence.sources);
+    return {...f,primary};
+}
+
+test('automatic status refresh is receipts-only, deduplicated, durable and restricted to verified primary real packages',()=>{
+    const f=makePrimaryFixture();
+    try {
+        assert.equal(f.store.refreshReceiptsIfDue(f.job.id,account),null);
+        const inspection=f.store.refreshReceiptsIfDue(f.job.id,f.primary)!;
+        assert.equal(inspection.kind,'receipts');assert.equal(inspection.triggerSource,'automatic');
+        assert.equal(f.store.refreshReceiptsIfDue(f.job.id,f.primary),null);
+        const {CheckoutStore}=require('./checkoutStore') as typeof import('./checkoutStore');
+        const reopened=new CheckoutStore(f.sql,id=>f.jobs.get(id)||null,()=>{});
+        assert.equal(reopened.refreshReceiptsIfDue(f.job.id,f.primary),null);
+        assert.equal(reopened.get(inspection.id)!.triggerSource,'automatic');
+        reopened.claim();reopened.complete(inspection.id,{kind:'receipts',state:'unsubmitted',observations:[receipt()],
+            checkedAt:new Date().toISOString(),issue:null},f.primary);
+        assert.equal(reopened.refreshReceiptsIfDue(f.job.id,f.primary,Date.now()+299000),null);
+        assert.ok(reopened.refreshReceiptsIfDue(f.job.id,f.primary,Date.now()+301000));
+        assert.equal(reopened.state(f.job.id,f.primary).paymentExecutionEnabled,false);
+    }finally{f.db.close();}
+});
+
+test('automatic status failures back off while explicit manual receipt checks remain available',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const inspection=f.store.refreshReceiptsIfDue(f.job.id,f.primary)!;f.store.claim();f.store.fail(inspection.id,'Temporary outage');
+        const now=Date.now();
+        assert.equal(f.store.refreshReceiptsIfDue(f.job.id,f.primary,now+5*60_000),null);
+        const manual=f.store.queue(f.job.id,'receipts',f.primary);
+        assert.equal(manual.triggerSource,'manual');f.store.claim();f.store.fail(manual.id,'Still unavailable');
+        assert.equal(f.store.refreshReceiptsIfDue(f.job.id,f.primary,now+19*60_000),null);
+        assert.ok(f.store.refreshReceiptsIfDue(f.job.id,f.primary,now+21*60_000));
+    }finally{f.db.close();}
+});
+
+test('automatic status checks do not starve queued preparation and respect a bounded backlog',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const automatic=f.store.refreshReceiptsIfDue(f.job.id,f.primary)!;
+        f.sql.prepare("UPDATE filing_jobs SET status='queued' WHERE id=?").run(f.job.id);
+        assert.equal(f.store.claim(),null);
+        f.sql.prepare("UPDATE filing_jobs SET status='prepared' WHERE id=?").run(f.job.id);
+        assert.equal(f.store.claim()!.id,automatic.id);f.store.fail(automatic.id,'Test stop');
+        for(let i=1;i<=5;i++) {
+            const id='backlog-job-'+i;
+            f.sql.prepare(`INSERT INTO filing_jobs(id,case_draft_id,attempt_number,mode,status,created_at,updated_at)
+                VALUES(?, ?, ?, 'prepare','prepared',?,?)`).run(id,f.job.caseDraftId,i+1,new Date().toISOString(),new Date().toISOString());
+            f.sql.prepare(`INSERT INTO mifile_checkout_inspections(id,filing_job_id,kind,status,account_identity,created_at,trigger_source)
+                VALUES(?,?,'receipts','queued',?,?,'automatic')`).run('backlog-'+i,id,f.primary.identity,new Date().toISOString());
+        }
+        assert.equal(f.store.refreshReceiptsIfDue(f.job.id,f.primary,Date.now()+61*60_000),null);
+    }finally{f.db.close();}
+});
+
+test('manual inspections take priority over an older automatic check and QA packages never auto-refresh',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const automatic=f.store.refreshReceiptsIfDue(f.job.id,f.primary)!;
+        const other={...f.job,id:'manual-priority'};f.jobs.set(other.id,other);
+        f.sql.prepare(`INSERT INTO filing_jobs(id,case_draft_id,attempt_number,mode,status,created_at,updated_at)
+            VALUES(?, ?, 2, 'prepare','prepared',?,?)`).run(other.id,other.caseDraftId,new Date().toISOString(),new Date().toISOString());
+        const manual=f.store.queue(other.id,'receipts',f.primary);
+        assert.equal(f.store.claim()!.id,manual.id);f.store.fail(manual.id,'Test stop');
+        assert.equal(f.store.claim()!.id,automatic.id);f.store.fail(automatic.id,'Test stop');
+        f.job.payload!.subject='NEW LT FILING - QA package';
+        const evidence=f.job.result!.savedBundleEvidence as any;evidence.packageDigest=preparationDigest(f.job.payload!,evidence.sources);
+        assert.equal(f.store.refreshReceiptsIfDue(f.job.id,f.primary,Date.now()+61*60_000),null);
+    }finally{f.db.close();}
+});
+
+test('automatic polling history is bounded without deleting manual quotes or consolidated receipt evidence',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const q=completeQuote(f,'selected',Date.now(),f.primary);
+        const manualId=f.store.state(f.job.id,f.primary).inspection!.id;
+        for(let i=0;i<13;i++) {
+            const item=f.store.refreshReceiptsIfDue(f.job.id,f.primary,Date.now()+i*6*60_000)!;
+            assert.ok(item);f.store.claim();
+            f.store.complete(item.id,{kind:'receipts',state:'unsubmitted',observations:[receipt()],
+                checkedAt:new Date().toISOString(),issue:null},f.primary);
+        }
+        assert.equal(f.sql.prepare("SELECT count(*) AS n FROM mifile_checkout_inspections WHERE trigger_source='automatic'").get().n,10);
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_receipt_events').get().n,1);
+        assert.equal(f.store.get(manualId)!.result!.kind,'quote');
+        assert.equal(f.store.state(f.job.id,f.primary).quote!.id,q.id);
+    }finally{f.db.close();}
+});
+
+async function historyPageFixture(page:import('playwright').Page,job:FilingJobView,rows:string,receiptPdf?:Buffer) {
+    job.createdAt=new Date().toISOString();
+    await page.route('**/*',async route=>{
+        const url=new URL(route.request().url());
+        if(url.pathname.startsWith('/filing/create/')) {
+            await route.fulfill({status:302,headers:{location:'https://mifile.courts.michigan.gov/filings/myHistory'}});return;
+        }
+        if(url.pathname.startsWith('/receipts/')) {
+            await route.fulfill({contentType:'application/pdf',body:receiptPdf || testPdfFixture('Unknown receipt format')});return;
+        }
+        await route.fulfill({contentType:'text/html',body:`<header>${account.username}</header><main>
+            <div role="tabpanel" aria-label="My History"><label>Start Date:<input></label><label>End Date:<input></label>
+            <button onclick="window.searched=true">Search</button><table><tbody>${rows}</tbody></table></div></main>`});
+    });
+    return async (href:string) => {
+        assert.equal(new URL(href).origin,'https://mifile.courts.michigan.gov');
+        return {ok:()=>true,headers:()=>({'content-type':'application/pdf'}),
+            body:async()=>receiptPdf || testPdfFixture('Unknown receipt format')};
+    };
+}
+
+test('history collector finds an exact bundle row and verifies its PDF transaction receipt',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        const fetchReceipt=await historyPageFixture(page,job,`<tr><td><a href="/filing/create/${job.externalBundleId}">View bundle</a></td><td>Paid</td>
+            <td><a href="/receipts/verified.pdf">Receipt</a></td></tr>`,testPdfFixture(`Bundle ID: ${job.externalBundleId}\nTransaction ID: TX-QA-100\nTotal Paid: $126.69`));
+        const result=await collectReceiptObservations(page,job,account,fetchReceipt);
+        assert.equal(result.kind,'receipts');if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.equal(result.issue,null);
+        assert.equal(receiptSummary(result.observations).verifiedPaymentReceipt,true);
+        assert.deepEqual(receiptSummary(result.observations).courtFiledDocumentIds,[]);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).searched)),true);
+    }finally{await page.close();}
+});
+
+test('history collector rejects substring and off-origin bundle links instead of assigning another case result',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        const fetchReceipt=await historyPageFixture(page,job,`<tr><td><a href="/filing/create/${job.externalBundleId}-other">View</a></td><td>Filed</td></tr>
+            <tr><td><a href="https://untrusted.example/filing/create/${job.externalBundleId}">View</a></td><td>Paid</td></tr>`);
+        const result=await collectReceiptObservations(page,job,account,fetchReceipt);
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'inconclusive');assert.equal(result.observations.length,0);
+    }finally{await page.close();}
+});
+
+test('an unknown receipt PDF retains the observed status but never fabricates a payment receipt',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        const fetchReceipt=await historyPageFixture(page,job,`<tr><td><a href="/filing/create/${job.externalBundleId}">View</a></td><td>Paid</td>
+            <td><a href="/receipts/unknown.pdf">Receipt</a></td></tr>`);
+        const result=await collectReceiptObservations(page,job,account,fetchReceipt);
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.ok(result.issue?.includes('could not be verified'));
+        assert.equal(receiptSummary(result.observations).paymentReported,true);
+        assert.equal(receiptSummary(result.observations).verifiedPaymentReceipt,false);
+    }finally{await page.close();}
+});
+
+test('a failed receipt request retains the observed Paid status and never permits automatic payment retry',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        await historyPageFixture(page,job,`<tr><td><a href="/filing/create/${job.externalBundleId}">View</a></td><td>Paid</td>
+            <td><a href="/receipts/unavailable.pdf">Receipt</a></td></tr>`);
+        const result=await collectReceiptObservations(page,job,account,async()=>{throw new Error('Fixture connection reset');});
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.ok(result.issue?.includes('statuses are retained'));
+        assert.equal(receiptSummary(result.observations).paymentReported,true);
+        assert.equal(receiptSummary(result.observations).retryPaymentAllowed,false);
+    }finally{await page.close();}
+});
+
+test('refund receipts are distinct from paid receipts, and untrusted receipt URLs are never fetched',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        const fetchReceipt=await historyPageFixture(page,job,`<tr><td><a href="/filing/create/${job.externalBundleId}">View</a></td><td>Refunded</td>
+            <td><a href="/receipts/refund.pdf">Refund receipt</a></td><td><a href="https://untrusted.example/receipt.pdf">Receipt</a></td></tr>`,
+            testPdfFixture(`Bundle ID: ${job.externalBundleId}\nReceipt Number: REF-QA-100\nTotal Refunded: $1.00`));
+        let fetched=0;
+        const result=await collectReceiptObservations(page,job,account,async href=>{fetched++;return fetchReceipt(href);});
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(fetched,1);assert.equal(result.observations.some(item=>item.kind==='refund'),true);
+        assert.equal(result.observations.find(item=>item.kind==='refund')!.totalCents,100);
+        assert.equal(receiptSummary(result.observations).verifiedPaymentReceipt,false);
+        assert.equal(receiptSummary(result.observations).refundReported,true);
+    }finally{await page.close();}
 });

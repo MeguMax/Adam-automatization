@@ -53,7 +53,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-29-checkout-preflight-v76';
+const ADMIN_BUILD_ID = '2026-10-29-receipt-status-v77';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2385,6 +2385,7 @@ const html = String.raw`<!doctype html>
     .checkout-preflight { list-style: none; padding: 0; margin: 0; display: grid; gap: 7px; }
     .checkout-preflight li { display: flex; align-items: flex-start; gap: 7px; }
     .checkout-preflight svg { width: 15px; height: 15px; flex: 0 0 15px; margin-top: 1px; }
+    .draft-validation.draft-result:not(.has-errors):not(.is-ready) { background: var(--panel); border-color: var(--line); color: var(--text); }
     [data-checkout-review] .draft-filing-job-actions { margin-top: 12px; }
     .draft-filing-job-error {
       margin-top: 8px;
@@ -4510,6 +4511,26 @@ const html = String.raw`<!doctype html>
       document.getElementById('toastRegion').classList.add('draft-toast-region');
       renderDraftWorkspace();
       autoExtractDraft(draftId).catch(showDraftError);
+      refreshPreparedReceiptStatus().catch(() => {});
+    }
+
+    const receiptRefreshAttempts = new Map();
+    let receiptRefreshBusy = false;
+    async function refreshPreparedReceiptStatus() {
+      const job = state.draftFilingJobs[0], draftId = state.selectedDraftId;
+      if (!job || job.status !== 'prepared' || job.checkout?.active || receiptRefreshBusy ||
+          !job.releaseChecks?.primaryAccountConfirmed || job.releaseChecks.testOnly || document.hidden) return;
+      if (Date.now() - (receiptRefreshAttempts.get(job.id) || 0) < 60_000) return;
+      receiptRefreshAttempts.set(job.id, Date.now());
+      if (receiptRefreshAttempts.size > 100) receiptRefreshAttempts.delete(receiptRefreshAttempts.keys().next().value);
+      receiptRefreshBusy = true;
+      try {
+        const checkout = await api('/api/filing-jobs/' + encodeURIComponent(job.id) + '/checkout/refresh-status',
+          {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+        if (state.selectedDraftId !== draftId || state.draftFilingJobs[0]?.id !== job.id) return;
+        state.draftFilingJobs[0].checkout = checkout;
+        renderDraftFilingJobs();
+      } finally { receiptRefreshBusy = false; }
     }
 
     async function autoExtractDraft(draftId) {
@@ -4608,14 +4629,15 @@ const html = String.raw`<!doctype html>
       const running = draft.filingStatus === 'queued' || draft.status === 'filing_in_progress';
       const ready = state.mifileConfig && state.mifileConfig.ready;
       const progress = state.draftFilingJobs[0]?.progress;
+      const outcome = state.draftFilingJobs[0]?.checkout?.outcome;
       const title = unavailable ? (draft.status === 'rejected' ? 'Package rejected' : 'Court notification') :
-        filed ? 'Filed in MiFILE' : prepared ? 'Saved in MiFILE' : reconcile ? 'Check MiFILE before retrying' :
+        filed ? 'Filed in MiFILE' : prepared ? outcome?.title || 'Saved in MiFILE' : reconcile ? 'Check MiFILE before retrying' :
         running ? (progress ? progress.stage + (progress.uploaded !== null && progress.total ? ' (' + progress.uploaded + ' / ' + progress.total + ')' : '') : 'Preparation in progress') : state.draftDirty ? 'Changes not saved' :
         errors ? errors + (errors === 1 ? ' correction needed' : ' corrections needed') :
         !ready ? 'MiFILE account needs attention' : 'Ready for your confirmation';
       document.getElementById('draftNextActionTitle').textContent = title;
       document.getElementById('draftNextActionNote').textContent = prepared
-        ? filed ? 'Court filing recorded. Open MiFILE for details.' : 'Unsubmitted only. Nothing has been sent to the court.'
+        ? filed ? 'Court filing recorded. Open MiFILE for details.' : outcome?.message || 'Preparation is complete. The current court result has not been checked.'
         : running ? 'You can leave this page. Preparation continues in the background.'
         : 'Destination: MiFILE Unsubmitted. No payment or court submission.';
       const label = unavailable ? (draft.status === 'rejected' ? 'Rejected' : 'Download history only') :
@@ -4766,12 +4788,14 @@ const html = String.raw`<!doctype html>
         (checkout.receiptCheckIssue ? '<span>' + escapeHtml(checkout.receiptCheckIssue) + '</span>' : '') +
         (checkout.receipts.length ? '<ul>' + checkout.receipts.map(receipt => '<li>' + escapeHtml(receipt.status) +
           (receipt.totalCents !== null ? ' · ' + escapeHtml(money(receipt.totalCents)) : '') +
-          ' · ' + escapeHtml(fmtDate(receipt.occurredAt || receipt.observedAt)) + '</li>').join('') + '</ul>' : '<span>No verified payment receipt recorded.</span>') +
+          ' · ' + escapeHtml(fmtDate(receipt.occurredAt || receipt.observedAt)) +
+          (receipt.receiptUrl ? ' · <a target="_blank" rel="noopener" href="' + escapeHtml(receipt.receiptUrl) + '">Receipt</a>' : '') +
+          '</li>').join('') + '</ul>' : '<span>No verified payment receipt recorded.</span>') +
         (checkout.preflight ? '<strong>Submission preflight</strong><ul class="checkout-preflight">' + checkout.preflight.checks.map(check =>
           '<li>' + icon(check.passed ? 'circle-check' : 'circle') + '<span>' + escapeHtml(check.label) + '</span></li>').join('') + '</ul>' +
           (checkout.preflight.complete ? '<span>Preflight complete. Live submission remains disabled.</span>' : '') +
           (checkout.preflight.recordedAt ? '<span>Preflight recorded: ' + escapeHtml(fmtDate(checkout.preflight.recordedAt)) + '</span>' : '') : '') +
-        '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active ? ' disabled' : '') + '>' +
+        '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active || !checkout.canInspect ? ' disabled' : '') + '>' +
         icon('refresh-cw') + 'Check checkout</button>' +
         '<button type="button" data-checkout-action="confirm"' + (!checkout.canConfirm || checkout.confirmedAt ? ' disabled' : '') + '>' +
         icon('check') + 'Confirm amount</button>' +
@@ -4825,19 +4849,25 @@ const html = String.raw`<!doctype html>
         icon(!config.ready ? 'circle-alert' : config.accountEnvironment === 'production'
           ? 'shield-check' : 'flask-conical') +
         '<span><strong>' + escapeHtml(config.accountLabel) + '</strong> · ' +
-        'Unsubmitted only. Payment and court submission are disabled.' +
+          'Automation: Unsubmitted only. This app will not pay or submit to court.' +
         (!config.ready && config.issues && config.issues.length
           ? '<br>' + escapeHtml(config.issues.join(' '))
           : '') + '</span></div>';
       const latest = jobs[0];
+      const outcome = latest?.status === 'prepared' ? latest.checkout?.outcome : null;
       document.getElementById('draftPreparationStatus').innerHTML = latest
-        ? '<div class="draft-validation' + (latest.status === 'prepared' ? ' is-ready' : '') + '"><strong>' +
-          escapeHtml(statusLabel(latest.status)) + '</strong><span>' +
+        ? '<div class="draft-validation draft-result' + (outcome?.tone === 'warning' ? ' has-errors' :
+            outcome?.tone === 'success' || outcome?.code === 'unsubmitted' ? ' is-ready' : '') + '"><strong>' +
+          escapeHtml(outcome?.title || statusLabel(latest.status)) + '</strong><span>' +
           escapeHtml(latest.temporaryCaseNumber || (latest.status === 'reconciliation_required'
             ? 'Check History > Unsubmitted before another attempt.'
             : latest.status === 'running' ? 'Preparing documents in MiFILE.'
             : latest.status === 'failed' ? latest.errorMessage || 'Open Activity for details.' : 'Unsubmitted preparation')) +
-          '</span><button type="button" data-show-preparation>View activity</button></div>' : '';
+          '</span>' + (outcome ? '<p>' + escapeHtml(outcome.message) + '</p>' +
+            (outcome.checkedAt ? '<span>Last checked: ' + escapeHtml(fmtDate(outcome.checkedAt)) + (outcome.fresh ? '' : ' · Refresh needed') + '</span>' : '') +
+            (outcome.filedDocuments || outcome.rejectedDocuments ? '<span>Filed documents: ' + outcome.filedDocuments + ' / ' + outcome.expectedDocuments +
+              ' · Rejected documents: ' + outcome.rejectedDocuments + '</span>' : '') : '') +
+          '<button type="button" data-show-preparation>View activity</button></div>' : '';
       const progressButton = document.querySelector('[data-show-preparation]');
       if (progressButton) progressButton.onclick = () => setDraftSection('activity', true);
       if (!jobs.length) {
@@ -4933,6 +4963,7 @@ const html = String.raw`<!doctype html>
             .catch(showDraftError);
         });
       });
+      updateDraftPreparationButton();
       renderIcons();
     }
 
@@ -4979,6 +5010,7 @@ const html = String.raw`<!doctype html>
       } else {
         renderDraftFilingJobs();
       }
+      refreshPreparedReceiptStatus().catch(() => {});
     }
 
     async function queueDraftFiling(isRetry) {
@@ -5100,12 +5132,12 @@ const html = String.raw`<!doctype html>
                   icon('arrow-right') + '</button></div>').join('') + '</div></div>';
           }).join('') +
           (errorCount ? '' : '<span>Required checks passed. Review the notes before confirming the package.</span>') + '</div>';
+      } else if (draft.status === 'filing_prepared') {
+        validationRoot.innerHTML = '';
       } else {
         validationRoot.innerHTML = '<div class="draft-validation is-ready">' +
           '<div class="draft-validation-row">' + icon('circle-check') +
-          '<span>' + escapeHtml(draft.status === 'filing_prepared'
-            ? 'Package saved in MiFILE Unsubmitted.'
-            : draft.manualPackage ? 'Custom package is ready for confirmation.'
+          '<span>' + escapeHtml(draft.manualPackage ? 'Custom package is ready for confirmation.'
             : 'Landlord-tenant package passed validation.') +
           '</span></div></div>';
       }
@@ -7367,6 +7399,7 @@ const html = String.raw`<!doctype html>
 export interface CreateAdminServerOptions {
     handleSignals?: boolean;
     closeDatabaseOnShutdown?: boolean;
+    filingWorkerAvailable?: () => boolean;
 }
 
 export function createAdminServer(
@@ -7379,6 +7412,9 @@ export function createAdminServer(
 
     const db = getWorkflowDatabase();
     let syncTimer: NodeJS.Timeout | null = null;
+    const automaticStatusRefreshAvailable = () => options.filingWorkerAvailable?.() === true &&
+        !['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase()) &&
+        !['false','0','no','off'].includes((process.env.MIFILE_FILING_WORKER_ENABLED || 'true').toLowerCase());
 
     loadLegacyProcessed()
         .then(state => {
@@ -7425,6 +7461,7 @@ export function createAdminServer(
                         accountEnvironment: mifileConfig.accountEnvironment,
                         preparationMode: mifileConfig.preparationMode,
                         ready: mifileConfig.ready,
+                        automaticStatusRefreshEnabled: automaticStatusRefreshAvailable(),
                     },
                 });
                 return;
@@ -7785,7 +7822,7 @@ export function createAdminServer(
             const checkoutMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/checkout\/([^/]+)$/);
             if (req.method === 'POST' && checkoutMatch) {
                 const action = checkoutMatch[2];
-                if (!['inspect','confirm','receipts','payment-method','clear-method'].includes(action)) {
+                if (!['inspect','confirm','receipts','payment-method','clear-method','refresh-status'].includes(action)) {
                     sendJson(res, 403, {error:'Payment and final court submission are disabled in this release.'});
                     return;
                 }
@@ -7800,7 +7837,11 @@ export function createAdminServer(
                     if (accountTestRunning || !getMiFileRuntimeConfig().ready) throw new Error('Verify the MiFILE account and wait for the current account check to finish.');
                     const id = decodeURIComponent(checkoutMatch[1]), account = getCheckoutAccount();
                     if (!db.getFilingJob(id)) { sendJson(res,404,{error:'MiFILE job not found'}); return; }
-                    if (action === 'confirm') {
+                    if (action === 'refresh-status') {
+                        if (automaticStatusRefreshAvailable()) {
+                            db.checkout().refreshReceiptsIfDue(id,account);
+                        }
+                    } else if (action === 'confirm') {
                         db.checkout().confirm(id, input, account, process.env.ADMIN_USERNAME || 'admin');
                     } else {
                         if (['false','0','no','off'].includes((process.env.MIFILE_FILING_WORKER_ENABLED || 'true').toLowerCase())) {
@@ -7811,7 +7852,7 @@ export function createAdminServer(
                         if (action === 'clear-method') db.checkout().clearPaymentMethod(id,account,process.env.ADMIN_USERNAME || 'admin');
                         db.checkout().queue(id, action === 'receipts' ? 'receipts' : 'quote', account);
                     }
-                    sendJson(res, action === 'confirm' ? 200 : 202, db.checkout().state(id,account));
+                    sendJson(res, ['confirm','refresh-status'].includes(action) ? 200 : 202, db.checkout().state(id,account));
                 } catch (error) { sendJson(res,409,{error:(error as Error).message}); }
                 return;
             }

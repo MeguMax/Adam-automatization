@@ -85,6 +85,13 @@ export async function runFilingWorker(options: {
                 debugArtifactPath: result.screenshotPath,
             });
             console.log(`MiFILE job ${job.id} prepared and saved as an unsubmitted bundle.`);
+            try {
+                if (!['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase())) {
+                    db.checkout().refreshReceiptsIfDue(job.id,getCheckoutAccount());
+                }
+            } catch {
+                console.warn('The initial read-only MiFILE status check could not be queued. The prepared bundle is unchanged.');
+            }
         } catch (error) {
             const filingError = error instanceof MiFileFilingError
                 ? error

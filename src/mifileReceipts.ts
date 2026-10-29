@@ -1,7 +1,7 @@
 import type { FilingJobView } from './database';
 import type { CheckoutAccount, MiFileReceiptObservation, ReceiptStatus } from './mifileCheckout';
 import { usdCents } from './mifilePreparationEvidence';
-import type { Page } from 'playwright';
+import type { Page, APIResponse } from 'playwright';
 import type { CheckoutInspectionResult } from './mifileCheckout';
 import { dismissMifilePreparationNotice } from './mifileSession';
 import { inspectFilingPdf } from './pdfValidation';
@@ -45,14 +45,24 @@ export async function parseMiFileReceiptPdf(buffer: Buffer, job: FilingJobView, 
     return parseMiFileReceiptFields(fields, job, account, kind, receiptUrl);
 }
 
-export async function collectReceiptObservations(page: Page, job: FilingJobView, account: CheckoutAccount): Promise<CheckoutInspectionResult> {
+function exactBundleLink(href: string, bundleId: string): boolean {
+    try {
+        const url = new URL(href);
+        return url.origin === 'https://mifile.courts.michigan.gov' && !url.username && !url.password &&
+            url.pathname.split('/').some(part => decodeURIComponent(part).toLowerCase() === bundleId.toLowerCase());
+    } catch { return false; }
+}
+
+export async function collectReceiptObservations(page: Page, job: FilingJobView, account: CheckoutAccount,
+    fetchReceipt: (href:string) => Promise<Pick<APIResponse,'ok'|'headers'|'body'>> = href =>
+        page.request.get(href,{maxRedirects:0,timeout:30_000})): Promise<CheckoutInspectionResult> {
     const checkedAt = new Date().toISOString();
     if (!job.externalBundleId || typeof job.result?.url !== 'string') throw new Error('The saved bundle reference is missing.');
     const url = new URL(job.result.url);
     if (url.origin !== 'https://mifile.courts.michigan.gov' || url.username || url.password || url.search || url.hash ||
         url.pathname !== '/filing/create/' + job.externalBundleId) throw new Error('The saved MiFILE reference is not trusted.');
     await page.goto(url.href, {waitUntil:'domcontentloaded'});
-    await page.locator('#documentTable').waitFor({state:'visible',timeout:15_000}).catch(() => {});
+    if (page.url() === url.href) await page.locator('#documentTable').waitFor({state:'visible',timeout:15_000}).catch(() => {});
     await dismissMifilePreparationNotice(page);
     if (page.url() === url.href && await page.locator('#documentTable').isVisible() &&
         await page.getByRole('button',{name:'Save Progress',exact:true}).isVisible() &&
@@ -78,11 +88,14 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     await history.getByRole('button',{name:'Search',exact:true}).click();
     await history.getByText('Please wait...', {exact:true}).waitFor({state:'hidden'});
     if (!(await page.getByRole('banner').innerText()).toLowerCase().includes(account.username)) throw new Error('MiFILE history account could not be verified.');
-    const linkedRows = history.locator('tr').filter({has:history.locator('a[href*="' + job.externalBundleId + '"]')});
+    const linkedRows = history.locator('tr').filter({has:page.locator('a[href*="' + job.externalBundleId + '" i]')});
     const count = await linkedRows.count();
     const observations: MiFileReceiptObservation[] = [];
+    let receiptErrors = 0;
     for (let index = 0; index < count; index++) {
         const row = linkedRows.nth(index);
+        const rowLinks = await row.getByRole('link').evaluateAll(elements => elements.map(element => (element as HTMLAnchorElement).href));
+        if (!rowLinks.some(link => exactBundleLink(link,job.externalBundleId!))) continue;
         const cells = await row.locator('td').allTextContents();
         const statuses = cells.map(parseReceiptStatus).filter((status): status is ReceiptStatus => status !== null);
         if (statuses.length !== 1) continue;
@@ -92,21 +105,22 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
         const links = await row.getByRole('link').evaluateAll(elements => elements.filter(element =>
             /receipt/i.test((element as HTMLElement).innerText)).map(element => (element as HTMLAnchorElement).href));
         for (const link of links.slice(0,10)) {
-            const receiptUrl = new URL(link);
-            if (receiptUrl.origin !== url.origin || receiptUrl.username || receiptUrl.password) continue;
-            const response = await page.request.get(receiptUrl.href,{maxRedirects:0,timeout:30_000});
-            if (!response.ok() || !response.headers()['content-type']?.includes('application/pdf') ||
-                Number(response.headers()['content-length'] || 0) > 5*1024*1024) continue;
-            const content = await response.body();
-            if (content.length > 5*1024*1024) continue;
             try {
+                const receiptUrl = new URL(link);
+                if (receiptUrl.origin !== url.origin || receiptUrl.username || receiptUrl.password) throw new Error('Untrusted receipt');
+                const response = await fetchReceipt(receiptUrl.href);
+                if (!response.ok() || !response.headers()['content-type']?.includes('application/pdf') ||
+                    Number(response.headers()['content-length'] || 0) > 5*1024*1024) throw new Error('Unreadable receipt');
+                const content = await response.body();
+                if (content.length > 5*1024*1024) throw new Error('Oversized receipt');
                 observations.push(await parseMiFileReceiptPdf(content,job,account,
                     statuses[0] === 'Refunded' ? 'refund' : 'payment',receiptUrl.href));
-            } catch { /* Unknown receipt layouts remain unverified, never inferred from a Paid label. */ }
+            } catch { receiptErrors++; /* Preserve the observed status even when its receipt cannot be fetched. */ }
         }
     }
     return {kind:'receipts',observations,state:observations.length ? 'found' : 'inconclusive',checkedAt,
-        issue:observations.some(item => item.kind === 'payment' || item.kind === 'refund') ? null : observations.length ?
+        issue:receiptErrors ? 'Some receipt links could not be verified. Reported statuses are retained; check MiFILE before any payment retry.' :
+            observations.some(item => item.kind === 'payment' || item.kind === 'refund') ? null : observations.length ?
             'Status observed. An exact transaction receipt has not been verified; check MiFILE Status Updates.' :
             'The bundle could not be matched to a receipt with an exact reference. Check MiFILE History before any payment retry.'};
 }

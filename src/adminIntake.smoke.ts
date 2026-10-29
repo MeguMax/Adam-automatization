@@ -18,6 +18,7 @@ async function main() {
         USER_EMAIL: 'intake@example.com', ONEDRIVE_ROOT_SHARE_URL: 'https://onedrive.example/root',
         WORKFLOW_DB_PATH: path.join(directory, 'workflow.sqlite'), ADMIN_SYNC_ENABLED: 'false',
         MIFILE_FILING_DEBUG_DIR: path.join(directory, 'mifile-debug'),
+        MIFILE_AUTO_STATUS_REFRESH_ENABLED:'false',
         ADMIN_USERNAME: 'qa', ADMIN_PASSWORD: 'qa-admin-only',
         MIFILE_USER: 'alternate@example.com', MIFILE_PASSWORD: 'qa-mifile-only',
         MIFILE_CREDENTIALS_KEY: 'ab'.repeat(32), NODE_ENV: 'test',
@@ -102,7 +103,7 @@ async function main() {
     db.markEmailProcessed(notificationEmail.id);
     db.refreshCaseDraftValidation(notificationDraftId);
     const { createAdminServer } = require('./adminServer') as typeof import('./adminServer');
-    const server = createAdminServer(0, { handleSignals: false, closeDatabaseOnShutdown: false });
+    const server = createAdminServer(0, { handleSignals: false, closeDatabaseOnShutdown: false, filingWorkerAvailable:()=>true });
     await once(server, 'listening');
     const port = (server.address() as { port: number }).port;
     const url = `http://127.0.0.1:${port}`;
@@ -661,7 +662,8 @@ async function main() {
         assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),false);
         await page.screenshot({path:path.join(screenshots,'draft-checkout-missing-payment.png'),fullPage:true});
         await page.locator('#draftReviewTab').click();
-        assert.match(await page.locator('#draftValidationSummary').innerText(), /Package saved in MiFILE Unsubmitted/);
+        assert.equal(await page.locator('#draftValidationSummary').innerText(),'');
+        assert.match(await page.locator('#draftPreparationStatus').innerText(),/MiFILE status not checked/);
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});
         const lockedDocument=db.getDraftDetail(draftId)!.documents.find(doc=>doc.isPrimary)!;
         assert.equal((await context.request.put(`${url}/api/documents/${lockedDocument.id}/content`,{headers:{Origin:url},data:testComplaintFormFixture()})).status(),409);
@@ -714,6 +716,37 @@ async function main() {
             assert.equal(await fresh.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
             await fresh.screenshot({path:path.join(screenshots,'draft-initial-preview-mobile.png'),fullPage:true});
         } finally {await fresh.close();}
+        process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED='true';
+        const automaticResponse=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/refresh-status`,{headers:{Origin:url},data:{}});
+        assert.equal(automaticResponse.status(),200);
+        const automaticCheck=db.checkout().claim()!;
+        assert.equal(automaticCheck.triggerSource,'automatic');assert.equal(automaticCheck.kind,'receipts');
+        db.checkout().complete(automaticCheck.id,{kind:'receipts',state:'unsubmitted',checkedAt:new Date().toISOString(),issue:null,
+            observations:[{bundleId,accountEmail:checkoutAccount.username,kind:'bundle_status',externalReference:bundleId,
+                documentId:null,status:'Unsubmitted',occurredAt:null,observedAt:new Date().toISOString(),totalCents:null,currency:null,
+                receiptUrl:null,source:'mifile_history'}]},checkoutAccount);
+        await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/refresh-status`,{headers:{Origin:url},data:{}});
+        assert.equal(db.checkout().claim(),null);
+        process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED='false';
+        const paidCheck=db.checkout().queue(job.id,'receipts',checkoutAccount);db.checkout().claim();
+        db.checkout().complete(paidCheck.id,{kind:'receipts',state:'found',checkedAt:new Date().toISOString(),issue:null,
+            observations:[{bundleId,accountEmail:checkoutAccount.username,kind:'payment',externalReference:'QA-PAID-ONLY',
+                documentId:null,status:'Paid',occurredAt:null,observedAt:new Date().toISOString(),totalCents:12669,currency:'USD',
+                receiptUrl:'https://mifile.courts.michigan.gov/receipts/qa-only.pdf',source:'mifile_history'}]},checkoutAccount);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('#draftPreparationStatus').innerText(),/Payment receipt verified/);
+        assert.match(await page.locator('#draftNextActionNote').innerText(),/not court acceptance/);
+        assert.ok(!(await page.locator('#draftNextActionNote').innerText()).includes('Nothing has been sent'));
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.filingStatus,'prepared');
+        await page.locator('#draftActivityTab').click();
+        assert.equal(await page.locator('[data-checkout-action="inspect"]').isEnabled(),false);
+        assert.equal(await page.locator('[data-checkout-review] a').getAttribute('href'),'https://mifile.courts.michigan.gov/receipts/qa-only.pdf');
+        await page.locator('#draftReviewTab').click();
+        await page.screenshot({path:path.join(screenshots,'draft-payment-result-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-payment-result-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#settingsTab').click();
         const localForm = db.listLibraryForms().find(form => form.role === 'local')!;
         page.once('dialog', dialog => dialog.accept());

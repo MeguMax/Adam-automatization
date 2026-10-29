@@ -44,16 +44,17 @@ async function main(): Promise<void> {
     }
 
     const port = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
+    const filingWorkerEnabled = isFilingWorkerEnabled();
     const server = createAdminServer(port, {
         handleSignals: false,
         closeDatabaseOnShutdown: false,
+        filingWorkerAvailable: () => filingWorkerEnabled,
     });
     const controller = new AbortController();
     const workerEnabled = isWorkerEnabled();
     const workerPromise = workerEnabled
         ? runWorker({ signal: controller.signal, closeDatabaseOnExit: false })
         : Promise.resolve();
-    const filingWorkerEnabled = isFilingWorkerEnabled();
     const filingWorkerPromise = filingWorkerEnabled
         ? runFilingWorker({ signal: controller.signal })
         : Promise.resolve();

@@ -2565,6 +2565,12 @@ const migrations: Migration[] = [
             account_identity TEXT NOT NULL, created_at TEXT NOT NULL, snapshot_json TEXT NOT NULL
         );`),
     },
+    {
+        version: 31,
+        name: 'readonly_status_refresh_origin',
+        up: db => db.exec(`ALTER TABLE mifile_checkout_inspections ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'manual'
+            CHECK(trigger_source IN ('manual','automatic'));`),
+    },
 ];
 
 export class WorkflowDatabase {

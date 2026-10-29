@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FilingJobView } from './database';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
+import { mifileOutcome } from './mifileOutcome';
 import { checkoutReviewIssues, digest, receiptEventKey, receiptSummary, validateReceipt,
     type CheckoutAccount, type CheckoutInspection, type CheckoutInspectionResult, type CheckoutQuote,
     type MiFileReceiptObservation } from './mifileCheckout';
@@ -68,6 +69,7 @@ export class CheckoutStore {
         let result: CheckoutInspectionResult | null = null;
         if (row?.result_json) { try { result = JSON.parse(String(row.result_json)); } catch { /* Corrupt evidence is never actionable. */ } }
         return row ? { id: String(row.id), filingJobId: String(row.filing_job_id), kind: row.kind as CheckoutInspection['kind'],
+            triggerSource:row.trigger_source === 'automatic' ? 'automatic' : 'manual',
             status: row.status as CheckoutInspection['status'], stage: String(row.stage), accountIdentity: String(row.account_identity),
             createdAt: String(row.created_at), startedAt: row.started_at as string | null, finishedAt: row.finished_at as string | null,
             error: row.result_json && !result ? 'The stored inspection cannot be read. Refresh the check.' : row.error_message as string | null, result } : null;
@@ -85,12 +87,48 @@ export class CheckoutStore {
             const active = this.db.prepare("SELECT id FROM mifile_checkout_inspections WHERE filing_job_id = ? AND status IN ('queued','running')")
                 .get(filingJobId) as { id: string } | undefined;
             if (active) return this.get(active.id)!;
-            const id = randomUUID();
-            this.db.prepare(`INSERT INTO mifile_checkout_inspections
-                (id, filing_job_id, kind, status, account_identity, created_at) VALUES (?, ?, ?, 'queued', ?, ?)`)
-                .run(id, filingJobId, kind, account.identity, new Date().toISOString());
-            this.audit(id, 'checkout_inspection_queued', { filingJobId, kind });
-            return this.get(id)!;
+            return this.insertInspection(filingJobId,kind,account,'manual');
+        });
+    }
+
+    private insertInspection(filingJobId: string, kind: CheckoutInspection['kind'], account: CheckoutAccount,
+        source: CheckoutInspection['triggerSource'], now = Date.now()): CheckoutInspection {
+        const id = randomUUID();
+        this.db.prepare(`INSERT INTO mifile_checkout_inspections
+            (id, filing_job_id, kind, status, account_identity, created_at, trigger_source) VALUES (?, ?, ?, 'queued', ?, ?, ?)`)
+            .run(id,filingJobId,kind,account.identity,new Date(now).toISOString(),source);
+        this.audit(id,'checkout_inspection_queued',{filingJobId,kind,source});
+        return this.get(id)!;
+    }
+
+    private pruneAutomaticHistory(filingJobId: string): void {
+        this.db.prepare(`DELETE FROM mifile_checkout_inspections WHERE filing_job_id = ? AND kind = 'receipts'
+            AND trigger_source = 'automatic' AND status IN ('completed','failed') AND id NOT IN (
+                SELECT id FROM mifile_checkout_inspections WHERE filing_job_id = ? AND kind = 'receipts'
+                AND trigger_source = 'automatic' AND status IN ('completed','failed')
+                ORDER BY created_at DESC, rowid DESC LIMIT 10)`)
+            .run(filingJobId,filingJobId);
+    }
+
+    refreshReceiptsIfDue(filingJobId: string, account: CheckoutAccount, now = Date.now()): CheckoutInspection | null {
+        return this.transaction(() => {
+            const job = this.getFilingJob(filingJobId), checks = job && filingReleaseChecks(job,account);
+            if (!checks?.sameAccount || !checks.primaryAccountConfirmed || checks.testOnly) return null;
+            if (this.db.prepare(`SELECT 1 FROM mifile_checkout_inspections WHERE filing_job_id = ? AND status IN ('queued','running')`)
+                .get(filingJobId)) return null;
+            const rows = this.db.prepare(`SELECT id FROM mifile_checkout_inspections WHERE filing_job_id = ?
+                AND account_identity = ? AND kind = 'receipts' ORDER BY created_at DESC, rowid DESC LIMIT 5`)
+                .all(filingJobId,account.identity) as Array<{id:string}>;
+            const recent = rows.map(row => this.get(row.id)!);
+            const failures = recent.findIndex(item => item.status === 'completed' && item.result?.kind === 'receipts' && item.result.state !== 'inconclusive');
+            const consecutiveFailures = failures < 0 ? recent.length : failures;
+            const delayMs = Math.min(60,5 * 2 ** consecutiveFailures) * 60_000;
+            const latestAt = recent[0] ? Date.parse(recent[0].finishedAt || recent[0].createdAt) : null;
+            if (latestAt !== null && (!Number.isFinite(latestAt) || now - latestAt < delayMs)) return null;
+            const backlog = this.db.prepare(`SELECT count(*) AS n FROM mifile_checkout_inspections
+                WHERE trigger_source = 'automatic' AND status IN ('queued','running')`).get() as {n:number};
+            if (backlog.n >= 5) return null;
+            return this.insertInspection(filingJobId,'receipts',account,'automatic',now);
         });
     }
 
@@ -98,7 +136,9 @@ export class CheckoutStore {
         return this.transaction(() => {
             if (this.db.prepare("SELECT 1 FROM filing_jobs WHERE status = 'running' LIMIT 1").get() ||
                 this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status = 'running' LIMIT 1").get()) return null;
-            const row = this.db.prepare("SELECT id FROM mifile_checkout_inspections WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1")
+            const row = this.db.prepare(`SELECT id FROM mifile_checkout_inspections WHERE status = 'queued'
+                AND (trigger_source = 'manual' OR NOT EXISTS(SELECT 1 FROM filing_jobs WHERE status = 'queued'))
+                ORDER BY CASE trigger_source WHEN 'manual' THEN 0 ELSE 1 END, created_at, rowid LIMIT 1`)
                 .get() as { id: string } | undefined;
             if (!row) return null;
             this.db.prepare("UPDATE mifile_checkout_inspections SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'")
@@ -164,6 +204,7 @@ export class CheckoutStore {
             this.audit(id, 'checkout_inspection_completed', { filingJobId: job.id, kind: result.kind,
                 paymentAttempted: false, courtSubmissionAttempted: false });
             this.recordPreflight(job.id,account);
+            this.pruneAutomaticHistory(job.id);
         });
     }
 
@@ -173,6 +214,7 @@ export class CheckoutStore {
         this.db.prepare("UPDATE mifile_checkout_inspections SET status = 'failed', stage = 'failed', finished_at = ?, error_message = ? WHERE id = ?")
             .run(new Date().toISOString(), error.slice(0, 1200), id);
         this.audit(id, 'checkout_inspection_failed', { filingJobId: inspection.filingJobId, kind: inspection.kind });
+        this.pruneAutomaticHistory(inspection.filingJobId);
     }
 
     state(filingJobId: string, account: CheckoutAccount, now = Date.now()) {
@@ -217,7 +259,7 @@ export class CheckoutStore {
         const publicQuote = quote && !issues.includes('The stored checkout snapshot is invalid.')
             ? (({ accountIdentity: privateIdentity, paymentMethodFingerprint: privateMethod, ...rest }) => rest)(quote) : null;
         const last = inspections[0];
-        const receiptCheck = inspections.find(item => item.kind === 'receipts');
+        const receiptCheck = inspections.find(item => item.kind === 'receipts' && item.accountIdentity === account.identity);
         const receiptResult = receiptCheck?.status === 'completed' && receiptCheck.result?.kind === 'receipts' ? receiptCheck.result : null;
         const recentUnsubmitted = receiptResult?.state === 'unsubmitted' &&
             Number.isFinite(Date.parse(receiptResult.checkedAt)) && Date.parse(receiptResult.checkedAt) <= now &&
@@ -240,6 +282,7 @@ export class CheckoutStore {
                 startedAt: last.startedAt, finishedAt: last.finishedAt, error: last.error } : null,
             active: Boolean(active), quote: publicQuote, issues,
             canConfirm: Boolean(quote && !issues.length),
+            canInspect:Boolean(job && filingReleaseChecks(job,account).sameAccount && !summary.submissionObserved && !receiptEvidenceInvalid),
             confirmedAt: reviewedAt,
             checkoutVerified: Boolean(quote && job && latestQuote?.id === quoteInspection?.id &&
                 issues.every(issue => /^(Add a payment method|Select the intended payment method)/.test(issue))),
@@ -248,6 +291,9 @@ export class CheckoutStore {
             preflight:{checks:preflightChecks,complete:preflightChecks.every(check=>check.passed),
                 recordedAt:preflightChecks.every(check=>check.passed) ? preflight?.created_at || null : null,
                 executionEnabled:false as const},
+            outcome:mifileOutcome(receipts,job?.payload?.documents.map(document => document.id) || [],receiptCheck ? {
+                status:receiptCheck.status,state:receiptResult?.state || null,checkedAt:receiptResult?.checkedAt || null,
+            } : null,receiptEvidenceInvalid,now),
             receipts, receiptSummary:summary, receiptCheckState: receiptResult?.state || null,
             receiptCheckIssue: quote && receipts.some(receipt => receipt.kind === 'payment' && receipt.status === 'Paid' && receipt.totalCents !== quote.totalCents)
                 ? 'The payment receipt amount differs from the reviewed checkout quote. Check MiFILE; do not retry payment.' : receiptResult?.issue || null,

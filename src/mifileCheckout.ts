@@ -69,6 +69,7 @@ export interface CheckoutInspection {
     id: string;
     filingJobId: string;
     kind: 'quote' | 'receipts';
+    triggerSource: 'manual' | 'automatic';
     status: 'queued' | 'running' | 'completed' | 'failed';
     stage: string;
     accountIdentity: string;
