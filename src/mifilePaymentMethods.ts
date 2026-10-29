@@ -34,7 +34,7 @@ async function paymentOptions(page: Page) {
     if (usable.length > 20 || new Set(fingerprints).size !== fingerprints.length) {
         throw new Error('MiFILE shows ambiguous payment account controls. No account was selected.');
     }
-    return {dialog, group, usable, methods:usable.map(control => {
+    return {dialog, group, controls, usable, methods:usable.map(control => {
         const fingerprint = digest(control.token);
         return {fingerprint, label:safePaymentLabel(control.text, fingerprint)};
     })};
@@ -47,8 +47,13 @@ export async function readPaymentMethods(page: Page): Promise<{
     const snapshot = await paymentOptions(page);
     const selected = snapshot.usable.filter(control => control.selected);
     if (selected.length > 1) throw new Error('MiFILE shows more than one selected payment account. Check checkout manually.');
-    const missing = (await snapshot.dialog.innerText()).includes('No payment methods exist for your account');
+    const emptyAccountPanel = !snapshot.controls.length &&
+        (await snapshot.group.innerText()).replace(/\s+/g,' ').trim() === 'Available Payment Accounts Add Payment Account';
+    const missing = emptyAccountPanel || (await snapshot.dialog.innerText()).includes('No payment methods exist for your account');
     if (missing && snapshot.usable.length) throw new Error('MiFILE payment account information is inconsistent. Refresh checkout.');
+    if (!missing && !snapshot.usable.length) {
+        throw new Error('MiFILE payment accounts are not readable yet. Check checkout again or inspect the payment account in MiFILE. No payment was attempted.');
+    }
     return {state:missing ? 'missing' : selected.length === 1 ? 'selected' : 'not_selected',
         fingerprint:selected.length === 1 ? digest(selected[0].token) : null, available:snapshot.methods};
 }

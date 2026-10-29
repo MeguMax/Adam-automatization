@@ -650,6 +650,16 @@ async function main() {
         db.checkout().fail(clearInspection.id,'QA refresh interrupted; nothing charged');
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),false);
+        const emptyInspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
+        const emptyQuote=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
+            ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
+            {state:'missing',fingerprint:null,available:[]},packageDigest,10300);
+        db.checkout().complete(emptyInspection.id,{kind:'quote',quote:emptyQuote},checkoutAccount);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('[data-checkout-review]').innerText(),/No saved account visible in MiFILE checkout/);
+        assert.equal(await page.locator('#checkoutPaymentMethod').count(),0);
+        assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),false);
+        await page.screenshot({path:path.join(screenshots,'draft-checkout-missing-payment.png'),fullPage:true});
         await page.locator('#draftReviewTab').click();
         assert.match(await page.locator('#draftValidationSummary').innerText(), /Package saved in MiFILE Unsubmitted/);
         await page.screenshot({path:path.join(screenshots,'draft-prepared-desktop.png'),fullPage:true});

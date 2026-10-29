@@ -276,7 +276,34 @@ test('unknown, duplicate, contradictory and multiple selected payment controls f
         }
         await page.setContent(`<div role="dialog"><h2>Checkout</h2><fieldset><legend>Available Payment Accounts</legend>
             <select disabled><option value="${accountTokenA}">Card ending 1234</option></select></fieldset></div>`);
-        assert.deepEqual((await readPaymentMethods(page)).available,[]);
+        await assert.rejects(readPaymentMethods(page),/not readable/);
+    }finally{await page.close();}
+});
+
+test('the live empty payment panel is missing, not an unselected account, and never clicks Add',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent(`<fieldset aria-label="Available Payment Accounts"><div>Available Payment Accounts</div>
+            <button onclick="window.added=true">Add Payment Account</button></fieldset>`);
+        // The vendor nests this exact empty fieldset inside its Checkout dialog.
+        await page.setContent(`<div role="dialog"><h2>Checkout</h2>${await page.locator('fieldset').evaluate(el=>el.outerHTML)}</div>`);
+        const result=await readPaymentMethods(page);
+        assert.equal(result.state,'missing');assert.equal(result.fingerprint,null);assert.deepEqual(result.available,[]);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).added)),false);
+    }finally{await page.close();}
+});
+
+test('checkout waits for asynchronously rendered payment controls before recording availability',async()=>{
+    const {readVerifiedCheckoutQuote}=require('./mifileCheckoutRunner') as typeof import('./mifileCheckoutRunner');
+    const page=await browser.newPage(),job=prepared();
+    try {
+        await page.setContent(`<div role="dialog"><h2>Checkout</h2><table aria-label="Fees"><tbody>
+            ${fees.map(row=>'<tr><td>'+row[0]+'</td><td>'+row[1]+'</td></tr>').join('')}</tbody></table>
+            <fieldset><legend>Available Payment Accounts</legend><div id="accounts">Loading</div></fieldset>
+            <script>setTimeout(()=>document.getElementById('accounts').innerHTML=${JSON.stringify(`<label><input type="radio" value="${accountTokenA}">Card ending 1234</label>`)},700)</script></div>`);
+        const result=await readVerifiedCheckoutQuote(page,job,account,{packageDigest:(job.result!.savedBundleEvidence as any).packageDigest,
+            sourceFeeSubtotalCents:10300});
+        assert.equal(result.paymentMethodState,'not_selected');assert.deepEqual(result.availablePaymentMethods,[available[0]]);
     }finally{await page.close();}
 });
 

@@ -187,7 +187,7 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
         expiresAt <= now || expiresAt - quotedAt !== CHECKOUT_REVIEW_LIFETIME_MS) issues.push('This checkout quote expired. Refresh checkout.');
     if (quote.sourceContentVerified !== true) issues.push('Source PDFs have not been checked against the preparation snapshot.');
     if (quote.totalCents > 0 && (quote.paymentMethodState !== 'selected' || !/^[a-f0-9]{64}$/.test(quote.paymentMethodFingerprint || ''))) {
-        issues.push(quote.paymentMethodState === 'missing' ? 'Add a payment method in MiFILE, then refresh checkout. Nothing has been charged.' :
+        issues.push(quote.paymentMethodState === 'missing' ? 'Add a payment method to this MiFILE login, or make the existing account available there, then refresh checkout. Nothing has been charged.' :
             (quote.availablePaymentMethods?.length ? 'Select the intended payment method below for a new fee check. Nothing has been charged.' :
                 'Select the intended payment method in MiFILE, then refresh checkout. Nothing has been charged.'));
     }

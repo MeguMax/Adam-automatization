@@ -49,14 +49,15 @@ export async function readVerifiedCheckoutQuote(page: Page, job: FilingJobView, 
     let signature = '', stableSince = 0;
     let lastError: unknown = new Error('Checkout fees did not finish loading.');
     do {
-        const snapshot = await readCheckoutForInspection(page);
         try {
+            const snapshot = await readCheckoutForInspection(page);
             const quote = buildCheckoutQuote(job,account,snapshot.rows,snapshot.method,source.packageDigest,source.sourceFeeSubtotalCents);
             const current = digest(snapshot);
-            if (signature === current && Date.now()-stableSince >= 500) return quote;
+            if (signature === current && Date.now()-stableSince >= (snapshot.method.available.length ? 500 : 2_000)) return quote;
             if (signature !== current) { signature=current;stableSince=Date.now(); }
         } catch(error) {
-            if (!(error instanceof Error) || !error.message.includes('does not reconcile')) throw error;
+            if (!(error instanceof Error) || !error.message.includes('does not reconcile') &&
+                !error.message.startsWith('MiFILE payment accounts are not readable yet.')) throw error;
             signature=''; lastError=error;
         }
         await page.waitForTimeout(250);
