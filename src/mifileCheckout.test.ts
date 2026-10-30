@@ -665,6 +665,19 @@ test('receipt checks explicitly open My History when MiFILE initially retains an
     }finally{await page.close();}
 });
 
+test('a zero-height MiFILE history panel does not hide its visible floating form from receipt checks',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        await historyPageFixture(page,job,`<tr><td><a href="/filing/details/${job.externalBundleId}">View</a></td><td>Submitted</td></tr>`,
+            undefined,`<script>document.getElementById('history').style.height='0px'</script>`);
+        const result=await collectReceiptObservations(page,job,account);
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.equal(result.observations[0].status,'Submitted');
+        assert.equal(await page.getByRole('tabpanel',{name:'My History',exact:true}).isVisible(),false);
+        assert.equal(await page.getByRole('textbox',{name:'Start Date:',exact:true}).isVisible(),true);
+    }finally{await page.close();}
+});
+
 test('an unknown receipt PDF retains the observed status but never fabricates a payment receipt',async()=>{
     const page=await browser.newPage(),job=prepared();
     try {

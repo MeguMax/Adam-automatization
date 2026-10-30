@@ -83,7 +83,9 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     await historyTab.waitFor({state:'visible',timeout:90_000});
     if (await historyTab.getAttribute('aria-selected') !== 'true') await historyTab.click();
     const history = page.getByRole('tabpanel', {name:'My History', exact:true});
-    await history.waitFor({state:'visible',timeout:90_000});
+    await history.waitFor({state:'attached',timeout:90_000});
+    // MiFILE's floating history form can be visible outside a zero-height panel.
+    await history.getByRole('textbox',{name:'Start Date:',exact:true}).waitFor({state:'visible',timeout:90_000});
     const date = new Date(job.createdAt);
     if (!Number.isFinite(date.getTime())) throw new Error('The preparation date is invalid. Check MiFILE History manually.');
     date.setDate(date.getDate()-1);
