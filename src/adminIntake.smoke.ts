@@ -751,6 +751,24 @@ async function main() {
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
         await page.screenshot({path:path.join(screenshots,'draft-payment-result-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
+        const rejectedCheck=db.checkout().queue(job.id,'receipts',checkoutAccount);db.checkout().claim();
+        db.checkout().complete(rejectedCheck.id,{kind:'receipts',state:'found',checkedAt:new Date().toISOString(),issue:null,
+            observations:[{bundleId,accountEmail:checkoutAccount.username,kind:'filing_status',externalReference:'QA-REJECTED-DOC',
+                documentId:job.payload!.documents[0].id,status:'Rejected',occurredAt:null,observedAt:new Date().toISOString(),totalCents:null,currency:null,
+                receiptUrl:null,source:'mifile_history',message:'Missing Demand <img src=x onerror=alert(1)>'}]},checkoutAccount);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('#draftNextActionNote').innerText(),/Missing Demand/);
+        await page.locator('#draftActivityTab').click();
+        assert.match(await page.locator('[data-checkout-review]').innerText(),/Missing Demand <img src=x onerror=alert\(1\)>/);
+        assert.match(await page.locator('[data-checkout-review]').innerText(),new RegExp(job.payload!.documents[0].filingName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')));
+        assert.equal(await page.locator('[data-checkout-review] img').count(),0);
+        assert.equal(await page.locator('[data-checkout-action="inspect"]').isEnabled(),false);
+        await page.locator('[data-checkout-review]').scrollIntoViewIfNeeded();
+        await page.screenshot({path:path.join(screenshots,'draft-rejection-comment-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-rejection-comment-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#settingsTab').click();
         const localForm = db.listLibraryForms().find(form => form.role === 'local')!;
         page.once('dialog', dialog => dialog.accept());

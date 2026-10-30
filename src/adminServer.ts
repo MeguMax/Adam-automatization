@@ -53,7 +53,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-30-scan-payment-review-v81';
+const ADMIN_BUILD_ID = '2026-10-30-scan-payment-review-v82';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4788,8 +4788,10 @@ const html = String.raw`<!doctype html>
         '<span>Receipt check: ' + escapeHtml(checkout.receiptCheckState || 'Not checked') + '</span>' +
         (checkout.receiptCheckIssue ? '<span>' + escapeHtml(checkout.receiptCheckIssue) + '</span>' : '') +
         (checkout.receipts.length ? '<ul>' + checkout.receipts.map(receipt => '<li>' + escapeHtml(receipt.status) +
+          (receipt.documentId ? ' · ' + escapeHtml(job.payload?.documents.find(document => document.id === receipt.documentId)?.filingName || 'Document') : '') +
           (receipt.totalCents !== null ? ' · ' + escapeHtml(money(receipt.totalCents)) : '') +
           ' · ' + escapeHtml(fmtDate(receipt.occurredAt || receipt.observedAt)) +
+          (receipt.message ? '<div>' + escapeHtml(receipt.message) + '</div>' : '') +
           (receipt.receiptUrl ? ' · <a target="_blank" rel="noopener" href="' + escapeHtml(receipt.receiptUrl) + '">Receipt</a>' : '') +
           '</li>').join('') + '</ul>' : '<span>No verified payment receipt recorded.</span>') +
         (checkout.preflight ? '<strong>Submission preflight</strong><ul class="checkout-preflight">' + checkout.preflight.checks.map(check =>

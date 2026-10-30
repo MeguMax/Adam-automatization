@@ -1,6 +1,6 @@
 import type { FilingJobView } from './database';
 import type { CheckoutAccount, MiFileReceiptObservation, ReceiptStatus } from './mifileCheckout';
-import { usdCents } from './mifilePreparationEvidence';
+import { filingReleaseChecks, isRequiredMiFileFiler, usdCents } from './mifilePreparationEvidence';
 import type { Page, APIResponse } from 'playwright';
 import type { CheckoutInspectionResult } from './mifileCheckout';
 import { dismissMifilePreparationNotice, matchesMiFileAccountHeader } from './mifileSession';
@@ -53,6 +53,45 @@ function exactBundleLink(href: string, bundleId: string): boolean {
     } catch { return false; }
 }
 
+export function parseExpandedBundleHistory(bundleCells: string[], rows: Array<{cells:string[]; message:string | null}>,
+    job: FilingJobView, account: CheckoutAccount, checkedAt = new Date().toISOString()): MiFileReceiptObservation[] {
+    const clean = (value:string) => value.trim().replace(/\s+/g,' ');
+    const bundle = bundleCells.map(clean), checks = filingReleaseChecks(job,account);
+    if (!checks.savedBundleVerified || !checks.sameAccount || !job.payload || !job.externalBundleId ||
+        !/^TEMP-[A-Z0-9]+$/i.test(job.temporaryCaseNumber || '') || bundle.length !== 7 ||
+        !/^\d{6,16}$/.test(bundle[1]) || bundle[2] !== job.payload.courtName ||
+        bundle[3] !== job.temporaryCaseNumber || !isRequiredMiFileFiler(bundle[5])) return [];
+    const documents = new Map(job.payload.documents.map(document => [document.filingName,document]));
+    if (documents.size !== job.payload.documents.length) return [];
+    const found = new Set<string>(), systemRows = new Set<string>(), observations:MiFileReceiptObservation[] = [];
+    for (const row of rows) {
+        const cells = row.cells.map(clean);
+        if (cells.length !== 9 || cells[1] !== bundle[2] || cells[2] !== bundle[3] ||
+            !isRequiredMiFileFiler(cells[6])) return [];
+        const status = parseReceiptStatus(cells[8]);
+        if (!status) return [];
+        const document = documents.get(cells[3]);
+        const systemForm = cells[3] === 'Case Initiation Form' && cells[4] === 'ISI_CASE_INIT_FORM_DT';
+        const mailingFee = cells[3] === 'Mailing Fee' && cells[4] === 'Mailing Fee';
+        if (!document && !systemForm && !mailingFee) return [];
+        if (!document) {
+            if (systemRows.has(cells[3])) return [];
+            systemRows.add(cells[3]);
+        }
+        if (document) {
+            const expectedType = document.filingRelation === 'connected_to_complaint' ? 'CONNECTED FILING' : document.filingType;
+            if (found.has(document.id) || cells[4] !== expectedType) return [];
+            found.add(document.id);
+        }
+        const message = row.message ? clean(row.message).slice(0,1500) : null;
+        observations.push({bundleId:job.externalBundleId,accountEmail:account.username.trim().toLowerCase(),
+            kind:document ? 'filing_status' : 'bundle_status',documentId:document?.id || null,status,
+            externalReference:'bundle-index:' + bundle[1] + ':' + (document?.id || (systemForm ? 'initiation' : 'mailing')),
+            occurredAt:null,observedAt:checkedAt,totalCents:null,currency:null,receiptUrl:null,source:'mifile_history',message});
+    }
+    return found.size === documents.size && systemRows.has('Case Initiation Form') ? observations : [];
+}
+
 export async function collectReceiptObservations(page: Page, job: FilingJobView, account: CheckoutAccount,
     fetchReceipt: (href:string) => Promise<Pick<APIResponse,'ok'|'headers'|'body'>> = href =>
         page.request.get(href,{maxRedirects:0,timeout:30_000}), progress: (stage:string)=>void = ()=>{}): Promise<CheckoutInspectionResult> {
@@ -96,21 +135,23 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     await history.getByRole('button',{name:'Search',exact:true}).click();
     const waitForHistory = () => history.getByText('Please wait...', {exact:true}).waitFor({state:'hidden',timeout:90_000});
     await waitForHistory();
+    await history.locator('#searchResultsStatus').filter({hasText:'Search complete.'}).waitFor({state:'attached',timeout:90_000});
     if (!await matchesMiFileAccountHeader(page,account.username)) throw new Error('MiFILE history account could not be verified.');
     const view = history.locator('#historyViewTypeSelect');
-    if (await view.count() && await view.isVisible()) {
-        await view.selectOption({label:'Bundle View'});
-        await waitForHistory();
-    }
+    await view.waitFor({state:'visible',timeout:90_000});
+    await view.selectOption({label:'Bundle View'});
+    await waitForHistory();
+    const table = history.locator('#bundleHistoryTable');
+    await table.waitFor({state:'visible',timeout:90_000});
     const observations: MiFileReceiptObservation[] = [];
     let receiptErrors = 0;
     const seenPages = new Set<string>(), deadline = Date.now()+120_000;
     for (let pageIndex=0;pageIndex<100 && Date.now()<deadline;pageIndex++) {
         progress('reading_history_rows');
-        const signature = JSON.stringify(await history.locator('tbody').allTextContents());
+        const signature = JSON.stringify(await table.locator('tbody').allTextContents());
         if (seenPages.has(signature)) throw new Error('MiFILE History did not advance to another page. Check the existing bundle manually; do not retry payment.');
         seenPages.add(signature);
-        const linkedRows = history.locator('tr').filter({visible:true,has:page.locator('a[href*="' + job.externalBundleId + '" i]')});
+        const linkedRows = table.locator('tr').filter({visible:true,has:page.locator('a[href*="' + job.externalBundleId + '" i]')});
         const count = await linkedRows.count();
         for (let index = 0; index < count; index++) {
             const row = linkedRows.nth(index);
@@ -139,8 +180,30 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
                 } catch { receiptErrors++; /* Preserve the observed status even when its receipt cannot be fetched. */ }
             }
         }
+        // Current Bundle View exposes expandable rows, not bundle hyperlinks. A saved TEMP number,
+        // exact court/filer and the complete pinned PDF manifest must agree before using those statuses.
+        const expandable = table.locator(':scope > tbody > tr[role="button"]');
+        for (let index=0;index<await expandable.count();index++) {
+            const row = expandable.nth(index), cells = await row.locator(':scope > td').allTextContents();
+            if (cells.length !== 7 || cells[2].trim() !== job.payload?.courtName ||
+                cells[3].trim() !== job.temporaryCaseNumber || !isRequiredMiFileFiler(cells[5])) continue;
+            progress('reading_history_rows');
+            if (await row.getAttribute('aria-expanded') !== 'true') await row.click();
+            const details = row.locator('xpath=following-sibling::tr[1]').locator('#historyTable');
+            await details.waitFor({state:'visible',timeout:90_000});
+            const length = details.locator('..').locator('select[aria-controls="historyTable"]');
+            if (await length.count() === 1) await length.selectOption('25');
+            const readRows = () => details.locator(':scope > tbody > tr[role="button"]').evaluateAll(elements => elements.map(element => ({
+                cells:[...element.querySelectorAll(':scope > td')].map(cell => (cell as HTMLElement).innerText),
+                message:element.nextElementSibling?.classList.contains('child') ? (element.nextElementSibling as HTMLElement).innerText : null,
+            })));
+            const rows = await readRows();
+            const next = details.locator('..').getByRole('button',{name:'Next page',exact:true});
+            if (await next.count() === 1 && await next.isEnabled()) continue;
+            observations.push(...parseExpandedBundleHistory(cells,rows,job,account,checkedAt));
+        }
         if (observations.length) break;
-        const next = history.getByRole('button',{name:'Next page',exact:true});
+        const next = history.getByRole('button',{name:'Next page',exact:true}).filter({visible:true});
         if (await next.count() !== 1 || !await next.isEnabled() || await next.getAttribute('aria-disabled') === 'true') break;
         progress('waiting_for_history');
         await next.click();

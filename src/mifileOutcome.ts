@@ -34,6 +34,8 @@ export function mifileOutcome(observations: MiFileReceiptObservation[], document
     } else if (rejectedCount || latestBundleStatus === 'Rejected') {
         code = 'rejected'; title = 'Court rejection reported'; tone = 'warning';
         message = 'Review the rejection in MiFILE. A rejection does not prove a refund; do not pay or file again automatically.';
+        const reason = [...observations].reverse().find(item => item.status === 'Rejected' && item.message)?.message;
+        if (reason) message = 'MiFILE: ' + reason + ' Check the filing and refund in MiFILE before any retry.';
     } else if (expected.size && filedCount === expected.size) {
         code = 'filed'; title = 'All documents reported filed'; tone = 'success';
         message = 'MiFILE reported Filed for every expected document. Review the official court record in MiFILE.';

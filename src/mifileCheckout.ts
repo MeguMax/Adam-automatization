@@ -63,6 +63,7 @@ export interface MiFileReceiptObservation {
     currency: 'USD' | null;
     receiptUrl: string | null;
     source: 'mifile_history';
+    message?: string | null;
 }
 
 export interface CheckoutInspection {
@@ -188,10 +189,10 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
         expiresAt <= now || expiresAt - quotedAt !== CHECKOUT_REVIEW_LIFETIME_MS) issues.push('This checkout quote expired. Refresh checkout.');
     if (quote.sourceContentVerified !== true) issues.push('Source PDFs have not been checked against the preparation snapshot.');
     if (quote.totalCents > 0 && (quote.paymentMethodState !== 'selected' || !/^[a-f0-9]{64}$/.test(quote.paymentMethodFingerprint || ''))) {
-        issues.push(quote.paymentMethodState === 'unverified' ? 'Verify the payment account directly in MiFILE. The Add Payment Account button alone does not mean a linked card is missing. Nothing has been charged.' :
-            quote.paymentMethodState === 'missing' ? 'Verify the payment account directly in MiFILE. This quote did not verify an account; it does not prove a linked card is absent. Add another account only if needed in MiFILE. Nothing has been charged.' :
-            (quote.availablePaymentMethods?.length ? 'Select the intended payment method below for a new fee check. Nothing has been charged.' :
-                'Select the intended payment method in MiFILE, then refresh checkout. Nothing has been charged.'));
+        issues.push(quote.paymentMethodState === 'unverified' ? 'Verify the payment account directly in MiFILE. The Add Payment Account button alone does not mean a linked card is missing. This app did not attempt a charge.' :
+            quote.paymentMethodState === 'missing' ? 'Verify the payment account directly in MiFILE. This quote did not verify an account; it does not prove a linked card is absent. Add another account only if needed in MiFILE. This app did not attempt a charge.' :
+            (quote.availablePaymentMethods?.length ? 'Select the intended payment method below for a new fee check. This app did not attempt a charge.' :
+                'Select the intended payment method in MiFILE, then refresh checkout. This app did not attempt a charge.'));
     }
     return issues;
 }
@@ -205,7 +206,9 @@ export function validateReceipt(observation: MiFileReceiptObservation, job: Fili
         !receiptStatuses.has(observation.status) || !observation.externalReference || observation.externalReference.length > 200 ||
         !Number.isFinite(Date.parse(observation.observedAt)) ||
         (observation.occurredAt !== null && !Number.isFinite(Date.parse(observation.occurredAt))) ||
-        !['bundle_status', 'filing_status', 'payment', 'refund'].includes(observation.kind)) throw new Error('Receipt identity or status could not be verified.');
+        !['bundle_status', 'filing_status', 'payment', 'refund'].includes(observation.kind) ||
+        observation.message != null && (typeof observation.message !== 'string' || observation.message.length > 1500 ||
+            /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(observation.message))) throw new Error('Receipt identity or status could not be verified.');
     if (observation.documentId !== null && !job.payload?.documents.some(document => document.id === observation.documentId)) {
         throw new Error('The receipt belongs to a different document.');
     }

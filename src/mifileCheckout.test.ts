@@ -8,7 +8,7 @@ import {WorkflowDatabase,type FilingJobView,type FilingPayload} from './database
 import {preparationDigest} from './mifilePreparationEvidence';
 import {buildCheckoutQuote,checkoutReviewIssues,digest,FINAL_MIFILE_ACTIONS_ENABLED,quoteDigest,
     receiptSummary,validateReceipt,type CheckoutAccount,type MiFileReceiptObservation} from './mifileCheckout';
-import {parseMiFileReceiptFields,parseMiFileReceiptPdf,collectReceiptObservations} from './mifileReceipts';
+import {parseMiFileReceiptFields,parseMiFileReceiptPdf,parseExpandedBundleHistory,collectReceiptObservations} from './mifileReceipts';
 import {testPdfFixture} from './testPdfFixture';
 import {readPaymentMethods,selectPaymentMethodForQuote} from './mifilePaymentMethods';
 import {mifileOutcome} from './mifileOutcome';
@@ -601,7 +601,9 @@ async function historyPageFixture(page:import('playwright').Page,job:FilingJobVi
         await route.fulfill({contentType:'text/html',body:`<header>${account.username}</header><main>
             <button role="tab" aria-selected="${!startHidden}" onclick="this.setAttribute('aria-selected','true');document.getElementById('history').hidden=false">My History</button>
             <div id="history" role="tabpanel" aria-label="My History"${startHidden?' hidden':''}><label>Start Date:<input></label><label>End Date:<input></label>
-            <button onclick="window.searched=true">Search</button>${controls}<table><tbody>${rows}</tbody></table></div></main>`});
+            <button onclick="window.searched=true">Search</button><div id="searchResultsStatus">Search complete.</div>
+            ${controls.includes('historyViewTypeSelect') ? '' : '<select id="historyViewTypeSelect"><option>Bundle View</option></select>'}
+            ${controls}<table id="bundleHistoryTable"><tbody>${rows}</tbody></table></div></main>`});
     });
     return async (href:string) => {
         assert.equal(new URL(href).origin,'https://mifile.courts.michigan.gov');
@@ -678,6 +680,79 @@ test('account verification tolerates missing banner semantics but not another lo
         assert.equal(await matchesMiFileAccountHeader(page,account.username),false);
         await page.setContent(`<header>${account.username}</header><header>${account.username}</header>`);
         assert.equal(await matchesMiFileAccountHeader(page,account.username),false);
+    }finally{await page.close();}
+});
+
+test('receipt checks wait for asynchronously mounted history results and scope pagination to visible controls',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        const rows=`<tr><td><a href="/filing/details/${job.externalBundleId}">View</a></td><td>Submitted</td></tr>`;
+        await historyPageFixture(page,job,rows,undefined,`<div hidden><button aria-label="Next page">Next</button></div>
+            <script>const finish=()=>{const table=document.getElementById('bundleHistoryTable');const result=table.cloneNode(true);table.remove();
+                setTimeout(()=>document.getElementById('history').appendChild(result),180)};
+            document.querySelector('button:not([role])').addEventListener('click',finish)</script>`);
+        const result=await collectReceiptObservations(page,job,account);
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.equal(result.observations[0].status,'Submitted');
+    }finally{await page.close();}
+});
+
+function expandedHistoryFixture(job=prepared()) {
+    const bundle=['10/30/2026 at 12:46:15 PM','90000123',job.payload!.courtName,job.temporaryCaseNumber!,'','Devlin, Adam (P72877)','Adam Devlin'];
+    const cells=(name:string,type:string,status:string)=>[bundle[0],bundle[2],bundle[3],name,type,'',bundle[5],bundle[6],status];
+    const rows=[{cells:cells('Case Initiation Form','ISI_CASE_INIT_FORM_DT','Rejected'),message:'Other: Missing Demand / Please resubmit with Demand (QA-100)'},
+        ...job.payload!.documents.map(document=>({cells:cells(document.filingName,
+            document.filingRelation==='connected_to_complaint'?'CONNECTED FILING':document.filingType,'Refunded'),message:'Missing Demand'})),
+        {cells:cells('Mailing Fee','Mailing Fee','Refunded'),message:'Missing Demand'}];
+    return {bundle,rows};
+}
+
+test('expanded bundle history binds exact TEMP, court, filer and complete pinned manifest without inventing a transaction amount',()=>{
+    const job=prepared(),fixture=expandedHistoryFixture(job);
+    const observations=parseExpandedBundleHistory(fixture.bundle,fixture.rows,job,account);
+    assert.equal(observations.length,3);observations.forEach(item=>validateReceipt(item,job,account));
+    assert.equal(observations.find(item=>item.documentId==='doc-1')!.status,'Refunded');
+    assert.ok(observations[0].message!.includes('Missing Demand'));
+    assert.equal(receiptSummary(observations).refundReported,true);
+    assert.equal(receiptSummary(observations).verifiedPaymentReceipt,false);
+    assert.equal(receiptSummary(observations).retryPaymentAllowed,false);
+    assert.equal(mifileOutcome(observations,['doc-1'],{status:'completed',state:'found',checkedAt:new Date().toISOString()}).code,'rejected');
+});
+
+test('expanded history refuses a different case, court, filer, account, changed snapshot, missing or duplicate source PDF',()=>{
+    const job=prepared(),{bundle,rows}=expandedHistoryFixture(job);
+    for(const changed of [[...bundle.slice(0,2),'Other Court',...bundle.slice(3)],
+        [...bundle.slice(0,3),'TEMP-QA-OTHER',...bundle.slice(4)],
+        [...bundle.slice(0,5),'Other Attorney (P99999)',bundle[6]]]) {
+        assert.deepEqual(parseExpandedBundleHistory(changed,rows,job,account),[]);
+    }
+    assert.deepEqual(parseExpandedBundleHistory(bundle,rows,job,{...account,username:'other@example.com'}),[]);
+    assert.deepEqual(parseExpandedBundleHistory(bundle,rows,{...job,payload:{...job.payload!,subject:'changed'}},account),[]);
+    assert.deepEqual(parseExpandedBundleHistory(bundle,rows.filter(row=>row.cells[3]!=='Complaint.pdf'),job,account),[]);
+    assert.deepEqual(parseExpandedBundleHistory(bundle,[...rows,rows[1]],job,account),[]);
+    assert.deepEqual(parseExpandedBundleHistory(bundle,rows.slice(1),job,account),[]);
+    assert.deepEqual(parseExpandedBundleHistory(bundle,[...rows,rows[0]],job,account),[]);
+    for(const index of [1,2,4,6,8]) {
+        const changed=rows.map(row=>({...row,cells:[...row.cells]}));changed[1].cells[index]='Unexpected value';
+        assert.deepEqual(parseExpandedBundleHistory(bundle,changed,job,account),[]);
+    }
+    assert.throws(()=>validateReceipt({...receipt(),message:'\u0000invalid'},job,account));
+    assert.throws(()=>validateReceipt({...receipt(),message:'x'.repeat(1501)},job,account));
+});
+
+test('collector opens current read-only Bundle View rows and records rejection comments for the matched manifest',async()=>{
+    const page=await browser.newPage(),job=prepared(),fixture=expandedHistoryFixture(job);
+    try {
+        const details=`<tr class="child"><td colspan="7"><div><table id="historyTable"><tbody>${fixture.rows.map((row,index)=>
+            '<tr role="button">'+row.cells.map(cell=>'<td>'+cell+'</td>').join('')+'</tr>'+
+            '<tr class="child"><td colspan="9">'+row.message+'</td></tr>').join('')}</tbody></table></div></td></tr>`;
+        await historyPageFixture(page,job,`<tr role="button" aria-expanded="false" onclick="this.setAttribute('aria-expanded','true');this.insertAdjacentHTML('afterend',${JSON.stringify(details).replace(/"/g,'&quot;')})">
+            ${fixture.bundle.map(cell=>'<td>'+cell+'</td>').join('')}</tr>`);
+        const result=await collectReceiptObservations(page,job,account);
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.equal(result.observations.length,3);
+        assert.equal(result.observations.find(item=>item.documentId==='doc-1')!.status,'Refunded');
+        assert.ok(result.observations[0].message!.includes('Missing Demand'));
     }finally{await page.close();}
 });
 

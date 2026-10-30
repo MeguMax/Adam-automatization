@@ -153,6 +153,8 @@ Extractor version 6 corrects tightly printed scanned captions. Bounded, padded c
 
 Complaints naming another attorney do not silently become Adam Devlin filings. The attorney field must be corrected and authorized before preparation under the currently supported filer, P72877. Source scans remain unchanged. Manual field corrections survive repeated extraction.
 
+Read-only History checks wait for completed search results and the rendered Bundle View table, including MiFILE's zero-height floating panels and non-landmark account header. Current expandable Bundle View rows can be reconciled by the exact saved temporary case number, court, Devlin filer and the complete pinned PDF-name/type manifest. A similar case title, a partial manifest, changed source snapshot, unknown row or another account is insufficient. Per-document rejection/refund statuses and rejection comments are retained and displayed. A Refunded status without an exact USD transaction receipt does not establish a verified refund amount and never permits an automatic payment or filing retry.
+
 The automatic extraction queue excludes legacy court-notification copies before applying its batch limit. One rejected/ineligible record cannot continually occupy that slot or stop the following Drafts.
 
 The read-only checkout adapter distinguishes **Unverified** from an explicit MiFILE message that no payment accounts exist. **Add Payment Account** by itself is not evidence that the owner has no linked card. Fees can still be inspected, but unverified account availability cannot authorize payment or pass amount confirmation. Payment and court submission remain disabled.
