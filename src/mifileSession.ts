@@ -109,6 +109,14 @@ export async function dismissMifileModalIfAny(page: Page): Promise<void> {
 
 export class MiFileNoticeRequiresReviewError extends Error {}
 
+export async function matchesMiFileAccountHeader(page: Page, username: string): Promise<boolean> {
+    // History uses a real header that does not always expose the banner ARIA role.
+    const header = page.locator('header');
+    await header.first().waitFor({state:'attached'});
+    return await header.count() === 1 && (await header.innerText()).toLowerCase()
+        .split(/\s+/).includes(username.trim().toLowerCase());
+}
+
 export async function dismissMifilePreparationNotice(page: Page): Promise<void> {
     const news = page.getByText('TrueFiling Notification', { exact: true })
         .locator('xpath=ancestor::div[.//button[normalize-space()="OK"]][1]');

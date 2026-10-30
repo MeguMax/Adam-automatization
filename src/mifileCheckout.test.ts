@@ -12,6 +12,7 @@ import {parseMiFileReceiptFields,parseMiFileReceiptPdf,collectReceiptObservation
 import {testPdfFixture} from './testPdfFixture';
 import {readPaymentMethods,selectPaymentMethodForQuote} from './mifilePaymentMethods';
 import {mifileOutcome} from './mifileOutcome';
+import {matchesMiFileAccountHeader} from './mifileSession';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -662,6 +663,21 @@ test('receipt checks explicitly open My History when MiFILE initially retains an
         if(result.kind!=='receipts') throw new Error('Wrong result');
         assert.equal(result.state,'found');assert.equal(result.observations[0].status,'Submitted');
         assert.equal(await page.getByRole('tab',{name:'My History',exact:true}).getAttribute('aria-selected'),'true');
+    }finally{await page.close();}
+});
+
+test('account verification tolerates missing banner semantics but not another login or a body-only email',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent(`<header role="presentation">Adam Example ${account.username} Log Out</header>`);
+        assert.equal(await page.getByRole('banner').count(),0);
+        assert.equal(await matchesMiFileAccountHeader(page,account.username),true);
+        await page.setContent(`<header>other@example.com</header><main>${account.username}</main>`);
+        assert.equal(await matchesMiFileAccountHeader(page,account.username),false);
+        await page.setContent(`<header>prefix-${account.username}</header>`);
+        assert.equal(await matchesMiFileAccountHeader(page,account.username),false);
+        await page.setContent(`<header>${account.username}</header><header>${account.username}</header>`);
+        assert.equal(await matchesMiFileAccountHeader(page,account.username),false);
     }finally{await page.close();}
 });
 

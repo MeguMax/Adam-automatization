@@ -14,7 +14,7 @@ import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClien
 import { validatePdfBuffer } from './pdfValidation';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
-import { authenticateMifilePage, dismissMifilePreparationNotice } from './mifileSession';
+import { authenticateMifilePage, dismissMifilePreparationNotice, matchesMiFileAccountHeader } from './mifileSession';
 import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
     type FilingSourceFingerprint, type MiFileFeeObservation, type MiFileSavedBundleEvidence } from './mifilePreparationEvidence';
 
@@ -704,8 +704,7 @@ export class MiFileFilingRunner {
     }
 
     async verifyAccount(page: Page, username: string): Promise<void> {
-        const header = await page.getByRole('banner').innerText();
-        if (!header.toLowerCase().split(/\s+/).includes(username.trim().toLowerCase())) {
+        if (!await matchesMiFileAccountHeader(page,username)) {
             throw new MiFileFilingError('The signed-in MiFILE account does not match the configured login.',
                 'ACCOUNT_IDENTITY_MISMATCH', 'login');
         }

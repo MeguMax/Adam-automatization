@@ -3,7 +3,7 @@ import type { CheckoutAccount, MiFileReceiptObservation, ReceiptStatus } from '.
 import { usdCents } from './mifilePreparationEvidence';
 import type { Page, APIResponse } from 'playwright';
 import type { CheckoutInspectionResult } from './mifileCheckout';
-import { dismissMifilePreparationNotice } from './mifileSession';
+import { dismissMifilePreparationNotice, matchesMiFileAccountHeader } from './mifileSession';
 import { inspectFilingPdf } from './pdfValidation';
 
 export function parseReceiptStatus(value: string): ReceiptStatus | null {
@@ -68,7 +68,7 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     if (page.url() === url.href && await page.locator('#documentTable').isVisible() &&
         await page.getByRole('button',{name:'Save Progress',exact:true}).isVisible() &&
         await page.getByRole('button',{name:'Save Progress',exact:true}).isEnabled() &&
-        (await page.getByRole('banner').innerText()).toLowerCase().includes(account.username) &&
+        await matchesMiFileAccountHeader(page,account.username) &&
         (await page.locator('main').innerText()).includes(job.temporaryCaseNumber || '\u0000')) {
         return {kind:'receipts', state:'unsubmitted', checkedAt, issue:null, observations:[{
             bundleId:job.externalBundleId, accountEmail:account.username, kind:'bundle_status',
@@ -96,7 +96,7 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     await history.getByRole('button',{name:'Search',exact:true}).click();
     const waitForHistory = () => history.getByText('Please wait...', {exact:true}).waitFor({state:'hidden',timeout:90_000});
     await waitForHistory();
-    if (!(await page.getByRole('banner').innerText()).toLowerCase().includes(account.username)) throw new Error('MiFILE history account could not be verified.');
+    if (!await matchesMiFileAccountHeader(page,account.username)) throw new Error('MiFILE history account could not be verified.');
     const view = history.locator('#historyViewTypeSelect');
     if (await view.count() && await view.isVisible()) {
         await view.selectOption({label:'Bundle View'});
