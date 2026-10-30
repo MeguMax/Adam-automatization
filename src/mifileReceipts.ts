@@ -79,6 +79,9 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
     // A missing editable bundle is not proof of payment or submission. Only exact bundle-linked history is usable.
     progress('opening_history');
     await page.goto('https://mifile.courts.michigan.gov/filings/myHistory', {waitUntil:'domcontentloaded'});
+    const historyTab = page.getByRole('tab',{name:'My History',exact:true});
+    await historyTab.waitFor({state:'visible',timeout:90_000});
+    if (await historyTab.getAttribute('aria-selected') !== 'true') await historyTab.click();
     const history = page.getByRole('tabpanel', {name:'My History', exact:true});
     await history.waitFor({state:'visible',timeout:90_000});
     const date = new Date(job.createdAt);

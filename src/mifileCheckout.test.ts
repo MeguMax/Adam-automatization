@@ -83,7 +83,8 @@ test('confirmation binds expiry, account credential revision, source package and
     assert.ok(checkoutReviewIssues(q,job,{...account,identity:digest('revision-2')},now).some(issue=>issue.includes('account changed')));
     assert.ok(checkoutReviewIssues(q,{...job,payload:{...job.payload!,courtName:'Other court'}},account,now).length);
     const missing=buildCheckoutQuote(job,account,fees,{state:'missing',fingerprint:null},q.packageDigest,10300,now);
-    assert.ok(checkoutReviewIssues(missing,job,account,now).some(issue=>issue.startsWith('Add a payment')));
+    assert.ok(checkoutReviewIssues(missing,job,account,now).some(issue=>issue.startsWith('Verify the payment account')));
+    assert.ok(!checkoutReviewIssues(missing,job,account,now).some(issue=>issue.startsWith('Add a payment')));
     assert.throws(()=>buildCheckoutQuote(job,account,fees,{state:'selected',fingerprint:'4111111111111111'},q.packageDigest,10300));
     assert.ok(checkoutReviewIssues({...q,lines:[null]} as any,job,account).length);
     assert.ok(checkoutReviewIssues({...q,totalCents:1},job,account).length);
@@ -586,7 +587,7 @@ test('automatic polling history is bounded without deleting manual quotes or con
     }finally{f.db.close();}
 });
 
-async function historyPageFixture(page:import('playwright').Page,job:FilingJobView,rows:string,receiptPdf?:Buffer,controls='') {
+async function historyPageFixture(page:import('playwright').Page,job:FilingJobView,rows:string,receiptPdf?:Buffer,controls='',startHidden=false) {
     job.createdAt=new Date().toISOString();
     await page.route('**/*',async route=>{
         const url=new URL(route.request().url());
@@ -597,7 +598,8 @@ async function historyPageFixture(page:import('playwright').Page,job:FilingJobVi
             await route.fulfill({contentType:'application/pdf',body:receiptPdf || testPdfFixture('Unknown receipt format')});return;
         }
         await route.fulfill({contentType:'text/html',body:`<header>${account.username}</header><main>
-            <div role="tabpanel" aria-label="My History"><label>Start Date:<input></label><label>End Date:<input></label>
+            <button role="tab" aria-selected="${!startHidden}" onclick="this.setAttribute('aria-selected','true');document.getElementById('history').hidden=false">My History</button>
+            <div id="history" role="tabpanel" aria-label="My History"${startHidden?' hidden':''}><label>Start Date:<input></label><label>End Date:<input></label>
             <button onclick="window.searched=true">Search</button>${controls}<table><tbody>${rows}</tbody></table></div></main>`});
     });
     return async (href:string) => {
@@ -648,6 +650,18 @@ test('history checks Bundle View and later pages without changing the default vi
         assert.equal(result.state,'found');assert.equal(result.observations[0].status,'Submitted');
         assert.ok(stages.includes('opening_history'));assert.ok(stages.includes('reading_history_rows'));
         assert.equal(await page.evaluate(()=>Boolean((window as any).defaultChanged || (window as any).paid)),false);
+    }finally{await page.close();}
+});
+
+test('receipt checks explicitly open My History when MiFILE initially retains another history tab',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        await historyPageFixture(page,job,`<tr><td><a href="/filing/details/${job.externalBundleId}">View</a></td><td>Submitted</td></tr>`,
+            undefined,'',true);
+        const result=await collectReceiptObservations(page,job,account);
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.equal(result.observations[0].status,'Submitted');
+        assert.equal(await page.getByRole('tab',{name:'My History',exact:true}).getAttribute('aria-selected'),'true');
     }finally{await page.close();}
 });
 

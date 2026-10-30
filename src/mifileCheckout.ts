@@ -189,7 +189,7 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
     if (quote.sourceContentVerified !== true) issues.push('Source PDFs have not been checked against the preparation snapshot.');
     if (quote.totalCents > 0 && (quote.paymentMethodState !== 'selected' || !/^[a-f0-9]{64}$/.test(quote.paymentMethodFingerprint || ''))) {
         issues.push(quote.paymentMethodState === 'unverified' ? 'Verify the payment account directly in MiFILE. The Add Payment Account button alone does not mean a linked card is missing. Nothing has been charged.' :
-            quote.paymentMethodState === 'missing' ? 'Add a payment method to this MiFILE login, or make the existing account available there, then refresh checkout. Nothing has been charged.' :
+            quote.paymentMethodState === 'missing' ? 'Verify the payment account directly in MiFILE. This quote did not verify an account; it does not prove a linked card is absent. Add another account only if needed in MiFILE. Nothing has been charged.' :
             (quote.availablePaymentMethods?.length ? 'Select the intended payment method below for a new fee check. Nothing has been charged.' :
                 'Select the intended payment method in MiFILE, then refresh checkout. Nothing has been charged.'));
     }
