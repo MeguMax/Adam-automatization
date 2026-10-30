@@ -5,6 +5,7 @@
     let selectedData = null, resultSnapshot = null, refreshTimer;
     let generationId = '', deliveryAvailable = false, savedCopy = null;
     let filenameOwner = '', resultFilename = '';
+    let packageUrl = '', packageSnapshot = null, packageFilename = '';
     const FORM_KEY = 'devlin.excel.form.v1';
     let storage;
     try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
@@ -13,6 +14,8 @@
     function message(error, status = '') { $('error').textContent = error; $('status').textContent = status; }
     function controls() {
         $('generate').disabled = busy || connecting || !officeReady || !token || !forms.length || !selectedData;
+        $('generatePackage').disabled = busy || connecting || !officeReady || !token || forms.length !== 3 || !selectedData;
+        $('downloadPackage').setAttribute('aria-disabled', String(busy || !packageUrl));
         $('refresh').disabled = busy || !officeReady; $('form').disabled = busy || !forms.length;
         $('filename').disabled = busy || !selectedData; $('resetFilename').disabled = busy || !selectedData;
         for (const id of ['download','save']) $(id).setAttribute('aria-disabled',String(busy || !pdfUrl));
@@ -22,6 +25,10 @@
         $('saveCloud').querySelector('span').textContent = savedCopy ? 'Saved to OneDrive' : 'Save to OneDrive';
     }
     function clearResult() {
+        if (packageUrl) URL.revokeObjectURL(packageUrl);
+        packageUrl = ''; packageSnapshot = null; packageFilename = '';
+        $('packageResult').hidden = true; $('packageFiles').replaceChildren();
+        $('downloadPackage').removeAttribute('href'); $('downloadPackage').removeAttribute('download');
         if (pdfUrl) URL.revokeObjectURL(pdfUrl);
         pdfUrl = ''; previewBlob = null; resultSnapshot = null; resultFilename = '';
         generationId = ''; savedCopy = null; $('openCloud').hidden = true; $('openCloud').removeAttribute('href');
@@ -44,7 +51,7 @@
         const owner = token;
         const abort = new AbortController();
         // Include response-body reads in the deadline, not only the HTTP headers.
-        const timer = setTimeout(() => abort.abort(), url === '/excel/generate' ? 45000 : url === '/excel/save' ? 55000 : 20000);
+        const timer = setTimeout(() => abort.abort(), url === '/excel/generate-package' ? 105000 : url === '/excel/generate' ? 45000 : url === '/excel/save' ? 55000 : 20000);
         try {
             const response = await fetch(url, { method:'POST', credentials:'omit', signal:abort.signal,
                 headers:{'Content-Type':'application/json', ...(token ? { Authorization:'Bearer ' + token } : {})}, body:JSON.stringify(data) });
@@ -56,6 +63,12 @@
                 error.status = response.status;
                 if (typeof result?.field === 'string') error.field = result.field;
                 throw error;
+            }
+            if (url === '/excel/generate-package') {
+                if (!response.headers.get('content-type')?.includes('application/zip')) throw new Error('The PDF service returned an unexpected ZIP response.');
+                const blob = await response.blob();
+                if (blob.size < 22 || (await blob.slice(0,2).text()) !== 'PK') throw new Error('The generated ZIP is invalid.');
+                return {blob};
             }
             if (url !== '/excel/generate') return await response.json();
             if (!response.headers.get('content-type')?.includes('application/pdf')) throw new Error('The PDF service returned an unexpected response. Please try again.');
@@ -253,6 +266,50 @@
         } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else message(sourceError(error, source)); }
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
+    $('generatePackage').addEventListener('click', async () => {
+        if (busy) return;
+        clearTimeout(refreshTimer);
+        const current = ++revision;
+        busy = true; clearResult(); controls(); message('', 'Reading all three forms from the selected row...');
+        let source = null;
+        try {
+            source = await DevlinExcelWorkbook.readPackage(Excel, forms);
+            if (!token || current !== revision) throw new Error('The worksheet changed. Generate the package again.');
+            const items = forms.map(form => ({form:form.id,
+                filename:DevlinExcelRow.pdfFilename({...source,form:form.id}),
+                values:Object.fromEntries(form.fields.map(field => [field,source.values[field]]))}));
+            message('', 'Generating DC105, DC508 and MC202...');
+            const {blob} = await api('/excel/generate-package', {forms:items});
+            if (!token) return;
+            const latest = await DevlinExcelWorkbook.readPackage(Excel, forms, {recalculate:false});
+            if (current !== revision || !DevlinExcelWorkbook.sameSnapshot(source, latest)) {
+                selectedData = null; throw new Error('The worksheet changed during generation. Generate the package again.');
+            }
+            packageSnapshot = source; packageUrl = URL.createObjectURL(blob);
+            packageFilename = DevlinExcelRow.pdfFilename({...source,form:'Forms'}).replace(/\.pdf$/i,'.zip');
+            $('packageFiles').replaceChildren(...items.map(item => { const li=document.createElement('li'); li.textContent=item.filename; return li; }));
+            $('downloadPackage').href = packageUrl; $('downloadPackage').download = packageFilename;
+            $('packageResult').hidden = false;
+            message('', 'All 3 fillable PDFs are ready in one ZIP.');
+            $('packageResult').scrollIntoView({block:'nearest'});
+        } catch(error) { clearResult(); message(sourceError(error,source)); }
+        finally { busy=false; controls(); if (!selectedData && token) refresh(true); }
+    });
+    $('downloadPackage').addEventListener('click', async event => {
+        event.preventDefault();
+        if (busy || !packageUrl || !packageSnapshot) return;
+        const source=packageSnapshot, url=packageUrl, current=revision;
+        busy=true; controls(); message('', 'Checking current row...');
+        try {
+            const latest = await DevlinExcelWorkbook.readPackage(Excel,forms,{recalculate:false});
+            if (!token || current!==revision || url!==packageUrl || !DevlinExcelWorkbook.sameSnapshot(source,latest)) {
+                selectedData=null; throw new Error('The worksheet changed since this ZIP was generated. Generate the package again.');
+            }
+            const link=document.createElement('a'); link.href=url; link.download=packageFilename;
+            document.body.append(link); link.click(); link.remove(); message('', 'ZIP download requested. All 3 PDFs remain fillable.');
+        } catch(error) {clearResult(); message(error.message);}
+        finally {busy=false; controls(); if (!selectedData && token) refresh(true);}
+    });
     async function download(event) {
         event.preventDefault();
         if (busy || !pdfUrl || !resultSnapshot) return;
@@ -305,7 +362,7 @@
         }).catch(() => { /* Before/after generation and download rechecks also protect hosts without change events. */ });
     });
     reconnect();
-    window.addEventListener('beforeunload', () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); });
+    window.addEventListener('beforeunload', () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); if (packageUrl) URL.revokeObjectURL(packageUrl); });
     let resizeTimer;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimer);

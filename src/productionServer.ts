@@ -8,6 +8,7 @@ import { runFilingWorker } from './filingWorker';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { runDraftExtractionWorker } from './draftExtraction';
 import { initializeMiFileAccountEncryption } from './mifileAccountSettings';
+import { workerHealth, watchWorkerHealth } from './workerHealth';
 
 function isWorkerEnabled(): boolean {
     const value = (process.env.WORKER_ENABLED ?? 'true').trim().toLowerCase();
@@ -52,6 +53,9 @@ async function main(): Promise<void> {
     });
     const controller = new AbortController();
     const workerEnabled = isWorkerEnabled();
+    if (!workerEnabled) { workerHealth.disable('inbox'); workerHealth.disable('extraction'); }
+    if (!filingWorkerEnabled) workerHealth.disable('mifile');
+    const stopHealthWatch = watchWorkerHealth();
     const workerPromise = workerEnabled
         ? runWorker({ signal: controller.signal, closeDatabaseOnExit: false })
         : Promise.resolve();
@@ -68,6 +72,7 @@ async function main(): Promise<void> {
         shuttingDown = true;
         console.log(`Production service shutdown requested: ${reason}`);
         controller.abort();
+        stopHealthWatch();
         await Promise.all([
             closeServer(server),
             workerPromise.catch(error => {

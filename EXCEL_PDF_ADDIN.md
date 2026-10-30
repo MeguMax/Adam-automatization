@@ -346,3 +346,26 @@ were needed for this acceptance run.
 The full project regression was rerun on 2026-10-29: all 218 tests passed, with
 zero failures, cancellations or skipped tests. Production health reported
 `2026-10-28-inline-preview-v73`, ready, with `unsubmitted_only` preparation.
+
+## Three-form local ZIP (v86)
+
+The panel offers `Generate all 3 forms (ZIP)` alongside individual generation.
+It reads all 101 matching fields from one calculated row, formats date serials
+using Excel, then generates DC105, DC508 and MC202 as three separate fillable
+PDFs. Member filenames use the same case metadata and their own form prefixes.
+The archive filename begins `FORMS`. ZIP generation uses automatic member names;
+the editable single-PDF filename still applies only to that individual form.
+
+The whole input is validated before generation. A missing column, formula error,
+invalid field or failed PDF prevents the entire download; partial archives are
+not returned. Changes to the row, sheet, case identity or any of the 101 fields
+invalidate the ZIP both after generation and immediately before download.
+`/excel/generate-package` uses the same PDF-only 12-hour session, same-origin
+checks and single-generation slot. Sessions are checked again before returning
+the result. Each Python worker retains its 25-second deadline; the package
+request has a separate 105-second client deadline.
+
+ZIP contents are held in memory only for the response. The ZIP never creates a
+OneDrive generation handle or performs a cloud save, including when optional
+single-PDF cloud delivery is configured. Local downloads remain the production
+delivery mode. Updating the installed panel requires no new Office permissions.

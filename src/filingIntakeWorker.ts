@@ -4,6 +4,7 @@ import type { DownloadResult } from './downloadFiledDocuments';
 import { ComplaintExtractionResult } from './complaintExtractor';
 import { recognizeDocumentPdf } from './documentRecognition';
 import { applyLibraryForms, type FormUploadDependencies } from './formLibrary';
+import type { WorkerPhase } from './workerHealth';
 
 export async function processFilingIntake(
     db: WorkflowDatabase,
@@ -14,6 +15,7 @@ export async function processFilingIntake(
         download(parsed: ParsedEmailInfo): Promise<DownloadResult>;
         extract(buffer: Buffer, documentType: string | null): Promise<ComplaintExtractionResult>;
         forms?: FormUploadDependencies;
+        progress?: (phase:WorkerPhase)=>void;
     },
 ) {
     const initial = db.getDraftDetail(draftId);
@@ -30,6 +32,7 @@ export async function processFilingIntake(
         // A removed source document stays removed on reprocessing.
         if (!document || !document.sourceUrl || document.oneDriveUrl || document.status === 'uploaded') continue;
         try {
+            dependencies.progress?.('downloading_pdf');
             const stableSource = { ...source, downloadUrl: document.sourceUrl || source.downloadUrl };
             const result = await dependencies.download({ ...parsed, filedDocuments: [stableSource] });
             const file = result.notificationFiles[0];
@@ -57,10 +60,12 @@ export async function processFilingIntake(
                 downloadAttempts: downloaded.downloadAttempts || 1,
                 metadata: { driveId: file.driveId, itemId: file.itemId },
             });
+            dependencies.progress?.('recognizing_pdf');
             const recognition = downloaded.recognition || await recognizeDocumentPdf(file.buffer, source.documentName || file.displayName);
             db.recordDocumentRecognition(document.id, recognition);
             if (recognition.role === 'complaint' && recognition.source !== 'conflict') {
                 try {
+                    dependencies.progress?.('extracting_complaint');
                     const extraction = await dependencies.extract(file.buffer, source.documentType);
                     db.applyComplaintExtraction(draftId, document.id, extraction);
                 } catch (error) {
@@ -77,5 +82,6 @@ export async function processFilingIntake(
     }
     if (parsed.filedDocuments.length) db.refreshEmailAfterDocumentRetries(emailId, draftId);
     else db.markEmailProcessed(emailId);
+    dependencies.progress?.('adding_forms');
     return applyLibraryForms(db, draftId, dependencies.forms);
 }

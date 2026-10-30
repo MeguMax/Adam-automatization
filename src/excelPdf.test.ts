@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
+import { unzipSync } from 'fflate';
 import { createAdminAuth } from './adminAuth';
 import { createExcelPdfHandler, EXCEL_FORMS, EXCEL_SESSION_MS, ExcelSessionStore, ExcelPdfFieldError, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
 import { WorkflowDatabase } from './database';
@@ -17,6 +18,7 @@ const row = require('../excel-addin/row.js');
 const workbook = require('../excel-addin/workbook.js');
 const clientSessions = require('../excel-addin/session.js');
 const values = (id = 'dc105'): Record<string, unknown> => Object.fromEntries(EXCEL_FORMS.find(form => form.id === id)!.fields.map(field => [field, '']));
+const packageInput = () => ({forms: EXCEL_FORMS.map(form => ({form:form.id,values:values(form.id),filename:form.id.toUpperCase()+' - QA example.pdf'}))});
 
 function officeFixture() {
     const form=EXCEL_FORMS[0];
@@ -54,6 +56,78 @@ test('Excel adapter times out busy calculation without reading cached field valu
     const {state,form,excel,sleep}=officeFixture();state.states=['Calculating'];
     await assert.rejects(workbook.readSelection(excel,form,{sleep,timeoutMs:0}),/still calculating/);
     assert.equal(state.reads,0);
+});
+
+test('three-form adapter reads one calculated row, formats both form date sets and guards every field', async () => {
+    const {state,excel,sleep}=officeFixture();
+    state.headers.push(...EXCEL_FORMS.slice(1).flatMap(form=>form.fields));
+    state.values.push(...EXCEL_FORMS.slice(1).flatMap(form=>form.fields.map(()=>'')));
+    state.width=state.headers.length;
+    for (const field of ['dc105_24','dc508_13']) state.values[state.headers.indexOf(field)]=46300;
+    const result=await workbook.readPackage(excel,EXCEL_FORMS,{sleep});
+    assert.equal(state.calculations,1); assert.equal(Object.keys(result.values).length,101);
+    assert.equal(result.values.dc508_13,'10/5/2026'); assert.equal(result.values.dc105_24,'10/5/2026');
+    assert.equal(result.form,'package');
+    const changed=structuredClone(result);changed.values.mc202_01='Different value';
+    assert.equal(workbook.sameSnapshot(result,changed),false);
+    state.headers.splice(state.headers.indexOf('mc202_01'),1);state.width--;
+    await assert.rejects(workbook.readPackage(excel,EXCEL_FORMS,{sleep}),/Missing column: mc202_01/);
+    await assert.rejects(workbook.readPackage(excel,EXCEL_FORMS.slice(1),{sleep}),/All three/);
+});
+
+test('ZIP endpoint validates all three forms before generation and is authenticated and same-origin', async () => {
+    let calls=0;
+    await fixture(async base=>{
+        assert.equal((await post(base,'generate-package',packageInput())).status,401);
+        const token=await login(base);
+        assert.equal((await post(base,'generate-package',packageInput(),token,'https://foreign.example')).status,403);
+        const missing=packageInput(); missing.forms.pop();
+        const duplicate=packageInput(); duplicate.forms[2]=duplicate.forms[1];
+        const invalidField=packageInput(); invalidField.forms[2].values.mc202_05='#REF!';
+        const unsafe=packageInput(); unsafe.forms[2].filename='../../MC202.pdf';
+        for (const input of [missing,duplicate,invalidField,unsafe,{forms:[null,null,null]}]) {
+            assert.equal((await post(base,'generate-package',input,token)).status,422);
+        }
+        assert.equal(calls,0);
+        const response=await post(base,'generate-package',packageInput(),token);
+        assert.equal(response.status,200);assert.equal(calls,3);
+        assert.equal(response.headers.get('content-type'),'application/zip');
+        assert.equal(response.headers.get('cache-control'),'no-store');
+        assert.equal(response.headers.has('x-excel-generation-id'),false);
+        const files=unzipSync(new Uint8Array(await response.arrayBuffer()));
+        assert.deepEqual(Object.keys(files),['DC105 - QA example.pdf','DC508 - QA example.pdf','MC202 - QA example.pdf']);
+        for(const bytes of Object.values(files)) assert.equal(Buffer.from(bytes).toString(),'%PDF-fixture');
+    },async()=>{calls++;return Buffer.from('%PDF-fixture');});
+});
+
+test('a failed ZIP form yields no partial archive and releases the generation slot',async()=>{
+    let fail=true;const calls:string[]=[];
+    await fixture(async base=>{
+        const token=await login(base);
+        const response=await post(base,'generate-package',packageInput(),token);
+        assert.equal(response.status,422);
+        assert.deepEqual(await response.json(),{error:'DC508: Invalid value',field:'dc508_13',form:'dc508'});
+        assert.deepEqual(calls,['dc105','dc508']);
+        fail=false;
+        assert.equal((await post(base,'generate-package',packageInput(),token)).status,200);
+    },async form=>{calls.push(String(form)); if(fail&&form==='dc508')throw new ExcelPdfFieldError('Invalid value','dc508_13');return Buffer.from('%PDF-fixture');});
+});
+
+test('ZIP and individual PDF generation share one slot and expiry during generation disallows download',async()=>{
+    let release!:()=>void, started!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    const active=new Promise<void>(resolve=>{started=resolve;});
+    let calls=0;
+    await fixture(async(base,advance)=>{
+        const token=await login(base);
+        const pending=post(base,'generate-package',packageInput(),token);
+        await active;
+        assert.equal((await post(base,'generate', {form:'dc105',values:values()},token)).status,503);
+        advance(EXCEL_SESSION_MS); release();
+        assert.equal((await pending).status,401);assert.equal(calls,1);
+        const again=await login(base);
+        assert.equal((await post(base,'generate',{form:'dc105',values:values()},again)).status,200);
+    },async()=>{calls++;started();await gate;return Buffer.from('%PDF-fixture');});
 });
 test('snapshot rechecks do not force another recalculation and reject row or sheet changes',async()=>{
     const first=officeFixture();
@@ -323,7 +397,7 @@ test('Excel delivery is opt-in and generated names cannot introduce file paths',
     assert.equal(createExcelOneDriveDelivery({ ONEDRIVE_ROOT_SHARE_URL: 'https://example.sharepoint.com/court-folder' }), undefined);
     assert.equal(excelPdfFilename('dc105', undefined), 'DC105.pdf');
     assert.equal(excelPdfFilename('dc105', 'DC105 - QA-1 - Example.pdf'), 'DC105 - QA-1 - Example.pdf');
-    for (const filename of ['../DC105.pdf', 'DC105 - a/b.pdf', 'DC105 - a\\b.pdf', 'DC508 - Other.pdf', 'DC105 - X.pdf.exe', 'DC105 - trailing.pdf ', 'DC105 - ' + 'a'.repeat(180) + '.pdf']) {
+    for (const filename of ['../DC105.pdf', 'DC105 - a/b.pdf', 'DC105 - a\\b.pdf', 'DC508 - Other.pdf', 'DC105 - X.pdf.exe', 'DC105 - trailing.pdf ', 'DC105 - .pdf', 'DC105 - trailing .pdf', 'DC105 - invalid\u007f.pdf', 'DC105 - ' + 'a'.repeat(180) + '.pdf']) {
         assert.throws(() => excelPdfFilename('dc105', filename));
     }
 });
@@ -517,3 +591,24 @@ test('all three packaged templates generate verified interactive PDFs through th
         assert.equal(result.value, 'Example Property LLC'); assert.equal(result.blank, 1);
     }
 });
+
+test('ZIP contains three independently readable fillable PDFs, 101 fields and four pages without cloud writes',
+    {skip:!pythonAvailable && 'Set EXCEL_PDF_PYTHON'}, async()=>fixture(async base=>{
+        const token=await login(base),input=packageInput();
+        const fields={dc105:'dc105_05',dc508:'dc508_06',mc202:'mc202_08'};
+        for(const item of input.forms)item.values[fields[item.form as keyof typeof fields]]='Fictional ZIP LLC';
+        const response=await post(base,'generate-package',input,token);
+        assert.equal(response.status,200);
+        const archive=Buffer.from(await response.arrayBuffer());
+        const check=spawnSync(python,['-c',
+            'import sys,io,json,zipfile; from pypdf import PdfReader; z=zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())); assert z.testzip() is None; result=[]\nfor name in z.namelist():\n r=PdfReader(io.BytesIO(z.read(name))); f=r.get_fields(); widgets=[a.get_object() for p in r.pages for a in p.get("/Annots",[]) if a.get_object().get("/Subtype")=="/Widget"]; assert all(a.get("/AP") for a in widgets); result.append({"name":name,"fields":len(f),"widgets":len(widgets),"pages":len(r.pages),"values":[str(v.get("/V")) for v in f.values() if str(v.get("/V"))=="Fictional ZIP LLC"]})\nprint(json.dumps(result))'],
+            {input:archive,windowsHide:true});
+        assert.equal(check.status,0,check.stderr.toString());
+        const result=JSON.parse(check.stdout.toString());
+        assert.equal(result.length,3);
+        assert.equal(result.reduce((n:number,item:any)=>n+item.fields,0),101);
+        assert.equal(result.reduce((n:number,item:any)=>n+item.pages,0),4);
+        for(const item of result){assert.ok(item.widgets>=item.fields);assert.deepEqual(item.values,['Fictional ZIP LLC']);}
+        assert.equal(response.headers.has('x-excel-generation-id'),false);
+        assert.deepEqual(await (await post(base,'delivery',{},token)).json(),{available:false});
+    }));

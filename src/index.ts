@@ -16,6 +16,7 @@ import {
     NotificationFile,
 } from './downloadFiledDocuments';
 import { closeMifileBrowser } from './mifileSession';
+import { workerHealth } from './workerHealth';
 import { getGraphClient } from './graphClient';
 import { buildSuccessBody, buildErrorBody } from './buildSuccessBody';
 import { sendProcessingReport } from './notificationEmail';
@@ -50,7 +51,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-10-26-persistent-admin-sessions-v47';
+const WORKER_BUILD_ID = '2026-10-31-worker-health-excel-package-v86';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -403,6 +404,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
         db.markEmailRetrying(emailId);
 
         for (const retry of retries) {
+            workerHealth.work('inbox', 'retrying_document', 900_000);
             try {
                 const parsed = retryParsedEmail(retry);
                 const storedDocument = parsed.filedDocuments.find(document =>
@@ -564,6 +566,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
 }
 
 async function processOnce(db: WorkflowDatabase): Promise<void> {
+    workerHealth.work('inbox', 'checking');
     console.log('Checking inbox for new court emails...');
 
     const recentEmails = await fetchRecentCourtEmailHeaders(MAX_EMAILS_PER_POLL);
@@ -574,6 +577,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
 
     for (const pending of pendingEmails) {
         if (emailsById.has(pending.externalMessageId)) continue;
+        workerHealth.work('inbox', 'fetching_email');
         try {
             const email = await recoverOutlookMessage(db, pending);
             emailsById.set(String(email.id), email);
@@ -609,6 +613,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
     for (const candidate of emails) {
         const externalMessageId = String(candidate.id);
         if (db.shouldSkipEmail(externalMessageId)) continue;
+        workerHealth.work('inbox', 'fetching_email');
 
         let msg = candidate;
         if (!(msg as any).body?.content) {
@@ -628,6 +633,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
 
         const emailRecord = db.registerEmail(msg);
         db.markEmailProcessing(emailRecord.id);
+        workerHealth.work('inbox', 'processing_email', 900_000);
 
         let parsed: ParsedEmailInfo | undefined;
         let caseDraftId: string | undefined;
@@ -669,6 +675,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                         resolveDocumentBuffer: resolver,
                     }),
                     extract: extractComplaintPdf,
+                    progress: phase => workerHealth.work('inbox', phase, 900_000),
                 });
                 console.log('New filing intake completed:', {
                     draftId: caseDraftId,
@@ -685,6 +692,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 'downloads',
                 msg.receivedDateTime as string | undefined,
                 {
+                    onProgress: () => workerHealth.work('inbox', 'processing_email', 900_000),
                     plaintiffShortName: plaintiffNaming.shortName,
                     resolvePlaintiffNaming: () => lookupPlaintiffNaming(db, parsed!),
                     resolveDocumentBuffer: createEmailAttachmentResolver(async () => msg),
@@ -817,6 +825,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
 export async function runWorker(options: WorkerRunOptions = {}): Promise<void> {
     const runOnce = options.runOnce ?? RUN_ONCE;
     const db = getWorkflowDatabase();
+    workerHealth.start('inbox', POLL_INTERVAL_MS);
     console.log('Worker runtime:', {
         buildId: WORKER_BUILD_ID,
         entryFile: __filename,
@@ -843,13 +852,16 @@ export async function runWorker(options: WorkerRunOptions = {}): Promise<void> {
     try {
         if (runOnce) {
             await processOnce(db);
+            workerHealth.finish('inbox');
             return;
         }
 
         while (!options.signal?.aborted) {
             try {
                 await processOnce(db);
+                workerHealth.finish('inbox');
             } catch (err) {
+                workerHealth.finish('inbox', false);
                 console.error('Error in main loop (Graph or processing):', err);
                 await waitFor(5000, options.signal);
             }
@@ -857,6 +869,7 @@ export async function runWorker(options: WorkerRunOptions = {}): Promise<void> {
             await waitFor(POLL_INTERVAL_MS, options.signal);
         }
     } finally {
+        workerHealth.stop('inbox');
         await closeMifileBrowser();
         if (options.closeDatabaseOnExit !== false) {
             db.close();

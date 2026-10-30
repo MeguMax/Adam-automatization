@@ -103,6 +103,8 @@ async function main() {
     db.markEmailProcessed(notificationEmail.id);
     db.refreshCaseDraftValidation(notificationDraftId);
     const { createAdminServer } = require('./adminServer') as typeof import('./adminServer');
+    const {workerHealth}=require('./workerHealth') as typeof import('./workerHealth');
+    workerHealth.start('inbox',10_000); workerHealth.finish('inbox'); workerHealth.disable('mifile');
     const server = createAdminServer(0, { handleSignals: false, closeDatabaseOnShutdown: false, filingWorkerAvailable:()=>true });
     await once(server, 'listening');
     const port = (server.address() as { port: number }).port;
@@ -126,6 +128,7 @@ async function main() {
         await page.goto(url);
         await page.locator('#loginForm').waitFor();
         assert.ok(page.url().endsWith('/login'));
+        assert.equal((await context.request.get(url+'/api/worker-health')).status(),401);
         await page.locator('#username').fill('qa');
         await page.locator('#password').fill('wrong-password');
         await page.locator('#signIn').click();
@@ -139,6 +142,19 @@ async function main() {
         await page.locator('#signIn').click();
         await page.waitForURL(url + '/');
         await page.setViewportSize({ width: 1440, height: 1000 });
+        await page.locator('#workerStatusBtn').click();
+        await page.waitForFunction(()=>document.getElementById('workerStatusList')?.textContent?.includes('Idle'));
+        assert.ok((await page.locator('#workerStatusList').textContent())?.includes('Disabled'));
+        await page.screenshot({path:path.join(screenshots,'worker-health-desktop.png')});
+        workerHealth.finish('inbox',false);
+        await page.locator('[aria-label="Close worker status"]').click();
+        await page.locator('#workerStatusBtn').click();
+        await page.waitForFunction(()=>document.getElementById('workerStatusList')?.textContent?.includes('Last cycle failed'));
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        await page.screenshot({path:path.join(screenshots,'worker-health-mobile.png')});
+        await page.locator('[aria-label="Close worker status"]').click();
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#settingsTab').click();
         await page.waitForFunction(() => document.getElementById('intakeMailbox')?.textContent === 'intake@example.com');
         assert.equal(microsoftChecks, 0, 'Opening Settings must not request Microsoft resources');

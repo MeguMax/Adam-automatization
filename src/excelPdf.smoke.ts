@@ -134,6 +134,61 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             await download.saveAs(path.join(output, download.suggestedFilename()));
             await page.screenshot({ path: path.join(output, form.id + '-mobile.png'), fullPage: true });
         }
+        const savesBeforeZip=savedCopies.length;
+        const zipRequest=page.waitForRequest(req=>req.url().endsWith('/excel/generate-package'));
+        await page.click('#generatePackage');
+        const zipPayload=(await zipRequest).postDataJSON();
+        assert.equal(zipPayload.forms.length,3);
+        assert.equal(zipPayload.forms.reduce((count:number,item:any)=>count+Object.keys(item.values).length,0),101);
+        assert.equal(zipPayload.forms[0].values.dc105_24,'10/5/2026');
+        await page.waitForSelector('#packageResult:visible');
+        assert.equal(await page.locator('#packageFiles li').count(),3);
+        assert.equal(savedCopies.length,savesBeforeZip,'ZIP never triggers optional cloud delivery');
+        await page.screenshot({path:path.join(output,'three-form-zip-mobile.png'),fullPage:true});
+        const zipEvent=page.waitForEvent('download');await page.click('#downloadPackage');
+        const zipDownload=await zipEvent;
+        assert.equal(zipDownload.suggestedFilename(),'FORMS - 29th - 26-00001-LT - Example Property LLC v Morgan Tenant.zip');
+        const zipPath=path.join(output,zipDownload.suggestedFilename());await zipDownload.saveAs(zipPath);
+        const zipReadback=spawnSync(process.env.EXCEL_PDF_PYTHON||'python3',['-c',
+            'import sys,io,json,zipfile; from pypdf import PdfReader; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; result=[]\nfor name in z.namelist():\n r=PdfReader(io.BytesIO(z.read(name))); f=r.get_fields(); assert any(str(v.get("/V"))=="Morgan Tenant" for v in f.values()); result.append({"name":name,"fields":len(f),"pages":len(r.pages)})\nprint(json.dumps(result))',zipPath],{windowsHide:true});
+        assert.equal(zipReadback.status,0,zipReadback.stderr.toString());
+        const zipped=JSON.parse(zipReadback.stdout.toString());
+        assert.equal(zipped.length,3);assert.equal(zipped.reduce((count:number,item:any)=>count+item.fields,0),101);
+        assert.equal(zipped.reduce((count:number,item:any)=>count+item.pages,0),4);
+        // Even a field belonging to a form not selected in the dropdown invalidates the ZIP.
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('dc508_03')]='Changed without events';});
+        let zipUnexpectedDownload=false;
+        const unexpectedZip=()=>{zipUnexpectedDownload=true;};page.on('download',unexpectedZip);
+        await page.click('#downloadPackage');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since this ZIP'));
+        assert.equal(zipUnexpectedDownload,false);page.off('download',unexpectedZip);
+        assert.equal(await page.locator('#packageResult').isVisible(),false);
+        await page.waitForFunction(()=>!(document.getElementById('generatePackage') as HTMLButtonElement).disabled);
+        await page.route('**/excel/generate-package',route=>route.fulfill({status:422,contentType:'application/json',body:JSON.stringify({error:'DC508: Review date',field:'dc508_13'})}));
+        await page.click('#generatePackage');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('DC508: Review date'));
+        assert.equal(await page.locator('#packageResult').isVisible(),false);
+        assert.equal(await page.locator('#generatePackage').isEnabled(),true);
+        await page.unroute('**/excel/generate-package');
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('dc508_03')]='';});
+        await page.route('**/excel/generate-package',async route=>{
+            await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('dc105_01')]='Changed during generation';});
+            await route.fulfill({contentType:'application/zip',body:fs.readFileSync(zipPath)});
+        });
+        await page.click('#generatePackage');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed during generation'));
+        assert.equal(await page.locator('#packageResult').isVisible(),false);
+        await page.unroute('**/excel/generate-package');
+        await page.waitForFunction(()=>!(document.getElementById('generatePackage') as HTMLButtonElement).disabled);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('dc105_01')]='';});
+        await page.setViewportSize({width:1440,height:950});
+        await page.click('#generatePackage');await page.waitForSelector('#packageResult:visible');
+        await page.screenshot({path:path.join(output,'three-form-zip-desktop.png'),fullPage:true});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        // Restore individual preview before the existing single-form regression scenarios.
+        await page.setViewportSize({width:380,height:850});
+        await page.click('#generate');
+        await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
         await page.click('#back');
         await page.fill('#filename', 'reviewed copy');
         await page.click('#refresh');
@@ -376,7 +431,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.ok((await page.locator('#error').innerText()).includes('12-hour Excel connection expired'));
         assert.equal(await page.locator('#result').isVisible(), false);
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: 12-hour session restoration after reload and reopening, password-free outage recovery, logout and expired-session cleanup, disabled-storage fallback, fillable downloads, all 31 checkbox marks rendered and compared on/off, source-cell errors, formula PDF readback, simulated OneDrive delivery, responsive previews, calculation/change guards and network recovery. No real OneDrive uploads.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: a local three-form ZIP (101 fillable fields, four pages), ZIP change guards and partial-failure recovery, 12-hour session restoration after reload and reopening, password-free outage recovery, logout and expired-session cleanup, disabled-storage fallback, individual fillable downloads, all 31 checkbox marks rendered and compared on/off, source-cell errors, formula PDF readback, simulated OneDrive delivery, responsive previews, calculation/change guards and network recovery. No real OneDrive uploads.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

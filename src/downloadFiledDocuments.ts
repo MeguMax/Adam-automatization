@@ -62,6 +62,7 @@ export interface DocumentAttemptLog {
 }
 
 export interface DownloadFiledDocumentsOptions {
+    onProgress?: () => void;
     plaintiffShortName?: string | null;
     resolvePlaintiffNaming?: () => Promise<PlaintiffFileNaming> | PlaintiffFileNaming;
     resolveDocumentBuffer?: (document: FiledDocumentInfo) => Promise<Buffer>;
@@ -316,6 +317,7 @@ export async function uploadTrueCertifyDocuments(
     const dayFolderItemId = await ensureChildFolder(driveId, rootItemId, dateFolderName);
 
     for (const doc of trueCertifyDocs) {
+        options.onProgress?.();
         if (!doc.downloadUrl) {
             failures.push({
                 documentType: doc.documentType ?? null,
@@ -530,6 +532,7 @@ export async function downloadFiledDocuments(
         const fileNamesSeen = new Set<string>();
 
         for (const doc of miFileDocs) {
+            options.onProgress?.();
             if (!doc.downloadUrl) {
                 failures.push({
                     documentType: doc.documentType ?? null,

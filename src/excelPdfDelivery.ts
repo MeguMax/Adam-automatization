@@ -11,7 +11,8 @@ export interface ExcelPdfDelivery {
 export function excelPdfFilename(form: string, input: unknown): string {
     if (input === undefined) return form.toUpperCase() + '.pdf';
     if (typeof input !== 'string' || input.length > 174 || !input.startsWith(form.toUpperCase() + ' - ') ||
-        !input.endsWith('.pdf') || /[<>:"/\\|?*\x00-\x1f]/.test(input) || input.trim() !== input) {
+        !input.endsWith('.pdf') || /[<>:"/\\|?*\x00-\x1f\x7f]/.test(input) || input.trim() !== input ||
+        !input.slice(form.length + 3, -4).trim() || /[. ]\.pdf$/.test(input)) {
         throw new Error('Invalid generated PDF filename.');
     }
     return input;

@@ -4,11 +4,12 @@ import { applyLibraryForms } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
 import type { DocumentRecognition } from './documentRecognition';
 import { createHash } from 'node:crypto';
+import { workerHealth, type WorkerPhase } from './workerHealth';
 
 const running = new WeakMap<WorkflowDatabase, Map<string, Promise<EmailDetail>>>();
 const recognizing = new WeakMap<WorkflowDatabase, Map<string, Promise<EmailDetail>>>();
 
-export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:string,download?: (url:string)=>Promise<Buffer>):Promise<EmailDetail> {
+export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:string,download?: (url:string)=>Promise<Buffer>,progress?: (phase:WorkerPhase)=>void):Promise<EmailDetail> {
     let jobs=recognizing.get(db);
     if(!jobs){jobs=new Map();recognizing.set(db,jobs);}
     const active=jobs.get(draftId);if(active)return active;
@@ -30,10 +31,12 @@ export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:stri
                     ['uploaded','downloaded','replaced'].includes(doc.status));
                 if(!document)continue;
                 const version=db.getComplaintSourceVersion(document.id);
+                progress?.('downloading_pdf');
                 const content=await (download || (async url=>{
                     const drive=await import('./oneDriveClient'),item=await drive.resolveSharedDriveItem(url);
                     return drive.downloadDriveItemBuffer(item.driveId,item.itemId);
                 }))(document.oneDriveUrl!);
+                progress?.('recognizing_pdf');
                 const recognition=await recognizeDocumentPdf(content,document.originalFilename || document.currentFilename || 'document.pdf');
                 const latest=db.getDraftDetail(draftId);
                 if(!latest || !editable(latest))return latest || initial;
@@ -42,7 +45,7 @@ export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:stri
                     latest.caseDraft.complaintExtraction?.contentHash !== recognition.contentHash) {
                     if(recognition.role === 'complaint' && recognition.source !== 'conflict') {
                         await ensureDraftComplaintExtraction(db,draftId,{documentId:document.id,content,
-                            recognition,expectedSourceVersion:version});
+                            recognition,expectedSourceVersion:version,progress});
                     } else {
                         db.recordDocumentRecognition(document.id,recognition);
                         db.recordComplaintExtractionFailure(draftId,document.id,
@@ -66,6 +69,7 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
     download?: (url: string) => Promise<Buffer>;
     recognition?: DocumentRecognition;
     expectedSourceVersion?: string | null;
+    progress?: (phase:WorkerPhase)=>void;
 } = {}): Promise<EmailDetail> {
     let jobs = running.get(db);
     if (!jobs) { jobs = new Map(); running.set(db, jobs); }
@@ -109,6 +113,7 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
         db.setComplaintAutoExtractionState(draftId, { ...state, status: 'running' });
         try {
             if (options.recognition) db.recordDocumentRecognition(source.id,options.recognition);
+            options.progress?.('downloading_pdf');
             const content = options.content || await (options.download || (async url => {
                 const { downloadDriveItemBuffer, resolveSharedDriveItem } = await import('./oneDriveClient');
                 const item = await resolveSharedDriveItem(url);
@@ -116,6 +121,7 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
             }))(source.oneDriveUrl!);
             const contentHash = createHash('sha256').update(content).digest('hex');
             state.contentHash = contentHash;
+            options.progress?.('extracting_complaint');
             const extraction = {...await (options.extract || extractComplaintPdf)(content),contentHash};
             const latest = db.getDraftDetail(draftId);
             // A replacement, removal or primary-source change invalidates work already in flight.
@@ -151,29 +157,38 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
 }
 
 export async function runDraftExtractionWorker(db: WorkflowDatabase, signal: AbortSignal): Promise<void> {
+    workerHealth.start('extraction', 10_000);
+    const progress = (phase:WorkerPhase) => workerHealth.work('extraction', phase, 300_000);
     db.recoverInterruptedComplaintExtractions();
+    try {
     while (!signal.aborted) {
+        let ok = true;
+        progress('checking');
         try {
             for (const draftId of db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION)) {
                 if (signal.aborted) break;
                 try {
-                    const detail = await ensureDraftComplaintExtraction(db, draftId);
+                    const detail = await ensureDraftComplaintExtraction(db, draftId, {progress});
+                    progress('adding_forms');
                     if (!signal.aborted && detail.caseDraft?.filingEligible &&
                         ['not_started','failed'].includes(detail.caseDraft.filingStatus)) await applyLibraryForms(db, draftId);
                 } catch (error) {
+                    ok = false;
                     console.error('Automatic Complaint extraction for Draft ' + draftId + ':', (error as Error).message);
                 }
             }
             for (const draftId of db.listPendingDocumentRecognitions()) {
                 if(signal.aborted)break;
-                try{await ensureDraftDocumentRecognitions(db,draftId);}
-                catch(error){console.error('Automatic supporting-document recognition:',(error as Error).message);}
+                try{await ensureDraftDocumentRecognitions(db,draftId,undefined,progress);}
+                catch(error){ok=false;console.error('Automatic supporting-document recognition:',(error as Error).message);}
             }
-        } catch (error) { console.error('Automatic Complaint extraction:', (error as Error).message); }
+        } catch (error) { ok = false; console.error('Automatic Complaint extraction:', (error as Error).message); }
+        workerHealth.finish('extraction', ok);
         if (!signal.aborted) await new Promise<void>(resolve => {
             const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve(); };
             const timer = setTimeout(finish, 10_000);
             signal.addEventListener('abort', finish, {once:true});
         });
     }
+    } finally { workerHealth.stop('extraction'); }
 }

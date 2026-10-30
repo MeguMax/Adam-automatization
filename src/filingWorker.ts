@@ -2,15 +2,18 @@ import { getWorkflowDatabase } from './database';
 import { MiFileFilingError, MiFileFilingRunner } from './mifileFilingRunner';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { MiFileCheckoutRunner, getCheckoutAccount } from './mifileCheckoutRunner';
+import { workerHealth } from './workerHealth';
 
 function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return Promise.resolve();
     return new Promise(resolve => {
-        const timer = setTimeout(resolve, delayMs);
-        signal?.addEventListener('abort', () => {
+        const finish = () => {
             clearTimeout(timer);
+            signal?.removeEventListener('abort', finish);
             resolve();
-        }, { once: true });
+        };
+        const timer = setTimeout(finish, delayMs);
+        signal?.addEventListener('abort', finish, { once: true });
     });
 }
 
@@ -23,6 +26,7 @@ export async function runFilingWorker(options: {
         Math.max(options.pollIntervalMs ?? Number(process.env.MIFILE_FILING_POLL_MS || 5_000), 1_000),
         60_000,
     );
+    workerHealth.start('mifile', pollIntervalMs);
     const recovered = db.recoverInterruptedFilingJobs();
     db.checkout().recover();
     if (recovered > 0) {
@@ -30,21 +34,29 @@ export async function runFilingWorker(options: {
     }
     console.log(`MiFILE filing worker enabled (poll ${pollIntervalMs} ms).`);
 
+    try {
     while (!options.signal?.aborted) {
+        workerHealth.work('mifile', 'checking');
         if (process.env.MIFILE_AUTO_PREPARE_ENABLED !== 'false' && getMiFileRuntimeConfig().ready) {
             try { db.queueValidatedIntakes(); }
             catch (error) { console.error('Automatic Unsubmitted preparation could not be queued:', error); }
         }
         const inspection = db.checkout().claim();
         if (inspection) {
+            workerHealth.work('mifile', 'checking_bundle', 300_000);
             try {
                 const job = db.getFilingJob(inspection.filingJobId);
                 if (!job) throw new Error('The prepared MiFILE job no longer exists.');
-                const runner = new MiFileCheckoutRunner(stage => db.checkout().progress(inspection.id, stage));
+                const runner = new MiFileCheckoutRunner(stage => {
+                    workerHealth.work('mifile', 'checking_bundle', 300_000);
+                    db.checkout().progress(inspection.id, stage);
+                });
                 const choice = db.checkout().paymentMethodChoice(job.id,getCheckoutAccount());
                 const {result,account} = await runner.inspect(inspection,job,choice);
                 db.checkout().complete(inspection.id,result,account);
+                workerHealth.finish('mifile');
             } catch (error) {
+                workerHealth.finish('mifile', false);
                 const message = error instanceof Error ? error.message : 'MiFILE inspection failed.';
                 const diagnostic = /\b(?:locator|page|browser|frame)\.|strict mode violation|Timeout \d+ms/i.test(message);
                 if (diagnostic) console.error(`[MiFILE checkout ${inspection.id}] Browser inspection could not complete:`,
@@ -62,6 +74,7 @@ export async function runFilingWorker(options: {
         }
         const job = db.claimNextFilingJob();
         if (!job) {
+            workerHealth.finish('mifile');
             await wait(pollIntervalMs, options.signal);
             continue;
         }
@@ -70,10 +83,12 @@ export async function runFilingWorker(options: {
             `MiFILE job ${job.id} started for Draft ${job.caseDraftId} (attempt ${job.attemptNumber}).`,
         );
         const runner = new MiFileFilingRunner(entry => {
+            workerHealth.work('mifile', 'preparing_bundle', 300_000);
             db.appendFilingJobLog(job.id, entry);
             console.log(`[MiFILE ${job.id}] ${entry.checkpoint}: ${entry.message}`);
         });
         try {
+            workerHealth.work('mifile', 'preparing_bundle', 300_000);
             const result = await runner.prepare(job);
             db.completeFilingJob({
                 filingJobId: job.id,
@@ -91,6 +106,7 @@ export async function runFilingWorker(options: {
                 debugArtifactPath: result.screenshotPath,
             });
             console.log(`MiFILE job ${job.id} prepared and saved as an unsubmitted bundle.`);
+            workerHealth.finish('mifile');
             try {
                 if (!['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase())) {
                     db.checkout().refreshReceiptsIfDue(job.id,getCheckoutAccount());
@@ -99,6 +115,7 @@ export async function runFilingWorker(options: {
                 console.warn('The initial read-only MiFILE status check could not be queued. The prepared bundle is unchanged.');
             }
         } catch (error) {
+            workerHealth.finish('mifile', false);
             const filingError = error instanceof MiFileFilingError
                 ? error
                 : new MiFileFilingError(
@@ -136,5 +153,6 @@ export async function runFilingWorker(options: {
             );
         }
     }
+    } finally { workerHealth.stop('mifile'); }
     console.log('MiFILE filing worker stopped.');
 }

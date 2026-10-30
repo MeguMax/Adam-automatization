@@ -69,7 +69,16 @@
             left.name === right.name && JSON.stringify(left.values) === JSON.stringify(right.values) &&
             JSON.stringify(left.metadata) === JSON.stringify(right.metadata);
     }
-    const api = {MIN_EXCEL_API, readSelection, sameSnapshot};
+    async function readPackage(excel, forms, options = {}) {
+        if (!Array.isArray(forms) || forms.length !== 3 ||
+            ['dc105','dc508','mc202'].some(id => forms.filter(form => form.id === id).length !== 1)) {
+            throw new Error('All three court forms must be available.');
+        }
+        // One calculation and one row read for all 101 fields, not three independent selections.
+        return readSelection(excel, {id:'package', fields:forms.flatMap(form => form.fields),
+            dateFields:forms.flatMap(form => form.dateFields)}, options);
+    }
+    const api = {MIN_EXCEL_API, readSelection, readPackage, sameSnapshot};
     if (typeof module !== 'undefined' && module.exports) module.exports = api;
     else root.DevlinExcelWorkbook = api;
 })(globalThis);

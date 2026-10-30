@@ -43,6 +43,12 @@
       </div>
       <div id="deliveryOptions" hidden><label class="check-label"><input id="autoSave" type="checkbox">Save to OneDrive automatically</label><p id="destination" class="secondary"></p></div>
       <button id="generate" class="primary" disabled><i data-lucide="file-plus-2"></i><span>Generate PDF</span></button>
+      <button id="generatePackage" disabled><i data-lucide="archive"></i><span>Generate all 3 forms (ZIP)</span></button>
+      <section id="packageResult" hidden>
+        <h2>Three-form package</h2>
+        <ul id="packageFiles" class="secondary"></ul>
+        <a id="downloadPackage" class="save"><i data-lucide="download"></i><span>Download ZIP</span></a>
+      </section>
       <section id="result" hidden>
         <div class="section-heading"><h2>Generated PDF</h2><div class="result-tools"><button id="back" class="icon" title="Back to form" aria-label="Back to form"><i data-lucide="arrow-left"></i></button><a id="download" class="icon" title="Download fillable PDF" aria-label="Download fillable PDF"><i data-lucide="download"></i></a></div></div>
         <p id="resultName" class="secondary"></p>

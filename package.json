@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "npm run build && node --test --test-concurrency=2 dist/pdfValidation.test.js dist/pdfPreview.test.js dist/complaintExtractor.test.js dist/database.test.js dist/draftDocuments.test.js dist/emailProcessor.test.js dist/graphRetry.test.js dist/mifileRuntimeConfig.test.js dist/filingIntake.test.js dist/mifileAccountSettings.test.js dist/adminAuth.test.js dist/formLibrary.test.js dist/scanIntake.test.js dist/mifileFilingRunner.test.js dist/filingProgress.test.js dist/mifileCheckout.test.js dist/excelPdf.test.js dist/microsoftAccess.test.js dist/packageCompleteness.test.js dist/documentRecognition.test.js",
+    "test": "npm run build && node --test --test-concurrency=2 dist/pdfValidation.test.js dist/pdfPreview.test.js dist/complaintExtractor.test.js dist/database.test.js dist/draftDocuments.test.js dist/emailProcessor.test.js dist/graphRetry.test.js dist/mifileRuntimeConfig.test.js dist/filingIntake.test.js dist/mifileAccountSettings.test.js dist/adminAuth.test.js dist/formLibrary.test.js dist/scanIntake.test.js dist/mifileFilingRunner.test.js dist/filingProgress.test.js dist/mifileCheckout.test.js dist/excelPdf.test.js dist/microsoftAccess.test.js dist/packageCompleteness.test.js dist/documentRecognition.test.js dist/workerHealth.test.js tools/verify-intake-suite.test.cjs",
+    "test:intake-examples": "npm run build && node tools/verify-intake-suite.cjs",
     "build": "tsc",
     "test:admin-intake": "npm run build && node dist/adminIntake.smoke.js",
     "test:excel-pdf": "npm run build && node dist/excelPdf.smoke.js",
@@ -41,6 +42,7 @@
     "@napi-rs/canvas": "1.0.5",
     "@tesseract.js-data/eng": "1.0.0",
     "dotenv": "^17.3.1",
+    "fflate": "0.8.3",
     "isomorphic-fetch": "^3.0.0",
     "lucide": "1.26.0",
     "node-fetch": "^2.7.0",

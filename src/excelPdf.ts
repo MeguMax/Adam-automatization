@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { zipSync } from 'fflate';
 import { credentialsMatch } from './adminAuth';
 import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery, ExcelPdfSavedCopy } from './excelPdfDelivery';
 
@@ -56,7 +57,7 @@ function sameOrigin(req: http.IncomingMessage): boolean {
     } catch { return false; }
 }
 
-async function body(req: http.IncomingMessage): Promise<any> {
+async function body(req: http.IncomingMessage, limit = BODY_LIMIT): Promise<any> {
     return new Promise((resolve, reject) => {
         let size = 0;
         const chunks: Buffer[] = [];
@@ -64,10 +65,10 @@ async function body(req: http.IncomingMessage): Promise<any> {
         const finish = (error?: Error) => { clearTimeout(timer); if (error) reject(error); };
         req.on('error', finish);
         req.on('aborted', () => finish(new Error('Request cancelled.')));
-        req.on('data', chunk => { size += chunk.length; if (size <= BODY_LIMIT) chunks.push(Buffer.from(chunk)); });
+        req.on('data', chunk => { size += chunk.length; if (size <= limit) chunks.push(Buffer.from(chunk)); });
         req.on('end', () => {
             finish();
-            if (size > BODY_LIMIT) return reject(new Error('Request is too large.'));
+            if (size > limit) return reject(new Error('Request is too large.'));
             try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
             catch { reject(new Error('Invalid JSON request.')); }
         });
@@ -136,6 +137,19 @@ export async function generateExcelPdf(formId: unknown, input: unknown, python =
             resolve(output);
         });
         child.stdin.end(JSON.stringify(values));
+    });
+}
+
+export function validateExcelPackage(input: any) {
+    if (!Array.isArray(input?.forms) || input.forms.length !== EXCEL_FORMS.length ||
+        new Set(input.forms.map((item: any) => item?.form)).size !== EXCEL_FORMS.length) {
+        throw new Error('The ZIP must contain DC105, DC508 and MC202 exactly once.');
+    }
+    // Validate the whole row before starting any PDF worker; never return a partial package.
+    return EXCEL_FORMS.map(form => {
+        const item = input.forms.find((candidate: any) => candidate?.form === form.id);
+        validateExcelValues(form.id, item?.values);
+        return { form: form.id, values: item.values as Record<string, unknown>, filename: excelPdfFilename(form.id, item.filename) };
     });
 }
 
@@ -219,7 +233,7 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             res.end(excelManifest()); return true;
         }
         if (req.method === 'GET' && pathname === '/excel/catalog') { json(res, 200, EXCEL_FORMS); return true; }
-        if (req.method !== 'POST' || !['/excel/session', '/excel/resume', '/excel/logout', '/excel/generate', '/excel/delivery', '/excel/save'].includes(pathname)) {
+        if (req.method !== 'POST' || !['/excel/session', '/excel/resume', '/excel/logout', '/excel/generate', '/excel/generate-package', '/excel/delivery', '/excel/save'].includes(pathname)) {
             json(res, 404, { error: 'Not found.' }); return true;
         }
         if (!sameOrigin(req) || !req.headers['content-type']?.startsWith('application/json')) {
@@ -273,10 +287,37 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
         if (running) { res.setHeader('Retry-After', '3'); json(res, 503, { error: 'Another PDF is being generated. Retry in a moment.' }); return true; }
         running = true;
         try {
+            if (pathname === '/excel/generate-package') {
+                const items = validateExcelPackage(await body(req, 512 * 1024));
+                const files: Record<string, Uint8Array> = {};
+                for (const item of items) {
+                    if (!sessionFor(token)) { json(res, 401, {error:'Your Excel connection expired. Connect again.'}); return true; }
+                    if (res.destroyed) return true;
+                    try {
+                        const pdf = await (options.generate || generateExcelPdf)(item.form, item.values);
+                        if (!pdf.subarray(0, 5).equals(Buffer.from('%PDF-')) || pdf.length > 5 * 1024 * 1024) throw new Error('Invalid PDF generation result.');
+                        files[item.filename] = pdf;
+                    } catch (error) {
+                        json(res, 422, {error: item.form.toUpperCase() + ': ' + (error as Error).message,
+                            form:item.form, ...(error instanceof ExcelPdfFieldError ? {field:error.field} : {})});
+                        return true;
+                    }
+                }
+                if (!sessionFor(token)) { json(res, 401, {error:'Your Excel connection expired. Connect again.'}); return true; }
+                if (res.destroyed) return true;
+                // PDFs are already compressed; storing them avoids blocking the event loop on recompression.
+                const archive = Buffer.from(zipSync(files, {level:0}));
+                res.writeHead(200, {'Content-Type':'application/zip', 'Content-Length':archive.length,
+                    'Content-Disposition':'attachment; filename="Devlin-Law-forms.zip"',
+                    'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff'});
+                res.end(archive);
+                return true;
+            }
             const input = await body(req);
             validateExcelValues(input?.form, input?.values);
             const filename = excelPdfFilename(input.form, input.filename);
             const pdf = await (options.generate || generateExcelPdf)(input.form, input.values);
+            if (!sessionFor(token)) { json(res, 401, {error:'Your Excel connection expired. Connect again.'}); return true; }
             let generationId = '';
             if (delivery && sessionFor(token)) {
                 if (!pdf.subarray(0, 5).equals(Buffer.from('%PDF-')) || pdf.length > 5 * 1024 * 1024) throw new Error('Invalid PDF generation result.');

@@ -4,6 +4,7 @@ import { URL } from 'url';
 import { randomUUID } from 'crypto';
 import { createAdminAuth, hasAdminCredentials } from './adminAuth';
 import { createExcelPdfHandler } from './excelPdf';
+import { workerHealth } from './workerHealth';
 import { checkMicrosoftAccess, MicrosoftAccessReport } from './microsoftAccess';
 import {
     CaseDraftStatus,
@@ -53,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-30-pringle-completeness-v85';
+const ADMIN_BUILD_ID = '2026-10-31-worker-health-excel-package-v86';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3184,6 +3185,8 @@ const html = String.raw`<!doctype html>
     .draft-confirm-dialog { border: 1px solid var(--line); border-radius: 6px; padding: 24px; width: 460px; max-width: calc(100vw - 24px); max-height: calc(100dvh - 32px); overflow: auto; color: var(--text); }
     .draft-confirm-dialog::backdrop { background: #1e242a66; }
     .draft-confirm-dialog h2 { font-size: 18px; margin: 0 0 12px; }
+    #workerStatusDialog .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    #workerStatusDialog h2 { margin: 0; }
     .draft-confirm-dialog p { font-size: 13px; line-height: 1.65; white-space: pre-line; }
     .draft-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
     @media (max-width: 1080px) { .draft-workspace { grid-template-columns: minmax(0, 1fr) minmax(390px, 1fr); } }
@@ -3253,6 +3256,7 @@ const html = String.raw`<!doctype html>
     </div>
     <div class="controls header-actions">
       <div class="livebar"><span id="liveDot" class="dot"></span><span id="liveStatus">Live</span></div>
+      <button id="workerStatusBtn" class="icon-button" type="button" title="Background workers: checking" aria-label="Background worker status"><i data-lucide="activity"></i></button>
       <select id="syncLimit" aria-label="Inbox sync limit" title="Inbox sync limit">
         <option value="50">Sync 50</option>
         <option value="100" selected>Sync 100</option>
@@ -3265,6 +3269,10 @@ const html = String.raw`<!doctype html>
       <button id="signOutBtn" class="icon-button" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
     </div>
   </header>
+  <dialog id="workerStatusDialog" class="draft-confirm-dialog" aria-labelledby="workerStatusTitle">
+    <form method="dialog"><div class="section-heading"><h2 id="workerStatusTitle">Background workers</h2><button class="icon-button" aria-label="Close worker status" title="Close"><i data-lucide="x"></i></button></div></form>
+    <div id="workerStatusList" aria-live="polite">Checking...</div>
+  </dialog>
   <main>
     <section id="queuePane">
       <div class="summary" id="summary"></div>
@@ -7243,6 +7251,37 @@ const html = String.raw`<!doctype html>
       showToast(error.message || String(error), 'error');
     }
 
+    let workerStatusLoading = false;
+    async function loadWorkerStatus() {
+      if (workerStatusLoading) return;
+      workerStatusLoading = true;
+      const button = document.getElementById('workerStatusBtn');
+      try {
+        const result = await api('/api/worker-health');
+        const unmonitored = result.workers.every(worker => ['not_started','disabled'].includes(worker.state));
+        button.style.color = result.attention ? '#b54708' : '';
+        button.title = result.attention ? 'Background workers need attention' : unmonitored ? 'Background workers are not running here' : 'Background workers are responding';
+        const labels = {not_started:'Not started',disabled:'Disabled',idle:'Idle',working:'Working',stalled:'No recent progress',error:'Last cycle failed',stopped:'Stopped'};
+        document.getElementById('workerStatusList').innerHTML = result.workers.map(worker =>
+          '<section style="padding:12px 0;border-bottom:1px solid var(--line)"><strong>' + escapeHtml(worker.name) + '</strong> ' +
+          '<span class="' + (worker.attention ? 'error-text' : 'muted') + '">' + escapeHtml(labels[worker.state] || 'Unknown') + '</span>' +
+          (worker.phase ? '<div>' + escapeHtml(worker.phase) + '</div>' : '') +
+          '<div class="muted">Last progress: ' + escapeHtml(worker.lastProgressAt ? fmtDate(worker.lastProgressAt) : 'None since this server started') +
+          (worker.elapsedSeconds == null ? '' : ' (' + escapeHtml(worker.elapsedSeconds) + 's ago)') + '</div>' +
+          '<div class="muted">Last completed cycle: ' + escapeHtml(worker.lastSuccessfulCycleAt ? fmtDate(worker.lastSuccessfulCycleAt) : 'None since this server started') + '</div></section>').join('');
+      } catch {
+        button.style.color = '#b54708'; button.title = 'Background worker status unavailable';
+        document.getElementById('workerStatusList').textContent = 'Worker status could not be refreshed. The previous status is not current.';
+      } finally { workerStatusLoading = false; }
+    }
+    document.getElementById('workerStatusBtn').addEventListener('click', () => {
+      const dialog = document.getElementById('workerStatusDialog');
+      if (!dialog.open) dialog.showModal();
+      void loadWorkerStatus();
+    });
+    void loadWorkerStatus();
+    setInterval(() => { if (!document.hidden) void loadWorkerStatus(); }, 15_000);
+
     async function loadData(force) {
       if (state.loadPromise) {
         try {
@@ -7607,6 +7646,10 @@ export function createAdminServer(
 
             if (req.method === 'GET' && url.pathname === '/api/live-status') {
                 sendJson(res, 200, { ...syncStatus, dbPath: db.getPath() });
+                return;
+            }
+            if (req.method === 'GET' && url.pathname === '/api/worker-health') {
+                sendJson(res, 200, workerHealth.snapshot());
                 return;
             }
             if (req.method === 'GET' && ['/assets/pdfjs/pdf.mjs', '/assets/pdfjs/pdf.worker.mjs'].includes(url.pathname)) {
