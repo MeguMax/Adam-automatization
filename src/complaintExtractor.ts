@@ -6,7 +6,7 @@ import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 5;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 6;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -58,7 +58,7 @@ export interface ComplaintExtractionWarning {
 
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
-    extractorVersion: 1 | 2 | 3 | 4 | 5;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6;
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -128,12 +128,12 @@ function parseCityStateZip(value: string): {
     state?: string;
     postalCode?: string;
 } {
-    const match = normalizeLine(value).match(/^(.+?)[,\s]+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/i);
+    const match = normalizeLine(value).match(/^(.+?)[,\s]+([A-Z]{2})\s+(\d{5})(?:-?(\d{4}))?$/i);
     return match
         ? {
             city: cleanName(match[1]),
             state: match[2].toUpperCase(),
-            postalCode: match[3],
+            postalCode: match[3] + (match[4] ? '-' + match[4] : ''),
         }
         : {};
 }
@@ -826,18 +826,20 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
         return rows.map(row => ({ y: row[0].y, confidence: Math.min(...row.map(word => word.confidence)),
             text: row.sort((a, b) => a.x - b.x).map(word => word.text).join(' ') }));
     };
-    const left = groupLines(words.filter(word => word.x < 300));
-    const right = groupLines(words.filter(word => word.x >= 300));
+    const left = groupLines(words.filter(word => word.x + word.width / 2 < 300));
+    const right = groupLines(words.filter(word => word.x + word.width / 2 >= 300));
     const plaintiffLabel = left.find(line => /plaintiff.{0,8}name/i.test(line.text));
     const defendantLabel = right.find(line => /defendant.{0,8}name/i.test(line.text));
     const attorneyLabel = left.find(line => /plaintiff.{0,8}attorney/i.test(line.text));
     const statesLabel = groupLines(words).find(line => /\b(?:the\s+)?plaintiff\s+states\b/i.test(line.text));
     function party(rows: Array<{y: number; text: string}>, start?: number, end?: number): ComplaintPartyExtraction | undefined {
         if (start === undefined || end === undefined) return;
-        const values = rows.filter(line => line.y > start + 6 && line.y < end - 2).map(line => line.text.trim());
+        const values = rows.filter(line => line.y > start + 6 && line.y < end - 2)
+            .map(line => line.text.trim().replace(/^[|\[\]]+(?=\d+\s)/, ''));
         // Caption names may wrap. The address begins at the first numbered street line.
-        const street = values.findIndex(line => /^\d+[A-Z]?(?:[-/]\d+)?\s+\S/i.test(line));
-        if (street > 1) values.splice(0, street, values.slice(0, street).join(' '));
+        const contact = values.findIndex(line => /^\d+[A-Z]?(?:[-/]\d+)?\s+\S/i.test(line) ||
+            Boolean(normalizedPhone(line)) || /^c\s*\/\s*o\b/i.test(line) || Boolean(parseCityStateZip(line).state));
+        if (contact > 1) values.splice(0, contact, values.slice(0, contact).join(' '));
         const name = values[0];
         if (!name || !/[a-z]{2}/i.test(name) || /name,? address|telephone|plaintiff|defendant|attorney/i.test(name)) return;
         return partyFromLines(values);
@@ -883,8 +885,17 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
             if (start === undefined || end === undefined) continue;
             if (rows.some(line => line.y > start + 6 && line.y < end - 2 && line.confidence < 80)) result.fieldConfidence[key] = 'low';
         }
+        if (attorneyLabel && left.some(line => line.y > attorneyLabel.y + 6 &&
+            line.y < attorneyLabel.y + 65 && line.confidence < 80)) result.fieldConfidence.attorney = 'low';
+        const uncertain = (['plaintiff','defendants','attorney'] as const).filter(key=>result.fieldConfidence[key]==='low');
+        if (uncertain.length) result.warnings.push({code:'caption_review',
+            message:'Low-confidence scan values need checking: ' + uncertain.map(key=>
+                key==='plaintiff' ? 'Plaintiff name/contact details' : key==='defendants' ? 'Defendant names/addresses' : 'attorney details').join(', ') + '.'});
     }
     if (!result.data.plaintiff) result.warnings.push({ code: 'missing_plaintiff', message: 'Enter the Plaintiff from the scanned Complaint.' });
     if (!result.data.defendants?.length) result.warnings.push({ code: 'missing_defendant', message: 'Enter the Defendant names and address from the scanned Complaint.' });
+    if (source === 'ocr' && !result.data.courtDistrict) result.warnings.push({
+        code:'caption_review', message:'The court district could not be read reliably from the Complaint. Select the court after checking the PDF.',
+    });
     return result;
 }

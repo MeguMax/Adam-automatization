@@ -3,7 +3,7 @@ import { createCanvas } from '@napi-rs/canvas';
 import { createWorker, PSM } from 'tesseract.js';
 import type { Page as RecognizedPage } from 'tesseract.js';
 import sharp from 'sharp';
-import type { OcrPage, OcrLine } from './pdfOcr';
+import { mergeOcrRegionWords, type OcrPage, type OcrLine } from './pdfOcr';
 import { pdfResourceOptions } from './pdfValidation';
 import { readComplaintSelections } from './pdfCheckboxes';
 
@@ -41,16 +41,16 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
             canvas.width = 1; canvas.height = 1;
             page.cleanup();
             const xScale = 612 / viewport.width, yScale = 792 / viewport.height;
-            const convert = (data: RecognizedPage): OcrPage => {
+            const convert = (data: RecognizedPage, offsetX = 0, offsetY = 0): OcrPage => {
                 const lines = (data.blocks || []).flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines.map(line => ({
                     text: line.text.trim(), confidence: line.confidence,
-                    x: line.bbox.x0 * xScale, y: line.bbox.y0 * yScale,
+                    x: (line.bbox.x0 + offsetX) * xScale, y: (line.bbox.y0 + offsetY) * yScale,
                     width: (line.bbox.x1 - line.bbox.x0) * xScale,
                     height: (line.bbox.y1 - line.bbox.y0) * yScale, pageNumber: number,
                 }))));
                 const words = (data.blocks || []).flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines.flatMap(line => line.words.map(word => ({
                     text: word.text.trim(), confidence: word.confidence,
-                    x: word.bbox.x0 * xScale, y: word.bbox.y0 * yScale,
+                    x: (word.bbox.x0 + offsetX) * xScale, y: (word.bbox.y0 + offsetY) * yScale,
                     width: (word.bbox.x1 - word.bbox.x0) * xScale,
                     height: (word.bbox.y1 - word.bbox.y0) * yScale, pageNumber: number,
                 })))));
@@ -84,40 +84,48 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                         const row = grouped.find(row => Math.abs(row[0].y - word.y) < 5);
                         if (row) row.push(word); else grouped.push([word]);
                     }
-                    return grouped.map(row => ({ x: Math.min(...row.map(w=>w.x)), y: row[0].y, height: Math.max(...row.map(w=>w.height)), text: row.sort((a,b)=>a.x-b.x).map(w=>w.text).join(' ') }));
+                    return grouped.map(row => ({ x: Math.min(...row.map(w=>w.x)), y: Math.min(...row.map(w=>w.y)),
+                        height: Math.max(...row.map(w=>w.y+w.height))-Math.min(...row.map(w=>w.y)),
+                        text: row.sort((a,b)=>a.x-b.x).map(w=>w.text).join(' ') }));
                 };
-                const left = rows(recognized.words.filter(word => word.x < 300));
-                const right = rows(recognized.words.filter(word => word.x >= 300));
+                const left = rows(recognized.words.filter(word => word.x + word.width / 2 < 300));
+                const right = rows(recognized.words.filter(word => word.x + word.width / 2 >= 300));
                 const plaintiff = left.find(row => /plaintiff.{0,8}name/i.test(row.text));
                 const defendant = right.find(row => /defendant.{0,8}name/i.test(row.text));
                 const attorney = left.find(row => /plaintiff.{0,8}attorney/i.test(row.text));
                 const states = rows(recognized.words).find(row => /\b(?:the\s+)?plaintiff\s+states\b/i.test(row.text));
-                for (const [label, end, xMax] of [
-                    [plaintiff, attorney?.y, 289], [defendant, states?.y, 585],
+                const related = rows(recognized.words).find(row => /there is no other pending/i.test(row.text));
+                for (const [label, end, xMax, column] of [
+                    [plaintiff, attorney?.y, 289, left], [defendant, states?.y, 585, right],
+                    [attorney, related?.y, 289, left],
                 ] as const) {
                     if (!label || end === undefined || end <= label.y + 20) continue;
                     const xMin = Math.max(0, label.x - 1);
-                    const top = label.y + label.height + 2, bottom = end - 5;
+                    const firstData = column.find(row => row.y > label.y + 5 && row.y < end - 2);
+                    if (!firstData) continue;
+                    // Closely printed captions can start immediately below the label.
+                    // Crop from the first data row, not a padded label bounding box.
+                    const top = firstData.y - 1, bottom = end - 2;
                     const crop = { left: Math.round(xMin / xScale), top: Math.round(top / yScale),
                         width: Math.round((xMax-xMin) / xScale), height: Math.round((bottom-top) / yScale) };
                     if (crop.width <= 0 || crop.height <= 0 || crop.left + crop.width > pixelWidth || crop.top + crop.height > pixelHeight) continue;
                     await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK });
-                    const data = (await worker.recognize(image, { rectangle: crop }, { text: true, blocks: true })).data;
-                    const block = convert(data);
+                    const padding = 16;
+                    const cropped = await sharp(image).extract(crop).extend({top:padding,bottom:padding,left:padding,right:padding,
+                        background:'#fff'}).png().toBuffer();
+                    const data = (await worker.recognize(cropped, {}, { text: true, blocks: true })).data;
+                    const block = convert(data, crop.left-padding, crop.top-padding);
                     passes++;
                     if (!block.words.length) continue;
-                    const inside = (word: OcrLine) => word.x >= xMin && word.x < xMax && word.y >= top && word.y < bottom;
-                    const previous = recognized.words.filter(inside);
-                    const score = (words: OcrLine[]) => words.filter(word => word.confidence >= 80).length;
-                    if (score(block.words) < score(previous)) continue;
-                    recognized.words = [...recognized.words.filter(word => !inside(word)), ...block.words];
+                    recognized.words = mergeOcrRegionWords(recognized.words, block.words,
+                        {left:xMin,top,right:xMax,bottom});
                 }
             }
             await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
             if (Math.abs(recognized.rotationRadians || 0) < 0.015) {
                 const raw = await sharp(image).toColourspace('srgb').ensureAlpha().raw().toBuffer({resolveWithObject:true});
                 recognized.selections = readComplaintSelections(new Uint8ClampedArray(raw.data.buffer,raw.data.byteOffset,raw.data.length),
-                    raw.info.width,raw.info.height,recognized.words.filter(word=>word.confidence>=80));
+                    raw.info.width,raw.info.height,recognized.words.filter(word=>word.confidence>=50));
             }
             pages.push({ ...recognized, recognitionPasses: passes });
         }

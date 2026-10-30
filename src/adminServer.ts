@@ -53,7 +53,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-29-receipt-status-v77';
+const ADMIN_BUILD_ID = '2026-10-30-scan-payment-review-v78';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4772,7 +4772,8 @@ const html = String.raw`<!doctype html>
           '<dt class="checkout-total">Checkout total:</dt><dd class="checkout-total">' + escapeHtml(money(quote.totalCents)) + ' USD</dd></dl>' +
           '<span>Quote expires: ' + escapeHtml(fmtDate(quote.expiresAt)) + '</span>' : '<span>Check checkout to retrieve the exact total, including MiFILE processing fees.</span>') +
         (quote?.totalCents > 0 ? '<span>Payment account: ' + escapeHtml(checkout.selectedPaymentMethodLabel ||
-          (quote.paymentMethodState === 'selected' ? 'Selected in MiFILE' : quote.paymentMethodState === 'missing' ? 'No saved account visible in MiFILE checkout' : 'Not selected')) + '</span>' : '') +
+          (quote.paymentMethodState === 'selected' ? 'Selected in MiFILE' : quote.paymentMethodState === 'missing' ? 'No payment account verified in this quote' :
+            quote.paymentMethodState === 'unverified' ? 'Linked account not independently verified' : 'Not selected')) + '</span>' : '') +
         (methods.length && quote?.totalCents > 0 ? '<div class="checkout-account-choice"><label for="checkoutPaymentMethod">Payment account for fee check</label>' +
           '<select id="checkoutPaymentMethod"' + (!canChoose ? ' disabled' : '') + '><option value="">Choose an account</option>' +
           methods.map(method => '<option value="' + escapeHtml(method.fingerprint) + '"' +

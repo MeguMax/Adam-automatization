@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createCanvas } from '@napi-rs/canvas';
-import { recognizeScannedPdf } from './pdfOcr';
+import { recognizeScannedPdf, mergeOcrRegionWords, type OcrLine } from './pdfOcr';
 import { parseScannedComplaint } from './complaintExtractor';
 import { inspectFilingPdf } from './pdfValidation';
 import { isProcessingReportSubject } from './processingReport';
@@ -122,6 +122,46 @@ test('a caption boundary split across columns still finds wrapped business and p
     assert.deepEqual(result.data.defendants?.map(p=>[p.displayName,p.partyType]),[['Example Ventures LLC','entity'],['Morgan Tenant','person']]);
     assert.equal(result.data.defendants?.[0].postalCode,'48184');
     assert.ok(result.warnings.some(w=>w.code==='scan_review'));
+});
+
+test('caption rereads never duplicate a clipped name or promote disagreeing spelling to confidence', () => {
+    const word = (text:string,x:number,y:number,confidence:number):OcrLine =>
+        ({text,x,y,width:25,height:8,confidence,pageNumber:1});
+    const original = [word('Caption',40,130,95), word('Example',40,150,92), word('LLC',75,150,95), word('Outside',320,150,95)];
+    const result = mergeOcrRegionWords(original,
+        [word('Caption',40,130,96),word('Examp1e',40,150,96),word('LLC',75,150,96),word('100',40,170,95)],
+        {left:39,top:149,right:289,bottom:190});
+    assert.equal(result.filter(item => item.x===40 && item.y===150).length,1);
+    assert.equal(result.find(item => item.y===150 && item.x===40)?.text,'Example');
+    assert.ok(result.find(item => item.y===150 && item.x===40)!.confidence<80);
+    assert.equal(result.filter(item => item.text==='Caption').length,1);
+    assert.equal(result.find(item=>item.text==='LLC')?.confidence,96);
+    assert.ok(result.some(item=>item.text==='100'));
+    assert.ok(result.some(item=>item.text==='Outside'));
+});
+
+test('tight typewritten captions keep contact lines out of names and the right-column heading out of the attorney', () => {
+    const word = (text:string,x:number,y:number,width=100):OcrLine =>
+        ({text,x,y,width,height:7,confidence:95,pageNumber:1});
+    const words=[word('Plaintiff name(s), address(es)',40,141,170),word('Example Estates LLC',40,150,180),
+        word('248-555-0199',40,163),word('c/o Alex Attorney (P70000)',40,174,200),
+        word('Plaintiff attorney, bar no.',40,194,210),word('Alex Attorney (P70000)',40,207,200),
+        word('200 Legal Avenue',40,217,160),word('Example City, MI 480014551',40,227,210),word('248-555-0101',40,238),
+        word('Defendant name(s) and address',310,141,210),word('Morgan Tenant, and all other occupants',310,153,265),
+        word('[20251 Rental Avenue',310,164,180),word('Example City, MI 48002',310,174,210),
+        word('The',298,206,18),word('plaintiff states:',319,206,80),word('There is no other pending',65,272,220),
+        word('25th District Court',40,75,160)];
+    const result=parseScannedComplaint([{text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT\n'+words.map(w=>w.text).join('\n'),
+        confidence:90,words,lines:words,selections:{money:false,noRelated:true,previousRelated:false}}]);
+    assert.equal(result.data.plaintiff?.displayName,'Example Estates LLC');
+    assert.equal(result.data.attorney?.displayName,'Alex Attorney');
+    assert.equal(result.data.attorney?.address1,'200 Legal Avenue');
+    assert.equal(result.data.attorney?.postalCode,'48001-4551');
+    assert.equal(result.data.defendants?.[0].address1,'20251 Rental Avenue');
+    assert.deepEqual(result.data.defendants?.map(p=>p.displayName),['Morgan Tenant']);
+    assert.equal(result.data.includeAllOtherOccupants,true);
+    assert.equal(result.data.moneyJudgmentRequested,false);
+    assert.equal(result.data.claimAmount,'0.00');
 });
 
 test('processing report correspondence cannot be mistaken for source filings', () => {

@@ -282,7 +282,7 @@ test('unknown, duplicate, contradictory and multiple selected payment controls f
     }finally{await page.close();}
 });
 
-test('the live empty payment panel is missing, not an unselected account, and never clicks Add',async()=>{
+test('Add Payment Account alone does not prove that the login has no linked payment account',async()=>{
     const page=await browser.newPage();
     try {
         await page.setContent(`<fieldset aria-label="Available Payment Accounts"><div>Available Payment Accounts</div>
@@ -290,9 +290,24 @@ test('the live empty payment panel is missing, not an unselected account, and ne
         // The vendor nests this exact empty fieldset inside its Checkout dialog.
         await page.setContent(`<div role="dialog"><h2>Checkout</h2>${await page.locator('fieldset').evaluate(el=>el.outerHTML)}</div>`);
         const result=await readPaymentMethods(page);
-        assert.equal(result.state,'missing');assert.equal(result.fingerprint,null);assert.deepEqual(result.available,[]);
+        assert.equal(result.state,'unverified');assert.equal(result.fingerprint,null);assert.deepEqual(result.available,[]);
         assert.equal(await page.evaluate(()=>Boolean((window as any).added)),false);
     }finally{await page.close();}
+});
+
+test('unverified payment availability retains exact fees but cannot confirm readiness or authorize payment',()=>{
+    const {db,store,job}=storeFixture();
+    try {
+        const hash=(job.result!.savedBundleEvidence as any).packageDigest;
+        const q=buildCheckoutQuote(job,account,fees,{state:'unverified',fingerprint:null,available:[]},hash,10300);
+        const work=store.queue(job.id,'quote',account);store.claim();store.complete(work.id,{kind:'quote',quote:q},account);
+        const state=store.state(job.id,account);
+        assert.equal(state.quote!.totalCents,12669);assert.equal(state.checkoutVerified,true);
+        assert.equal(state.canConfirm,false);assert.equal(state.paymentExecutionEnabled,false);
+        assert.ok(state.issues.some(issue=>issue.startsWith('Verify the payment account')));
+        assert.ok(!state.issues.some(issue=>issue.startsWith('Add a payment method')));
+        assert.throws(()=>store.confirm(job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents},account,'qa'));
+    }finally{db.close();}
 });
 
 test('checkout waits for asynchronously rendered payment controls before recording availability',async()=>{
@@ -571,7 +586,7 @@ test('automatic polling history is bounded without deleting manual quotes or con
     }finally{f.db.close();}
 });
 
-async function historyPageFixture(page:import('playwright').Page,job:FilingJobView,rows:string,receiptPdf?:Buffer) {
+async function historyPageFixture(page:import('playwright').Page,job:FilingJobView,rows:string,receiptPdf?:Buffer,controls='') {
     job.createdAt=new Date().toISOString();
     await page.route('**/*',async route=>{
         const url=new URL(route.request().url());
@@ -583,7 +598,7 @@ async function historyPageFixture(page:import('playwright').Page,job:FilingJobVi
         }
         await route.fulfill({contentType:'text/html',body:`<header>${account.username}</header><main>
             <div role="tabpanel" aria-label="My History"><label>Start Date:<input></label><label>End Date:<input></label>
-            <button onclick="window.searched=true">Search</button><table><tbody>${rows}</tbody></table></div></main>`});
+            <button onclick="window.searched=true">Search</button>${controls}<table><tbody>${rows}</tbody></table></div></main>`});
     });
     return async (href:string) => {
         assert.equal(new URL(href).origin,'https://mifile.courts.michigan.gov');
@@ -614,6 +629,25 @@ test('history collector rejects substring and off-origin bundle links instead of
         const result=await collectReceiptObservations(page,job,account,fetchReceipt);
         if(result.kind!=='receipts') throw new Error('Wrong result');
         assert.equal(result.state,'inconclusive');assert.equal(result.observations.length,0);
+    }finally{await page.close();}
+});
+
+test('history checks Bundle View and later pages without changing the default view or touching payment',async()=>{
+    const page=await browser.newPage(),job=prepared();
+    try {
+        const target=`<tr><td><a href="/filing/details/${job.externalBundleId}">View bundle</a></td><td>Submitted</td></tr>`;
+        const controls=`<select id="historyViewTypeSelect" onchange="window.bundleView=this.value==='bundle';document.getElementById('next').disabled=!window.bundleView">
+            <option value="filing">Filing View</option><option value="bundle">Bundle View</option></select>
+            <input type="checkbox" aria-label="Default view" onchange="window.defaultChanged=true">
+            <button id="next" disabled aria-label="Next page" onclick="document.querySelector('tbody').innerHTML=${JSON.stringify(target).replace(/"/g,'&quot;')};this.disabled=true">Next</button>
+            <button onclick="window.paid=true">Submit</button>`;
+        await historyPageFixture(page,job,'<tr><td>Unrelated first page</td><td>Paid</td></tr>',undefined,controls);
+        const stages:string[]=[];
+        const result=await collectReceiptObservations(page,job,account,undefined,stage=>stages.push(stage));
+        if(result.kind!=='receipts') throw new Error('Wrong result');
+        assert.equal(result.state,'found');assert.equal(result.observations[0].status,'Submitted');
+        assert.ok(stages.includes('opening_history'));assert.ok(stages.includes('reading_history_rows'));
+        assert.equal(await page.evaluate(()=>Boolean((window as any).defaultChanged || (window as any).paid)),false);
     }finally{await page.close();}
 });
 

@@ -49,8 +49,14 @@ export async function runFilingWorker(options: {
                 const diagnostic = /\b(?:locator|page|browser|frame)\.|strict mode violation|Timeout \d+ms/i.test(message);
                 if (diagnostic) console.error(`[MiFILE checkout ${inspection.id}] Browser inspection could not complete:`,
                     message.split('Call log:')[0].slice(0,500));
+                const stage = db.checkout().get(inspection.id)?.stage;
+                const safeStage = {opening_saved_bundle:'opening the saved bundle', opening_history:'opening MiFILE History',
+                    waiting_for_history:'waiting for MiFILE History results', reading_history_rows:'matching the exact bundle in History',
+                    reading_receipt_documents:'reading receipt documents',login:'signing in',reading_receipts:'verifying the account',
+                }[stage || ''];
                 db.checkout().fail(inspection.id, diagnostic ?
-                    'MiFILE could not be read reliably. No payment or court submission was attempted. Refresh the check; contact support if it repeats.' : message);
+                    'MiFILE could not be read reliably' + (safeStage ? ' while ' + safeStage : '') +
+                    '. No payment or court submission was attempted. Refresh the check; contact support if it repeats.' : message);
             }
             continue;
         }

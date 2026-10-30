@@ -101,7 +101,7 @@ export class MiFileCheckoutRunner {
             } else {
                 this.progress('reading_receipts');
                 await runner.verifyAccount(page, account.username);
-                result = await collectReceiptObservations(page, job, account);
+                result = await collectReceiptObservations(page, job, account, undefined, this.progress);
             }
             if (getCheckoutAccount().identity !== account.identity) throw new Error('MiFILE account changed during inspection.');
             return {result,account};

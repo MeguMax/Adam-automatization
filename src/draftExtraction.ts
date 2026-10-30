@@ -89,8 +89,13 @@ export async function runDraftExtractionWorker(db: WorkflowDatabase, signal: Abo
         try {
             for (const draftId of db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION)) {
                 if (signal.aborted) break;
-                await ensureDraftComplaintExtraction(db, draftId);
-                if (!signal.aborted) await applyLibraryForms(db, draftId);
+                try {
+                    const detail = await ensureDraftComplaintExtraction(db, draftId);
+                    if (!signal.aborted && detail.caseDraft?.filingEligible &&
+                        ['not_started','failed'].includes(detail.caseDraft.filingStatus)) await applyLibraryForms(db, draftId);
+                } catch (error) {
+                    console.error('Automatic Complaint extraction for Draft ' + draftId + ':', (error as Error).message);
+                }
             }
         } catch (error) { console.error('Automatic Complaint extraction:', (error as Error).message); }
         if (!signal.aborted) await new Promise<void>(resolve => {

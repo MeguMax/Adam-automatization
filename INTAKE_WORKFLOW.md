@@ -147,6 +147,26 @@ The Draft workspace opens on **Review**: court, parties, claim and included docu
 
 The primary action changes with the case: **Save & check**, **Review corrections**, **Confirm & prepare**, **View progress**, **Check result**, or **Open MiFILE**. Saving locks mutating controls until completion. Tab/disclosure selection, unsaved inputs and PDF navigation survive ordinary refreshes. Known-good new email intakes retain their existing automatic Unsubmitted preparation; incomplete packages still require correction, and uncertain remote results still require checking MiFILE before retrying.
 
+### Scan recognition and payment availability (October 30)
+
+Extractor version 6 corrects tightly printed scanned captions. Bounded, padded caption reads no longer cut the first data row or concatenate two alternative readings. Disagreeing spellings retain a low-confidence marker rather than becoming trusted party names. Telephone/care-of lines are not appended to the Plaintiff name, right-column text is kept out of the attorney name, and nine-digit ZIP values are formatted as ZIP+4. Image-based paragraph 10 checks may use a lower-confidence printed number only when the actual square is detected; a missing square is still unknown. Low-confidence parties, attorney details and unreadable court districts remain explicit review items. This is not a promise of perfect OCR.
+
+Complaints naming another attorney do not silently become Adam Devlin filings. The attorney field must be corrected and authorized before preparation under the currently supported filer, P72877. Source scans remain unchanged. Manual field corrections survive repeated extraction.
+
+The automatic extraction queue excludes legacy court-notification copies before applying its batch limit. One rejected/ineligible record cannot continually occupy that slot or stop the following Drafts.
+
+The read-only checkout adapter distinguishes **Unverified** from an explicit MiFILE message that no payment accounts exist. **Add Payment Account** by itself is not evidence that the owner has no linked card. Fees can still be inspected, but unverified account availability cannot authorize payment or pass amount confirmation. Payment and court submission remain disabled.
+
+Receipt checks explicitly select **Bundle View** where supported and inspect bounded additional history pages for the exact saved reference, without changing the account's default view. A missing reference, history timeout or unrecognized receipt is not converted into Paid or Filed. The admin records which read-only stage failed. Attorney-reported manual submission still requires remote status/receipt reconciliation, never an automatic payment retry.
+
+For private local scan acceptance, run the production intake pipeline with isolated SQLite and mocked cloud storage:
+
+```powershell
+node tools/verify-local-intake.cjs --expect-review --forms "path-to-approved-forms" --output "output/local-intake.json" "Complaint.pdf" "Summons.pdf" "Request.pdf" "Demand.pdf"
+```
+
+The command makes no network requests or MiFILE jobs. It verifies automatic document classification/extraction, idempotent reprocessing, manual-edit preservation and any expected review gate. Source PDFs and generated diagnostic reports must remain outside Git.
+
 ## Account settings
 
 The existing environment credentials remain active until an account is saved through Settings. Admin authentication is required. In production, no extra Render secret is needed for a fresh installation: the server creates one random 256-bit key at `/var/data/.secrets/mifile-credentials.key` and reuses it after restarts. The key file is separate from SQLite, private to the server user on Linux, and excluded from Git and Docker builds. Back it up securely; restoring the database alone cannot decrypt a saved account.

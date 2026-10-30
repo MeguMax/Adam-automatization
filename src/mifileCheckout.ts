@@ -38,7 +38,7 @@ export interface CheckoutQuote {
     lines: Array<{ label: string; cents: number }>;
     totalCents: number;
     processingFeeCents: number;
-    paymentMethodState: 'missing' | 'not_selected' | 'selected' | 'not_required';
+    paymentMethodState: 'missing' | 'unverified' | 'not_selected' | 'selected' | 'not_required';
     paymentMethodFingerprint: string | null;
     availablePaymentMethods?: CheckoutPaymentMethod[];
     sourceContentVerified: true;
@@ -133,7 +133,7 @@ export function buildCheckoutQuote(job: FilingJobView, account: CheckoutAccount,
     if (method.state === 'selected' && !/^[a-f0-9]{64}$/.test(method.fingerprint || '')) {
         throw new Error('The selected payment method could not be identified safely.');
     }
-    if (!['missing','not_selected','selected'].includes(method.state) ||
+    if (!['missing','unverified','not_selected','selected'].includes(method.state) ||
         method.state !== 'selected' && method.fingerprint !== null) {
         throw new Error('The payment account state is inconsistent. Refresh checkout.');
     }
@@ -167,7 +167,7 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
         new Set(quote.lines.map(line => line.label)).size !== quote.lines.length ||
         quote.processingFeeCents !== (quote.lines.find(line => line.label === 'Processing Service Fee')?.cents || 0) ||
         quote.paymentAuthorized !== false || quote.courtSubmissionAuthorized !== false) issues.push('The stored checkout snapshot is invalid.');
-    if (!['missing','not_selected','selected','not_required'].includes(quote.paymentMethodState) ||
+    if (!['missing','unverified','not_selected','selected','not_required'].includes(quote.paymentMethodState) ||
         quote.totalCents === 0 && (quote.paymentMethodState !== 'not_required' || quote.paymentMethodFingerprint !== null) ||
         quote.totalCents > 0 && quote.paymentMethodState === 'not_required' ||
         quote.paymentMethodState !== 'selected' && quote.paymentMethodFingerprint !== null ||
@@ -188,7 +188,8 @@ export function checkoutReviewIssues(quote: CheckoutQuote, job: FilingJobView, a
         expiresAt <= now || expiresAt - quotedAt !== CHECKOUT_REVIEW_LIFETIME_MS) issues.push('This checkout quote expired. Refresh checkout.');
     if (quote.sourceContentVerified !== true) issues.push('Source PDFs have not been checked against the preparation snapshot.');
     if (quote.totalCents > 0 && (quote.paymentMethodState !== 'selected' || !/^[a-f0-9]{64}$/.test(quote.paymentMethodFingerprint || ''))) {
-        issues.push(quote.paymentMethodState === 'missing' ? 'Add a payment method to this MiFILE login, or make the existing account available there, then refresh checkout. Nothing has been charged.' :
+        issues.push(quote.paymentMethodState === 'unverified' ? 'Verify the payment account directly in MiFILE. The Add Payment Account button alone does not mean a linked card is missing. Nothing has been charged.' :
+            quote.paymentMethodState === 'missing' ? 'Add a payment method to this MiFILE login, or make the existing account available there, then refresh checkout. Nothing has been charged.' :
             (quote.availablePaymentMethods?.length ? 'Select the intended payment method below for a new fee check. Nothing has been charged.' :
                 'Select the intended payment method in MiFILE, then refresh checkout. Nothing has been charged.'));
     }

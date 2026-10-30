@@ -172,7 +172,7 @@ export class CheckoutStore {
                     throw new Error('MiFILE did not retain the chosen payment account. Clear the choice and refresh checkout.');
                 }
                 // An exact displayed quote is retained even when payment setup is incomplete.
-                if (issues.some(issue => !/^(Add a payment method|Select the intended payment method)/.test(issue))) {
+                if (issues.some(issue => !/^(Add a payment method|Select the intended payment method|Verify the payment account)/.test(issue))) {
                     throw new Error(issues.join(' '));
                 }
             } else {
@@ -285,7 +285,7 @@ export class CheckoutStore {
             canInspect:Boolean(job && filingReleaseChecks(job,account).sameAccount && !summary.submissionObserved && !receiptEvidenceInvalid),
             confirmedAt: reviewedAt,
             checkoutVerified: Boolean(quote && job && latestQuote?.id === quoteInspection?.id &&
-                issues.every(issue => /^(Add a payment method|Select the intended payment method)/.test(issue))),
+                issues.every(issue => /^(Add a payment method|Select the intended payment method|Verify the payment account)/.test(issue))),
             paymentMethodChoice:choice,
             selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
             preflight:{checks:preflightChecks,complete:preflightChecks.every(check=>check.passed),

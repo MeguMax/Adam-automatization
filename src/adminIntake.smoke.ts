@@ -327,7 +327,9 @@ async function main() {
         assert.equal(db.getDraftDetail(draftId)!.documents.length, 1);
         assert.equal(storedFiles.size, 2, 'Removing a library document must not delete its OneDrive copy');
         await page.locator('#draftAddDocumentBtn').click();
-        await page.locator('#draftDocumentFileInput').setInputFiles({ name:'Complaint.pdf',mimeType:'application/pdf',buffer:testComplaintFormFixture() });
+        await page.locator('#draftDocumentFileInput').setInputFiles({ name:'Complaint.pdf',mimeType:'application/pdf',buffer:testComplaintFormFixture({
+            6:'Adam J Devlin P72877\r30850 Telegraph Rd Ste 250\rBingham Farms, MI 48025\r248 703 6201',
+        }) });
         await page.waitForFunction(() => document.querySelector('.draft-source-summary')?.textContent?.includes('PDF form fields'));
         let extracted=db.getDraftDetail(draftId)!.caseDraft!;
         assert.equal(await page.locator('[data-filing-field="mailingRequested"]').isDisabled(),true);
@@ -654,13 +656,15 @@ async function main() {
         const emptyInspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
         const emptyQuote=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
             ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
-            {state:'missing',fingerprint:null,available:[]},packageDigest,10300);
+            {state:'unverified',fingerprint:null,available:[]},packageDigest,10300);
         db.checkout().complete(emptyInspection.id,{kind:'quote',quote:emptyQuote},checkoutAccount);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
-        assert.match(await page.locator('[data-checkout-review]').innerText(),/No saved account visible in MiFILE checkout/);
+        assert.match(await page.locator('[data-checkout-review]').innerText(),/Linked account not independently verified/);
+        assert.match(await page.locator('[data-checkout-review]').innerText(),/Add Payment Account button alone does not mean a linked card is missing/);
+        assert.doesNotMatch(await page.locator('[data-checkout-review]').innerText(),/Add a payment method to this MiFILE login/);
         assert.equal(await page.locator('#checkoutPaymentMethod').count(),0);
         assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),false);
-        await page.screenshot({path:path.join(screenshots,'draft-checkout-missing-payment.png'),fullPage:true});
+        await page.screenshot({path:path.join(screenshots,'draft-checkout-unverified-payment.png'),fullPage:true});
         await page.locator('#draftReviewTab').click();
         assert.equal(await page.locator('#draftValidationSummary').innerText(),'');
         assert.match(await page.locator('#draftPreparationStatus').innerText(),/MiFILE status not checked/);
@@ -832,7 +836,8 @@ async function main() {
             await clickDocumentTool('draftReplaceDocumentBtn');
             page.once('dialog',dialog=>dialog.accept());
             await page.locator('#draftDocumentFileInput').setInputFiles({name:'Complaint.pdf',mimeType:'application/pdf',
-                buffer:testComplaintFormFixture({7:name+', and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146'})});
+                buffer:testComplaintFormFixture({6:'Adam J Devlin P72877\r30850 Telegraph Rd Ste 250\rBingham Farms, MI 48025\r248 703 6201',
+                    7:name+', and all other occupants\r200 Rental Avenue\rLincoln Park, MI 48146'})});
             assert.equal((await replaced).status(),200);
             await page.waitForFunction(()=>document.getElementById('closeDraftBtn')?.hasAttribute('disabled')===false);
             assert.equal(db.getDraftDetail(manual.caseDraft.id)!.caseDraft!.complaintExtraction?.extractorVersion,CURRENT_COMPLAINT_EXTRACTOR_VERSION);

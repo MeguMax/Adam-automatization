@@ -49,12 +49,12 @@ export async function readPaymentMethods(page: Page): Promise<{
     if (selected.length > 1) throw new Error('MiFILE shows more than one selected payment account. Check checkout manually.');
     const emptyAccountPanel = !snapshot.controls.length &&
         (await snapshot.group.innerText()).replace(/\s+/g,' ').trim() === 'Available Payment Accounts Add Payment Account';
-    const missing = emptyAccountPanel || (await snapshot.dialog.innerText()).includes('No payment methods exist for your account');
+    const missing = (await snapshot.dialog.innerText()).includes('No payment methods exist for your account');
     if (missing && snapshot.usable.length) throw new Error('MiFILE payment account information is inconsistent. Refresh checkout.');
-    if (!missing && !snapshot.usable.length) {
+    if (!missing && !emptyAccountPanel && !snapshot.usable.length) {
         throw new Error('MiFILE payment accounts are not readable yet. Check checkout again or inspect the payment account in MiFILE. No payment was attempted.');
     }
-    return {state:missing ? 'missing' : selected.length === 1 ? 'selected' : 'not_selected',
+    return {state:missing ? 'missing' : emptyAccountPanel ? 'unverified' : selected.length === 1 ? 'selected' : 'not_selected',
         fingerprint:selected.length === 1 ? digest(selected[0].token) : null, available:snapshot.methods};
 }
 

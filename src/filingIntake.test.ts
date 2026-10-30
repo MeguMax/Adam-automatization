@@ -73,6 +73,39 @@ test('intake uses an explicit subject and authorized sender; replies and court n
     assert.equal(intakeSenderAllowed(message, { FILING_INTAKE_ALLOWED_SENDERS: 'somebody@example.com' }), false);
 });
 
+test('the current extraction version is retained and another Complaint attorney cannot silently use the Devlin workflow',()=>{
+    const f=fixture([]);
+    try {
+        const id=f.db.addDocument({emailId:f.email.id,caseDraftId:f.draftId,documentType:'Complaint',
+            currentFilename:'Complaint.pdf',oneDriveUrl:'https://onedrive.example/complaint',status:'uploaded',uploadSource:'test'});
+        const detail=f.db.applyComplaintExtraction(f.draftId,id,{...extraction,data:{...extraction.data,
+            attorney:{displayName:'Alex Attorney',barNumber:'P70000'}}});
+        assert.equal(detail.caseDraft!.complaintExtraction!.extractorVersion,CURRENT_COMPLAINT_EXTRACTOR_VERSION);
+        assert.equal(detail.caseDraft!.filingData.attorney.barNumber,'P70000');
+        assert.ok(detail.caseDraft!.validationIssues.some(issue=>issue.field==='filingData.attorney.barNumber' && issue.severity==='error'));
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.throws(()=>f.db.buildFilingPayload(f.draftId),/blocked/);
+    }finally{f.close();}
+});
+
+test('a legacy court-notification copy cannot starve automatic extraction of genuine new packages',()=>{
+    const invalid=fixture([]);
+    try {
+        const db=invalid.db, sql=(db as any).db;
+        const badDocument=db.addDocument({emailId:invalid.email.id,caseDraftId:invalid.draftId,documentType:'Complaint',
+            currentFilename:'Complaint.pdf',oneDriveUrl:'https://onedrive.example/bad',status:'uploaded',uploadSource:'test'});
+        sql.prepare("UPDATE case_drafts SET normalized_data_json=json_set(normalized_data_json,'$.manualPackageSource','legacy-court-copy') WHERE id=?")
+            .run(invalid.draftId);
+        const email=db.registerEmail({...message,id:'genuine-later-intake'});
+        const parsed=buildFilingIntake({...message,id:'genuine-later-intake'},[]), draftId=db.createCaseDraft(email.id,parsed);
+        db.addDocument({emailId:email.id,caseDraftId:draftId,documentType:'Complaint',currentFilename:'Complaint.pdf',
+            oneDriveUrl:'https://onedrive.example/good',status:'uploaded',uploadSource:'test'});
+        assert.ok(badDocument);
+        assert.deepEqual(db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION,1),[draftId]);
+        assert.equal(db.getDraftDetail(invalid.draftId)!.caseDraft!.filingEligible,false);
+    }finally{invalid.close();}
+});
+
 test('required Complaint answers and Other/Connected choices cannot be waived by confirming a package', () => {
     const f = fixture([]);
     try {

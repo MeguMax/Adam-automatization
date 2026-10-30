@@ -20,6 +20,36 @@ export interface OcrPage {
     rotationRadians?: number;
     recognitionPasses?: number;
 }
+
+export interface OcrRegion { left: number; top: number; right: number; bottom: number }
+
+/** A second pass may repair missing words, but conflicting spellings stay uncertain. */
+export function mergeOcrRegionWords(words: OcrLine[], reread: OcrLine[], region: OcrRegion): OcrLine[] {
+    const inside = (word: OcrLine) => word.x + word.width / 2 >= region.left &&
+        word.x + word.width / 2 < region.right && word.y + word.height / 2 >= region.top &&
+        word.y + word.height / 2 < region.bottom;
+    const overlap = (a: OcrLine, b: OcrLine) => {
+        const area = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) *
+            Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+        return area / Math.max(1, Math.min(a.width * a.height, b.width * b.height));
+    };
+    const prior = words.filter(inside), next = reread.filter(inside), used = new Set<OcrLine>();
+    const normalize = (value: string) => value.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    const merged = prior.map(word => {
+        const matches = next.filter(candidate => candidate.pageNumber === word.pageNumber && overlap(word, candidate) > 0.5);
+        if (matches.length !== 1 || prior.filter(other => overlap(other, matches[0]) > 0.5).length !== 1) return word;
+        const candidate = matches[0]; used.add(candidate);
+        if (normalize(word.text) === normalize(candidate.text)) {
+            return {...word, confidence:Math.max(word.confidence, candidate.confidence)};
+        }
+        return {...word, confidence:Math.min(79, word.confidence)};
+    });
+    for (const word of next) {
+        if (!used.has(word) && word.confidence >= 80 && !prior.some(other => overlap(other, word) > 0.15)) merged.push(word);
+    }
+    return [...words.filter(word => !inside(word)), ...merged];
+}
+
 let queue: Promise<unknown> = Promise.resolve();
 
 /** One isolated OCR process at a time; a bad PDF must not take down the web server. */

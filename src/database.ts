@@ -1001,7 +1001,8 @@ function complaintExtractionFromDraft(data: unknown): StoredComplaintExtraction 
     if (
         typeof source.documentId !== 'string' ||
         typeof source.extractedAt !== 'string' ||
-        (![1, 2, 3, 4, 5].includes(source.extractorVersion as number)) ||
+        (!Number.isInteger(source.extractorVersion) || Number(source.extractorVersion) < 1 ||
+            Number(source.extractorVersion) > CURRENT_COMPLAINT_EXTRACTOR_VERSION) ||
         !source.data ||
         typeof source.data !== 'object'
     ) {
@@ -1402,6 +1403,10 @@ function validatePrimaryComplaint(
     }
 
     if (extraction?.documentId === primary.id) {
+        if (filing.attorney.barNumber && filing.attorney.barNumber.replace(/\s/g,'').toUpperCase() !== ADAM_ATTORNEY.barNumber) {
+            issues.push({field:'filingData.attorney.barNumber',severity:'error',
+                message:'This workflow requires Adam Devlin (P72877). The Complaint identifies another attorney; verify the source and authorized attorney before preparation.'});
+        }
         if (extraction.extractorVersion < 2) {
             issues.push({
                 field: 'complaintExtraction',
@@ -2675,7 +2680,7 @@ export class WorkflowDatabase {
     }
 
     listPendingComplaintExtractions(version: number, limit = 1): string[] {
-        return (this.db.prepare(`SELECT c.id FROM case_drafts c JOIN email_records e ON e.id = c.email_id
+        return (this.db.prepare(`SELECT c.id, c.normalized_data_json, e.subject, e.sender FROM case_drafts c JOIN email_records e ON e.id = c.email_id
             WHERE json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'
               AND c.filing_status IN ('not_started','failed') AND c.status IN ('parsed', 'needs_review', 'validation_failed', 'ready_to_file','filing_failed')
               AND e.processing_status != 'processing'
@@ -2695,7 +2700,10 @@ export class WorkflowDatabase {
                 OR (c.primary_document_id IS NULL AND (SELECT COUNT(*) FROM document_records d
                   WHERE d.case_draft_id = c.id AND d.is_active = 1 AND lower(d.document_type) LIKE '%complaint%'
                     AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','replaced','downloaded')) = 1))
-            ORDER BY c.updated_at LIMIT ?`).all(version, version, nowIso(), limit) as Array<{id:string}>).map(row=>row.id);
+            ORDER BY c.updated_at`).all(version, version, nowIso()) as Array<{
+                id:string;normalized_data_json:string;subject:string|null;sender:string|null;
+            }>).filter(row=>validateNewCaseSource(this.safeJson(row.normalized_data_json),row.subject,row.sender).length===0)
+            .slice(0,Math.min(100,Math.max(0,Math.floor(limit)))).map(row=>row.id);
     }
 
     queueValidatedIntakes(limit = 5): number {
