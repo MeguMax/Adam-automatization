@@ -163,6 +163,25 @@ test('receipt events deduplicate, reject conflicting totals and remain scoped to
         assert.equal(store.state(job.id,{...rotated,username:'different@example.com'}).receipts.length,0);
     } finally{db.close();}
 });
+
+test('later history reads can enrich a missing rejection reason without duplicating the receipt or erasing it',()=>{
+    const {db,store,job}=storeFixture();
+    try {
+        const observation={...receipt('Rejected'),message:null as string | null};
+        for(const message of [null,'Missing Demand',null,'Missing Demand']) {
+            const work=store.queue(job.id,'receipts',account);store.claim();
+            store.complete(work.id,{kind:'receipts',state:'found',checkedAt:new Date().toISOString(),issue:null,
+                observations:[{...observation,message}]},account);
+        }
+        assert.equal(store.state(job.id,account).receipts.length,1);
+        assert.equal(store.state(job.id,account).receipts[0].message,'Missing Demand');
+        const work=store.queue(job.id,'receipts',account);store.claim();
+        assert.throws(()=>store.complete(work.id,{kind:'receipts',state:'found',checkedAt:new Date().toISOString(),issue:null,
+            observations:[{...observation,message:'A different reason'}]},account),/Conflicting/);
+        store.fail(work.id,'Conflicting comment');
+        assert.equal(store.state(job.id,account).receipts[0].message,'Missing Demand');
+    }finally{db.close();}
+});
 test('checkout browser adapter reads fees and cancels without clicking Submit or adding payment methods',async()=>{
     const {openCheckoutForInspection,readCheckoutForInspection}=require('./mifileCheckoutRunner') as typeof import('./mifileCheckoutRunner');
     const page=await browser.newPage();
@@ -745,7 +764,7 @@ test('collector opens current read-only Bundle View rows and records rejection c
     try {
         const details=`<tr class="child"><td colspan="7"><div><table id="historyTable"><tbody>${fixture.rows.map((row,index)=>
             '<tr role="button">'+row.cells.map(cell=>'<td>'+cell+'</td>').join('')+'</tr>'+
-            '<tr class="child"><td colspan="9">'+row.message+'</td></tr>').join('')}</tbody></table></div></td></tr>`;
+            '<tr class="childRow"><td colspan="9">'+row.message+'</td></tr>').join('')}</tbody></table></div></td></tr>`;
         await historyPageFixture(page,job,`<tr role="button" aria-expanded="false" onclick="this.setAttribute('aria-expanded','true');this.insertAdjacentHTML('afterend',${JSON.stringify(details).replace(/"/g,'&quot;')})">
             ${fixture.bundle.map(cell=>'<td>'+cell+'</td>').join('')}</tr>`);
         const result=await collectReceiptObservations(page,job,account);

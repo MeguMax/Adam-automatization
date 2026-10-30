@@ -195,7 +195,7 @@ export async function collectReceiptObservations(page: Page, job: FilingJobView,
             if (await length.count() === 1) await length.selectOption('25');
             const readRows = () => details.locator(':scope > tbody > tr[role="button"]').evaluateAll(elements => elements.map(element => ({
                 cells:[...element.querySelectorAll(':scope > td')].map(cell => (cell as HTMLElement).innerText),
-                message:element.nextElementSibling?.classList.contains('child') ? (element.nextElementSibling as HTMLElement).innerText : null,
+                message:element.nextElementSibling?.matches('tr.childRow, tr.child') ? (element.nextElementSibling as HTMLElement).innerText : null,
             })));
             const rows = await readRows();
             const next = details.locator('..').getByRole('button',{name:'Next page',exact:true});

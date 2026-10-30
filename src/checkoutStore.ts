@@ -182,10 +182,22 @@ export class CheckoutStore {
                 for (const observation of result.observations) {
                     validateReceipt(observation, job, account);
                     const key = receiptEventKey(observation);
-                    const prior = this.db.prepare(`SELECT event_key FROM mifile_receipt_events WHERE filing_job_id = ?
+                    const prior = this.db.prepare(`SELECT event_key, event_json FROM mifile_receipt_events WHERE filing_job_id = ?
                         AND external_reference = ? AND receipt_kind = ? AND remote_status = ? AND document_id = ?`)
-                        .get(job.id, observation.externalReference, observation.kind, observation.status, observation.documentId || '') as { event_key: string } | undefined;
-                    if (prior && prior.event_key !== key) throw new Error('Conflicting values were reported for an existing receipt. Review MiFILE; no payment retry is allowed.');
+                        .get(job.id, observation.externalReference, observation.kind, observation.status, observation.documentId || '') as { event_key: string; event_json:string } | undefined;
+                    if (prior && prior.event_key !== key) {
+                        const previous = JSON.parse(prior.event_json) as MiFileReceiptObservation;
+                        validateReceipt(previous,job,account);
+                        if (receiptEventKey({...previous,message:undefined}) !== receiptEventKey({...observation,message:undefined}) ||
+                            previous.message && observation.message && previous.message !== observation.message) {
+                            throw new Error('Conflicting values were reported for an existing receipt. Review MiFILE; no payment retry is allowed.');
+                        }
+                        // A later read may add the court's comment, never change financial facts or erase a known reason.
+                        const enriched = {...observation,message:observation.message || previous.message || null};
+                        this.db.prepare('UPDATE mifile_receipt_events SET event_key = ?, event_json = ?, observed_at = ? WHERE event_key = ?')
+                            .run(receiptEventKey(enriched),JSON.stringify(enriched),observation.observedAt,prior.event_key);
+                        continue;
+                    }
                     this.db.prepare(`INSERT INTO mifile_receipt_events
                         (event_key, filing_job_id, account_identity, observed_at, event_json, external_reference, receipt_kind, remote_status, document_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
