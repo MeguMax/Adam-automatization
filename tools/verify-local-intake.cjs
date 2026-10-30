@@ -7,6 +7,7 @@ const {parseArgs} = require('node:util');
 
 const {values, positionals} = parseArgs({allowPositionals:true, options:{
     forms:{type:'string'}, output:{type:'string'}, 'expect-review':{type:'boolean',default:false},
+    'expected-extraction':{type:'string'},
 }});
 if (!positionals.length || !values.output) throw new Error('Use --output report.json [--forms directory] file.pdf ...');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(),'local-intake-qa-'));
@@ -74,9 +75,21 @@ const {planFormImports}=require('../dist/courtForms');
         if(values['expect-review']) assert.equal(db.queueValidatedIntakes(),0,'An uncertain scan must not be queued automatically');
         assert.equal(db.listFilingJobs().length,0);
         assert.equal(networkAttempts,0);
+        let assertedFields=0;
+        if(values['expected-extraction']) {
+            const expected=JSON.parse(fs.readFileSync(values['expected-extraction'],'utf8'));
+            const compare=(actual,wanted,field)=>{
+                if(wanted && typeof wanted==='object') {
+                    for(const [key,value] of Object.entries(wanted)) compare(actual?.[key],value,field+'.'+key);
+                } else {assert.deepEqual(actual,wanted,field);assertedFields++;}
+            };
+            compare(detail.caseDraft.complaintExtraction.data,expected,'Complaint');
+        }
         const report={sourcePdfs:files.size,pdfCount:detail.documents.length,uploads:uploadCount,
+            assertedFields,
             networkAttempts,filingJobs:0,manualOverridePreserved:true,reprocessingIdempotent:true,
             extraction:detail.caseDraft.complaintExtraction,fields:detail.caseDraft.filingData,
+            completeness:detail.caseDraft.packageCompleteness,
             issues:detail.caseDraft.validationIssues,documents:detail.documents.map(document=>({
                 filename:document.originalFilename,role:document.packageRole,status:document.status,recognition:document.recognition,
             }))};

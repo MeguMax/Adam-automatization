@@ -3,8 +3,52 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { WorkflowDatabase } from './database';
 import type { ParsedEmailInfo } from './emailProcessor';
+import { recognizeDocumentText, type DocumentRecognition } from './documentRecognition';
+import { testPdfFixture } from './testPdfFixture';
+
+const demandPdf = testPdfFixture('DEMAND FOR POSSESSION NONPAYMENT OF RENT');
+const demandRecognition: DocumentRecognition = {
+    role: 'ancillary', source: 'content', supportingKind: 'demand',
+    contentHash: createHash('sha256').update(demandPdf).digest('hex'), recognitionVersion: 2,
+    message: 'Synthetic Demand title verified from fixture content.',
+};
+
+for (const concurrentChange of ['pdf', 'fields'] as const) {
+test(`supporting review checks concurrent ${concurrentChange} changes inside its write transaction`, () => {
+    const tempDir=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-review-transaction-'));
+    const filename=path.join(tempDir,'workflow.sqlite'),db=new WorkflowDatabase(filename),writer=new DatabaseSync(filename);
+    try {
+        const email=db.registerEmail({id:'transaction-review',subject:'NEW LT FILING - transaction QA',
+            from:{emailAddress:{address:'ajd@devlinlawpllc.com'}}});
+        const draftId=db.createCaseDraft(email.id,{isMiFile:false,sourceKind:'new_filing_intake',courtName:'25th District Court',
+            caseNumber:null,caseTitle:'Original case',plaintiff:null,defendant:null,bundleNumber:null,filerName:null,
+            filedAt:null,filedDocuments:[],fileTypeByAttachmentId:{}});
+        const documentId=db.addDocument({emailId:email.id,caseDraftId:draftId,documentType:'Other',currentFilename:'Demand.pdf',
+            oneDriveUrl:'https://onedrive.example/transaction-demand',uploadSource:'test',status:'uploaded',
+            metadata:{recognition:demandRecognition}});
+        const before=db.getDraftDetail(draftId)!,context=before.caseDraft!.packageCompleteness.contextHash;
+        const transaction=(db as any).runInTransaction.bind(db);
+        (db as any).runInTransaction=(fn:()=>unknown)=>{
+            if(concurrentChange==='pdf') writer.prepare('UPDATE document_records SET required_for_filing=0 WHERE id=?').run(documentId);
+            else writer.prepare("UPDATE case_drafts SET normalized_data_json=json_set(normalized_data_json,'$.caseTitle','Newer case title') WHERE id=?").run(draftId);
+            return transaction(fn);
+        };
+        assert.throws(()=>db.updateCaseDraft(draftId,{caseTitle:'Stale edit',supportingRequirement:'none',
+            supportingRequirementReason:'This stale review must not bind to an unseen package.'},'Stale reviewer note',undefined,[],undefined,context),
+        concurrentChange==='pdf'?/supporting package changed since it was reviewed/:/Draft changed since it was reviewed/);
+        const after=db.getDraftDetail(draftId)!;
+        assert.equal(after.caseDraft!.reviewerNotes,before.caseDraft!.reviewerNotes);
+        assert.equal(after.caseDraft!.editableData.caseTitle,concurrentChange==='fields'?'Newer case title':'Original case');
+        assert.equal(after.caseDraft!.editableData.supportingRequirement,null);
+        assert.equal(after.documents[0].requiredForFiling,concurrentChange!=='pdf');
+        assert.equal(after.caseDraft!.packageCompleteness.source,concurrentChange==='pdf'?'unknown':'documents');
+    } finally { writer.close();db.close();fs.rmSync(tempDir,{recursive:true,force:true}); }
+});
+}
 
 test('processing reports keep the active Plaintiff mapping available on repeat syncs', () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-db-'));
@@ -975,16 +1019,23 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
             fileTypeByAttachmentId: {},
         });
 
-        const addUploadedDocument = (documentType: string, filename: string) => db.addDocument({
-            emailId: email.id,
-            caseDraftId: draftId,
-            currentFilename: filename,
-            oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
-            documentType,
-            mimeType: 'application/pdf',
-            uploadSource: 'test',
-            status: 'uploaded',
-        });
+        const addUploadedDocument = (documentType: string, filename: string, recognition?: DocumentRecognition) => {
+            const pdf = recognition ? demandPdf : testPdfFixture(documentType);
+            const pinned = recognition || { ...recognizeDocumentText([documentType], filename),
+                contentHash: createHash('sha256').update(pdf).digest('hex'), recognitionVersion: 2 };
+            return db.addDocument({
+                emailId: email.id,
+                caseDraftId: draftId,
+                currentFilename: filename,
+                oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
+                documentType,
+                mimeType: 'application/pdf',
+                uploadSource: 'test',
+                status: 'uploaded',
+                fileSize: pdf.length,
+                metadata: { recognition: pinned },
+            });
+        };
         const complaintId = addUploadedDocument(
             'Complaint for Possession Only',
             'Complaint.pdf',
@@ -1002,7 +1053,7 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
             'Summons, Landlord-Tenant/Land Contract',
             'Summons.pdf',
         );
-        const connectedId = addUploadedDocument('CONNECTED FILING', 'Demand.pdf');
+        const connectedId = addUploadedDocument('CONNECTED FILING', 'Demand.pdf', demandRecognition);
 
         db.applyComplaintExtraction(draftId, complaintId, {
             extractorVersion: 2,
@@ -1059,6 +1110,8 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
         );
         assert.equal(ready.caseDraft?.validationStatus, 'passed');
         assert.deepEqual(ready.caseDraft?.validationIssues, []);
+        assert.ok(ready.documents.every(document => /^[a-f0-9]{64}$/.test(document.recognition?.contentHash || '') &&
+            document.recognition?.source === 'content' && document.recognition.recognitionVersion === 2));
         assert.equal(ready.caseDraft?.filingData.moneyJudgmentRequested, true);
         assert.equal(ready.caseDraft?.filingData.claimAmount, '1471.01');
 
@@ -1072,6 +1125,9 @@ test('complete first-hearing nonpayment packages become ready with Complaint-dri
 
         const connected = ready.documents.find(document => document.id === connectedId);
         assert.equal(connected?.filingType, 'Other');
+        assert.deepEqual(connected?.supportingEvidence, {
+            kind: 'demand', source: 'content', contentHash: demandRecognition.contentHash,
+        });
         assert.equal(connected?.filingRelation, 'connected_to_complaint');
         assert.equal(connected?.filingSequence, null);
         assert.ok(ready.documents.every(document => document.requiredForFiling));
@@ -1170,16 +1226,23 @@ test('paragraph 10 selects possession-only filing and keeps Other as a separate 
             filedDocuments: [],
             fileTypeByAttachmentId: {},
         });
-        const addDocument = (documentType: string, filename: string) => db.addDocument({
-            emailId: email.id,
-            caseDraftId: draftId,
-            currentFilename: filename,
-            oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
-            documentType,
-            mimeType: 'application/pdf',
-            uploadSource: 'test',
-            status: 'uploaded',
-        });
+        const addDocument = (documentType: string, filename: string, recognition?: DocumentRecognition) => {
+            const pdf = recognition ? demandPdf : testPdfFixture(documentType);
+            const pinned = recognition || { ...recognizeDocumentText([documentType], filename),
+                contentHash: createHash('sha256').update(pdf).digest('hex'), recognitionVersion: 2 };
+            return db.addDocument({
+                emailId: email.id,
+                caseDraftId: draftId,
+                currentFilename: filename,
+                oneDriveUrl: `https://onedrive.example/${encodeURIComponent(filename)}`,
+                documentType,
+                mimeType: 'application/pdf',
+                uploadSource: 'test',
+                status: 'uploaded',
+                fileSize: pdf.length,
+                metadata: { recognition: pinned },
+            });
+        };
         const complaintId = addDocument(
             'Complaint for Possession and Supplemental Money Judgment (Fee Varies)',
             'Complaint.pdf',
@@ -1188,7 +1251,8 @@ test('paragraph 10 selects possession-only filing and keeps Other as a separate 
         addDocument('Local Rental and Housing Information', 'Local.pdf');
         addDocument('Request for Court Mailing and Record (Landlord-Tenant)', 'Request.pdf');
         addDocument('Summons, Landlord-Tenant/Land Contract', 'Summons.pdf');
-        const otherId = addDocument('Other', 'Seven-Day Notice.pdf');
+        // Other is the MiFILE routing type; this fixture's actual PDF is a Demand.
+        const otherId = addDocument('Other', 'Other.pdf', demandRecognition);
 
         db.applyComplaintExtraction(draftId, complaintId, {
             extractorVersion: 2,
@@ -1226,7 +1290,13 @@ test('paragraph 10 selects possession-only filing and keeps Other as a separate 
 
         const ready = db.refreshCaseDraftValidation(draftId);
         assert.equal(ready.caseDraft?.status, 'ready_to_file');
+        assert.ok(ready.documents.every(document => /^[a-f0-9]{64}$/.test(document.recognition?.contentHash || '') &&
+            document.recognition?.source === 'content' && document.recognition.recognitionVersion === 2));
         assert.equal(ready.caseDraft?.filingData.claimAmount, '0.00');
+        assert.deepEqual(ready.documents.find(document => document.id === otherId)?.supportingEvidence, {
+            kind: 'demand', source: 'content', contentHash: demandRecognition.contentHash,
+        });
+        assert.equal(ready.documents.find(document => document.id === otherId)?.filingType, 'Other');
         assert.equal(
             ready.documents.find(document => document.id === complaintId)?.filingType,
             'Complaint for Possession Only',

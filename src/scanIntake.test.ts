@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createCanvas } from '@napi-rs/canvas';
-import { recognizeScannedPdf, mergeOcrRegionWords, type OcrLine } from './pdfOcr';
+import { recognizeScannedPdf, mergeOcrRegionWords, mergeOcrLineReads, type OcrLine } from './pdfOcr';
 import { parseScannedComplaint } from './complaintExtractor';
 import { inspectFilingPdf } from './pdfValidation';
 import { isProcessingReportSubject } from './processingReport';
@@ -88,6 +88,11 @@ test('real raster-only PDF is read offline; OCR parties become editable without 
     assert.equal(result.data.claimAmount, undefined);
     assert.equal(result.textSource, 'ocr');
     assert.ok(result.warnings.some(w => w.code === 'scan_review'));
+    const original=pages[0].words[0].text;
+    pages[0].words[0].text='Modified by caller';
+    const cached=await recognizeScannedPdf(pdf,[1]);
+    assert.equal(cached[0].words[0].text,original,'Cached page selections must be defensive copies');
+    await assert.rejects(recognizeScannedPdf(pdf,[2]),/outside/);
 });
 
 test('OCR page selection rejects malformed requests before spawning a worker', async () => {
@@ -138,6 +143,18 @@ test('caption rereads never duplicate a clipped name or promote disagreeing spel
     assert.equal(result.find(item=>item.text==='LLC')?.confidence,96);
     assert.ok(result.some(item=>item.text==='100'));
     assert.ok(result.some(item=>item.text==='Outside'));
+});
+
+test('line consensus repairs uncertain spellings without treating a single read or a tie as agreement',()=>{
+    const w=(text:string,confidence:number,x=40,y=150):OcrLine=>({text,confidence,x,y,width:35,height:8,pageNumber:1});
+    const region={left:39,top:149,right:100,bottom:160};
+    const original=[w('Raguel',89),w('Surname',95,110)];
+    const result=mergeOcrLineReads(original,[[w('Raguel',90)],[w('Raquel',60)],[w('Raquel',15)]],region);
+    assert.equal(result[0].text,'Raquel');assert.ok(result[0].confidence<80);assert.equal(result[1].text,'Surname');
+    assert.equal(mergeOcrLineReads(original,[[w('Raquel',96)]],region)[0].text,'Raguel');
+    assert.equal(mergeOcrLineReads(original,[[w('Raquel',96)],[w('Raguel',96)]],region)[0].text,'Raguel');
+    const repeated=[w('MALIK',83),w('MALIK',81,40,350)];
+    assert.equal(mergeOcrLineReads(repeated,[[w('MALTK',94)],[w('MALTK',93)],[w('MALIK',80)]],region)[0].text,'MALIK');
 });
 
 test('tight typewritten captions keep contact lines out of names and the right-column heading out of the attorney', () => {

@@ -8,6 +8,8 @@ import type { FilingDocumentPayload, FilingJobView, FilingPayload } from './data
 import { createHash } from 'node:crypto';
 import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, usdCents } from './mifilePreparationEvidence';
 import { testPdfFixture } from './testPdfFixture';
+import { completenessContext, evaluatePackageCompleteness } from './packageCompleteness';
+import { recognizeDocumentText } from './documentRecognition';
 
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mifile-runner-qa-'));
 let browser: Browser;
@@ -40,6 +42,7 @@ function filingDocument(index: number, connected = false): FilingDocumentPayload
         packageRole: index === 0 ? 'complaint' : 'ancillary',
         oneDriveUrl: `https://onedrive.example/doc-${index}`, mimeType: 'application/pdf',
         fileSize: 200, isPrimary: index === 0,
+        supportingEvidence:{kind:'unknown',source:'unknown',contentHash:createHash('sha256').update(testPdfFixture()).digest('hex')},
     };
 }
 
@@ -326,6 +329,10 @@ test('partial OneDrive materialization is cleaned up and reports its actual chec
         const job = { id: 'partial-materialization', mode: 'prepare',
             payload: { filingData: {relatedCivilAction:'none',moneyJudgmentRequested:false},
                 documents: [filingDocument(0), filingDocument(1)] } } as FilingJobView;
+        job.payload!.courtName='Court';
+        job.payload!.completeness=evaluatePackageCompleteness('Court',job.payload!.documents,null,
+            {requirement:'none',reason:'Attorney-reviewed custom QA package without a Demand or Notice.',
+                contextHash:completenessContext('Court',job.payload!.documents)});
         await assert.rejects(new MiFileFilingRunner().prepare(job), (error: any) =>
             error.checkpoint === 'materialize_documents' && /OneDrive disconnect/.test(error.message));
         assert.equal(fs.existsSync(path.join(directory, job.id, 'documents')), false);
@@ -367,10 +374,25 @@ test('old queued snapshots with unknown answers or document relations are stoppe
         [{...payload,documents:[{...filingDocument(0),filingRelation:'unknown'}]},'DOCUMENT_RELATION_UNCONFIRMED'],
         [{...payload,filingData:{...payload.filingData,moneyJudgmentRequested:true,claimAmount:'0'}},'CLAIM_AMOUNT_UNCONFIRMED'],
         [{...payload,documents:[{...filingDocument(0),isPrimary:false},filingDocument(1,true)]},'CONNECTED_COMPLAINT_REQUIRED'],
+        [payload,'PACKAGE_COMPLETENESS_UNCONFIRMED'],
     ] as const) {
         await assert.rejects(runner.prepare({mode:'prepare',payload:invalid} as FilingJobView),
             (error:any)=>error.code===code && error.checkpoint==='starting');
     }
+});
+
+test('a supporting PDF changed on OneDrive after recognition cannot reach MiFILE',async()=>{
+    const drive=require('./oneDriveClient'),resolve=drive.resolveSharedDriveItem,download=drive.downloadDriveItemBuffer;
+    drive.resolveSharedDriveItem=async()=>({driveId:'qa',itemId:'qa'});
+    drive.downloadDriveItemBuffer=async()=>testPdfFixture('A different supporting document');
+    const target=path.join(directory,'changed-support');fs.mkdirSync(target);
+    try {
+        const document={...filingDocument(1),supportingEvidence:{kind:'demand',source:'content',
+            contentHash:createHash('sha256').update(testPdfFixture('DEMAND FOR POSSESSION')).digest('hex')}};
+        await assert.rejects((new MiFileFilingRunner() as any).materializeDocuments({documents:[document]},target),
+            (error:any)=>error.code==='PACKAGE_CONTENT_CHANGED' && error.checkpoint==='materialize_documents');
+        assert.deepEqual(fs.readdirSync(target),[]);
+    }finally{drive.resolveSharedDriveItem=resolve;drive.downloadDriveItemBuffer=download;}
 });
 
 test('partial case forms, uploads and uncertain saves require reconciliation without blocking later packages', async () => {
@@ -380,6 +402,12 @@ test('partial case forms, uploads and uncertain saves require reconciliation wit
     const {runFilingWorker}=require('./filingWorker') as typeof import('./filingWorker');
     const db=getWorkflowDatabase();
     const checkpoints=['case_form','document_upload','save_progress','verify_saved_bundle','saved_unsubmitted'];
+    const supportingTitle='AFFIDAVIT OF SERVICE';
+    const supportingPdf=testPdfFixture(supportingTitle);
+    const supportingRecognition={...recognizeDocumentText([supportingTitle],'Other.pdf'),
+        contentHash:createHash('sha256').update(supportingPdf).digest('hex'),recognitionVersion:2};
+    assert.equal(supportingRecognition.source,'content');
+    assert.equal(supportingRecognition.supportingKind,'affidavit');
     const jobs=Array.from({length:checkpoints.length+1},(_,index)=>{
         const message={id:'worker-recovery-'+index,subject:'NEW LT FILING - QA '+index,
             from:{emailAddress:{address:'qa@example.com'}}};
@@ -388,11 +416,13 @@ test('partial case forms, uploads and uncertain saves require reconciliation wit
         const email=db.registerEmail(message);
         const draft=db.createCaseDraft(email.id,parsed);
         db.addDocument({emailId:email.id,caseDraftId:draft,currentFilename:'Other.pdf',documentType:'Other',
-            oneDriveUrl:'https://onedrive.example/other',status:'uploaded',uploadSource:'test'});
+            oneDriveUrl:'https://onedrive.example/other',status:'uploaded',uploadSource:'test',
+            fileSize:supportingPdf.length,metadata:{recognition:supportingRecognition}});
         const party={displayName:'Example Owner LLC',entityName:'Example Owner LLC',partyType:'entity',
             address1:'100 Main Street',city:'Lincoln Park',state:'MI',postalCode:'48146'};
         db.updateCaseDraft(draft,{courtName:'25th District Court',caseTitle:'Example Owner v Tenant',
-            plaintiff:'Example Owner LLC',defendant:'Morgan Tenant'},undefined,{
+            plaintiff:'Example Owner LLC',defendant:'Morgan Tenant',supportingRequirement:'none',
+            supportingRequirementReason:'Attorney reviewed this custom QA package and its supporting-document exception.'},undefined,{
             caseType:'LT - Landlord-Tenant Summary Proceedings',action:'Initiate a new case',
             relatedCivilAction:'none',moneyJudgmentRequested:false,claimAmount:'0.00',mailingRequested:true,
             plaintiff:party,defendants:[{...party,partyType:'person',entityName:null,displayName:'Morgan Tenant',firstName:'Morgan',lastName:'Tenant'}],

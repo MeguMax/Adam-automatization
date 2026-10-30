@@ -4,6 +4,7 @@ import { randomUUID } from 'crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { ParsedEmailInfo } from './emailProcessor';
 import { DOCUMENT_LABELS, documentLabel, DocumentRecognition } from './documentRecognition';
+import { completenessContext, evaluatePackageCompleteness, supportingEvidence, SUPPORTING_KINDS, type PackageCompleteness, type SupportingEvidence } from './packageCompleteness';
 import { LibraryForm, FormRole, courtKey } from './formLibraryTypes';
 import { isProcessingReportSubject } from './processingReport';
 import { resolveCourt, districtCode } from './courtForms';
@@ -378,6 +379,10 @@ export interface DraftDocumentFilingUpdate {
     filingSequence?: unknown;
     requiredForFiling?: unknown;
     filingRelationReviewed?: boolean;
+    supportingKind?: unknown;
+    supportingKindReviewed?: boolean;
+    expectedSourceVersion?: unknown;
+    expectedContentHash?: unknown;
 }
 
 export interface DraftDocumentAccess {
@@ -403,6 +408,8 @@ export interface EmailPurgeResult extends EmailDeleteResult {
 }
 
 export interface DocumentRecordView {
+    sourceVersion?: string | null;
+    supportingEvidence?: SupportingEvidence;
     recognition?: DocumentRecognition | null;
     formTemplate?: { id: string; role: FormRole; courtKey: string; courtName: string; slotKey?: string } | null;
     id: string;
@@ -489,6 +496,8 @@ export interface QueuedEmailRetry {
 }
 
 export interface FilingDocumentPayload {
+    sourceVersion?: string | null;
+    supportingEvidence?: SupportingEvidence;
     id: string;
     filename: string;
     filingName: string;
@@ -502,6 +511,7 @@ export interface FilingDocumentPayload {
 }
 
 export interface FilingPayload {
+    completeness?: PackageCompleteness;
     version: 1;
     caseDraftId: string;
     emailId: string;
@@ -587,6 +597,7 @@ export interface EmailDetail {
             appliedFields: string[];
         }) | null;
         manualPackage: boolean;
+        packageCompleteness: PackageCompleteness;
         validationIssues: DraftValidationIssue[];
         filingEligible: boolean;
         filingEligibilityIssues: DraftValidationIssue[];
@@ -743,6 +754,8 @@ const EDITABLE_DRAFT_FIELDS = [
     'temporaryCaseNumber',
     'newCaseNumber',
     'filedAt',
+    'supportingRequirement',
+    'supportingRequirementReason',
 ] as const;
 
 type EditableDraftField = typeof EDITABLE_DRAFT_FIELDS[number];
@@ -2650,7 +2663,8 @@ export class WorkflowDatabase {
     getComplaintSourceVersion(documentId: string): string | null {
         const row = this.db.prepare(`SELECT one_drive_url, file_size, metadata_json FROM document_records WHERE id = ? AND is_active = 1`)
             .get(documentId) as { one_drive_url: string | null; file_size: number | null; metadata_json: string | null } | undefined;
-        return row ? toJson([documentId, row.one_drive_url, row.file_size, this.safeJson(row.metadata_json)?.replacement?.token || null]) : null;
+        const metadata=row && this.safeJson(row.metadata_json);
+        return row ? toJson([documentId, row.one_drive_url, row.file_size, metadata?.replacement?.token || metadata?.lastReplacement?.token || null]) : null;
     }
 
     setComplaintAutoExtractionState(draftId: string, state: Record<string, unknown>): void {
@@ -2720,7 +2734,8 @@ export class WorkflowDatabase {
         let queued = 0;
         for (const row of rows) {
             const detail = this.getDraftDetail(row.id);
-            if (!detail?.caseDraft?.filingEligible || detail.caseDraft.validationIssues.length) continue;
+            if (!detail?.caseDraft?.filingEligible || detail.caseDraft.validationIssues.length ||
+                detail.caseDraft.packageCompleteness.source === 'manual') continue;
             this.queueFilingJob(row.id, 'prepare', 'validated_intake', 'worker');
             queued++;
         }
@@ -2860,9 +2875,13 @@ export class WorkflowDatabase {
         const row = this.db.prepare('SELECT * FROM document_records WHERE id = ? AND is_active = 1').get(documentId) as any;
         if (!row?.case_draft_id) throw new Error('Document not found');
         this.assertEditableIntake(row.case_draft_id);
-        if (row.filing_type_source === 'manual') return;
         const label = DOCUMENT_LABELS[recognition.role];
         const metadata = { ...this.safeJson(row.metadata_json), recognition };
+        if (row.filing_type_source === 'manual') {
+            this.db.prepare('UPDATE document_records SET metadata_json = ?, updated_at = ? WHERE id = ?').run(toJson(metadata),nowIso(),documentId);
+            this.insertAuditLog('document_record',documentId,'document_content_recognized',recognition);
+            return;
+        }
         this.db.prepare(`UPDATE document_records SET document_type = ?, filing_type = ?, filing_type_source = 'suggested',
             filing_relation = CASE WHEN filing_relation_source IN ('court_rule','manual') THEN filing_relation ELSE ? END,
             metadata_json = ?, updated_at = ? WHERE id = ?`).run(label,
@@ -2872,6 +2891,31 @@ export class WorkflowDatabase {
                 .run(row.case_draft_id, documentId);
         } else this.assignPrimaryComplaint(row.case_draft_id, documentId, label, null);
         this.insertAuditLog('document_record', documentId, 'document_type_recognized', recognition);
+    }
+
+    listPendingDocumentRecognitions(limit=1):string[] {
+        const rows=this.db.prepare(`SELECT c.id,c.normalized_data_json,e.subject,e.sender FROM case_drafts c JOIN email_records e ON e.id=c.email_id
+            WHERE json_extract(c.normalized_data_json,'$.sourceKind')='new_filing_intake'
+              AND c.filing_status IN ('not_started','failed') AND c.status IN ('parsed','needs_review','validation_failed','ready_to_file','filing_failed')
+              AND e.processing_status!='processing' AND COALESCE(json_extract(c.normalized_data_json,'$.supportingRecognitionRetryAt'),'')<=?
+              AND EXISTS(SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1 AND d.required_for_filing=1
+                AND d.upload_source!='form_library' AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','downloaded','replaced')
+                AND (COALESCE(json_extract(d.metadata_json,'$.recognition.recognitionVersion'),0)<2
+                  OR length(COALESCE(json_extract(d.metadata_json,'$.recognition.contentHash'),''))!=64))
+            ORDER BY c.updated_at`).all(nowIso()) as Array<{id:string;normalized_data_json:string;subject:string|null;sender:string|null}>;
+        return rows.filter(row=>!validateNewCaseSource(this.safeJson(row.normalized_data_json),row.subject,row.sender).length)
+            .slice(0,Math.min(20,Math.max(0,limit))).map(row=>row.id);
+    }
+
+    recordDocumentRecognitionRefresh(draftId:string,error?:unknown):void {
+        if(error) {
+            const message=error instanceof Error?error.message:String(error);
+            this.db.prepare(`UPDATE case_drafts SET normalized_data_json=json_set(normalized_data_json,
+                '$.supportingRecognitionError',?,'$.supportingRecognitionRetryAt',?),updated_at=? WHERE id=?`)
+                .run(message.slice(0,1200),new Date(Date.now()+5*60_000).toISOString(),nowIso(),draftId);
+            this.insertAuditLog('case_draft',draftId,'supporting_recognition_failed',{message:message.slice(0,1200)});
+        } else this.db.prepare(`UPDATE case_drafts SET normalized_data_json=json_remove(normalized_data_json,
+            '$.supportingRecognitionError','$.supportingRecognitionRetryAt') WHERE id=?`).run(draftId);
     }
 
     removeLibraryDocument(draftId: string, documentId: string): EmailDetail {
@@ -5227,7 +5271,13 @@ export class WorkflowDatabase {
                 row.document_type,
                 row.current_filename || row.original_filename,
             );
+            const metadata = this.safeJson(row.metadata_json);
+            const sourceVersion = toJson([row.id,row.one_drive_url,row.file_size,metadata?.replacement?.token || metadata?.lastReplacement?.token || null])!;
+            const libraryHash=metadata?.formTemplate?.id ? (this.db.prepare('SELECT sha256 FROM filing_forms WHERE id=?')
+                .get(metadata.formTemplate.id) as {sha256:string} | undefined)?.sha256 : undefined;
             return {
+                sourceVersion,
+                supportingEvidence:supportingEvidence(metadata?.recognition || null,metadata?.supportingKindReview,sourceVersion,libraryHash),
                 id: row.id,
                 originalFilename: row.original_filename,
                 currentFilename: row.current_filename,
@@ -5289,6 +5339,9 @@ export class WorkflowDatabase {
             return left.createdAt.localeCompare(right.createdAt);
         });
         const manualPackage = isManualFilingPackage(normalizedDraftData);
+        const packageCompleteness=evaluatePackageCompleteness(normalizedDraftData?.courtName || null,documentViews,complaintExtraction?.formType || null,
+            {requirement:normalizedDraftData?.supportingRequirement,reason:normalizedDraftData?.supportingRequirementReason,
+                contextHash:normalizedDraftData?.supportingRequirementContext});
         const activeRuleIds = new Set(this.listCourtFilingRules().map(rule => rule.id));
         const validationIssues = caseDraft && !validateNewCaseSource(normalizedDraftData, email.subject, email.sender).length
             ? [
@@ -5305,6 +5358,7 @@ export class WorkflowDatabase {
                         ),
                         ...validateDraftDocuments(documentViews, normalizedFilingData),
                     ]),
+                ...(['not_started','failed'].includes(caseDraft.filing_status) ? packageCompleteness.issues : []),
                 ...documentViews.filter(document => document.requiredForFiling && document.formTemplate?.role === 'local' &&
                     document.formTemplate.courtKey !== courtKey(normalizedDraftData?.courtName || '')).map(document => ({
                         field: `document.${document.id}`, severity: 'error' as const,
@@ -5364,6 +5418,7 @@ export class WorkflowDatabase {
                     ),
                     complaintExtraction,
                     manualPackage,
+                    packageCompleteness,
                     validationIssues,
                     filingEligible: filingEligibilityIssues.length === 0,
                     filingEligibilityIssues,
@@ -5428,6 +5483,8 @@ export class WorkflowDatabase {
                     );
                 }
                 return {
+                    sourceVersion:document.sourceVersion,
+                    supportingEvidence:document.supportingEvidence,
                     id: document.id,
                     filename,
                     filingName: document.filingName || filename.replace(/\.pdf$/i, ''),
@@ -5448,6 +5505,7 @@ export class WorkflowDatabase {
         documents.sort((left, right) => uploadRank(left) - uploadRank(right));
 
         return {
+            completeness:detail.caseDraft.packageCompleteness,
             version: 1,
             caseDraftId,
             emailId: detail.email.id,
@@ -5834,6 +5892,7 @@ export class WorkflowDatabase {
         filingDataInput?: unknown,
         documentMappings: DraftDocumentFilingUpdate[] = [],
         primaryDocumentIdInput?: unknown,
+        expectedSupportingContextHash?: string,
     ): EmailDetail {
         const existing = this.db
             .prepare(`
@@ -5882,6 +5941,8 @@ export class WorkflowDatabase {
         const requestedFields = Object.keys(fields);
         const invalidField = requestedFields.find(field => !allowed.has(field));
         if (invalidField) throw new Error(`Draft field is not editable: ${invalidField}`);
+        if (Object.prototype.hasOwnProperty.call(fields,'supportingRequirement') && fields.supportingRequirement != null &&
+            !['auto','demand','notice_to_quit','none'].includes(String(fields.supportingRequirement))) throw new Error('Invalid supporting-document requirement');
 
         const current = this.safeJson(existing.normalized_data_json);
         const next = current && typeof current === 'object' && !Array.isArray(current)
@@ -6025,6 +6086,17 @@ export class WorkflowDatabase {
 
         const updatedDocumentIds: string[] = [];
         this.runInTransaction(() => {
+            const locked = this.db.prepare('SELECT normalized_data_json, extracted_data_json, reviewer_notes, filing_status, status, primary_document_id FROM case_drafts WHERE id=?')
+                .get(caseDraftId) as typeof existing | undefined;
+            if (!locked || locked.normalized_data_json !== existing.normalized_data_json || locked.filing_status !== existing.filing_status ||
+                locked.status !== existing.status || locked.primary_document_id !== existing.primary_document_id ||
+                locked.extracted_data_json !== existing.extracted_data_json || locked.reviewer_notes !== existing.reviewer_notes) {
+                throw new Error('The Draft changed since it was reviewed. Refresh the Draft before saving.');
+            }
+            if (expectedSupportingContextHash !== undefined &&
+                expectedSupportingContextHash !== this.getDraftDetail(caseDraftId)!.caseDraft!.packageCompleteness.contextHash) {
+                throw new Error('The supporting package changed since it was reviewed. Refresh the Draft and review its PDFs again.');
+            }
             this.db
                 .prepare(`
                     UPDATE case_drafts
@@ -6053,7 +6125,7 @@ export class WorkflowDatabase {
                 if (!documentId) throw new Error('Every document mapping requires an id');
                 const existingDocument = this.db
                     .prepare(`
-                        SELECT id, document_type, current_filename, original_filename, filing_type, filing_type_source, filing_relation, filing_relation_source
+                        SELECT id, document_type, current_filename, original_filename, filing_type, filing_type_source, filing_relation, filing_relation_source, metadata_json
                         FROM document_records
                         WHERE id = ?
                           AND case_draft_id = ?
@@ -6113,6 +6185,18 @@ export class WorkflowDatabase {
                     ? (existingDocument as any).filing_relation_source || 'suggested' : 'manual';
                 const typeSource = mapping.filingTypeReviewed === false && filingType === (existingDocument as any).filing_type
                     ? (existingDocument as any).filing_type_source : filingType ? 'manual' : null;
+                const metadata = this.safeJson((existingDocument as any).metadata_json) || {};
+                if (mapping.supportingKindReviewed === true) {
+                    if (!SUPPORTING_KINDS.includes(mapping.supportingKind as any)) throw new Error('Invalid supporting document contents');
+                    const contentHash=metadata.recognition?.contentHash;
+                    if (mapping.supportingKind !== 'unknown' && (mapping.expectedSourceVersion !== this.getComplaintSourceVersion(documentId) ||
+                        mapping.expectedContentHash !== contentHash)) throw new Error('The PDF changed since its contents were reviewed. Refresh the Draft and review the current PDF again.');
+                    if (mapping.supportingKind !== 'unknown' && !/^[a-f0-9]{64}$/.test(contentHash || '')) {
+                        throw new Error('Wait for automatic PDF content recognition before confirming this document’s contents.');
+                    }
+                    metadata.supportingKindReview={kind:mapping.supportingKind,contentHash:contentHash || null,
+                        sourceVersion:this.getComplaintSourceVersion(documentId)};
+                }
 
                 this.db
                     .prepare(`
@@ -6125,6 +6209,7 @@ export class WorkflowDatabase {
                             filing_relation_source = ?,
                             filing_sequence = NULL,
                             required_for_filing = ?,
+                            metadata_json = ?,
                             updated_at = ?
                         WHERE id = ?
                     `)
@@ -6136,6 +6221,7 @@ export class WorkflowDatabase {
                         filingRelation,
                         relationSource,
                         requiredForFiling ? 1 : 0,
+                        toJson(metadata),
                         timestamp,
                         documentId,
                     );
@@ -6152,6 +6238,12 @@ export class WorkflowDatabase {
                           AND is_active = 1
                     `)
                     .run(timestamp, primaryDocumentId, caseDraftId);
+            }
+            if (requestedFields.includes('supportingRequirement') || requestedFields.includes('supportingRequirementReason')) {
+                const detail=this.getDraftDetail(caseDraftId)!;
+                const context=completenessContext(next.courtName || null,detail.documents);
+                next.supportingRequirementContext=context;
+                this.db.prepare('UPDATE case_drafts SET normalized_data_json = ? WHERE id = ?').run(toJson(next),caseDraftId);
             }
         });
 

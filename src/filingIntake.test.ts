@@ -3,6 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake, intakeFileName, intakeSenderAllowed, isFilingIntakeSubject } from './filingIntake';
 import { emailAttachmentSourceId, emailAttachmentSourceName } from './emailAttachmentSource';
@@ -11,6 +12,8 @@ import { processFilingIntake } from './filingIntakeWorker';
 import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, extractComplaintPdf, type ComplaintExtractionResult } from './complaintExtractor';
 import { testComplaintFormFixture, testPdfFixture } from './testPdfFixture';
 import { saveFormPdf } from './formLibrary';
+import { validCompletenessSnapshot } from './packageCompleteness';
+import { recognizeDocumentText } from './documentRecognition';
 
 const message = {
     id: 'new-intake-message', internetMessageId: '<new-intake@example.com>',
@@ -22,6 +25,23 @@ const attachment = (name: string, id = name) => ({
     id, name, contentType: 'application/pdf', size: 100, isInline: false,
 });
 const pdf = testPdfFixture();
+const demandPdf=testPdfFixture('DEMAND FOR POSSESSION');
+const demandRecognition={role:'ancillary' as const,source:'content' as const,message:'Demand title verified in test PDF',supportingKind:'demand' as const,
+    contentHash:createHash('sha256').update(demandPdf).digest('hex'),recognitionVersion:2};
+const coreRecognition=(role:string)=>{
+    const titles:Record<string,string>={
+        Complaint:'COMPLAINT NONPAYMENT OF RENT',
+        Advice:'Advice of Rights and Information (Landlord-Tenant)',
+        Local:'Local Rental and Housing Information',
+        Summons:'Summons, Landlord-Tenant/Land Contract',
+        Request:'Request for Court Mailing and Record (Landlord-Tenant)',
+    };
+    const title=titles[role] || role;
+    const content=testPdfFixture(title);
+    const recognition=recognizeDocumentText([title],role+'.pdf');
+    if(titles[role]) assert.equal(recognition.source,'content',role+' must be recognized from its synthetic PDF title');
+    return {...recognition,contentHash:createHash('sha256').update(content).digest('hex'),recognitionVersion:2};
+};
 const extraction: ComplaintExtractionResult = {
     extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION, formType: 'NONPAYMENT OF RENT', pageCount: 1, textHash: 'fixture',
     data: {
@@ -48,7 +68,7 @@ function fixture(names: string[], packageMode?: 'standard_lt' | 'custom') {
     const uploaded: string[] = [];
     const dependencies = {
         download: (input: typeof parsed) => downloadIntakeDocuments(input, {
-            download: async () => pdf,
+            download: async source => /^(?:other|demand)\b/i.test(emailAttachmentSourceName(source.downloadUrl) || '') ? demandPdf : pdf,
             upload: async (_key: string, name: string) => {
                 uploaded.push(name);
                 return { driveId: 'drive', itemId: name, fileName: name, webUrl: `https://onedrive.example/${encodeURIComponent(name)}` };
@@ -112,6 +132,7 @@ test('required Complaint answers and Other/Connected choices cannot be waived by
         const ids = ['Complaint', 'Advice', 'Local', 'Summons', 'Request', 'Demand'].map(role => f.db.addDocument({
             emailId:f.email.id,caseDraftId:f.draftId,currentFilename:role+'.pdf',documentType:role,
             oneDriveUrl:'https://onedrive.example/'+role,mimeType:'application/pdf',uploadSource:'test',status:'uploaded',
+            metadata:{recognition:role==='Demand'?demandRecognition:coreRecognition(role)},
         }));
         f.db.applyComplaintExtraction(f.draftId,ids[0],extraction);
         f.db.updateCaseDraft(f.draftId,{courtName:'25th District Court'},undefined,undefined,
@@ -380,6 +401,7 @@ test('email pipeline reads PDF fields, inserts library forms, connects both supp
         assert.equal(job.mode, 'prepare');
         assert.equal(job.triggerSource, 'validated_intake');
         assert.equal(job.payload?.documents.length, 7);
+        assert.equal(validCompletenessSnapshot(job.payload!),true);
         const complaint = job.payload!.documents.find(document => document.packageRole === 'complaint')!;
         const connected = job.payload!.documents.filter(document => document.packageRole === 'ancillary');
         assert.equal(connected.length, 2);
@@ -395,6 +417,7 @@ test('standard LT uploads cannot waive required documents and still require expl
         const ids = ['Complaint', 'Advice', 'Local', 'Summons', 'Demand'].map(role => f.db.addDocument({
             emailId:f.email.id,caseDraftId:f.draftId,currentFilename:role+'.pdf',documentType:role,
             oneDriveUrl:'https://onedrive.example/'+role,mimeType:'application/pdf',uploadSource:'admin_draft_upload',status:'uploaded',
+            metadata:{recognition:role==='Demand'?demandRecognition:coreRecognition(role)},
         }));
         f.db.applyComplaintExtraction(f.draftId, ids[0], extraction);
         const incomplete = f.db.updateCaseDraft(f.draftId, {courtName:'25th District Court'}, undefined,
@@ -405,7 +428,7 @@ test('standard LT uploads cannot waive required documents and still require expl
         assert.throws(() => f.db.buildFilingPayload(f.draftId), /Request/);
         const requestId = f.db.addDocument({emailId:f.email.id,caseDraftId:f.draftId,
             currentFilename:'Request.pdf',documentType:'Request',oneDriveUrl:'https://onedrive.example/request',
-            mimeType:'application/pdf',uploadSource:'admin_draft_upload',status:'uploaded'});
+            mimeType:'application/pdf',uploadSource:'admin_draft_upload',status:'uploaded',metadata:{recognition:coreRecognition('Request')}});
         const complete = f.db.updateCaseDraft(f.draftId, {}, undefined, undefined,
             [{id:requestId,filingRelation:'connected_to_complaint',requiredForFiling:false}]);
         const request = complete.documents.find(document => document.id === requestId)!;
@@ -446,6 +469,7 @@ test(`${packageMode || 'legacy manual'} Drafts can prepare a reviewed arbitrary 
             mimeType: 'application/pdf',
             uploadSource: 'admin_draft_upload',
             status: 'uploaded',
+            metadata:{recognition:coreRecognition('Other')},
         });
         const filingData = {
             ...db.getDraftDetail(draftId)!.caseDraft!.filingData,
@@ -475,7 +499,8 @@ test(`${packageMode || 'legacy manual'} Drafts can prepare a reviewed arbitrary 
         };
         const ready = db.updateCaseDraft(
             draftId,
-            { courtName: '25th District Court' },
+            { courtName: '25th District Court', supportingRequirement:'none',
+                supportingRequirementReason:'Attorney reviewed this custom package; no Demand or Notice is required.' },
             undefined,
             filingData,
             [{

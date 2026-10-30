@@ -6,7 +6,7 @@ import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 6;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 7;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -58,7 +58,8 @@ export interface ComplaintExtractionWarning {
 
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6;
+    contentHash?: string;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7;
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -717,7 +718,8 @@ export async function extractComplaintPdf(
         }
 
         const formResult = parseComplaintFormFields(lines.join('\n'), widgets, document.numPages);
-        if (formResult) return { ...formResult, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION };
+        if (formResult) return { ...formResult, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            contentHash:createHash('sha256').update(buffer).digest('hex') };
 
         const result = parseComplaintText(lines, {
             pageCount: document.numPages,
@@ -749,7 +751,8 @@ export async function extractComplaintPdf(
             recovered.warnings.push({code:'claim_amount_review',message:'The paragraph 10 checkbox could not be verified from the page.'});
         }
         recovered = applyVisualComplaintSelections(recovered, selections, layoutPages);
-        return {...recovered, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION};
+        return {...recovered, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            contentHash:createHash('sha256').update(buffer).digest('hex')};
     } finally {
         await loadingTask.destroy();
     }

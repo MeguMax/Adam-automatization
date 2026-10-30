@@ -5,15 +5,49 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
-import { recognizeDocumentText } from './documentRecognition';
+import { recognizeDocumentText, type DocumentRecognition } from './documentRecognition';
 import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
-import { ensureDraftComplaintExtraction } from './draftExtraction';
+import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
+import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
 
 const court = 'MI Example County - 25th District Court';
 const otherCourt = 'MI Example County - 29th District Court';
+const coreTitles: Record<string,string> = {
+    Complaint:'COMPLAINT NONPAYMENT OF RENT',
+    Advice:'Advice of Rights and Information (Landlord-Tenant)',
+    Local:'Local Rental and Housing Information',
+    Summons:'Summons, Landlord-Tenant/Land Contract',
+    Request:'Request for Court Mailing and Record (Landlord-Tenant)',
+};
+
+function syntheticDocument(title:string,filename:string) {
+    const pdf=testPdfFixture(title);
+    const recognition:DocumentRecognition={...recognizeDocumentText([title],filename),
+        contentHash:createHash('sha256').update(pdf).digest('hex'),recognitionVersion:2};
+    return {pdf,recognition};
+}
+
+function padPdf(pdf:Buffer,bytes:number):Buffer {
+    assert.ok(pdf.length<=bytes,'The synthetic PDF must fit the unchanged source size');
+    return Buffer.concat([pdf,Buffer.alloc(bytes-pdf.length,0x20)]);
+}
+
+const demandPdf = testPdfFixture('DEMAND FOR POSSESSION NONPAYMENT OF RENT');
+const demandRecognition: DocumentRecognition = {
+    role:'ancillary',source:'content',supportingKind:'demand',
+    contentHash:createHash('sha256').update(demandPdf).digest('hex'),recognitionVersion:2,
+    message:'Synthetic Demand title verified from fixture content.',
+};
+const deedPdf = testPdfFixture("SHERIFF'S DEED");
+const deedRecognition: DocumentRecognition = {
+    role:'ancillary',source:'content',supportingKind:'deed',
+    contentHash:createHash('sha256').update(deedPdf).digest('hex'),recognitionVersion:2,
+    message:'Synthetic Sheriff deed title verified from fixture content.',
+};
 const extraction: ComplaintExtractionResult = {
     extractorVersion:3,extractionMethod:'form_fields',formType:'NONPAYMENT OF RENT',pageCount:1,textHash:'qa-v1',
     data:{courtDistrict:'25',relatedCivilAction:'none',moneyJudgmentRequested:false,claimAmount:'0.00',mailingRequested:true,
@@ -22,25 +56,114 @@ const extraction: ComplaintExtractionResult = {
     fieldConfidence:{},warnings:[],
 };
 
-function fixture(initialCourt: string | null = court) {
+function fixture(initialCourt: string | null = court, packageMode?: 'standard_lt' | 'custom') {
     const directory=fs.mkdtempSync(path.join(os.tmpdir(),'draft-documents-'));
     const db=new WorkflowDatabase(path.join(directory,'workflow.sqlite'));
     const message={id:'qa-package',subject:'NEW LT FILING - Example',from:{emailAddress:{address:'qa@example.com'}}};
     const parsed={...buildFilingIntake(message,[]),courtName:initialCourt};
+    if(packageMode) {
+        parsed.intake!.manual=true;
+        parsed.intake!.packageMode=packageMode;
+    }
     const email=db.registerEmail(message);
     const draftId=db.createCaseDraft(email.id,parsed);
-    const add=(type:string,name=type+'.pdf',status:'uploaded'|'failed'='uploaded')=>db.addDocument({
-        emailId:email.id,caseDraftId:draftId,originalFilename:name,currentFilename:name,documentType:type,
-        status,uploadSource:'email_intake',sourceUrl:'email-attachment://qa/'+encodeURIComponent(name),
-        oneDriveUrl:status==='uploaded'?'https://onedrive.example/'+encodeURIComponent(name):null,
-    });
+    const add=(type:string,name=type+'.pdf',status:'uploaded'|'failed'='uploaded',document?:{pdf:Buffer;recognition:DocumentRecognition})=>{
+        const content=document || syntheticDocument(coreTitles[type] || type,name);
+        return db.addDocument({
+            emailId:email.id,caseDraftId:draftId,originalFilename:name,currentFilename:name,documentType:type,
+            status,uploadSource:'email_intake',sourceUrl:'email-attachment://qa/'+encodeURIComponent(name),
+            oneDriveUrl:status==='uploaded'?'https://onedrive.example/'+encodeURIComponent(name):null,
+            fileSize:content.pdf.length,metadata:status==='uploaded'?{recognition:content.recognition}:undefined,
+        });
+    };
     const complaint=add('Complaint');
     for(const role of ['Advice','Local','Summons','Request'])add(role);
-    const ancillary=add('Ancillary document','Demand.pdf');
+    const ancillary=add('Ancillary document','Demand.pdf','uploaded',{pdf:demandPdf,recognition:demandRecognition});
     db.applyComplaintExtraction(draftId,complaint,extraction);
     db.markEmailProcessed(email.id);
     return {db,parsed,email,draftId,complaint,ancillary,add,close(){db.close();fs.rmSync(directory,{recursive:true,force:true});}};
 }
+
+test('legacy recognition refresh re-extracts changed Complaint bytes at a stable OneDrive URL without overwriting manual fields',async()=>{
+    const f=fixture();
+    try {
+        const replacement=testComplaintFormFixture({5:'Current Owner LLC',
+            6:'Adam Devlin P72877\r30850 Telegraph Rd Ste 250\rBingham Farms, MI 48025\r248 703 6201',32:'Off'});
+        const original=padPdf(testPdfFixture('COMPLAINT'),replacement.length);
+        const oldHash=createHash('sha256').update(original).digest('hex'),newHash=createHash('sha256').update(replacement).digest('hex');
+        (f.db as any).db.prepare('UPDATE document_records SET file_size=? WHERE id=?').run(original.length,f.complaint);
+        f.db.recordDocumentRecognition(f.complaint,{...recognizeDocumentText(['COMPLAINT'],'Complaint.pdf'),
+            contentHash:oldHash,recognitionVersion:1});
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...structuredClone(extraction),
+            extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,contentHash:oldHash});
+        const initial=f.db.getDraftDetail(f.draftId)!,version=f.db.getComplaintSourceVersion(f.complaint);
+        f.db.updateCaseDraft(f.draftId,{},undefined,{...initial.caseDraft!.filingData,
+            plaintiff:{...initial.caseDraft!.filingData.plaintiff,phone:'248-555-0101'}});
+        const record=f.db.recordDocumentRecognition.bind(f.db);
+        let guarded=false,downloads=0;
+        f.db.recordDocumentRecognition=(id,result)=>{
+            if(id===f.complaint) {
+                const root=JSON.parse(f.db.getDraftDetail(f.draftId)!.caseDraft!.normalizedDataJson!);
+                assert.equal(root.complaintAutoExtraction.status,'running');
+                assert.equal(f.db.queueValidatedIntakes(),0);
+                guarded=true;
+            }
+            record(id,result);
+        };
+        const result=await ensureDraftDocumentRecognitions(f.db,f.draftId,async url=>{
+            downloads++;assert.equal(url,initial.documents.find(doc=>doc.id===f.complaint)!.oneDriveUrl);return replacement;
+        });
+        assert.equal(downloads,1);assert.equal(guarded,true);
+        assert.equal(f.db.getComplaintSourceVersion(f.complaint),version);
+        assert.equal(result.caseDraft!.complaintExtraction!.contentHash,newHash);
+        assert.equal(result.documents.find(doc=>doc.id===f.complaint)!.recognition!.contentHash,newHash);
+        assert.equal(result.caseDraft!.filingData.plaintiff.entityName,'Current Owner LLC');
+        assert.equal(result.caseDraft!.filingData.plaintiff.phone,'248-555-0101');
+        const reused=await ensureDraftComplaintExtraction(f.db,f.draftId,{content:replacement,
+            extract:async()=>{throw new Error('An already verified identical Complaint must be reused');}});
+        assert.equal(JSON.parse(reused.caseDraft!.normalizedDataJson!).complaintExtractionError,undefined);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    }finally{f.close();}
+});
+
+test('a legacy primary PDF replaced by a deed cannot reuse old Complaint facts through a manual Filing Type',async()=>{
+    const f=fixture();
+    try {
+        f.db.recordDocumentRecognition(f.complaint,{...recognizeDocumentText(['COMPLAINT'],'Complaint.pdf'),recognitionVersion:1,
+            contentHash:createHash('sha256').update(testPdfFixture('COMPLAINT')).digest('hex')});
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.complaint,filingType:'Complaint for Possession Only',filingRelation:'separate'}]);
+        const result=await ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>deedPdf);
+        const root=JSON.parse(result.caseDraft!.normalizedDataJson!);
+        assert.match(root.complaintExtractionError,/primary PDF changed/);
+        assert.equal(result.documents.find(doc=>doc.id===f.complaint)!.recognition!.contentHash,deedRecognition.contentHash);
+        assert.ok(result.caseDraft!.validationIssues.some(issue=>issue.severity==='error' && issue.message.includes('primary PDF changed')));
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.throws(()=>f.db.buildFilingPayload(f.draftId),/blocked/);
+    }finally{f.close();}
+});
+
+test('a newly pinned Complaint invalidates an older extraction still in flight at the same URL',async()=>{
+    const f=fixture();let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    let started!:()=>void;const entered=new Promise<void>(resolve=>{started=resolve;});
+    let pending:ReturnType<typeof ensureDraftComplaintExtraction>|undefined;
+    try {
+        const original=syntheticDocument(coreTitles.Complaint,'Complaint.pdf').pdf;
+        const replacement=testComplaintFormFixture({5:'Newly Pinned Owner LLC'});
+        const newer={...recognizeDocumentText(['COMPLAINT'],'Complaint.pdf'),
+            contentHash:createHash('sha256').update(replacement).digest('hex'),recognitionVersion:2};
+        pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:original,force:true,extract:async()=>{
+            started();await gate;return {...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,textHash:'stale-in-flight'};
+        }});
+        await entered;
+        f.db.recordDocumentRecognition(f.complaint,newer);
+        release();await pending;
+        const result=f.db.getDraftDetail(f.draftId)!;
+        assert.notEqual(result.caseDraft!.complaintExtraction!.textHash,'stale-in-flight');
+        assert.match(JSON.parse(result.caseDraft!.normalizedDataJson!).complaintExtractionError,/contents changed during extraction/);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+    }finally{release();if(pending)await pending;f.close();}
+});
 
 test('attorney-confirmed contacts fill missing Plaintiff data without overwriting manual blanks',()=>{
     const f=fixture();
@@ -120,6 +243,323 @@ test('combined confirmation rolls back review if payload creation fails',()=>{
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
     } finally { f.close(); }
 });
+
+test('every included core PDF needs its own content hash before package approval',()=>{
+    for(const role of Object.keys(coreTitles)) {
+        const f=fixture();
+        try {
+            f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
+            const before=f.db.getDraftDetail(f.draftId)!;
+            assert.deepEqual(before.caseDraft!.validationIssues,[]);
+            assert.ok(before.documents.every(document=>document.recognition?.source==='content' &&
+                document.recognition.recognitionVersion===2 && /^[a-f0-9]{64}$/.test(document.recognition.contentHash || '')));
+            const document=before.documents.find(item=>item.packageRole===role.toLowerCase())!;
+            assert.ok(document,role);
+            f.db.recordDocumentRecognition(document.id,recognizeDocumentText([coreTitles[role]],document.originalFilename!));
+            f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:document.id,
+                filingType:document.filingType,filingRelation:document.filingRelation,filingTypeReviewed:true}]);
+            const unpinned=f.db.refreshCaseDraftValidation(f.draftId);
+            assert.equal(unpinned.documents.find(item=>item.id===document.id)!.recognition!.contentHash,undefined);
+            assert.ok(unpinned.caseDraft!.validationIssues.some(issue=>/Every included PDF must be pinned/.test(issue.message)),role);
+            assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/Every included PDF must be pinned/);
+            assert.throws(()=>f.db.buildFilingPayload(f.draftId),/Every included PDF must be pinned/);
+            assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        } finally { f.close(); }
+    }
+});
+
+test('a stale Demand semantic review cannot certify a same-size same-URL replacement deed',()=>{
+    const f=fixture();
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
+        const original=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!;
+        const replacementPdf=padPdf(deedPdf,original.fileSize!);
+        const replacementRecognition:DocumentRecognition={...deedRecognition,
+            contentHash:createHash('sha256').update(replacementPdf).digest('hex')};
+        const reservation=f.db.beginDocumentReplacement(f.ancillary);
+        f.db.recordDocumentReplacement(f.ancillary,{token:reservation.token,fileSize:replacementPdf.length,oneDriveUrl:original.oneDriveUrl!});
+        f.db.recordDocumentRecognition(f.ancillary,replacementRecognition);
+        const changed=f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
+        const current=changed.documents.find(item=>item.id===f.ancillary)!;
+        assert.equal(current.oneDriveUrl,original.oneDriveUrl);
+        assert.equal(current.fileSize,original.fileSize);
+        assert.notEqual(current.sourceVersion,original.sourceVersion);
+        assert.notEqual(current.recognition!.contentHash,original.recognition!.contentHash);
+        for(const expected of [
+            {expectedSourceVersion:original.sourceVersion,expectedContentHash:original.recognition!.contentHash},
+            {expectedSourceVersion:original.sourceVersion,expectedContentHash:current.recognition!.contentHash},
+            {expectedSourceVersion:current.sourceVersion,expectedContentHash:original.recognition!.contentHash},
+        ]) {
+            const before=f.db.getDraftDetail(f.draftId)!;
+            assert.throws(()=>f.db.updateCaseDraft(f.draftId,{caseTitle:'Stale semantic review must not persist'},
+                'Stale note must not persist',undefined,[{id:f.ancillary,filingName:'Stale Demand label',
+                    filingType:'Other',filingRelation:'separate',supportingKind:'demand',supportingKindReviewed:true,...expected}]),
+            /PDF changed since its contents were reviewed/);
+            assert.deepEqual(f.db.getDraftDetail(f.draftId),before,'the stale request must roll back all Draft and document edits');
+        }
+        const final=f.db.getDraftDetail(f.draftId)!;
+        assert.deepEqual(final.documents.find(item=>item.id===f.ancillary)!.supportingEvidence,{
+            kind:'deed',source:'content',contentHash:replacementRecognition.contentHash,
+        });
+        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/missing a verified Demand/);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { f.close(); }
+});
+
+test('same-size stable-URL replacements retain a new durable source version after completion',()=>{
+    const f=fixture();
+    try {
+        const original=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!;
+        let previousVersion=original.sourceVersion;
+        for(let generation=0;generation<2;generation++) {
+            const reservation=f.db.beginDocumentReplacement(f.ancillary);
+            const inProgress=f.db.getComplaintSourceVersion(f.ancillary);
+            assert.notEqual(inProgress,previousVersion);
+            assert.equal(JSON.parse(inProgress!)[3],reservation.token);
+            f.db.recordDocumentReplacement(f.ancillary,{token:reservation.token,fileSize:original.fileSize!,oneDriveUrl:original.oneDriveUrl!});
+            const completed=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!;
+            assert.equal(completed.oneDriveUrl,original.oneDriveUrl);
+            assert.equal(completed.fileSize,original.fileSize);
+            assert.equal(completed.sourceVersion,inProgress,'completion must retain the last replacement token');
+            assert.equal(f.db.getComplaintSourceVersion(f.ancillary),completed.sourceVersion);
+            f.db.recordDocumentRecognition(f.ancillary,demandRecognition);
+            assert.equal(f.db.getComplaintSourceVersion(f.ancillary),inProgress);
+            assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!.recognition!.contentHash,
+                original.recognition!.contentHash,'even identical replacement bytes must have a new source generation');
+            previousVersion=completed.sourceVersion;
+        }
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { f.close(); }
+});
+
+test('late recognition cannot restore Demand evidence over a same-size stable-URL replacement deed',async()=>{
+    const f=fixture();
+    let release=()=>{};
+    let pending:ReturnType<typeof ensureDraftDocumentRecognitions>|undefined;
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,{role:'ancillary',source:'filename',supportingKind:'unknown',
+            recognitionVersion:1,message:'Synthetic legacy PDF waiting for recognition.'});
+        const original=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!;
+        const gate=new Promise<void>(resolve=>{release=resolve;});
+        let started!:()=>void;
+        const reading=new Promise<void>(resolve=>{started=resolve;});
+        let downloads=0;
+        pending=ensureDraftDocumentRecognitions(f.db,f.draftId,async url=>{
+            downloads++;assert.equal(url,original.oneDriveUrl);started();await gate;return demandPdf;
+        });
+        await reading;
+        const replacementPdf=padPdf(deedPdf,original.fileSize!);
+        const currentRecognition:DocumentRecognition={...deedRecognition,
+            contentHash:createHash('sha256').update(replacementPdf).digest('hex')};
+        const reservation=f.db.beginDocumentReplacement(f.ancillary);
+        f.db.recordDocumentReplacement(f.ancillary,{token:reservation.token,fileSize:original.fileSize!,oneDriveUrl:original.oneDriveUrl!});
+        f.db.recordDocumentRecognition(f.ancillary,currentRecognition);
+        const currentVersion=f.db.getComplaintSourceVersion(f.ancillary);
+        assert.notEqual(currentVersion,original.sourceVersion);
+        release();await pending;
+        const final=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!;
+        assert.equal(downloads,1);
+        assert.equal(final.sourceVersion,currentVersion);
+        assert.equal(final.oneDriveUrl,original.oneDriveUrl);
+        assert.equal(final.fileSize,original.fileSize);
+        assert.deepEqual(final.recognition,currentRecognition);
+        assert.equal(final.supportingEvidence!.kind,'deed');
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { release();if(pending)await pending;f.close(); }
+});
+
+test('late Complaint extraction cannot overwrite newer facts after a same-size stable-URL replacement',async()=>{
+    const f=fixture();
+    let release=()=>{};
+    let pending:ReturnType<typeof ensureDraftComplaintExtraction>|undefined;
+    try {
+        const original=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.complaint)!;
+        const gate=new Promise<void>(resolve=>{release=resolve;});
+        let started!:()=>void;
+        const reading=new Promise<void>(resolve=>{started=resolve;});
+        const stale=structuredClone(extraction);
+        stale.textHash='stale-original-extraction';
+        stale.data.plaintiff={...stale.data.plaintiff,displayName:'Stale Owner LLC',entityName:'Stale Owner LLC'};
+        pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:syntheticDocument(coreTitles.Complaint,'Complaint.pdf').pdf,
+            force:true,extract:async()=>{started();await gate;return {...stale,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};}});
+        await reading;
+        const replacementPdf=padPdf(testPdfFixture('COMPLAINT'),original.fileSize!);
+        const reservation=f.db.beginDocumentReplacement(f.complaint);
+        f.db.recordDocumentReplacement(f.complaint,{token:reservation.token,fileSize:replacementPdf.length,oneDriveUrl:original.oneDriveUrl!});
+        f.db.recordDocumentRecognition(f.complaint,{...recognizeDocumentText(['COMPLAINT'],'Complaint.pdf'),
+            contentHash:createHash('sha256').update(replacementPdf).digest('hex'),recognitionVersion:2});
+        const current=structuredClone(extraction);
+        current.textHash='current-replacement-extraction';
+        current.data.plaintiff={...current.data.plaintiff,displayName:'Current Owner LLC',entityName:'Current Owner LLC'};
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...current,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
+        const currentVersion=f.db.getComplaintSourceVersion(f.complaint);
+        assert.notEqual(currentVersion,original.sourceVersion);
+        release();await pending;
+        const final=f.db.getDraftDetail(f.draftId)!;
+        const document=final.documents.find(item=>item.id===f.complaint)!;
+        assert.equal(document.oneDriveUrl,original.oneDriveUrl);
+        assert.equal(document.fileSize,original.fileSize);
+        assert.equal(document.sourceVersion,currentVersion);
+        assert.equal(final.caseDraft!.filingData.plaintiff.entityName,'Current Owner LLC');
+        assert.equal(final.caseDraft!.complaintExtraction!.textHash,current.textHash);
+        assert.equal(JSON.parse(final.caseDraft!.normalizedDataJson!).complaintAutoExtraction,undefined);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { release();if(pending)await pending;f.close(); }
+});
+
+test('an old requirement context is rejected atomically after another included PDF is added',()=>{
+    const f=fixture();
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
+        const oldContext=f.db.getDraftDetail(f.draftId)!.caseDraft!.packageCompleteness.contextHash;
+        const deed=f.add('Ancillary document','Added Deed.pdf','uploaded',{pdf:deedPdf,recognition:deedRecognition});
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:deed,filingType:'Other',filingRelation:'separate'}]);
+        f.db.reviewCaseDraft(f.draftId,'approve');
+        const before=f.db.getDraftDetail(f.draftId)!;
+        assert.notEqual(before.caseDraft!.packageCompleteness.contextHash,oldContext);
+        assert.ok(before.caseDraft!.reviewedAt);
+        assert.throws(()=>f.db.updateCaseDraft(f.draftId,{
+            caseTitle:'Stale requirement review must not persist',supportingRequirement:'none',
+            supportingRequirementReason:'This stale exception must not apply to a changed package.',
+        },'Stale review note',undefined,[{id:f.ancillary,filingName:'Stale filing name',filingType:'Other',filingRelation:'separate'}],
+        undefined,oldContext),/supporting package changed since it was reviewed/);
+        assert.deepEqual(f.db.getDraftDetail(f.draftId),before,'no fields, notes, mappings, approval or audit entries may change');
+        const current=f.db.updateCaseDraft(f.draftId,{supportingRequirement:'demand',
+            supportingRequirementReason:'Attorney reviewed the current PDFs and verified the included Demand.'},
+        undefined,undefined,[],undefined,before.caseDraft!.packageCompleteness.contextHash);
+        assert.equal(current.caseDraft!.packageCompleteness.source,'manual');
+        assert.equal(current.caseDraft!.packageCompleteness.requirement,'demand');
+        assert.equal(current.caseDraft!.packageCompleteness.reviewStale,false);
+        assert.deepEqual(current.caseDraft!.validationIssues,[]);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { f.close(); }
+});
+
+for(const packageMode of ['standard_lt','custom'] as const) {
+test(`${packageMode} deed-only support cannot pass approval through a generic manual Other mapping`,()=>{
+    const f=fixture(court,packageMode);
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        const detail=f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{
+            id:f.ancillary,filingType:'Other',filingTypeReviewed:true,filingRelation:'separate',
+        }]);
+        const document=detail.documents.find(item=>item.id===f.ancillary)!;
+        assert.equal(detail.caseDraft!.manualPackage,packageMode==='custom');
+        assert.equal(document.filingType,'Other');
+        assert.equal(document.filingTypeSource,'manual');
+        assert.deepEqual(document.supportingEvidence,{
+            kind:'deed',source:'content',contentHash:deedRecognition.contentHash,
+        });
+        assert.equal(detail.caseDraft!.packageCompleteness.requirement,'demand');
+        assert.deepEqual(detail.caseDraft!.validationIssues.filter(issue=>issue.severity==='error').map(issue=>issue.field),['package.supporting']);
+        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/missing a verified Demand/);
+        assert.throws(()=>f.db.buildFilingPayload(f.draftId),/missing a verified Demand/);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft:.*missing a verified Demand/);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { f.close(); }
+});
+}
+
+test('a none supporting exception needs an attorney reason and explicit manual package confirmation',()=>{
+    const f=fixture();
+    const reason='Attorney reviewed this synthetic package and confirmed no Demand or Notice is required.';
+    try {
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
+        f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
+        for(const invalidReason of [null,'Short']) {
+            const invalid=f.db.updateCaseDraft(f.draftId,{supportingRequirement:'none',supportingRequirementReason:invalidReason});
+            assert.equal(invalid.caseDraft!.packageCompleteness.requirement,'none');
+            assert.equal(invalid.caseDraft!.packageCompleteness.source,'manual');
+            assert.match(invalid.caseDraft!.packageCompleteness.issues[0].message,/reason why no Demand or Notice is required/);
+            assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft:.*reason/);
+            assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
+            assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        }
+        const reviewed=f.db.updateCaseDraft(f.draftId,{supportingRequirement:'none',supportingRequirementReason:reason});
+        assert.deepEqual(reviewed.caseDraft!.validationIssues,[]);
+        assert.equal(reviewed.caseDraft!.packageCompleteness.reason,reason);
+        assert.equal(reviewed.caseDraft!.reviewedAt,null);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId),/Approve the Draft/);
+        const ready=f.db.refreshCaseDraftValidation(f.draftId);
+        assert.equal(ready.caseDraft!.status,'ready_to_file');
+        assert.equal(JSON.parse(ready.caseDraft!.normalizedDataJson!).manualDocumentEdits,undefined);
+        assert.equal(f.db.queueValidatedIntakes(),0,'manual completeness decisions must not enter automatic preparation');
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true,ready.caseDraft!.updatedAt);
+        assert.equal(job.mode,'prepare');
+        assert.equal(job.payload!.completeness!.requirement,'none');
+        assert.equal(job.payload!.completeness!.source,'manual');
+        assert.equal(job.payload!.completeness!.reason,reason);
+        assert.ok(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,1);
+    } finally { f.close(); }
+});
+
+for(const operation of ['replace','remove'] as const) {
+for(const requirement of ['demand','none'] as const) {
+test(`${operation} supporting PDF invalidates semantic evidence and the manual ${requirement} requirement review`,()=>{
+    const f=fixture();
+    try {
+        const deed=f.add('Ancillary document','Deed.pdf','uploaded',{pdf:deedPdf,recognition:deedRecognition});
+        const original=f.db.getDraftDetail(f.draftId)!.documents.find(item=>item.id===f.ancillary)!;
+        const before=f.db.updateCaseDraft(f.draftId,{
+            supportingRequirement:requirement,
+            supportingRequirementReason:'Attorney reviewed the synthetic PDFs and confirmed this supporting-document requirement.',
+        },undefined,undefined,[
+            {id:f.ancillary,filingType:'Other',filingRelation:'separate',supportingKind:'demand',supportingKindReviewed:true,
+                expectedSourceVersion:original.sourceVersion,expectedContentHash:original.recognition!.contentHash},
+            {id:deed,filingType:'Other',filingRelation:'separate'},
+        ]);
+        assert.deepEqual(before.caseDraft!.validationIssues,[]);
+        assert.equal(before.caseDraft!.packageCompleteness.source,'manual');
+        assert.equal(before.caseDraft!.packageCompleteness.reviewStale,false);
+        assert.deepEqual(before.documents.find(item=>item.id===f.ancillary)!.supportingEvidence,{
+            kind:'demand',source:'manual',contentHash:demandRecognition.contentHash,
+        });
+        const contextHash=before.caseDraft!.packageCompleteness.contextHash;
+        f.db.reviewCaseDraft(f.draftId,'approve');
+        assert.ok(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt);
+        if(operation==='replace') {
+            const reservation=f.db.beginDocumentReplacement(f.ancillary);
+            const processing=f.db.getDraftDetail(f.draftId)!.caseDraft!;
+            assert.equal(processing.packageCompleteness.reviewStale,true);
+            assert.equal(processing.reviewedAt,null);
+            const replaced=f.db.recordDocumentReplacement(f.ancillary,{token:reservation.token,fileSize:deedPdf.length});
+            const unrecognized=replaced.documents.find(item=>item.id===f.ancillary)!;
+            assert.equal(unrecognized.recognition,null);
+            assert.deepEqual(unrecognized.supportingEvidence,{kind:'unknown',source:'unknown',contentHash:null});
+            assert.equal(replaced.caseDraft!.packageCompleteness.reviewStale,true);
+            f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+            const remapped=f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{
+                id:f.ancillary,filingType:'Other',filingTypeReviewed:true,filingRelation:'separate',
+            }]);
+            assert.deepEqual(remapped.documents.find(item=>item.id===f.ancillary)!.supportingEvidence,{
+                kind:'deed',source:'content',contentHash:deedRecognition.contentHash,
+            },'the old manual Demand confirmation cannot apply to replacement deed bytes');
+        } else {
+            const removed=f.db.removeDraftDocument(f.draftId,f.ancillary);
+            assert.ok(!removed.documents.some(item=>item.id===f.ancillary));
+            assert.equal(f.db.getDocumentAccess(f.ancillary),null);
+        }
+        const after=f.db.refreshCaseDraftValidation(f.draftId);
+        assert.equal(after.documents.length,operation==='replace'?7:6);
+        assert.ok(!after.documents.some(item=>item.supportingEvidence?.kind==='demand'));
+        assert.notEqual(after.caseDraft!.packageCompleteness.contextHash,contextHash);
+        assert.equal(after.caseDraft!.packageCompleteness.reviewStale,true);
+        assert.equal(after.caseDraft!.reviewedAt,null);
+        assert.ok(after.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting' && issue.severity==='error'));
+        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/supporting-document review is outdated/);
+        assert.throws(()=>f.db.buildFilingPayload(f.draftId),/supporting-document review is outdated/);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/supporting-document review is outdated/);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+    } finally { f.close(); }
+});
+}
+}
 
 test('automatic extraction deduplicates work and merges into manual leaf edits made while it runs',async()=>{
     const f=fixture();

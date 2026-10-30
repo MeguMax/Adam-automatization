@@ -12,6 +12,7 @@ import {
 } from './database';
 import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClient';
 import { validatePdfBuffer } from './pdfValidation';
+import { validCompletenessSnapshot } from './packageCompleteness';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
 import { authenticateMifilePage, dismissMifilePreparationNotice, matchesMiFileAccountHeader } from './mifileSession';
@@ -211,6 +212,10 @@ export class MiFileFilingRunner {
             );
         }
         this.validateConnectedPackage(job.payload.documents);
+        if (!validCompletenessSnapshot(job.payload)) {
+            throw new MiFileFilingError('Supporting-document completeness is missing or outdated. Review the Demand/Notice requirement before preparation.',
+                'PACKAGE_COMPLETENESS_UNCONFIRMED','starting');
+        }
         const runtimeConfig = getMiFileRuntimeConfig();
         const credentials = getMiFileCredentials();
         if (!runtimeConfig.ready) {
@@ -377,13 +382,18 @@ export class MiFileFilingRunner {
                     'materialize_documents',
                 );
             }
+            const contentHash=createHash('sha256').update(buffer).digest('hex');
+            if (document.supportingEvidence?.contentHash && document.supportingEvidence.contentHash !== contentHash) {
+                throw new MiFileFilingError(`${document.filename} changed after its contents were reviewed. Re-read and confirm the package before preparation.`,
+                    'PACKAGE_CONTENT_CHANGED','materialize_documents');
+            }
             const localPath = path.join(
                 directory,
                 `${String(index + 1).padStart(2, '0')}-${safePathToken(document.filename.replace(/\.pdf$/i, ''))}.pdf`,
             );
             fs.writeFileSync(localPath, buffer);
             materialized.push({ document, localPath, fingerprint: {
-                documentId: document.id, bytes: buffer.length, sha256: createHash('sha256').update(buffer).digest('hex'),
+                documentId: document.id, bytes: buffer.length, sha256: contentHash,
             } });
             await this.log('info', 'materialize_documents', 'PDF validated for MiFILE upload.', {
                 documentId: document.id,

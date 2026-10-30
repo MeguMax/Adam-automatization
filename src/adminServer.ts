@@ -47,13 +47,13 @@ import { pdfPreviewHtml } from './pdfPreview';
 import { PDF_PREVIEW_SCRIPT, PDF_PREVIEW_STYLE } from './pdfPreviewClient';
 import { applyLibraryForms, saveFormPdf, readFormPdf } from './formLibrary';
 import { recognizeDocumentPdf } from './documentRecognition';
-import { ensureDraftComplaintExtraction } from './draftExtraction';
+import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-30-scan-payment-review-v83';
+const ADMIN_BUILD_ID = '2026-10-30-pringle-completeness-v84';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2605,6 +2605,16 @@ const html = String.raw`<!doctype html>
     .draft-document-mapping input[type="text"] {
       width: 100%;
     }
+    .draft-document-mapping .document-contents-field { grid-column: 1 / -1; }
+    .draft-document-mapping .document-contents-field .draft-field-label {
+      display: flex;
+      flex-wrap: wrap;
+      white-space: normal;
+      overflow: visible;
+    }
+    .draft-supporting-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 7px; }
+    .draft-supporting-status > span { min-width: 0; overflow-wrap: anywhere; }
+    .draft-supporting-status button { flex: 0 0 30px; width: 30px; height: 30px; padding: 0; }
     .draft-document-required {
       display: flex;
       align-items: center;
@@ -4572,9 +4582,13 @@ const html = String.raw`<!doctype html>
       if (!detail || !draft) return;
       if (state.draftServerSnapshotOwner !== detail) {
         state.draftServerSnapshotOwner = detail;
-        state.draftServerSnapshot = JSON.parse(JSON.stringify({fields:draft.editableData, filingData:draft.filingData,
+        state.draftServerSnapshot = JSON.parse(JSON.stringify({fields:{...draft.editableData,
+          supportingRequirement:draft.editableData?.supportingRequirement || 'auto',
+          supportingRequirementReason:draft.editableData?.supportingRequirementReason || ''}, filingData:draft.filingData,
           documents:(detail.documents || []).map(doc=>({id:doc.id,filingName:doc.filingName || doc.currentFilename || '',filingType:doc.filingType || '',
-            filingRelation:doc.filingRelation,requiredForFiling:doc.requiredForFiling})),
+            filingRelation:doc.filingRelation,requiredForFiling:doc.requiredForFiling,supportingKind:doc.supportingEvidence?.kind || 'unknown',
+            sourceVersion:doc.sourceVersion ?? null,contentHash:doc.supportingEvidence?.contentHash ?? null})),
+          supportingContextHash:draft.packageCompleteness?.contextHash ?? null,
           primaryDocumentId:draft.primaryDocumentId, reviewerNotes:draft.reviewerNotes || ''}));
       }
       const data = draft.editableData || {};
@@ -5347,6 +5361,38 @@ const html = String.raw`<!doctype html>
           '</div>' +
         '</section>';
 
+      const completeness = draft.packageCompleteness || {};
+      const supportingLabels = {unknown:'Review required', demand:'Demand for possession',
+        notice_to_quit:'Notice to quit', none:'No Demand or Notice required'};
+      const supportingSource = {manual:'Manual', complaint:'Complaint', documents:'Document contents', unknown:'Unknown'};
+      const supportingRequirement =
+        '<section class="draft-field-section" data-draft-section="supporting">' +
+          '<div class="draft-section-heading"><h3>Supporting documents</h3>' +
+            '<span class="field-source ' + (completeness.source === 'manual' ? 'manual' :
+              completeness.source === 'complaint' ? 'complaint' : completeness.source === 'documents' ? 'derived' : 'empty') + '">' +
+              escapeHtml(supportingSource[completeness.source] || 'Unknown') + '</span></div>' +
+          '<div class="draft-field-grid">' +
+            renderDraftSelect('Required supporting document',
+              'data-draft-field="supportingRequirement" data-reviewed="' + Boolean(draft.supportingRequirementReviewed) + '"',
+              data.supportingRequirement || 'auto', [
+                {value:'auto',label:'Automatic'},
+                {value:'demand',label:'Demand for possession'},
+                {value:'notice_to_quit',label:'Notice to quit'},
+                {value:'none',label:'No Demand or Notice required'},
+              ], true) +
+            renderDraftInput('Exception reason (10 characters minimum)',
+              'data-draft-field="supportingRequirementReason" maxlength="1000"',
+              data.supportingRequirementReason, true) +
+          '</div><div class="draft-field-source draft-supporting-status">' +
+            '<span data-supporting-requirement-status>' + escapeHtml(
+              draft.supportingRequirementReviewed ? 'Review pending save' :
+                (supportingLabels[completeness.requirement] || 'Review required') +
+                (completeness.reviewStale ? ' - review required after package changes' : '')) + '</span>' +
+            (completeness.reviewStale ? '<button type="button" class="icon-button" data-review-supporting-requirement' +
+              (draft.supportingRequirementReviewed ? ' disabled' : '') +
+              ' title="Reconfirm supporting requirement" aria-label="Reconfirm supporting requirement">' + icon('check-check') + '</button>' : '') +
+          '</div></section>';
+
       const documentMappings =
         '<section class="draft-field-section" data-draft-section="documents">' +
           '<div class="draft-section-heading"><h3>MiFILE document types</h3></div>' +
@@ -5370,7 +5416,7 @@ const html = String.raw`<!doctype html>
           '<details class="draft-optional" data-disclosure="filing-setup"><summary>MiFILE setup & attorney</summary>' +
             filingSetup + attorney + '</details></div>' +
         '<div id="draftDocumentsPane" data-draft-pane="documents" role="tabpanel" aria-labelledby="draftDocumentsTab">' +
-          documentMappings + '</div>' +
+          supportingRequirement + documentMappings + '</div>' +
         '<div data-draft-pane="activity">' + extractionSummary + legacyGroups[1] + '</div>';
       decorateDraftReviewFields(draft);
       const identifierGrid = document.querySelector('[data-draft-section="identifiers"] .draft-field-grid');
@@ -5437,9 +5483,41 @@ const html = String.raw`<!doctype html>
       const moneyJudgment = document.querySelector(
         '[data-filing-field="moneyJudgmentRequested"]',
       );
-      document.querySelectorAll('[data-document-field="filingRelation"], [data-document-field="filingType"]').forEach(input => {
-        input.addEventListener('change', () => { input.dataset.reviewed = 'true'; });
-        input.addEventListener('input', () => { input.dataset.reviewed = 'true'; });
+      document.querySelectorAll('[data-document-field="filingRelation"], [data-document-field="filingType"], [data-document-field="supportingKind"]').forEach(input => {
+        const markReviewed = () => {
+          input.dataset.reviewed = 'true';
+          if (input.dataset.documentField === 'supportingKind') {
+            const source = input.closest('.draft-field').querySelector('.field-source');
+            source.textContent = 'Review pending save';
+            source.className = 'field-source manual';
+          }
+        };
+        input.addEventListener('change', markReviewed);
+        input.addEventListener('input', markReviewed);
+      });
+      const requirement = document.querySelector('[data-draft-field="supportingRequirement"]');
+      const requirementReason = document.querySelector('[data-draft-field="supportingRequirementReason"]');
+      const reconfirmRequirement = document.querySelector('[data-review-supporting-requirement]');
+      const markRequirementReviewed = () => {
+        requirement.dataset.reviewed = 'true';
+        document.querySelector('[data-supporting-requirement-status]').textContent = 'Review pending save';
+        if (reconfirmRequirement) reconfirmRequirement.disabled = true;
+      };
+      const syncRequirementReason = () => {
+        const exception = requirement.value === 'none';
+        requirementReason.closest('.draft-field').classList.toggle('hidden', !exception);
+        requirementReason.required = exception;
+        requirementReason.minLength = exception ? 10 : 0;
+      };
+      [requirement, requirementReason].forEach(input => {
+        input.addEventListener('input', markRequirementReviewed);
+        input.addEventListener('change', markRequirementReviewed);
+      });
+      requirement.addEventListener('change', syncRequirementReason);
+      syncRequirementReason();
+      if (reconfirmRequirement) reconfirmRequirement.addEventListener('click', () => {
+        markRequirementReviewed();
+        setDraftDirty(true);
       });
       const claimAmount = document.querySelector('[data-filing-field="claimAmount"]');
       const syncClaimAmount = () => {
@@ -5510,6 +5588,7 @@ const html = String.raw`<!doctype html>
       const exact = Array.from(root.querySelectorAll('[data-review-field]'))
         .find(input => input.dataset.reviewField === field);
       if (exact) return exact;
+      if (field === 'package.supporting') return root.querySelector('[data-draft-section="supporting"]');
       if (field.startsWith('document.')) {
         return Array.from(root.querySelectorAll('[data-draft-document-id]'))
           .find(row => row.dataset.draftDocumentId === field.slice(9));
@@ -5708,6 +5787,13 @@ const html = String.raw`<!doctype html>
         state.draftDetail.caseDraft.manualPackage);
       const coreDocument = !manualPackage &&
         ['complaint', 'advice', 'local', 'request', 'summons'].includes(document.packageRole);
+      const supportingDocument = !document.packageRole || ['ancillary', 'unknown'].includes(document.packageRole);
+      const supportingKind = document.supportingKind || document.supportingEvidence?.kind || 'unknown';
+      const supportingReady = /^[a-f0-9]{64}$/.test(document.supportingEvidence?.contentHash || '');
+      const supportingSource = document.supportingKindReviewed ? 'Review pending save' :
+        !supportingReady ? 'Recognition pending' :
+        document.supportingEvidence?.source === 'content' ? 'PDF contents' :
+        document.supportingEvidence?.source === 'manual' ? 'Manual' : 'Unclassified';
       return '<details class="draft-doc-details" data-disclosure="document-' + escapeHtml(document.id) + '">' +
         '<summary>' + icon('chevron-right') + '<span><strong>' +
         escapeHtml(document.currentFilename || document.documentType || ('Document ' + (index + 1))) +
@@ -5772,6 +5858,19 @@ const html = String.raw`<!doctype html>
             (document.requiredForFiling ? ' checked' : '') +
             (coreDocument || document.packageRole === 'fee' ? ' disabled' : '') + '>' +
         '</label>' +
+        (supportingDocument ? '<label class="draft-field document-contents-field">' +
+          '<span class="draft-field-label"><span>Document contents</span><span class="field-source ' +
+            (document.supportingKindReviewed || document.supportingEvidence?.source === 'manual' ? 'manual' :
+              document.supportingEvidence?.source === 'content' ? 'derived' : 'empty') + '">' +
+            escapeHtml(supportingSource) + '</span></span>' +
+          '<select data-document-field="supportingKind" data-reviewed="' + Boolean(document.supportingKindReviewed) + '"' +
+            (!supportingReady ? ' disabled title="Waiting for automatic PDF content recognition"' : '') + '>' +
+            [{value:'unknown',label:'Unknown / review required'}, {value:'demand',label:'Demand for possession'},
+              {value:'notice_to_quit',label:'Notice to quit'}, {value:'lease',label:'Lease'},
+              {value:'deed',label:'Deed'}, {value:'affidavit',label:'Affidavit'}, {value:'other',label:'Other'}]
+              .map(option => '<option value="' + option.value + '"' + (supportingKind === option.value ? ' selected' : '') +
+                '>' + option.label + '</option>').join('') +
+          '</select></label>' : '') +
       '</div></details>';
     }
 
@@ -6027,6 +6126,10 @@ const html = String.raw`<!doctype html>
           const filingName = root.querySelector('[data-document-field="filingName"]');
           const filingType = root.querySelector('[data-document-field="filingType"]');
           const filingRelation = root.querySelector('[data-document-field="filingRelation"]');
+          const supportingKind = root.querySelector('[data-document-field="supportingKind"]');
+          const current = state.draftDetail.documents.find(doc => doc.id === root.dataset.draftDocumentId);
+          const original = state.draftServerSnapshot?.documents?.find(doc => doc.id === root.dataset.draftDocumentId);
+          const supportingKindReviewed = Boolean(supportingKind && supportingKind.dataset.reviewed === 'true');
           const required = root.querySelector('[data-document-field="requiredForFiling"]');
           return {
             id: root.dataset.draftDocumentId,
@@ -6035,6 +6138,10 @@ const html = String.raw`<!doctype html>
             filingTypeReviewed: Boolean(filingType && filingType.dataset.reviewed === 'true'),
             filingRelation: filingRelation ? filingRelation.value : 'unknown',
             filingRelationReviewed: Boolean(filingRelation && filingRelation.dataset.reviewed === 'true'),
+            supportingKind: supportingKind ? supportingKind.value : current?.supportingEvidence?.kind || 'unknown',
+            supportingKindReviewed,
+            ...(supportingKindReviewed ? {expectedSourceVersion:original?.sourceVersion ?? null,
+              expectedContentHash:original?.contentHash ?? null} : {}),
             requiredForFiling: required ? required.checked : true,
           };
         },
@@ -6044,6 +6151,8 @@ const html = String.raw`<!doctype html>
     function snapshotDraftForm() {
       if (!state.draftDetail || !state.draftDetail.caseDraft) return;
       Object.assign(state.draftDetail.caseDraft.editableData, collectDraftFields());
+      state.draftDetail.caseDraft.supportingRequirementReviewed =
+        document.querySelector('[data-draft-field="supportingRequirement"]')?.dataset.reviewed === 'true';
       state.draftDetail.caseDraft.filingData = collectDraftFilingData();
       const mappings = new Map(
         collectDraftDocumentMappings().map(mapping => [mapping.id, mapping]),
@@ -6056,6 +6165,8 @@ const html = String.raw`<!doctype html>
         document.filingTypeReviewed = mapping.filingTypeReviewed;
         document.filingRelation = mapping.filingRelation;
         document.filingRelationReviewed = mapping.filingRelationReviewed;
+        document.supportingKind = mapping.supportingKind;
+        document.supportingKindReviewed = mapping.supportingKindReviewed;
         document.requiredForFiling = mapping.requiredForFiling;
       });
     }
@@ -6066,6 +6177,8 @@ const html = String.raw`<!doctype html>
       const payload = {
         base: state.draftServerSnapshot,
         fields: collectDraftFields(), filingData: collectDraftFilingData(),
+        supportingRequirementReviewed: document.querySelector('[data-draft-field="supportingRequirement"]')?.dataset.reviewed === 'true',
+        expectedSupportingContextHash: state.draftServerSnapshot?.supportingContextHash ?? null,
         documents: collectDraftDocumentMappings(), primaryDocumentId: detail.caseDraft.primaryDocumentId,
         reviewerNotes: document.getElementById('draftReviewerNotes').value,
       };
@@ -8322,7 +8435,8 @@ export function createAdminServer(
             const autoExtractMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/auto-extract$/);
             if (req.method === 'POST' && autoExtractMatch) {
                 const draftId = decodeURIComponent(autoExtractMatch[1]);
-                const detail = await ensureDraftComplaintExtraction(db, draftId);
+                await ensureDraftComplaintExtraction(db, draftId);
+                const detail = await ensureDraftDocumentRecognitions(db, draftId);
                 sendJson(res, 200, detail.caseDraft?.complaintExtraction && detail.caseDraft.filingEligible && ['not_started','failed'].includes(detail.caseDraft.filingStatus)
                     ? await applyLibraryForms(db, draftId) : detail);
                 return;
@@ -8377,7 +8491,9 @@ export function createAdminServer(
                     if (!latest?.caseDraft) { sendJson(res,404,{error:'Draft not found'}); return; }
                     const base = parsed.base;
                     if (parsed.fields && base.fields) parsed.fields = Object.fromEntries(Object.entries(parsed.fields)
-                        .filter(([key,value])=>String(value ?? '') !== String(base.fields[key] ?? '')));
+                        .filter(([key,value])=>String(value ?? '') !== String(base.fields[key] ?? '') ||
+                            (parsed.supportingRequirementReviewed === true &&
+                                ['supportingRequirement','supportingRequirementReason'].includes(key))));
                     if (parsed.filingData && base.filingData) {
                         const edits = new Set(changedFieldPaths('filingData',base.filingData,parsed.filingData));
                         parsed.filingData = mergeExtractedField('filingData',parsed.filingData,latest.caseDraft.filingData,edits);
@@ -8387,27 +8503,55 @@ export function createAdminServer(
                             const original = base.documents.find((doc:any)=>doc.id===mapping.id);
                             const current = latest.documents.find(doc=>doc.id===mapping.id);
                             if (!original || !current) return [mapping];
-                            const keys = ['filingName','filingType','filingRelation','requiredForFiling'] as const;
-                            const changed = keys.filter(key=>mapping[key] !== original[key]);
-                            if (!changed.length && !mapping.filingTypeReviewed && !mapping.filingRelationReviewed) return [];
-                            return [{...mapping,...Object.fromEntries(keys.filter(key=>!changed.includes(key)).map(key=>[key,current[key]]))}];
+                            const keys = ['filingName','filingType','filingRelation','requiredForFiling','supportingKind'] as const;
+                            const changed = keys.filter(key=>mapping[key] !== original[key] ||
+                                (key === 'supportingKind' && mapping.supportingKindReviewed === true));
+                            if (!changed.length && !mapping.filingTypeReviewed && !mapping.filingRelationReviewed && !mapping.supportingKindReviewed) return [];
+                            return [{...mapping,...Object.fromEntries(keys.filter(key=>!changed.includes(key)).map(key=>
+                                [key,key === 'supportingKind' ? current.supportingEvidence?.kind || 'unknown' : current[key]]))}];
                         });
                     }
                     if (parsed.primaryDocumentId === base.primaryDocumentId) delete parsed.primaryDocumentId;
                     if (parsed.reviewerNotes === base.reviewerNotes) delete parsed.reviewerNotes;
                 }
-                const detail = db.updateCaseDraft(
-                    decodeURIComponent(draftMatch[1]),
-                    parsed.fields ?? {},
-                    typeof parsed.reviewerNotes === 'string'
-                        ? parsed.reviewerNotes
-                        : undefined,
-                    parsed.filingData,
-                    Array.isArray(parsed.documents) ? parsed.documents : [],
-                    Object.prototype.hasOwnProperty.call(parsed, 'primaryDocumentId')
-                        ? parsed.primaryDocumentId
-                        : undefined,
-                );
+                const supportingRequirementReview = parsed.supportingRequirementReviewed === true ||
+                    ['supportingRequirement','supportingRequirementReason'].some(key =>
+                        Object.prototype.hasOwnProperty.call(parsed.fields ?? {}, key));
+                const expectedSupportingContextHash = supportingRequirementReview ? parsed.expectedSupportingContextHash : undefined;
+                if (supportingRequirementReview && (typeof expectedSupportingContextHash !== 'string' ||
+                    !/^[a-f0-9]{64}$/.test(expectedSupportingContextHash))) {
+                    sendJson(res, 409, {error:'The supporting review is missing its original package context. Refresh the Draft and review its PDFs again.'});
+                    return;
+                }
+                if (Array.isArray(parsed.documents) && parsed.documents.some((mapping: any) => mapping.supportingKindReviewed === true &&
+                    (typeof mapping.expectedSourceVersion !== 'string' || !mapping.expectedSourceVersion.trim() ||
+                        typeof mapping.expectedContentHash !== 'string' || !/^[a-f0-9]{64}$/.test(mapping.expectedContentHash)))) {
+                    sendJson(res, 409, {error:'The PDF review is missing its original source version or content hash. Refresh the Draft and review the current PDF again.'});
+                    return;
+                }
+                let detail: EmailDetail;
+                try {
+                    detail = db.updateCaseDraft(
+                        decodeURIComponent(draftMatch[1]),
+                        parsed.fields ?? {},
+                        typeof parsed.reviewerNotes === 'string'
+                            ? parsed.reviewerNotes
+                            : undefined,
+                        parsed.filingData,
+                        Array.isArray(parsed.documents) ? parsed.documents : [],
+                        Object.prototype.hasOwnProperty.call(parsed, 'primaryDocumentId')
+                            ? parsed.primaryDocumentId
+                            : undefined,
+                        expectedSupportingContextHash,
+                    );
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    if (/changed since .*reviewed/i.test(message)) {
+                        sendJson(res, 409, {error:message});
+                        return;
+                    }
+                    throw error;
+                }
                 if (Object.prototype.hasOwnProperty.call(parsed, 'primaryDocumentId') &&
                     detail.caseDraft?.primaryDocumentId && detail.caseDraft.primaryDocumentId !== detail.caseDraft.complaintExtraction?.documentId) {
                     await ensureDraftComplaintExtraction(db, decodeURIComponent(draftMatch[1]));

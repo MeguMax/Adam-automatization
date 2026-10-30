@@ -3,7 +3,7 @@ import { createCanvas } from '@napi-rs/canvas';
 import { createWorker, PSM } from 'tesseract.js';
 import type { Page as RecognizedPage } from 'tesseract.js';
 import sharp from 'sharp';
-import { mergeOcrRegionWords, type OcrPage, type OcrLine } from './pdfOcr';
+import { mergeOcrLineReads, mergeOcrRegionWords, type OcrPage, type OcrLine } from './pdfOcr';
 import { pdfResourceOptions } from './pdfValidation';
 import { readComplaintSelections } from './pdfCheckboxes';
 
@@ -36,23 +36,24 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
             const viewport = page.getViewport({ scale });
             const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
             await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-            const image = await sharp(canvas.toBuffer('image/png')).flatten({ background: '#fff' }).greyscale().normalize().png().toBuffer();
+            const sourceImage = await sharp(canvas.toBuffer('image/png')).flatten({ background: '#fff' }).greyscale().png().toBuffer();
+            const image = await sharp(sourceImage).normalize().png().toBuffer();
             const pixelWidth = canvas.width, pixelHeight = canvas.height;
             canvas.width = 1; canvas.height = 1;
             page.cleanup();
             const xScale = 612 / viewport.width, yScale = 792 / viewport.height;
-            const convert = (data: RecognizedPage, offsetX = 0, offsetY = 0): OcrPage => {
+            const convert = (data: RecognizedPage, offsetX = 0, offsetY = 0, resize = 1, coordinateX=xScale, coordinateY=yScale): OcrPage => {
                 const lines = (data.blocks || []).flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines.map(line => ({
                     text: line.text.trim(), confidence: line.confidence,
-                    x: (line.bbox.x0 + offsetX) * xScale, y: (line.bbox.y0 + offsetY) * yScale,
-                    width: (line.bbox.x1 - line.bbox.x0) * xScale,
-                    height: (line.bbox.y1 - line.bbox.y0) * yScale, pageNumber: number,
+                    x: (line.bbox.x0 / resize + offsetX) * coordinateX, y: (line.bbox.y0 / resize + offsetY) * coordinateY,
+                    width: (line.bbox.x1 - line.bbox.x0) / resize * coordinateX,
+                    height: (line.bbox.y1 - line.bbox.y0) / resize * coordinateY, pageNumber: number,
                 }))));
                 const words = (data.blocks || []).flatMap(block => block.paragraphs.flatMap(paragraph => paragraph.lines.flatMap(line => line.words.map(word => ({
                     text: word.text.trim(), confidence: word.confidence,
-                    x: (word.bbox.x0 + offsetX) * xScale, y: (word.bbox.y0 + offsetY) * yScale,
-                    width: (word.bbox.x1 - word.bbox.x0) * xScale,
-                    height: (word.bbox.y1 - word.bbox.y0) * yScale, pageNumber: number,
+                    x: (word.bbox.x0 / resize + offsetX) * coordinateX, y: (word.bbox.y0 / resize + offsetY) * coordinateY,
+                    width: (word.bbox.x1 - word.bbox.x0) / resize * coordinateX,
+                    height: (word.bbox.y1 - word.bbox.y0) / resize * coordinateY, pageNumber: number,
                 })))));
                 return { text: data.text, confidence: data.confidence, lines, words, rotationRadians: data.rotateRadians || 0 };
             };
@@ -68,16 +69,23 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
             // Separate columns and form rules can confuse full-page segmentation.
             // Re-read caption blocks, not the whole document, for names/addresses.
             if (/complaint/i.test(recognized.text) && Math.abs(recognized.rotationRadians || 0) < 0.015) {
+                const districtLabels = recognized.words.filter(word => word.x < 220 && word.y > 45 && word.y < 110 && /^(?:judicial|district)$/i.test(word.text));
                 for (const word of recognized.words.filter(word => word.x < 200 && word.y > 45 && word.y < 110 &&
-                    word.confidence < 80 && /^\d{1,3}[AB]?(?:-\d)?(?:st|nd|rd|th)$/i.test(word.text))) {
+                    word.confidence < 80 && (/^\d{1,3}[AB]?(?:-\d)?(?:st|nd|rd|th)$/i.test(word.text) ||
+                    districtLabels.some(label => label.x > word.x + word.width && label.x-word.x-word.width < 20 && Math.abs(label.y-word.y)<6)))) {
                     const crop = {left:Math.max(0,Math.floor((word.x-2)/xScale)),top:Math.max(0,Math.floor((word.y-2)/yScale)),
                         width:Math.ceil((word.width+4)/xScale),height:Math.ceil((word.height+4)/yScale)};
                     if (crop.left+crop.width>pixelWidth || crop.top+crop.height>pixelHeight) continue;
-                    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_WORD});
-                    const reread=(await worker.recognize(image,{rectangle:crop},{text:true,blocks:true})).data;
+                    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,tessedit_char_whitelist:'0123456789ABab-'});
+                    const bytes=await sharp(image).extract(crop).median(3).extend({top:24,bottom:24,left:24,right:24,background:'#fff'}).png().toBuffer();
+                    const reread=(await worker.recognize(bytes,{}, {text:true,blocks:true})).data;
                     passes++;
-                    if (reread.text.trim().toUpperCase()===word.text.toUpperCase() && reread.confidence>=80) word.confidence=reread.confidence;
+                    const district=reread.text.trim().toUpperCase().replace(/-(?=[AB]$)/,'');
+                    if (/^\d{1,3}[AB]?(?:-\d)?$/.test(district) && reread.confidence>=80) {
+                        word.text=district;word.confidence=reread.confidence;
+                    }
                 }
+                await worker.setParameters({tessedit_char_whitelist:''});
                 const rows = (items: OcrLine[]) => {
                     const grouped: OcrLine[][] = [];
                     for (const word of [...items].sort((a,b)=>a.y-b.y || a.x-b.x)) {
@@ -85,6 +93,7 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                         if (row) row.push(word); else grouped.push([word]);
                     }
                     return grouped.map(row => ({ x: Math.min(...row.map(w=>w.x)), y: Math.min(...row.map(w=>w.y)),
+                        width:Math.max(...row.map(w=>w.x+w.width))-Math.min(...row.map(w=>w.x)),
                         height: Math.max(...row.map(w=>w.y+w.height))-Math.min(...row.map(w=>w.y)),
                         text: row.sort((a,b)=>a.x-b.x).map(w=>w.text).join(' ') }));
                 };
@@ -95,6 +104,7 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                 const attorney = left.find(row => /plaintiff.{0,8}attorney/i.test(row.text));
                 const states = rows(recognized.words).find(row => /\b(?:the\s+)?plaintiff\s+states\b/i.test(row.text));
                 const related = rows(recognized.words).find(row => /there is no other pending/i.test(row.text));
+                const captionLines:Array<{x:number;y:number;width:number;height:number;text:string}>=[];
                 for (const [label, end, xMax, column] of [
                     [plaintiff, attorney?.y, 289, left], [defendant, states?.y, 585, right],
                     [attorney, related?.y, 289, left],
@@ -119,7 +129,46 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                     if (!block.words.length) continue;
                     recognized.words = mergeOcrRegionWords(recognized.words, block.words,
                         {left:xMin,top,right:xMax,bottom});
+                    captionLines.push(...rows(recognized.words.filter(word=>word.x>=xMin && word.x+word.width<=xMax &&
+                        word.y>=firstData.y && word.y<bottom)));
                 }
+                for (const line of captionLines.slice(0,18)) {
+                    const phone=/^[+()\d .-]{7,}$/.test(line.text),margin=phone?3.5:1.5,xMargin=phone?2:1;
+                    const crop={left:Math.max(0,Math.floor((line.x-xMargin)/xScale)),top:Math.max(0,Math.floor((line.y-margin)/yScale)),
+                        width:Math.ceil((line.width+xMargin*2)/xScale),height:Math.ceil((line.height+margin*2)/yScale)};
+                    if(crop.width<=0 || crop.height<=0 || crop.left+crop.width>pixelWidth || crop.top+crop.height>pixelHeight) continue;
+                    let lineImage=await sharp(phone?sourceImage:image).extract(crop).png().toBuffer();
+                    let originX=crop.left,originY=crop.top,coordinateX=xScale,coordinateY=yScale,lineWidth=crop.width;
+                    if(phone && line.width<300 && line.height<30) {
+                        // Re-render only the small number row: the full-page pixel cap must not blur fine digits.
+                        const highViewport=page.getViewport({scale:300/72});
+                        coordinateX=612/highViewport.width;coordinateY=792/highViewport.height;
+                        originX=Math.floor((line.x-2)/coordinateX);originY=Math.floor((line.y-2.5)/coordinateY);
+                        lineWidth=Math.ceil((line.width+4)/coordinateX);
+                        const height=Math.ceil((line.height+5)/coordinateY),detail=createCanvas(lineWidth,height);
+                        await page.render({canvasContext:detail.getContext('2d'),viewport:highViewport,
+                            transform:[1,0,0,1,-originX,-originY]}).promise;
+                        lineImage=await sharp(detail.toBuffer('image/png')).flatten({background:'#fff'}).greyscale().png().toBuffer();
+                        detail.width=1;detail.height=1;
+                    }
+                    const reads:OcrLine[][]=[];
+                    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,tessedit_char_whitelist:phone?'0123456789-()+.':''});
+                    for (const variant of (phone?['original','median','half']:['original','median','cubic'])) {
+                        const resize=variant==='cubic'?2:variant==='half'?0.5:1,padding=24;
+                        let cropped=sharp(lineImage);
+                        if(variant==='median') cropped=cropped.median(3);
+                        if(resize!==1) cropped=cropped.resize({width:Math.round(lineWidth*resize),kernel:'cubic'});
+                        const data=(await worker.recognize(await cropped.extend({top:padding,bottom:padding,left:padding,right:padding,
+                            background:'#fff'}).png().toBuffer(),{}, {text:true,blocks:true})).data;
+                        const reread=convert(data,originX-padding/resize,originY-padding/resize,resize,coordinateX,coordinateY).words;
+                        reads.push(phone?reread.filter(word=>/^\+?1?\D*[2-9]\d{2}\D*\d{3}\D*\d{4}\D*$/.test(word.text) &&
+                            word.text.replace(/\D/g,'').length<=11):reread);
+                        passes++;
+                    }
+                    recognized.words=mergeOcrLineReads(recognized.words,reads,{left:line.x-1,top:line.y-1.5,
+                        right:line.x+line.width+1,bottom:line.y+line.height+1.5},phone);
+                }
+                await worker.setParameters({tessedit_char_whitelist:''});
             }
             await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
             if (Math.abs(recognized.rotationRadians || 0) < 0.015) {
@@ -128,8 +177,9 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                     raw.info.width,raw.info.height,recognized.words.filter(word=>word.confidence>=50));
             }
             pages.push({ ...recognized, recognitionPasses: passes });
+            page.cleanup();
         }
-        process.send?.({ pages });
+        process.send?.({ pages, pageCount:pdf.numPages });
     } catch (error) {
         process.send?.({ error: error instanceof Error ? error.message : String(error) });
     } finally {

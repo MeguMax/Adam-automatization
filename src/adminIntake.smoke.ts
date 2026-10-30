@@ -452,6 +452,52 @@ async function main() {
         const complete = db.getDraftDetail(draftId)!;
         assert.equal(complete.documents.length, 6);
         assert.deepEqual(complete.caseDraft!.validationIssues, []);
+        const saveSupporting = async () => {
+            const saved=page.waitForResponse(response=>response.url().endsWith('/api/drafts/'+draftId) && response.request().method()==='PATCH');
+            await page.locator('#draftSaveBtn').click();
+            assert.equal((await saved).status(),200);
+            await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
+        };
+        const contents=ancillaryRow.locator('[data-document-field="supportingKind"]');
+        const requiredSupport=page.locator('[data-draft-field="supportingRequirement"]');
+        assert.equal(await contents.inputValue(),'demand');
+        const missingPins=await context.request.patch(`${url}/api/drafts/${draftId}`,{headers:{Origin:url},data:{fields:{},documents:[{
+            id:ancillary.id,filingType:ancillary.filingType,filingName:ancillary.filingName,filingRelation:'separate',
+            supportingKind:'demand',supportingKindReviewed:true}]}});
+        assert.equal(missingPins.status(),409);
+        const stalePins=await context.request.patch(`${url}/api/drafts/${draftId}`,{headers:{Origin:url},data:{fields:{},documents:[{
+            id:ancillary.id,filingType:ancillary.filingType,filingName:ancillary.filingName,filingRelation:'separate',
+            supportingKind:'demand',supportingKindReviewed:true,expectedSourceVersion:'stale-source',
+            expectedContentHash:ancillary.supportingEvidence!.contentHash}]}});
+        assert.equal(stalePins.status(),409);
+        const missingContext=await context.request.patch(`${url}/api/drafts/${draftId}`,{headers:{Origin:url},
+            data:{fields:{supportingRequirement:'none',supportingRequirementReason:'Stale review without a package context.'}}});
+        assert.equal(missingContext.status(),409);
+        assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
+        await contents.selectOption('deed');await saveSupporting();
+        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting'));
+        await ancillaryRow.locator('[data-document-field="filingType"]').fill('Other');await saveSupporting();
+        assert.equal(db.getDraftDetail(draftId)!.documents.find(doc=>doc.id===ancillary.id)!.supportingEvidence!.kind,'deed');
+        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting'));
+        await requiredSupport.selectOption('none');
+        await page.locator('[data-draft-field="supportingRequirementReason"]').fill('Attorney reviewed the exception for this synthetic QA case.');
+        await saveSupporting();
+        assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.source,'manual');
+        await contents.selectOption('other');await saveSupporting();
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.reviewStale,true);
+        await page.locator('[data-review-supporting-requirement]').click();await saveSupporting();
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.reviewStale,false);
+        await requiredSupport.selectOption('auto');await saveSupporting();
+        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting'));
+        await page.getByRole('heading',{name:'Supporting documents',exact:true}).click();
+        await page.screenshot({path:path.join(screenshots,'draft-supporting-completeness-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-supporting-completeness-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+        await contents.selectOption('demand');await saveSupporting();
+        assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
         await ancillaryRow.locator('[data-document-field="filingRelation"]').selectOption('connected_to_complaint');
         await page.locator('#draftSaveBtn').click();
         await page.waitForFunction(() => document.getElementById('draftSaveBtn')?.hasAttribute('disabled') === true);
