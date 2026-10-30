@@ -13,6 +13,7 @@ sends email, modifies case records, pays fees or submits a filing.
 - The selected sheet, row, case identity and mapped field values are checked again after generation and immediately before download. A changed case or formula invalidates the PDF and requires regeneration.
 - Changes and selections are tracked across the worksheet collection, including newly added sheets. Rechecks still protect downloads when host change events are unavailable.
 - Exact matching column names; missing/duplicate columns and mapped Excel errors stop generation. Errors in unrelated columns do not block a valid form.
+- Source issues are collected for the selected form or all three ZIP forms. The panel lists missing/duplicate headers and invalid mapped cells with their source sheet and addresses. Cell buttons select the exact worksheet cell (or the header row for a missing column) without rewriting values, formulas or headers. PDF layout errors also link back to the source cell.
 - Known numeric date fields use Excel's MONTH, DAY and YEAR results, assembled as m/d/yyyy without locale-specific TEXT format codes. No guessed serial-date epoch or date mutation.
 - One initial connection with admin credentials creates a separate, fixed 12-hour PDF-only session. The panel restores it automatically after reload/reopening; restarting Render does not revoke it. No password is stored in the pane, manifest, workbook or browser storage.
 - The browser stores only an opaque Excel access token and its expiry. SQLite stores only its hash and credential version in a separate `excel_sessions` table. This token cannot open the admin panel or MiFILE. Disconnect, expiry and credential changes revoke access; reconnecting never extends the original deadline.
@@ -404,3 +405,27 @@ Generation still runs on Render; file saving is local-only. No OneDrive copy,
 MiFILE preparation, payment or court submission was performed by this acceptance
 run. Installation and acceptance in Adam's own Microsoft 365 tenant remain a
 separate pilot step; this does not claim a new desktop-Excel ZIP acceptance run.
+
+## Source diagnostics (v88)
+
+Mapped column validation reports all detected missing headers, duplicate headers,
+formula errors and unsupported values in the current read instead of stopping at
+the first column. The ZIP checks the union of its three forms; an individual PDF
+still ignores errors in unrelated form columns. Required case identity and date
+errors also retain their worksheet context.
+
+`Source issues` appears only when applicable. It lists the affected sheet and
+cells, with selection buttons for real cells or the header row when a column is
+missing. Repeated headers expose their actual locations. These controls only
+activate a worksheet and select a cell; they do not repair, rename or overwrite
+anything. The immediate readback does not force another calculation. Selecting
+a header keeps generation blocked until a data row is selected again. Fixing a
+source value or choosing another form refreshes validation normally.
+
+All 312 project tests passed without skips. The simulated Excel 1.9 browser smoke
+also passed: two simultaneous ZIP header errors stopped before any PDF request,
+source navigation selected the exact header/data cell without changing values,
+and a server-side layout error linked back to its source cell. Existing individual
+PDFs, three-form ZIPs, session restoration, download guards and local-only mode
+remain covered. This is not a new real desktop-Excel acceptance result; native
+input was unavailable in this run, and the desktop ZIP pilot remains pending.

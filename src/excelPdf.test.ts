@@ -245,6 +245,50 @@ test('Excel row mapping uses exact headers, rejects errors/duplicates, and ignor
     row.assertSelection({ rowIndex: 35, rowCount: 1 });
 });
 
+test('row validation reports all mapped issues without changing cells or accepting partial values',()=>{
+    const form=EXCEL_FORMS[0],headers=[...form.fields],input=form.fields.map(()=>'' as unknown);
+    headers[2]='unmapped';headers.push('dc105_02');input.push('');
+    input[4]='#REF!';input[6]=Number.NaN;input[8]={unexpected:true};
+    const before=[...headers];
+    assert.throws(()=>row.selectedFields(headers,input,[],form),(error:any)=>{
+        assert.deepEqual(error.issues.map((issue:any)=>issue.code),['duplicate_column','missing_column','excel_error','invalid_number','unsupported_value']);
+        assert.deepEqual(error.issues[0].columns,[1,48]);assert.deepEqual(error.issues[1].columns,[]);
+        assert.deepEqual(error.issues[2].columns,[4]);return true;
+    });
+    assert.deepEqual(headers,before);assert.equal(input[4],'#REF!');
+    for(const [index,name] of [[0,'A'],[25,'Z'],[26,'AA'],[87,'CJ'],[2047,'BZT']] as const)assert.equal(row.columnName(index),name);
+    for(const index of [-1,2048,1.5,Number.NaN])assert.throws(()=>row.columnName(index));
+});
+
+test('Office validation errors include the source sheet, row and header or value columns',async()=>{
+    const fixture=officeFixture();
+    fixture.state.headers[fixture.state.headers.indexOf('dc105_03')]='unmapped';
+    fixture.state.values[fixture.state.headers.indexOf('dc105_05')]='#REF!';
+    await assert.rejects(workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep}),(error:any)=>{
+        assert.deepEqual(error.source,{sheet:'Working Document',sheetId:'sheet-1',row:36});
+        assert.equal(error.issues.length,2);assert.equal(error.issues[1].field,'dc105_05');
+        assert.deepEqual(error.issues[1].columns,[fixture.state.headers.indexOf('dc105_05')]);return true;
+    });
+    const metadata=officeFixture();metadata.state.headers.push('Defendant');metadata.state.values.push('Other person');metadata.state.width++;
+    await assert.rejects(workbook.readSelection(metadata.excel,metadata.form,{sleep:metadata.sleep}),(error:any)=>{
+        assert.equal(error.issues[0].field,'Defendant');assert.equal(error.issues[0].code,'duplicate_column');
+        assert.equal(error.source.row,36);return true;
+    });
+});
+
+test('source-cell navigation only activates and selects the exact worksheet cell',async()=>{
+    const operations:unknown[]=[];
+    const excel={run:async(callback:any)=>callback({workbook:{worksheets:{getItem(id:string){operations.push(['sheet',id]);return {
+        activate(){operations.push(['activate']);},getRangeByIndexes(...indexes:number[]){operations.push(['range',...indexes]);return {
+            select(){operations.push(['select']);}};}};}}},sync:async()=>{operations.push(['sync']);}})};
+    await workbook.selectSource(excel,{sheetId:'sheet-1',row:36,column:87});
+    assert.deepEqual(operations,[['sheet','sheet-1'],['activate'],['range',35,87,1,1],['select'],['sync']]);
+    for(const bad of [{row:0},{row:1048577},{column:-1},{column:2048},{sheetId:''},{row:1.5}]){
+        await assert.rejects(workbook.selectSource(excel,{sheetId:'sheet-1',row:36,column:87,...bad}),/source cell/);
+    }
+    assert.equal(operations.length,5);
+});
+
 test('generation input cannot choose a path, introduce extra fields, or send ambiguous numeric dates', () => {
     assert.throws(() => validateExcelValues('../file', {}), /available form/);
     assert.throws(() => validateExcelValues('dc105', { ...values(), extra: '' }), /exactly/);

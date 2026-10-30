@@ -42,10 +42,10 @@ window.qa.events = []; window.qa.calculations = 0; window.qa.pending = 0;
 const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(callback)}};
 const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'},load(){return this},
  getUsedRange(){return {columnIndex:0,columnCount:qa.headers.length,load(){return this}}},
- getRangeByIndexes(row){return {get values(){return [row===0?qa.headers:qa.values]},get valueTypes(){return [qa.values.map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}}}}};
+ activate(){qa.activatedSheet='sheet-1'},getRangeByIndexes(row,column=0){return {get values(){return [row===0?qa.headers:qa.values]},get valueTypes(){return [qa.values.map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}},select(){qa.sourceSelection=[row,column];qa.rowIndex=row;qa.events.forEach(callback=>callback())}}}};
 window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const field of ['dc105_05','dc508_06','mc202_08']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Defendant')];},load(){}},workbook:{
  getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
- worksheets:{onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
+ worksheets:{getItem(id){if(id!=='sheet-1')throw new Error('Unknown source sheet');return sheet},onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
  functions:Object.fromEntries(['month','day','year'].map((name,index)=>[name,()=>({value:Number((qa.date || '10/5/2026').split('/')[index]),load(){return this}})]))
 }})};
 window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:(_api,version)=>version==='1.9'&&!qa.unsupported}},onReady:callback=>Promise.resolve().then(()=>callback({host:'Excel'}))};`;
@@ -113,6 +113,26 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.equal(await page.locator('#form').inputValue(), 'mc202');
         assert.equal(loginRequests, 1);
         await page.screenshot({ path: path.join(output, 'selected-row.png') });
+        let invalidPackageRequests=0;
+        const countInvalidPackage=(request:any)=>{if(request.url().endsWith('/excel/generate-package'))invalidPackageRequests++;};
+        page.on('request',countInvalidPackage);
+        const valuesBeforeIssues=await page.evaluate(()=>JSON.stringify((window as any).qa.values));
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.headers[qa.headers.indexOf('dc105_03')]='unmapped-dc105';qa.headers[qa.headers.indexOf('dc508_04')]='unmapped-dc508';});
+        await page.click('#generatePackage');
+        await page.waitForSelector('#sourceIssues:visible');
+        assert.equal(await page.locator('#sourceIssueList li').count(),2);
+        assert.ok((await page.locator('#sourceIssueList').innerText()).includes('dc508_04'));
+        assert.equal(invalidPackageRequests,0);
+        await page.screenshot({path:path.join(output,'multiple-source-issues.png'),fullPage:true});
+        const calculationsBeforeSource=await page.evaluate(()=>(window as any).qa.calculations);
+        await page.locator('#sourceIssueList button').first().click();
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('header or multiple rows'));
+        assert.deepEqual(await page.evaluate(()=>(window as any).qa.sourceSelection),[0,0]);
+        assert.equal(await page.evaluate(()=>JSON.stringify((window as any).qa.values)),valuesBeforeIssues);
+        assert.equal(await page.evaluate(()=>(window as any).qa.calculations),calculationsBeforeSource);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.headers[qa.headers.indexOf('unmapped-dc105')]='dc105_03';qa.headers[qa.headers.indexOf('unmapped-dc508')]='dc508_04';qa.rowIndex=35;qa.events[0]();});
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        page.off('request',countInvalidPackage);
         for (const form of EXCEL_FORMS) {
             await page.selectOption('#form', form.id);
             const request = page.waitForRequest(req => req.url().endsWith('/excel/generate'));
@@ -313,6 +333,11 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.equal(await page.locator('#result').isVisible(),false);
         assert.equal(savedCopies.length,3);
         await page.screenshot({path:path.join(output,'source-field-error.png'),fullPage:true});
+        assert.equal(await page.locator('#sourceIssueList li').count(),1);
+        await page.getByRole('button',{name:'Select cell CJ36',exact:true}).click();
+        await page.waitForFunction(()=>(window as any).qa.sourceSelection?.[1]===87);
+        assert.deepEqual(await page.evaluate(()=>(window as any).qa.sourceSelection),[35,87]);
+        assert.equal(await page.evaluate(()=>(window as any).qa.activatedSheet),'sheet-1');
         await page.evaluate(()=>{
             const qa=(window as any).qa;qa.values[qa.headers.indexOf('Landlord')]='Updated Example LLC';qa.events[1]();
         });

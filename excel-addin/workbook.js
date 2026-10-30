@@ -19,6 +19,7 @@
             rowTools.assertSelection(selection);
             const width = used.columnIndex + used.columnCount;
             if (!Number.isInteger(width) || width < 1 || width > 2048) throw new Error('The worksheet must have between 1 and 2,048 used columns.');
+            const sourceError = error => Object.assign(error, {source:{sheet:sheet.name,sheetId:sheet.id,row:selection.rowIndex+1}});
             const headers = sheet.getRangeByIndexes(0, 0, 1, width);
             const row = sheet.getRangeByIndexes(selection.rowIndex, 0, 1, width);
             // Wait for Excel itself; cached XLSX values and guessed date epochs are not used.
@@ -31,7 +32,8 @@
                     context.application.load('calculationState');
                     await context.sync();
                     if (context.application.calculationState === excel.CalculationState.done) {
-                        data = rowTools.selectedFields(headers.values[0], row.values[0], row.valueTypes[0], form);
+                        try { data = rowTools.selectedFields(headers.values[0], row.values[0], row.valueTypes[0], form); }
+                        catch(error) { throw sourceError(error); }
                         break;
                     }
                 }
@@ -39,9 +41,11 @@
                 await sleep(100);
             } while (Date.now() < deadline);
             if (!data) throw new Error('Excel did not finish calculating in time.');
-            const dates = [];
+            const dates = [], dateIssues=[];
             for (const field of form.dateFields) if (typeof data.values[field] === 'number') {
-                if (!Number.isInteger(data.values[field])) throw new Error('Time-bearing date in ' + field + ' requires review.');
+                if (!Number.isInteger(data.values[field])) {
+                    dateIssues.push({code:'invalid_date',field,columns:[data.columns[field]],message:'Time-bearing date in '+field+' requires review.'});continue;
+                }
                 // TEXT's date-format tokens vary by Office locale. Let Excel resolve the calendar components.
                 const cell = row.getCell(0, data.columns[field]);
                 const parts = ['month','day','year'].map(name => {
@@ -50,14 +54,20 @@
                 });
                 dates.push({field, parts});
             }
+            if(dateIssues.length)throw sourceError(rowTools.validationError(dateIssues));
             if (dates.length) await context.sync();
             for (const date of dates) {
                 const parts = date.parts.map(part => part.value);
                 const formatted = parts.join('/');
-                if (!parts.every(Number.isInteger) || !rowTools.isCalendarDate(formatted)) throw new Error('Excel could not read ' + date.field + ' as a calendar date.');
+                if (!parts.every(Number.isInteger) || !rowTools.isCalendarDate(formatted)) {
+                    dateIssues.push({code:'invalid_date',field:date.field,columns:[data.columns[date.field]],message:'Excel could not read '+date.field+' as a calendar date.'});continue;
+                }
                 data.values[date.field] = formatted;
             }
-            const metadata = rowTools.caseMetadata(headers.values[0], row.values[0], row.valueTypes[0]);
+            if(dateIssues.length)throw sourceError(rowTools.validationError(dateIssues));
+            let metadata;
+            try { metadata = rowTools.caseMetadata(headers.values[0], row.values[0], row.valueTypes[0]); }
+            catch(error) { throw sourceError(error); }
             context.application.load('calculationState');
             const current = context.workbook.getSelectedRange();
             current.load('rowIndex,rowCount'); current.worksheet.load('id');
@@ -68,6 +78,18 @@
             }
             return {form:form.id, values:data.values, columns:data.columns, sheet:sheet.name, sheetId:sheet.id,
                 row:selection.rowIndex+1, name:metadata.defendant, metadata};
+        });
+    }
+    async function selectSource(excel, source) {
+        if (!source || typeof source.sheetId!=='string' || !source.sheetId ||
+            !Number.isInteger(source.row) || source.row<1 || source.row>1048576 ||
+            !Number.isInteger(source.column) || source.column<0 || source.column>=2048) {
+            throw new Error('The source cell is no longer available. Refresh the selected row.');
+        }
+        await excel.run(async context=>{
+            const sheet=context.workbook.worksheets.getItem(source.sheetId);
+            sheet.activate();sheet.getRangeByIndexes(source.row-1,source.column,1,1).select();
+            await context.sync();
         });
     }
     function sameSnapshot(left, right) {
@@ -85,7 +107,7 @@
         return readSelection(excel, {id:'package', fields:forms.flatMap(form => form.fields),
             dateFields:forms.flatMap(form => form.dateFields)}, options);
     }
-    const api = {MIN_EXCEL_API, readSelection, readPackage, sameSnapshot};
+    const api = {MIN_EXCEL_API, readSelection, readPackage, sameSnapshot, selectSource};
     if (typeof module !== 'undefined' && module.exports) module.exports = api;
     else root.DevlinExcelWorkbook = api;
 })(globalThis);

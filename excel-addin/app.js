@@ -11,7 +11,10 @@
     try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
     const sessions = DevlinExcelSession.create(storage);
     let connecting = false, connectionRevision = 0, expiryTimer;
-    function message(error, status = '') { $('error').textContent = error; $('status').textContent = status; }
+    function message(error, status = '') {
+        $('error').textContent = error; $('status').textContent = status;
+        $('sourceIssues').hidden=true; $('sourceIssueList').replaceChildren();
+    }
     function controls() {
         $('generate').disabled = busy || connecting || !officeReady || !token || !forms.length || !selectedData;
         $('generatePackage').disabled = busy || connecting || !officeReady || !token || forms.length !== 3 || !selectedData;
@@ -23,6 +26,7 @@
         $('autoSave').disabled = busy;
         $('saveCloud').disabled = busy || !generationId || !!savedCopy;
         $('saveCloud').querySelector('span').textContent = savedCopy ? 'Saved to OneDrive' : 'Save to OneDrive';
+        $('sourceIssueList').querySelectorAll('button').forEach(button=>{button.disabled=busy || !officeReady || !token;});
     }
     function clearResult() {
         if (packageUrl) URL.revokeObjectURL(packageUrl);
@@ -99,11 +103,43 @@
         $('caseContext').textContent = [data.metadata.plaintiff,data.metadata.court,data.metadata.caseNumber].filter(Boolean).join(' / ');
     }
     function sourceError(error, data) {
-        const index = data?.columns?.[error.field];
-        if (!Number.isInteger(index) || index < 0) return error.message;
-        let column = '', number = index + 1;
-        while (number > 0) { number--; column = String.fromCharCode(65 + number % 26) + column; number = Math.floor(number / 26); }
-        return error.message + '. Source: ' + data.sheet + ' / ' + column + data.row + '.';
+        const context=error.source || data, issue=error.issues?.[0];
+        const index=issue?.columns?.[0] ?? data?.columns?.[error.field];
+        if(!context || !Number.isInteger(index) || index<0 || index>=2048)return error.message;
+        const row=issue && ['missing_column','duplicate_column'].includes(issue.code) ? 1 : context.row;
+        return error.message.replace(/[. ]+$/,'') + '. Source: ' + context.sheet + ' / ' + DevlinExcelRow.columnName(index) + row + '.';
+    }
+    function showSourceError(error, data) {
+        message(sourceError(error,data));
+        const context=error.source || data;
+        const issues=error.issues || (error.field && Number.isInteger(data?.columns?.[error.field]) ?
+            [{field:error.field,columns:[data.columns[error.field]],message:error.message,code:'pdf_field'}] : []);
+        if(!context || !issues.length)return;
+        $('sourceIssuesTitle').textContent='Source issues ('+issues.length+')';
+        for(const issue of issues.slice(0,110)) {
+            const item=document.createElement('li'), label=document.createElement('div');label.textContent=issue.message;item.append(label);
+            const cells=document.createElement('div');cells.className='source-cells';
+            const location=document.createElement('span');location.textContent=context.sheet+' / ';cells.append(location);
+            const row=['missing_column','duplicate_column'].includes(issue.code)?1:context.row;
+            const columns=issue.columns.length?issue.columns.slice(0,5):[0];
+            for(const column of columns) {
+                const address=DevlinExcelRow.columnName(column)+row, button=document.createElement('button');
+                button.type='button';button.className='source-cell';button.title='Select cell '+address;button.setAttribute('aria-label','Select cell '+address);
+                const icon=document.createElement('i');icon.setAttribute('data-lucide','arrow-up-right');
+                const text=document.createElement('span');text.textContent=issue.columns.length?address:'Header row';button.append(icon,text);
+                button.addEventListener('click',async()=>{
+                    if(busy || !token || !officeReady)return;
+                    busy=true;controls();
+                    try {await DevlinExcelWorkbook.selectSource(Excel,{sheetId:context.sheetId,row,column});}
+                    catch {message('The source cell could not be selected. Refresh the selected row and try again.');}
+                    finally {busy=false;controls();if(token)await refresh(true,{recalculate:false});}
+                });
+                cells.append(button);
+            }
+            if(issue.columns.length>columns.length){const rest=document.createElement('span');rest.textContent='+'+(issue.columns.length-columns.length)+' more';cells.append(rest);}
+            item.append(cells);$('sourceIssueList').append(item);
+        }
+        $('sourceIssues').hidden=false;if(window.lucide)lucide.createIcons();controls();
     }
     async function renderPreview(blob) {
         const expectedRevision = revision;
@@ -129,12 +165,12 @@
             await page.render({ canvasContext:canvas.getContext('2d'), canvas, viewport }).promise;
         }
     }
-    async function refresh(keepMessage = false) {
+    async function refresh(keepMessage = false, readOptions = {}) {
         const current = ++revision;
         selectedData = null; clearResult(); controls();
         if (keepMessage !== true) message('');
-        try { const data = await readSelection(); if (current === revision) showSelection(data); }
-        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true; message(error.message); } }
+        try { const data = await readSelection(readOptions); if (current === revision) showSelection(data); }
+        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true; showSourceError(error); } }
         finally { controls(); }
     }
     async function loadDelivery() {
@@ -263,7 +299,7 @@
                 try { await saveToCloud(); }
                 catch(error) { message(error.message, pdfUrl ? 'PDF ready. You can still download it or retry saving.' : ''); }
             }
-        } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else message(sourceError(error, source)); }
+        } catch(error) { if (pdfUrl) message('PDF generated, but preview is unavailable. You can still download it.'); else showSourceError(error, source); }
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
     $('generatePackage').addEventListener('click', async () => {
@@ -292,7 +328,7 @@
             $('packageResult').hidden = false;
             message('', 'All 3 fillable PDFs are ready in one ZIP.');
             $('packageResult').scrollIntoView({block:'nearest'});
-        } catch(error) { clearResult(); message(sourceError(error,source)); }
+        } catch(error) { clearResult(); showSourceError(error,source); }
         finally { busy=false; controls(); if (!selectedData && token) refresh(true); }
     });
     $('downloadPackage').addEventListener('click', async event => {
