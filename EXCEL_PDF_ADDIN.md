@@ -369,3 +369,38 @@ ZIP contents are held in memory only for the response. The ZIP never creates a
 OneDrive generation handle or performs a cloud save, including when optional
 single-PDF cloud delivery is configured. Local downloads remain the production
 delivery mode. Updating the installed panel requires no new Office permissions.
+
+## Real Excel Online ZIP acceptance (2026-10-31, v87)
+
+The installed panel was tested in the real Excel Online host with the fictional
+`qa-cases.xlsx` workbook and the production Render generator. Reopening the pane
+loaded the new version and restored its valid connection without another login.
+
+The first attempt exposed a date-format failure at `dc105_24` in the localized
+Office host. Numeric dates now use Excel's MONTH, DAY and YEAR results instead
+of locale-sensitive TEXT format tokens. No cells, formulas or workbook date
+settings are changed, and no serial-date epoch is guessed. All 309 project tests
+and the complete simulated Office task-pane smoke passed after the correction.
+
+Two ZIPs were generated and downloaded from rows 2 and 3. Each archive contained
+exactly DC105, DC508 and MC202, with its own case-specific filenames. Selecting
+the second row removed the previous ZIP result; no additional login or pane
+restart was needed between cases. Both ZIPs passed CRC checks. All 202 canonical
+field values, their page widgets, editable flags and appearance streams passed
+independent readback. The eight original pages were rendered and inspected;
+the fixed DATE formula appeared as `10/27/2026` in each DC105.
+
+Local verification copies of all six PDFs were edited, saved and reopened.
+Changed text and checkbox states survived, while other fields were preserved.
+Three checked widgets from the first case were additionally rendered with PDF.js
+and visibly compared against their unchecked originals. The local Windows
+Poppler runtime did not display these legacy checkbox glyphs reliably, so its
+renders alone were not used as proof of checkbox appearance. The original ZIPs
+and PDFs were not modified by these edit checks.
+
+Evidence is under `output/qa-excel-zip-2026-10-31/`, including per-case verification
+JSON, rendered pages, checkbox pixel comparisons and real-Office screenshots.
+Generation still runs on Render; file saving is local-only. No OneDrive copy,
+MiFILE preparation, payment or court submission was performed by this acceptance
+run. Installation and acceptance in Adam's own Microsoft 365 tenant remain a
+separate pilot step; this does not claim a new desktop-Excel ZIP acceptance run.
