@@ -46,7 +46,7 @@ const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'
 window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const field of ['dc105_05','dc508_06','mc202_08']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Defendant')];},load(){}},workbook:{
  getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
  worksheets:{onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
- functions:{text(){return {value:qa.date || '10/5/2026',load(){return this}}}}
+ functions:Object.fromEntries(['month','day','year'].map((name,index)=>[name,()=>({value:Number((qa.date || '10/5/2026').split('/')[index]),load(){return this}})]))
 }})};
 window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:(_api,version)=>version==='1.9'&&!qa.unsupported}},onReady:callback=>Promise.resolve().then(()=>callback({host:'Excel'}))};`;
         const errors: string[] = [];

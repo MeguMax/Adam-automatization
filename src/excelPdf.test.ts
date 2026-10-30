@@ -25,7 +25,7 @@ function officeFixture() {
     const state={headers:['Defendant','Landlord','Court_Name','Case_Number',...form.fields],
         values:['Morgan Tenant','Example Property LLC','29th','26-00001-LT',...form.fields.map(()=>'' as string|number|boolean|null)],
         rowIndex:35,rowCount:1,width:form.fields.length+4,calculations:0,waits:0,reads:0,selectionReads:0,
-        states:['Done'],date:'10/5/2026',moveSelection:false,moveSheet:false};
+        states:['Done'],date:'10/5/2026',dateCalls:[] as string[],moveSelection:false,moveSheet:false};
     let currentState='Done';
     const sheet={id:'sheet-1',name:'Working Document',load(){return this;},getUsedRange(){return {
         columnIndex:0,get columnCount(){return state.width;},load(){return this;}};},
@@ -37,12 +37,16 @@ function officeFixture() {
             load(){if(state.states.length) currentState=state.states.shift()!;}},
         workbook:{getSelectedRange(){state.selectionReads++;return {rowIndex:state.rowIndex+(state.moveSelection&&state.selectionReads>1?1:0),
             rowCount:state.rowCount,worksheet:state.moveSheet&&state.selectionReads>1?{...sheet,id:'sheet-2'}:sheet,load(){return this;}};},
-            functions:{text(){return {get value(){return state.date;},load(){return this;}};}}},
+            functions:{text(){throw new Error('Localized TEXT must not be used');},
+                ...Object.fromEntries(['month','day','year'].map((name,index)=>[name,()=>{
+                    state.dateCalls.push(name);
+                    return {get value(){return Number(state.date.split('/')[index]);},load(){return this;}};
+                }]))}},
     })};
     return {state,form,excel,sleep:async()=>{state.waits++;}};
 }
 
-test('Excel adapter waits for calculation, reads the current row and lets Excel format date serials',async()=>{
+test('Excel adapter waits for calculation, reads the current row and lets Excel resolve calendar components',async()=>{
     const {state,form,excel,sleep}=officeFixture();
     state.states=['Calculating','Calculating','Done','Done','Done'];
     state.values[state.headers.indexOf('dc105_24')]=46300;
@@ -51,6 +55,22 @@ test('Excel adapter waits for calculation, reads the current row and lets Excel 
     assert.equal(data.values.dc105_24,'10/5/2026');assert.equal(data.row,36);assert.equal(data.sheetId,'sheet-1');
     assert.equal(data.metadata.plaintiff,'Example Property LLC');
     assert.equal(data.columns.dc105_24,state.headers.indexOf('dc105_24'));
+    assert.deepEqual(state.dateCalls,['month','day','year']);
+});
+
+test('date normalization uses locale-independent numeric Excel results and never guesses a serial-date epoch',async()=>{
+    for (const [serial,date] of [[46322,'10/27/2026'],[44860,'10/27/2026'],[45351,'2/29/2024']] as const) {
+        const fixture=officeFixture();fixture.state.date=date;
+        fixture.state.values[fixture.state.headers.indexOf('dc105_24')]=serial;
+        const data=await workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep});
+        assert.equal(data.values.dc105_24,date);
+        assert.deepEqual(fixture.state.dateCalls,['month','day','year']);
+    }
+    for (const date of ['2/29/1900','2/30/2026','13/1/2026','10/27/2026.5','NaN/27/2026']) {
+        const fixture=officeFixture();fixture.state.date=date;
+        fixture.state.values[fixture.state.headers.indexOf('dc105_24')]=46322;
+        await assert.rejects(workbook.readSelection(fixture.excel,fixture.form,{sleep:fixture.sleep}),/calendar date/);
+    }
 });
 test('Excel adapter times out busy calculation without reading cached field values',async()=>{
     const {state,form,excel,sleep}=officeFixture();state.states=['Calculating'];

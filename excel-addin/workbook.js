@@ -42,13 +42,20 @@
             const dates = [];
             for (const field of form.dateFields) if (typeof data.values[field] === 'number') {
                 if (!Number.isInteger(data.values[field])) throw new Error('Time-bearing date in ' + field + ' requires review.');
-                const formatted = context.workbook.functions.text(row.getCell(0, data.columns[field]), 'm/d/yyyy');
-                formatted.load('value'); dates.push({field, formatted});
+                // TEXT's date-format tokens vary by Office locale. Let Excel resolve the calendar components.
+                const cell = row.getCell(0, data.columns[field]);
+                const parts = ['month','day','year'].map(name => {
+                    const result = context.workbook.functions[name](cell);
+                    result.load('value'); return result;
+                });
+                dates.push({field, parts});
             }
             if (dates.length) await context.sync();
             for (const date of dates) {
-                if (!rowTools.isCalendarDate(date.formatted.value)) throw new Error('Excel could not format ' + date.field + ' as a calendar date.');
-                data.values[date.field] = date.formatted.value;
+                const parts = date.parts.map(part => part.value);
+                const formatted = parts.join('/');
+                if (!parts.every(Number.isInteger) || !rowTools.isCalendarDate(formatted)) throw new Error('Excel could not read ' + date.field + ' as a calendar date.');
+                data.values[date.field] = formatted;
             }
             const metadata = rowTools.caseMetadata(headers.values[0], row.values[0], row.valueTypes[0]);
             context.application.load('calculationState');
