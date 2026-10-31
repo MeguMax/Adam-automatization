@@ -1,5 +1,19 @@
 export interface CheckboxAnchor { text: string; x: number; y: number; width: number; height: number }
-export type ComplaintSelections = Partial<Record<'money' | 'rent' | 'damages' | 'noRelated' | 'previousRelated', boolean>>;
+export type ComplaintSelectionKey = 'money' | 'rent' | 'damages' | 'noRelated' | 'previousRelated';
+export type ComplaintSelections = Partial<Record<ComplaintSelectionKey, boolean>> & { conflicts?: ComplaintSelectionKey[] };
+
+/** Missing observations cannot erase evidence; contradictory boxes cannot choose a winner. */
+export function mergeComplaintSelections(observations: ComplaintSelections[]): ComplaintSelections {
+    const result: ComplaintSelections = {};
+    const conflicts = new Set(observations.flatMap(observation => observation.conflicts || []));
+    for (const key of ['money', 'rent', 'damages', 'noRelated', 'previousRelated'] as const) {
+        const values = new Set(observations.map(observation => observation[key]).filter(value => typeof value === 'boolean'));
+        if (values.size > 1) conflicts.add(key);
+        if (values.size === 1 && !conflicts.has(key)) result[key] = [...values][0];
+    }
+    if (conflicts.size) result.conflicts = [...conflicts];
+    return result;
+}
 
 /** Read the interior only after finding all four sides of a real square next to its label. */
 export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: number, height: number,
@@ -42,16 +56,17 @@ export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: numbe
 
 export function readComplaintSelections(pixels: Uint8ClampedArray, width: number, height: number,
     words: CheckboxAnchor[]): ComplaintSelections {
-    const result: ComplaintSelections = {};
+    const observations: ComplaintSelections[] = [];
     const candidates = words.map(word => ({ ...word, text: words.filter(other => other.x >= word.x - 0.5 &&
         Math.abs(other.y - word.y) < 3).sort((a,b)=>a.x-b.x).map(other=>other.text).join(' ') }));
-    const labels: Array<[keyof ComplaintSelections, RegExp]> = [
+    const labels: Array<[ComplaintSelectionKey, RegExp]> = [
         ['money', /^10\.(?:\s|$)/], ['rent', /^Rent owing/i], ['damages', /^Damages claimed/i],
         ['noRelated', /^There is no other pending/i], ['previousRelated', /^A civil action between/i],
     ];
     for (const [key, pattern] of labels) {
-        const anchor = candidates.find(word => pattern.test(word.text));
-        if (anchor) result[key] = readCheckboxBeforeAnchor(pixels, width, height, anchor);
+        for (const anchor of candidates.filter(word => pattern.test(word.text))) {
+            observations.push({ [key]: readCheckboxBeforeAnchor(pixels, width, height, anchor) });
+        }
     }
-    return result;
+    return mergeComplaintSelections(observations);
 }

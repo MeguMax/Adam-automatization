@@ -10,7 +10,7 @@ import {
 } from './complaintExtractor';
 import { testComplaintFormFixture } from './testPdfFixture';
 import { createCanvas } from '@napi-rs/canvas';
-import { readCheckboxBeforeAnchor } from './pdfCheckboxes';
+import { readCheckboxBeforeAnchor, mergeComplaintSelections, readComplaintSelections } from './pdfCheckboxes';
 import { recognizeDocumentText } from './documentRecognition';
 
 const POSSESSION_ONLY_TEXT = `
@@ -161,6 +161,59 @@ test('AcroForm missing values and ambiguous boxes do not default to possession o
     assert.equal(parseComplaintFormFields(FORM_TITLE, formWidgets({5:'',7:''})), null, 'empty overlay widgets must not override visible flattened text');
 });
 
+test('repeated PDF widgets agree by value but conflicting fields never use the last copy', () => {
+    const duplicate = formWidgets();
+    const same = parseComplaintFormFields(FORM_TITLE, [...duplicate, ...structuredClone(duplicate)])!;
+    assert.equal(same.data.claimAmount, '1991.50');
+    assert.deepEqual(same.warnings, []);
+    const irrelevant = parseComplaintFormFields(FORM_TITLE,[...formWidgets({32:'Off',10:'Unused court A'}),
+        {fieldName:'dc102a_37',fieldType:'Tx',fieldValue:'999.00'},
+        {fieldName:'dc102a_10',fieldType:'Tx',fieldValue:'Unused court B'}])!;
+    assert.equal(irrelevant.data.claimAmount,'0.00');
+    assert.equal(irrelevant.data.relatedCivilAction,'none');
+    assert.deepEqual(irrelevant.warnings,[],'unselected conditional fields must not create false conflicts');
+    const exportValue = parseComplaintFormFields(FORM_TITLE,[...duplicate,
+        {fieldName:'dc102a_32',fieldType:'Btn',checkBox:true,fieldValue:'Yes'}])!;
+    assert.equal(exportValue.data.moneyJudgmentRequested,true);
+    assert.deepEqual(exportValue.warnings,[],'equivalent checked exports must not conflict');
+    for (const [number, value, field] of [[5,'Another Owner LLC','plaintiff'],[7,'Another Tenant','defendants'],
+        [1,'25th','courtDistrict'],[32,'Off','moneyJudgmentRequested'],[37,'2500.00','claimAmount']] as const) {
+        const item = formWidgets({[number]:value}).find(widget => widget.fieldName === 'dc102a_' + String(number).padStart(2,'0'))!;
+        for (const widgets of [[...duplicate,item],[item,...duplicate]]) {
+            const result = parseComplaintFormFields(FORM_TITLE, widgets)!;
+            assert.equal(result.data[field], undefined, field);
+            assert.ok(result.warnings.some(warning => warning.code === 'source_conflict' && warning.field === field), field);
+        }
+    }
+});
+
+test('checkbox observations preserve known answers across blank pages and quarantine contradictions', () => {
+    assert.deepEqual(mergeComplaintSelections([{money:true,noRelated:true},{money:undefined},{previousRelated:false}]),
+        {money:true,noRelated:true,previousRelated:false});
+    const conflicted = mergeComplaintSelections([{money:true,noRelated:true},{money:false,noRelated:false},{money:true}]);
+    assert.equal(conflicted.money, undefined);
+    assert.equal(conflicted.noRelated, undefined);
+    assert.deepEqual(conflicted.conflicts, ['money','noRelated']);
+    assert.equal(mergeComplaintSelections([conflicted,{money:true}]).money, undefined);
+    const source = parseComplaintText(POSSESSION_ONLY_TEXT);
+    source.data.moneyJudgmentRequested = true; source.data.claimAmount = '900.00'; source.data.relatedCivilAction = 'none';
+    const result = applyVisualComplaintSelections(source, conflicted, []);
+    assert.equal(result.data.moneyJudgmentRequested, undefined);
+    assert.equal(result.data.claimAmount, undefined);
+    assert.equal(result.data.relatedCivilAction, undefined);
+    assert.ok(result.warnings.some(w => w.code === 'source_conflict' && w.field === 'moneyJudgmentRequested'));
+});
+
+test('duplicate visual paragraph labels cannot silently select the first checkbox', () => {
+    const canvas=createCanvas(1836,2376),context=canvas.getContext('2d');context.scale(3,3);
+    context.fillStyle='#fff';context.fillRect(0,0,612,792);context.strokeStyle='#000';context.lineWidth=0.6;
+    const anchors=[100,200].map(y=>({text:'10.',x:60,y,width:14,height:10}));
+    for (const anchor of anchors) context.strokeRect(48,anchor.y,9,9);
+    context.lineWidth=1.5;context.beginPath();context.moveTo(49,104);context.lineTo(52,107);context.lineTo(56,101);context.stroke();
+    const result=readComplaintSelections(context.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,anchors);
+    assert.equal(result.money,undefined);assert.deepEqual(result.conflicts,['money']);
+});
+
 test('DC102c excludes the attorney-confirmed third-party notice block from the parties', () => {
     const result = parseComplaintFormFields('DC 102c COMPLAINT TO RECOVER POSSESSION OF PROPERTY\nSUPPLEMENTAL COMPLAINT',
         formWidgets({39:'Off',7:'Taylor Tenant, Jordan Resident, and all other occupants\r300 Rental Street\rExample City, MI 48002\rNotice per MCL 600.3238(6):\rExample Association'}, 'dc102c'))!;
@@ -245,4 +298,17 @@ test('selected explicit damages are read from grouped OCR words, not the monthly
     assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},conflict).data.claimAmount,undefined);
     const combined=[{...pages[0],words:[{...words[0],text:'Damages claimed: 1991.50',width:140}]}];
     assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},combined).data.claimAmount,'1991.50');
+});
+
+test('conflicting rent totals and damaged amount text cannot retain a previous automatic claim', () => {
+    const make=()=>{const result=parseComplaintText(POSSESSION_ONLY_TEXT);result.data.claimAmount='999.00';return result;};
+    const words=[{text:'d. Total rent due now is $',x:268,y:610,width:111,height:10,pageNumber:1,confidence:100},
+        {text:'2350.07',x:383,y:606,width:39,height:10,pageNumber:1,confidence:100}];
+    const first={text:'',confidence:100,lines:[],words};
+    const other={...first,words:words.map(word=>({...word,pageNumber:2,text:word.text==='2350.07'?'2500.00':word.text}))};
+    const result=applyVisualComplaintSelections(make(),{money:true,rent:true,damages:false},[first,other]);
+    assert.equal(result.data.claimAmount,undefined);
+    assert.ok(result.warnings.some(w=>w.code==='source_conflict'&&w.field==='claimAmount'));
+    assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},[]).data.claimAmount,undefined);
+    assert.equal(applyVisualComplaintSelections(make(),{money:false,conflicts:['rent','damages']},[]).data.claimAmount,'0.00');
 });

@@ -54,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-31-supplied-supporting-v90';
+const ADMIN_BUILD_ID = '2026-10-31-complaint-review-v91';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -5547,11 +5547,14 @@ const html = String.raw`<!doctype html>
     }
 
     function draftIssueTarget(issue) {
-      const field = issue.field;
+      const field = issue.reviewField || issue.field;
       const root = document.getElementById('draftFieldGroups');
       const exact = Array.from(root.querySelectorAll('[data-review-field]'))
         .find(input => input.dataset.reviewField === field);
       if (exact) return exact;
+      if (field === 'filingData.attorney') return root.querySelector('[data-attorney-field="name"]');
+      if (field === 'filingData.defendants') return root.querySelector('[data-party-role="defendant"] [data-party-field="firstName"], [data-party-role="defendant"] [data-party-field="entityName"]');
+      if (field === 'filingData.plaintiff') return root.querySelector('[data-party-role="plaintiff"] [data-party-field="entityName"]');
       if (field === 'package.supporting') return root.querySelector('[data-draft-section="supporting"]');
       if (field.startsWith('document.')) {
         return Array.from(root.querySelectorAll('[data-draft-document-id]'))

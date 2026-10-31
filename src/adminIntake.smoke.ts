@@ -356,6 +356,37 @@ async function main() {
         assert.ok(!extracted.validationIssues.some(issue=>issue.message.startsWith('No PDF attachments were received.')));
         assert.equal(extracted.filingData.plaintiff.address1,'30850 Telegraph Rd Ste 250');
         assert.equal(extracted.filingData.plaintiff.email,'ajd@devlinlawpllc.com');
+        const originalExtraction=structuredClone(extracted.complaintExtraction!);
+        const lowConfidence=structuredClone(originalExtraction);
+        lowConfidence.fieldConfidence.courtDistrict='low';lowConfidence.fieldConfidence.attorney='low';
+        lowConfidence.warnings=[
+            {code:'caption_review',field:'courtDistrict',message:'Check the low-confidence scan value: court district.'},
+            {code:'caption_review',field:'attorney',message:'Check the low-confidence scan value: attorney details.'},
+        ];
+        db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,lowConfidence);
+        await page.evaluate(() => (window as any).refreshDraftFilingState());
+        let scanIssues=db.getDraftDetail(draftId)!.caseDraft!.validationIssues;
+        await page.locator('#draftReviewTab').click();
+        await page.locator('[data-review-issue="'+scanIssues.findIndex(issue=>issue.reviewField==='filingData.courtDistrict')+'"]').click();
+        await page.waitForFunction(()=>document.activeElement?.getAttribute('data-filing-field')==='courtDistrict');
+        assert.equal(await page.locator('#draftDataTab').getAttribute('aria-selected'),'true');
+        await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
+        await page.waitForFunction(()=>{
+            const canvas=document.querySelector<HTMLCanvasElement>('#draftPdfViewer canvas');
+            return !!canvas && canvas.width>0 && canvas.height>0 &&
+                canvas.getContext('2d')!.getImageData(0,0,canvas.width,canvas.height).data.some((value,index)=>index%4===0&&value<180);
+        });
+        await page.screenshot({path:path.join(screenshots,'draft-recognition-target-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        await page.locator('#draftReviewTab').click();
+        await page.locator('[data-review-issue="'+scanIssues.findIndex(issue=>issue.reviewField==='filingData.attorney')+'"]').click();
+        await page.waitForFunction(()=>document.activeElement?.getAttribute('data-attorney-field')==='name');
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-recognition-target-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+        db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,originalExtraction);
+        await page.evaluate(() => (window as any).refreshDraftFilingState());
+        extracted=db.getDraftDetail(draftId)!.caseDraft!;
         await page.locator('#draftDataTab').click();
         const defaultAddress=page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
         assert.match(await defaultAddress.locator('xpath=..').textContent() || '',/Attorney rule/);

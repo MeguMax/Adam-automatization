@@ -288,6 +288,7 @@ export interface DraftValidationIssue {
     field: string;
     severity: 'error' | 'warning';
     message: string;
+    reviewField?: string;
 }
 
 export type DraftFieldSource = 'email' | 'complaint' | 'manual' | 'derived' | 'empty';
@@ -1369,6 +1370,7 @@ function validatePrimaryComplaint(
     documents: DocumentRecordView[],
     extraction: StoredComplaintExtraction | null,
     filing: DraftFilingData,
+    manualFields: Set<DraftFilingDataKey>,
 ): DraftValidationIssue[] {
     const complaintDocuments = documents.filter(document =>
         isComplaintDocument(
@@ -1435,6 +1437,8 @@ function validatePrimaryComplaint(
             });
         }
         for (const warning of extraction.warnings) {
+            if (warning.code === 'source_conflict' && warning.field &&
+                !['plaintiff','defendants','attorney'].includes(warning.field) && manualFields.has(warning.field as DraftFilingDataKey)) continue;
             if (
                 (warning.code === 'related_action_review' && filing.relatedCivilAction !== 'unknown') ||
                 (warning.code === 'claim_amount_review' &&
@@ -1447,8 +1451,9 @@ function validatePrimaryComplaint(
                 continue;
             }
             issues.push({
-                field: `complaintExtraction.${warning.code}`,
-                severity: warning.code === 'unsupported_form' ||
+                field: `complaintExtraction.${warning.code}${warning.field ? '.' + warning.field : ''}`,
+                ...(warning.field ? {reviewField:'filingData.' + warning.field} : {}),
+                severity: warning.code === 'source_conflict' || warning.code === 'unsupported_form' ||
                     warning.code === 'missing_filled_section'
                     ? 'error'
                     : 'warning',
@@ -5380,6 +5385,7 @@ export class WorkflowDatabase {
                             documentViews,
                             complaintExtraction,
                             normalizedFilingData,
+                            inferredManualFilingFields(extractedDraftData, normalizedDraftData),
                         ),
                         ...validateDraftDocuments(documentViews, normalizedFilingData),
                     ]),

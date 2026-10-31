@@ -147,6 +147,34 @@ The Draft workspace opens on **Review**: court, parties, claim and included docu
 
 The primary action changes with the case: **Save & check**, **Review corrections**, **Confirm & prepare**, **View progress**, **Check result**, or **Open MiFILE**. Saving locks mutating controls until completion. Tab/disclosure selection, unsaved inputs and PDF navigation survive ordinary refreshes. Known-good new email intakes retain their existing automatic Unsubmitted preparation; incomplete packages still require correction, and uncertain remote results still require checking MiFILE before retrying.
 
+### Complaint confidence and source conflicts (version 8)
+
+The attorney caption boundary follows the observed right-column paragraph heading;
+the Plaintiff and Defendant regions retain their independent column split.
+A paragraph number beside the attorney's street address no longer becomes part
+of that address. Low-confidence court, Plaintiff, Defendant and attorney groups
+produce separate review notes. Each note opens the matching Case data control,
+including folded attorney/setup sections, instead of the generic source panel.
+Scanning still requires review; a high average OCR score is not proof that all
+party names, addresses or checkbox answers are correct.
+
+For standard LT Drafts, repeated PDF widgets with identical values are allowed. Conflicting values are
+not resolved by page order or by taking the last widget. Conflicting party or
+attorney fields require a corrected single-case Complaint; a phone-number edit
+cannot waive that source conflict. Scalar checkbox/reference/amount conflicts
+remain blocked until the specific field is entered manually or the PDF is
+replaced. Manual corrections survive later automatic extraction.
+
+Visual checkbox observations are combined across matching labels and pages.
+An absent observation cannot erase a known answer, and contradictory readings
+remain unknown. When paragraph 10 selects a total, different observed damages
+or total-rent amounts cannot retain an earlier automatic claim amount. If no
+money judgment is requested, the claim remains zero. The worker does not infer
+an amount from a monthly rate or use these checks to authorize payment.
+
+Prepared, rejected, reconciled and locked bundles are not re-extracted or
+replayed by this change. Final payment and court submission remain hard-disabled.
+
 ### Scan recognition and package completeness (version 7)
 
 The extractor re-reads bounded caption rows with independent image preprocessings. A spelling supported by multiple reads can replace a conflicting OCR suggestion, but remains low-confidence for review. Repeated high-confidence words elsewhere in the same Complaint protect against a corrupted alternative reading. Small telephone rows are rendered separately at 300 DPI rather than losing detail to the full-page pixel cap. Court headings, party names, addresses, ZIP+4 values and telephone numbers remain Complaint-derived; no client-specific names or phone numbers are embedded in the extractor. The two most recent OCR results may be reused in memory for two minutes, by exact PDF hash and page selection, with defensive copies. This avoids reading the same scan twice during recognition and extraction.

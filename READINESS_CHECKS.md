@@ -102,3 +102,32 @@ Other and Connected courts, a complete email-to-preparation queue without a
 Demand, an incomplete email that does not block the complete one, old snapshot
 rejection, changed content pins and prevention of bulk legacy auto-queueing.
 The runtime dependency audit reported zero known vulnerabilities.
+
+## Complaint confidence (v91)
+
+Extractor version 8 corrects attorney-column bleed while retaining the Defendant
+address region. Contradictory repeated PDF fields and visual checkbox readings
+are not resolved by document order. Selected damages/rent totals cannot retain
+an earlier automatic claim when the observed values conflict. Unselected
+conditional fields do not create false conflicts. Scalar corrections survive
+re-extraction; conflicting whole-party PDF fields require a corrected source.
+
+Review notes identify the exact low-confidence field group and open its Case
+data control, including folded setup/attorney sections. The desktop/mobile
+browser smoke verifies focus and responsive layout, alongside a nonblank PDF
+preview. The full regression passes 330 tests without failures or skips.
+
+All nine supplied intake scenarios passed their explicit offline expectations,
+including 63 Complaint-value comparisons. Five packages were ready; missing
+Request, an ambiguous related-action answer, scan review and the non-Devlin filer
+retained their applicable review gates. The Warady attorney street no longer
+contains the neighboring paragraph number and Pringle's Defendant address is
+preserved. Cloud storage was mocked, network calls were blocked and no MiFILE
+jobs were created. Private acceptance evidence is under
+`output/qa-recognition-v8-release-2026-10-31/`.
+
+The preceding v90 live automatic acceptance prepared ten source PDFs and five
+Connected children of the Complaint in the primary account's Unsubmitted area.
+The v91 recognition acceptance is offline and does not create another MiFILE
+bundle, charge a payment account or submit anything to court. Both releases
+retain the unsubmitted-only preparation limit.

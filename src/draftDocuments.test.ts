@@ -85,6 +85,45 @@ function fixture(initialCourt: string | null = court, packageMode?: 'standard_lt
     return {db,parsed,email,draftId,complaint,ancillary,add,close(){db.close();fs.rmSync(directory,{recursive:true,force:true});}};
 }
 
+test('conflicting Complaint source values block preparation until corrected and preserve the manual correction', () => {
+    const f=fixture();
+    try {
+        f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
+        const current=structuredClone(extraction);
+        current.extractorVersion=CURRENT_COMPLAINT_EXTRACTOR_VERSION;
+        current.data.moneyJudgmentRequested=true;delete current.data.claimAmount;
+        current.warnings=[{code:'source_conflict',field:'claimAmount',message:'Different totals occur in the source Complaint.'}];
+        const blocked=f.db.applyComplaintExtraction(f.draftId,f.complaint,current);
+        assert.equal(blocked.caseDraft!.filingData.claimAmount,null);
+        const issue=blocked.caseDraft!.validationIssues.find(item=>item.field==='complaintExtraction.source_conflict.claimAmount');
+        assert.equal(issue?.severity,'error');assert.equal(issue?.reviewField,'filingData.claimAmount');
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft/);
+        const manual={...blocked.caseDraft!.filingData,claimAmount:'850.00'};
+        f.db.updateCaseDraft(f.draftId,{},undefined,manual);
+        const reread=f.db.applyComplaintExtraction(f.draftId,f.complaint,current);
+        assert.equal(reread.caseDraft!.filingData.claimAmount,'850.00');
+        assert.ok(!reread.caseDraft!.validationIssues.some(item=>item.field.includes('source_conflict')));
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true);
+        assert.equal(job.payload!.filingData.claimAmount,'850.00');
+    } finally { f.close(); }
+});
+
+test('a manual contact edit cannot waive conflicting party fields from a merged Complaint', () => {
+    const f=fixture();
+    try {
+        const conflicted:ComplaintExtractionResult={...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            warnings:[{code:'source_conflict' as const,field:'plaintiff' as const,message:'Replace the conflicting Plaintiff PDF fields.'}]};
+        const blocked=f.db.applyComplaintExtraction(f.draftId,f.complaint,conflicted);
+        f.db.updateCaseDraft(f.draftId,{},undefined,{...blocked.caseDraft!.filingData,
+            plaintiff:{...blocked.caseDraft!.filingData.plaintiff,phone:'248-555-0109'}});
+        const reread=f.db.applyComplaintExtraction(f.draftId,f.complaint,conflicted);
+        assert.equal(reread.caseDraft!.filingData.plaintiff.phone,'248-555-0109');
+        assert.ok(reread.caseDraft!.validationIssues.some(issue=>issue.field==='complaintExtraction.source_conflict.plaintiff'&&issue.severity==='error'));
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft/);
+    } finally { f.close(); }
+});
+
 for(const district of ['25','45']) {
 test(`five supplied supporting PDFs remain distinct and use the approved ${district==='45'?'Connected':'Other'} court route`,async()=>{
     const f=fixture(`MI Example County - ${district}th District Court`);

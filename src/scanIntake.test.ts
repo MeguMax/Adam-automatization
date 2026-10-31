@@ -181,6 +181,33 @@ test('tight typewritten captions keep contact lines out of names and the right-c
     assert.equal(result.data.claimAmount,'0.00');
 });
 
+test('caption column boundaries exclude a paragraph number aligned with the attorney street address', () => {
+    const word=(text:string,x:number,y:number,width=150,confidence=95):OcrLine=>({text,x,y,width,height:8,confidence,pageNumber:1});
+    const words=[word('Plaintiff name(s), address(es)',40,140,180),word('Example Owner LLC',40,153,180),
+        word('Plaintiff attorney, bar no.',40,201,200),word('Alex Attorney P70000',40,214,160),
+        word('200 Legal Avenue',40,225,140),word('Example City, MI 48001',40,236,180),word('248-555-0101',40,247,100),
+        word('Defendant name(s) and address',310,140,200),word('Morgan Tenant, and all other occupants',310,153,260),
+        word('300 Rental Street',310,165,160),word('v',296,165,7),word('Example City, MI 48002',310,177,180),
+        word('The plaintiff states:',295,205,100),word('1.',296,224,7),word('Attached to this complaint',307,224,190),
+        word('There is no other pending',65,272,200),word('25th District Court',40,75,150,65)];
+    const result=parseScannedComplaint([{text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT\n'+words.map(w=>w.text).join('\n'),
+        confidence:90,words,lines:words,selections:{money:false,noRelated:true,previousRelated:false}}]);
+    assert.equal(result.data.attorney?.address1,'200 Legal Avenue');
+    assert.equal(result.data.attorney?.phone,'248-555-0101');
+    assert.equal(result.data.defendants?.[0].address1,'300 Rental Street');
+    assert.ok(result.warnings.some(warning=>warning.code==='caption_review'&&warning.field==='courtDistrict'));
+});
+
+test('a later scanned page cannot overwrite a contradictory paragraph answer', () => {
+    const page={text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT',confidence:95,words:[],lines:[]};
+    const result=parseScannedComplaint([{...page,selections:{money:true,noRelated:true,previousRelated:false}},
+        {...page,selections:{money:false,noRelated:false,previousRelated:true}}]);
+    assert.equal(result.data.moneyJudgmentRequested,undefined);
+    assert.equal(result.data.relatedCivilAction,undefined);
+    assert.equal(result.data.claimAmount,undefined);
+    assert.ok(result.warnings.some(w=>w.code==='source_conflict'&&w.field==='relatedCivilAction'));
+});
+
 test('processing report correspondence cannot be mistaken for source filings', () => {
     for (const subject of ['ERROR processing MiFILE/TrueFiling email: 26-1', 'RE: FW: MiFILE/TrueFiling processed: NO CASE', 'MiFILE/TrueFiling retry completed: 26-1']) assert.equal(isProcessingReportSubject(subject), true);
     assert.equal(isProcessingReportSubject('MiFILE - Document Sent 26-1'), false);

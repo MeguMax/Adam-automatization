@@ -4,9 +4,9 @@ import { validatePdfBuffer, pdfResourceOptions } from './pdfValidation';
 import { documentLabel } from './documentRecognition';
 import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
 import { createCanvas } from '@napi-rs/canvas';
-import { readComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
+import { readComplaintSelections, mergeComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 7;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 8;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -52,14 +52,16 @@ export interface ComplaintExtractionWarning {
         | 'related_action_review'
         | 'claim_amount_review'
         | 'caption_review'
+        | 'source_conflict'
         | 'scan_review';
     message: string;
+    field?: keyof ComplaintExtractionData;
 }
 
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
     contentHash?: string;
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -226,10 +228,24 @@ export interface ComplaintFormWidget {
 export function parseComplaintFormFields(text: string, widgets: ComplaintFormWidget[], pageCount = 1): ComplaintExtractionResult | null {
     const prefix = /\bDC\s*102c\b/i.test(text) ? 'dc102c' : /\bDC\s*102a\b/i.test(text) ? 'dc102a' : null;
     if (!prefix || !isLikelyComplaint(text)) return null;
-    const fields = new Map(widgets.map(widget => [widget.fieldName?.toLowerCase(), widget]));
-    const field = (number: number) => fields.get(`${prefix}_${String(number).padStart(2, '0')}`);
+    const fields = new Map<string, ComplaintFormWidget>();
+    const conflictingFields = new Set<string>();
+    const comparable = (widget: ComplaintFormWidget) => widget.fieldType === 'Btn' && widget.checkBox
+        ? widget.fieldValue === 'Off' ? 'unchecked' : widget.fieldValue ? 'checked' : 'unknown'
+        : typeof widget.fieldValue === 'string' ? normalizeLine(widget.fieldValue) : JSON.stringify(widget.fieldValue);
+    for (const widget of widgets) {
+        const key = widget.fieldName?.toLowerCase();
+        if (!key) continue;
+        const previous = fields.get(key);
+        if (previous && (previous.fieldType !== widget.fieldType || comparable(previous) !== comparable(widget))) conflictingFields.add(key);
+        fields.set(key, widget);
+    }
+    const field = (number: number) => {
+        const key = `${prefix}_${String(number).padStart(2, '0')}`;
+        return conflictingFields.has(key) ? undefined : fields.get(key);
+    };
     const value = (number: number) => typeof field(number)?.fieldValue === 'string' ? String(field(number)!.fieldValue) : '';
-    if (!value(5).trim() && !value(7).trim()) return null;
+    if (!value(5).trim() && !value(7).trim() && !conflictingFields.has(`${prefix}_05`) && !conflictingFields.has(`${prefix}_07`)) return null;
     const checked = (number: number): boolean | undefined => {
         const widget = field(number);
         if (widget?.fieldType !== 'Btn' || widget.checkBox !== true || typeof widget.fieldValue !== 'string' || !widget.fieldValue) return;
@@ -241,6 +257,25 @@ export function parseComplaintFormFields(text: string, widgets: ComplaintFormWid
         textHash: createHash('sha256').update(text + JSON.stringify(widgets)).digest('hex'),
         data: { mailingRequested: true }, fieldConfidence: { mailingRequested: 'high' }, warnings: [],
     };
+    const conflictGroups: Array<[keyof ComplaintExtractionData, number[], string]> = [
+        ['courtDistrict', [1], 'court district'], ['plaintiff', [5], 'Plaintiff'],
+        ['defendants', [7], 'Defendant names and addresses'], ['attorney', [6], 'attorney'],
+        ['relatedCivilAction', [8, 9], 'paragraph 2 answer'],
+        ['relatedCaseCourt', [10], 'related court'], ['relatedCaseDocketNumber', [11], 'related case reference'],
+        ['relatedCaseJudge', [11], 'related case judge'],
+        ['relatedCasePending', [12, 13], 'related case status'],
+        ['moneyJudgmentRequested', [prefix === 'dc102c' ? 39 : 32], 'paragraph 10 answer'],
+        ['claimAmount', [prefix === 'dc102c' ? 40 : 37], 'claim amount'],
+    ];
+    for (const [key, numbers, label] of conflictGroups) {
+        if (numbers.some(number => conflictingFields.has(`${prefix}_${String(number).padStart(2, '0')}`))) {
+            const partyField = ['plaintiff','defendants','attorney'].includes(key);
+            result.warnings.push({code:'source_conflict',field:key,
+                message:`The Complaint contains conflicting PDF field values for ${label}. ` + (partyField
+                    ? 'Replace it with the correct single-case Complaint before preparation.'
+                    : 'Check the source and enter the correct value, or replace the PDF.')});
+        }
+    }
     const plaintiff = partyFromLines(normalizedLines(value(5)));
     if (plaintiff) { result.data.plaintiff = { ...plaintiff, entityName: plaintiff.displayName }; result.fieldConfidence.plaintiff = 'high'; }
     const defendantLines = normalizedLines(value(7));
@@ -262,6 +297,8 @@ export function parseComplaintFormFields(text: string, widgets: ComplaintFormWid
     if (none !== undefined && previous !== undefined && none !== previous) {
         result.data.relatedCivilAction = none ? 'none' : 'previously_filed';
         result.fieldConfidence.relatedCivilAction = 'high';
+        if (none) result.warnings = result.warnings.filter(warning => warning.code !== 'source_conflict' ||
+            !warning.field || !['relatedCaseCourt','relatedCaseDocketNumber','relatedCaseJudge','relatedCasePending'].includes(warning.field));
         if (previous) {
             result.data.relatedCaseCourt = value(10).trim() || undefined;
             const docket = value(11).match(/\b[A-Z0-9]+(?:-[A-Z0-9]+){1,4}\b/i);
@@ -277,6 +314,7 @@ export function parseComplaintFormFields(text: string, widgets: ComplaintFormWid
         result.fieldConfidence.moneyJudgmentRequested = 'high';
         result.data.claimAmount = money ? normalizedMoney(value(prefix === 'dc102c' ? 40 : 37)) : '0.00';
         if (result.data.claimAmount) result.fieldConfidence.claimAmount = 'high';
+        if (!money) result.warnings = result.warnings.filter(warning => warning.code !== 'source_conflict' || warning.field !== 'claimAmount');
     }
     if (money === undefined || (money && !result.data.claimAmount)) result.warnings.push({ code: 'claim_amount_review', message: 'Confirm paragraph 10 and its total claim amount. No amount has been guessed from the rent rate.' });
     if (!plaintiff) result.warnings.push({ code: 'missing_plaintiff', message: 'Enter the Plaintiff from the Complaint.' });
@@ -732,7 +770,7 @@ export async function extractComplaintPdf(
             recovered = layout.data.plaintiff && layout.data.defendants?.length
                 ? layout : parseScannedComplaint(await recognizeScannedPdf(buffer), document.numPages);
         }
-        const selections: ComplaintSelections = {};
+        const observations: ComplaintSelections[] = [];
         for (let index = 0; index < layoutPages.length; index++) {
             if (!layoutPages[index].words.some(word => /^10\.$|^There is no other pending|^A civil action between/i.test(word.text))) continue;
             const page = await document.getPage(index + 1);
@@ -741,10 +779,11 @@ export async function extractComplaintPdf(
             const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
             const context = canvas.getContext('2d');
             await page.render({canvasContext:context, viewport}).promise;
-            Object.assign(selections, readComplaintSelections(context.getImageData(0,0,canvas.width,canvas.height).data,
+            observations.push(readComplaintSelections(context.getImageData(0,0,canvas.width,canvas.height).data,
                 canvas.width, canvas.height, layoutPages[index].words));
             canvas.width=1; canvas.height=1; page.cleanup();
         }
+        const selections = mergeComplaintSelections(observations);
         if (selections.money === undefined && recovered.textSource !== 'ocr' && recovered.data.moneyJudgmentRequested === false) {
             delete recovered.data.moneyJudgmentRequested;
             delete recovered.data.claimAmount;
@@ -760,20 +799,44 @@ export async function extractComplaintPdf(
 
 export function applyVisualComplaintSelections(result: ComplaintExtractionResult, selections: ComplaintSelections,
     pages: OcrPage[]): ComplaintExtractionResult {
-    if (selections.noRelated !== undefined && selections.previousRelated !== undefined && selections.noRelated !== selections.previousRelated) {
+    const conflicts = new Set(selections.conflicts || []);
+    if (conflicts.has('noRelated') || conflicts.has('previousRelated')) {
+        delete result.data.relatedCivilAction;
+        result.fieldConfidence.relatedCivilAction = 'low';
+        result.warnings.push({code:'source_conflict',field:'relatedCivilAction',
+            message:'Paragraph 2 has conflicting checkbox readings. Check the Complaint and confirm the related civil action answer.'});
+    }
+    if (conflicts.has('money')) {
+        delete result.data.moneyJudgmentRequested;
+        delete result.data.claimAmount;
+        result.fieldConfidence.moneyJudgmentRequested = 'low';
+        result.warnings.push({code:'source_conflict',field:'moneyJudgmentRequested',
+            message:'Paragraph 10 has conflicting checkbox readings. Check the Complaint and confirm whether a money judgment is requested.'});
+    }
+    const amountConflict = selections.money !== false && (conflicts.has('rent') || conflicts.has('damages'));
+    if (amountConflict) {
+        delete result.data.claimAmount;
+        result.fieldConfidence.claimAmount = 'low';
+        result.warnings.push({code:'source_conflict',field:'claimAmount',
+            message:'The rent or damages selection has conflicting readings. Check paragraph 10 and enter the total claim amount.'});
+    }
+    if (!conflicts.has('noRelated') && !conflicts.has('previousRelated') &&
+        selections.noRelated !== undefined && selections.previousRelated !== undefined && selections.noRelated !== selections.previousRelated) {
         result.data.relatedCivilAction = selections.noRelated ? 'none' : 'previously_filed';
         result.fieldConfidence.relatedCivilAction = 'high';
         if (selections.noRelated) result.warnings = result.warnings.filter(w => w.code !== 'related_action_review');
     }
-    if (selections.money !== undefined) {
+    if (!conflicts.has('money') && selections.money !== undefined) {
         result.data.moneyJudgmentRequested = selections.money;
         result.fieldConfidence.moneyJudgmentRequested = 'high';
         if (!selections.money) result.data.claimAmount = '0.00';
-        else if (selections.damages === true) {
+        else if (!amountConflict && selections.damages === true) {
+            delete result.data.claimAmount;
+            delete result.fieldConfidence.claimAmount;
             const candidates: string[] = [];
             for (const page of pages) {
                 for (const anchor of page.words.filter(word => /damages/i.test(word.text) && word.confidence >= 80)) {
-                    const line = page.words.filter(word => Math.abs(word.y - anchor.y) < 5 && word.x >= anchor.x)
+                    const line = page.words.filter(word => word.pageNumber === anchor.pageNumber && Math.abs(word.y - anchor.y) < 5 && word.x >= anchor.x)
                         .sort((a,b) => a.x-b.x);
                     if (!/^damages\s+claimed\s*:/i.test(line.map(word=>word.text).join(' '))) continue;
                     const amount = line.filter(word => word.confidence >= 90)
@@ -787,18 +850,31 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
                 }
             }
             if (new Set(candidates).size === 1) result.data.claimAmount = candidates[0];
-        } else if (selections.rent === true && selections.damages === false) {
+            else if (new Set(candidates).size > 1) result.warnings.push({code:'source_conflict',field:'claimAmount',
+                message:'The Complaint contains different damages totals. Check paragraph 10 and enter the correct total claim amount.'});
+        } else if (!amountConflict && selections.rent === true && selections.damages === false) {
+            delete result.data.claimAmount;
+            delete result.fieldConfidence.claimAmount;
             const words = pages.flatMap(page => page.words);
-            const label = words.find(word => /total rent due now is/i.test(word.text));
-            const candidates = label ? words.filter(word => word.pageNumber === label.pageNumber &&
-                word.x >= label.x + label.width - 2 && word.x < label.x + label.width + 100 &&
-                word.confidence >= 90 && Math.abs(word.y - label.y) < 8) : [];
-            const amounts = candidates.map(word => normalizedMoney(word.text)).filter((amount): amount is string => !!amount);
-            if (amounts.length === 1) result.data.claimAmount = amounts[0];
+            const amounts: string[] = [];
+            for (const label of words.filter(word => /total rent due now is/i.test(word.text) && word.confidence >= 80)) {
+                const candidates = words.filter(word => word.pageNumber === label.pageNumber &&
+                    word.x >= label.x + label.width - 2 && word.x < label.x + label.width + 100 &&
+                    word.confidence >= 90 && Math.abs(word.y - label.y) < 8)
+                    .map(word => normalizedMoney(word.text)).filter((amount): amount is string => !!amount);
+                if (candidates.length === 1) amounts.push(candidates[0]);
+            }
+            if (new Set(amounts).size === 1) result.data.claimAmount = amounts[0];
+            else if (new Set(amounts).size > 1) result.warnings.push({code:'source_conflict',field:'claimAmount',
+                message:'The Complaint contains different total-rent amounts. Check the source and enter the correct total claim amount.'});
         }
         if (result.data.claimAmount) {
             result.fieldConfidence.claimAmount = 'high';
             result.warnings = result.warnings.filter(w => w.code !== 'claim_amount_review');
+        } else if (!result.warnings.some(warning => warning.code === 'claim_amount_review' ||
+            (warning.code === 'source_conflict' && warning.field === 'claimAmount'))) {
+            result.warnings.push({code:'claim_amount_review',field:'claimAmount',
+                message:'Confirm the total claim amount from paragraph 10. No rent rate or earlier unverified amount has been substituted.'});
         }
     }
     return result;
@@ -806,7 +882,7 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
 
 export function parseScannedComplaint(pages: OcrPage[], pageCount = pages.length): ComplaintExtractionResult {
     return applyVisualComplaintSelections(parseLayoutComplaint(pages, pageCount, 'ocr'),
-        Object.assign({}, ...pages.map(page => page.selections || {})), pages);
+        mergeComplaintSelections(pages.map(page => page.selections || {})), pages);
 }
 
 function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf' | 'ocr'): ComplaintExtractionResult {
@@ -826,15 +902,21 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
             const row = rows.find(row => Math.abs(row[0].y - word.y) < 5);
             if (row) row.push(word); else rows.push([word]);
         }
-        return rows.map(row => ({ y: row[0].y, confidence: Math.min(...row.map(word => word.confidence)),
+        return rows.map(row => ({ x: Math.min(...row.map(word => word.x)), y: row[0].y,
+            confidence: Math.min(100, ...row.filter(word => /[a-z0-9]/i.test(word.text)).map(word => word.confidence)),
             text: row.sort((a, b) => a.x - b.x).map(word => word.text).join(' ') }));
     };
+    const statesAnchor = words.find(word => word.x >= 260 && word.x <= 340 &&
+        /^(?:the\s+)?plaintiff\s+states\b/i.test(words.filter(other => other.x >= word.x - 0.5 &&
+            Math.abs(other.y - word.y) < 5).sort((a,b) => a.x-b.x).map(other => other.text).join(' ')));
+    const statesLabel = statesAnchor || groupLines(words).find(line => /\b(?:the\s+)?plaintiff\s+states\b/i.test(line.text));
+    const divider = statesLabel && statesLabel.x >= 280 && statesLabel.x <= 320 ? Math.min(300, statesLabel.x) : 300;
     const left = groupLines(words.filter(word => word.x + word.width / 2 < 300));
     const right = groupLines(words.filter(word => word.x + word.width / 2 >= 300));
+    const attorneyRows = groupLines(words.filter(word => word.x + word.width / 2 < divider));
     const plaintiffLabel = left.find(line => /plaintiff.{0,8}name/i.test(line.text));
     const defendantLabel = right.find(line => /defendant.{0,8}name/i.test(line.text));
     const attorneyLabel = left.find(line => /plaintiff.{0,8}attorney/i.test(line.text));
-    const statesLabel = groupLines(words).find(line => /\b(?:the\s+)?plaintiff\s+states\b/i.test(line.text));
     function party(rows: Array<{y: number; text: string}>, start?: number, end?: number): ComplaintPartyExtraction | undefined {
         if (start === undefined || end === undefined) return;
         const values = rows.filter(line => line.y > start + 6 && line.y < end - 2)
@@ -856,9 +938,14 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     if (defendant) {
         applyDefendants(result, defendant, source === 'pdf' ? 'high' : 'medium');
     }
-    const header = groupLines(words.filter(word => word.y < (plaintiffLabel?.y || 180))).map(line => line.text).join('\n');
+    const headerRows = groupLines(words.filter(word => word.y < (plaintiffLabel?.y || 180)));
+    const header = headerRows.map(line => line.text).join('\n');
     const district = header.match(/\b(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)?\s+(?:judicial\s+)?district\b/i);
-    if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = source === 'pdf' ? 'high' : 'medium'; }
+    if (district) {
+        result.data.courtDistrict = district[1].toUpperCase();
+        const line = headerRows.find(row => row.text.includes(district[0]));
+        result.fieldConfidence.courtDistrict = source === 'pdf' ? 'high' : line && line.confidence < 80 ? 'low' : 'medium';
+    }
     if (!district) {
         const candidates = words.filter(word => word.x < 150 && word.y > 65 && word.y < 110 && word.confidence >= (source === 'ocr' ? 50 : 80));
         const codes = candidates.map(word => word.text.match(/^(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)$/i)?.[1]).filter(Boolean);
@@ -869,7 +956,7 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     }
     if (attorneyLabel) {
         const end = [...left, ...right].filter(line => line.y > attorneyLabel.y && /^2\.|^there is no other pending/i.test(line.text)).sort((a,b)=>a.y-b.y)[0]?.y || attorneyLabel.y + 120;
-        const rows = left.filter(line => line.y > attorneyLabel.y + 6 && line.y < end - 2).map(line => line.text);
+        const rows = attorneyRows.filter(line => line.y > attorneyLabel.y + 6 && line.y < end - 2).map(line => line.text);
         const bar = rows[0]?.match(/\(?\bP\d{5,8}\b\)?/i);
         const attorney = partyFromLines([rows[0]?.replace(/\(?\bP\d{5,8}\b\)?/i, '').trim() || '', ...rows.slice(1)]);
         if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() }; result.fieldConfidence.attorney = source === 'pdf' ? 'high' : 'medium'; }
@@ -888,17 +975,17 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
             if (start === undefined || end === undefined) continue;
             if (rows.some(line => line.y > start + 6 && line.y < end - 2 && line.confidence < 80)) result.fieldConfidence[key] = 'low';
         }
-        if (attorneyLabel && left.some(line => line.y > attorneyLabel.y + 6 &&
+        if (attorneyLabel && attorneyRows.some(line => line.y > attorneyLabel.y + 6 &&
             line.y < attorneyLabel.y + 65 && line.confidence < 80)) result.fieldConfidence.attorney = 'low';
-        const uncertain = (['plaintiff','defendants','attorney'] as const).filter(key=>result.fieldConfidence[key]==='low');
-        if (uncertain.length) result.warnings.push({code:'caption_review',
-            message:'Low-confidence scan values need checking: ' + uncertain.map(key=>
-                key==='plaintiff' ? 'Plaintiff name/contact details' : key==='defendants' ? 'Defendant names/addresses' : 'attorney details').join(', ') + '.'});
+        const uncertain = (['courtDistrict','plaintiff','defendants','attorney'] as const).filter(key=>result.fieldConfidence[key]==='low');
+        for (const field of uncertain) result.warnings.push({code:'caption_review',field,
+            message:'Check the low-confidence scan value: ' + ({courtDistrict:'court district',plaintiff:'Plaintiff name/contact details',
+                defendants:'Defendant names/addresses',attorney:'attorney details'}[field]) + '.'});
     }
     if (!result.data.plaintiff) result.warnings.push({ code: 'missing_plaintiff', message: 'Enter the Plaintiff from the scanned Complaint.' });
     if (!result.data.defendants?.length) result.warnings.push({ code: 'missing_defendant', message: 'Enter the Defendant names and address from the scanned Complaint.' });
     if (source === 'ocr' && !result.data.courtDistrict) result.warnings.push({
-        code:'caption_review', message:'The court district could not be read reliably from the Complaint. Select the court after checking the PDF.',
+        code:'caption_review', field:'courtDistrict', message:'The court district could not be read reliably from the Complaint. Select the court after checking the PDF.',
     });
     return result;
 }
