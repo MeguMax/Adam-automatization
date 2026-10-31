@@ -429,3 +429,38 @@ and a server-side layout error linked back to its source cell. Existing individu
 PDFs, three-form ZIPs, session restoration, download guards and local-only mode
 remain covered. This is not a new real desktop-Excel acceptance result; native
 input was unavailable in this run, and the desktop ZIP pilot remains pending.
+
+## Real Windows desktop ZIP acceptance (2026-10-31, v88)
+
+The installed task pane was tested in Windows desktop Excel after one initial
+user sign-in. Production Render generated two ZIPs from rows 2 and 3 of the local
+fictional `qa-cases.xlsx` workbook. Each actual local download contained exactly
+DC105, DC508 and MC202 with its own case-specific filenames. Switching rows
+removed the previous ZIP result and refreshed the case identity without another
+sign-in. Closing and reopening Home > PDF Forms restored the valid session and
+remembered MC202; no 12-hour wall-clock soak is claimed.
+
+Both ZIPs passed CRC checks. All 202 canonical field values, page widgets,
+appearance streams and editable flags matched the fixture. All eight original
+pages were rendered with PDF.js and visually inspected, including the fixed
+`DATE(2026,10,27)` result. Local verification copies of all six PDFs were edited,
+saved and reopened: changed text and checkbox states survived while other values
+remained intact. PDF.js pixel comparisons also confirmed that each of the six
+test checkbox marks visibly changed. The downloaded originals were not edited.
+
+A temporary rename of the fictional `dc105_01` header verified native source
+diagnostics. MC202 remained available independently, while the three-form ZIP
+reported the missing mapped column under Source issues. Its Header row button
+selected A1 on the correct worksheet. The temporary edit was undone, the
+original header was visibly restored, and ZIP generation succeeded again.
+The QA workbook was not saved with the temporary error. This closes the desktop
+ZIP acceptance gap above; it does not claim acceptance in Adam's own tenant.
+
+The complete project regression was rerun: 312 tests passed with zero failures,
+cancellations or skipped tests. Evidence is under
+`output/qa-excel-desktop-zip-2026-10-31/`, including field-verification JSON,
+PDF.js renderings, checkbox pixel comparisons and native Excel screenshots.
+Generation remains on Render and PDF delivery remains local-only. No customer
+workbook was uploaded, no OneDrive copy was created, and no MiFILE preparation,
+payment or court submission was performed by this acceptance run. No runtime,
+manifest, permission or environment changes were required.
