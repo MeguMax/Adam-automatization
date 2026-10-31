@@ -1,5 +1,43 @@
 # Offline acceptance and worker progress
 
+## Additional archived documents (v93)
+
+`npm run test:recognition-corpus -- --manifest C:\private\corpus.json --output C:\private\results`
+checks individual real PDFs independently of package preparation. Version-1
+manifests contain `cases` with a unique `id`, a PDF `file` and explicit
+`expected.role`. Optional expectations are `source`, `pageCount`, `extraction`
+and required extraction-warning codes. Paths are relative to the manifest.
+Expected party arrays require an exact length, not just matching first entries.
+
+Each document runs in an isolated process with external requests prohibited and
+an eight-minute deadline. The content classifier receives `document.pdf`, not a
+helpful source filename. Optional `filename` also tests the actual naming hint.
+Private results retain recognized roles, extracted fields, warnings and source
+text; no mailbox/OneDrive updates or MiFILE jobs are created. Expectations must
+be checked independently against the actual source pages, not copied blindly
+from an extractor's result. A failed document does not skip the remaining corpus.
+
+Extractor version 9 shares the same party-splitting rules across flattened text,
+interactive fields and OCR. Commas between people no longer collapse several
+Defendants into one party; business suffixes and ambiguous surname-first names
+retain their safeguards. Notice recipients after the occupants boundary do not
+become Defendants. Quarter-point checkbox geometry recognizes thin 8.75pt SCAO
+squares without relaxing checked-mark or border thresholds. Faint interior marks
+prevent an empty-box conclusion. Missing checkbox evidence stays unknown and no
+longer retains stale high-confidence metadata for cleared automatic values.
+
+Release acceptance: 17 additional archived PDFs (27 pages), including five
+Complaints and two image-only documents, passed all 138 explicit checks. The
+Complaints contributed 75 independently checked field values across four court
+districts. Judicial orders and an Appearance remained non-Complaint documents.
+The corpus is separate from the prior nine supplied package examples; those
+nine also passed their 63 field expectations (five ready, four under review).
+All 349 automated tests and desktop/mobile admin smoke passed. Runtime audit
+reported zero known vulnerabilities. Private evidence stays under
+`output/qa-broad-recognition-2026-10-31/`; PDFs, party data and cloud references
+are not committed. Archive retrieval was read-only; no MiFILE job, payment or
+court submission was created by this verification.
+
 ## Automatic checkout readiness (v92)
 
 New verified primary-account packages continue automatically from Unsubmitted

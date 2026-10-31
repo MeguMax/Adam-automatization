@@ -8,7 +8,7 @@ import {
     ComplaintFormWidget,
     applyVisualComplaintSelections,
 } from './complaintExtractor';
-import { testComplaintFormFixture } from './testPdfFixture';
+import { testComplaintFormFixture, testPdfFixture } from './testPdfFixture';
 import { createCanvas } from '@napi-rs/canvas';
 import { readCheckboxBeforeAnchor, mergeComplaintSelections, readComplaintSelections } from './pdfCheckboxes';
 import { recognizeDocumentText } from './documentRecognition';
@@ -76,7 +76,7 @@ test('extracts high-confidence filing fields from a Michigan Complaint', () => {
     assert.ok(!result.warnings.some(warning => warning.code === 'claim_amount_review'));
 });
 
-test('keeps ambiguous multiple Defendants together and requests review', () => {
+test('flattened PDF captions use the same unambiguous party splitting as interactive fields', () => {
     const result = parseComplaintText(
         POSSESSION_ONLY_TEXT.replace(
             'Taylor Tenant, and all other occupants',
@@ -85,13 +85,26 @@ test('keeps ambiguous multiple Defendants together and requests review', () => {
         { documentType: 'Complaint for Possession and Supplemental Money Judgment (Fee Varies)' },
     );
 
-    assert.equal(
-        result.data.defendants?.[0].displayName,
-        'Taylor Tenant and Jordan Resident',
-    );
-    assert.equal(result.fieldConfidence.defendants, 'medium');
-    assert.ok(result.warnings.some(warning => warning.code === 'multiple_defendants_review'));
+    assert.deepEqual(result.data.defendants?.map(p=>p.displayName),['Taylor Tenant','Jordan Resident']);
+    assert.ok(result.data.defendants?.every(p=>p.address1==='300 Rental Street Apt 4'));
+    assert.equal(result.data.includeAllOtherOccupants,true);
+    assert.equal(result.fieldConfidence.defendants, 'high');
+    assert.ok(!result.warnings.some(warning => warning.code === 'multiple_defendants_review'));
     assert.ok(result.warnings.some(warning => warning.code === 'claim_amount_review'));
+});
+
+test('flattened captions split comma-separated people, retain business suffixes and exclude notice recipients',()=>{
+    const parse=(caption:string)=>parseComplaintText(POSSESSION_ONLY_TEXT.replace('Taylor Tenant, and all other occupants',caption));
+    const people=parse('Taylor Tenant, Jordan Resident, and all other occupants');
+    assert.deepEqual(people.data.defendants?.map(p=>p.displayName),['Taylor Tenant','Jordan Resident']);
+    assert.ok(people.data.defendants?.every(p=>p.postalCode==='48002'));
+    const mixed=parse('Example Ventures, LLC, Taylor Tenant, Jordan Resident, and all other occupants; Notice Association');
+    assert.deepEqual(mixed.data.defendants?.map(p=>[p.displayName,p.partyType]),[
+        ['Example Ventures, LLC','entity'],['Taylor Tenant','person'],['Jordan Resident','person'],
+    ]);
+    const ambiguous=parse('Tenant, Taylor');
+    assert.ok(ambiguous.warnings.some(w=>w.code==='multiple_defendants_review'));
+    assert.equal(ambiguous.data.defendants?.length,1);
 });
 
 test('reads paragraph 2, paragraph 10, and the claim amount from positioned PDF values', () => {
@@ -260,6 +273,15 @@ test('real interactive PDF extracts Widget values even when page text contains o
     assert.equal(recognizeDocumentText(['DC 102a COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT'], 'scan001.pdf').source,'content');
 });
 
+test('unverified automatic money answers do not retain high-confidence metadata after being cleared',async()=>{
+    const result=await extractComplaintPdf(testPdfFixture(POSSESSION_ONLY_TEXT));
+    assert.equal(result.data.moneyJudgmentRequested,undefined);
+    assert.equal(result.data.claimAmount,undefined);
+    assert.equal(result.fieldConfidence.moneyJudgmentRequested,undefined);
+    assert.equal(result.fieldConfidence.claimAmount,undefined);
+    assert.ok(result.warnings.some(w=>w.code==='claim_amount_review'));
+});
+
 test('visual checkbox reading distinguishes a checked square, an empty square and absent geometry',()=>{
     const canvas=createCanvas(1836,2376);const context=canvas.getContext('2d');context.scale(3,3);
     context.fillStyle='#fff';context.fillRect(0,0,612,792);context.strokeStyle='#000';context.lineWidth=0.6;
@@ -269,6 +291,23 @@ test('visual checkbox reading distinguishes a checked square, an empty square an
     context.strokeRect(48,100,9,9);assert.equal(read(),false);
     context.lineWidth=1.5;context.beginPath();context.moveTo(49,104);context.lineTo(52,107);context.lineTo(56,101);context.stroke();
     assert.equal(read(),true);
+});
+
+test('thin quarter-point SCAO squares are read without relaxing mark or border thresholds',()=>{
+    for(const top of [687.125,713.525]) {
+        const canvas=createCanvas(1836,2376),context=canvas.getContext('2d');context.scale(3,3);
+        context.fillStyle='#fff';context.fillRect(0,0,612,792);context.strokeStyle='#000';context.lineWidth=0.25;
+        const anchor={text:'10.',x:51.5992,y:top-1.125,width:14,height:10};
+        const read=()=>readCheckboxBeforeAnchor(context.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,anchor);
+        assert.equal(read(),undefined);
+        context.strokeRect(39.724,top,8.75,8.75);assert.equal(read(),false);
+        context.strokeStyle='#aaa';context.lineWidth=0.25;context.beginPath();
+        context.moveTo(42,top+4);context.lineTo(44,top+6);context.lineTo(46,top+2);context.stroke();
+        assert.equal(read(),undefined,'A faint ambiguous mark must not be treated as an empty box');
+        context.strokeStyle='#000';context.lineWidth=1;context.beginPath();
+        context.moveTo(41.5,top+4);context.lineTo(43.5,top+6.5);context.lineTo(46.5,top+2);context.stroke();
+        assert.equal(read(),true);
+    }
 });
 
 test('paragraph 10 uses explicitly referenced total rent, never the monthly rent or unselected damages',()=>{

@@ -147,7 +147,13 @@ The Draft workspace opens on **Review**: court, parties, claim and included docu
 
 The primary action changes with the case: **Save & check**, **Review corrections**, **Confirm & prepare**, **View progress**, **Check result**, or **Open MiFILE**. Saving locks mutating controls until completion. Tab/disclosure selection, unsaved inputs and PDF navigation survive ordinary refreshes. Known-good new email intakes retain their existing automatic Unsubmitted preparation; incomplete packages still require correction, and uncertain remote results still require checking MiFILE before retrying.
 
-### Complaint confidence and source conflicts (version 8)
+### Complaint confidence and source conflicts (version 9)
+
+Flattened Complaints use the same person/entity splitting as interactive PDF
+fields and OCR, including comma-separated parties and company suffixes. The
+visual reader supports thin quarter-point SCAO checkboxes; faint or absent marks
+still require review rather than being assumed unchecked. Automatic upgrades
+continue to preserve manual field edits and skip locked/prepared filings.
 
 The attorney caption boundary follows the observed right-column paragraph heading;
 the Plaintiff and Defendant regions retain their independent column split.

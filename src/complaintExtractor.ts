@@ -6,7 +6,7 @@ import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, mergeComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 8;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 9;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -61,7 +61,7 @@ export interface ComplaintExtractionWarning {
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
     contentHash?: string;
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -188,7 +188,8 @@ function partyFromLines(lines: string[]): ComplaintPartyExtraction | undefined {
 
 const ENTITY_NAME = /\b(?:L\.?L\.?C\.?|L\.?L\.?P\.?|L\.?P\.?|incorporated|inc\.?|corp(?:oration)?\.?|ltd\.?|limited|association|management|apartments?|properties)\b/i;
 
-function applyDefendants(result: ComplaintExtractionResult, party: ComplaintPartyExtraction, confidence: ComplaintFieldConfidence): void {
+function applyDefendants(result: Pick<ComplaintExtractionResult,'data'|'fieldConfidence'|'warnings'>,
+    party: ComplaintPartyExtraction, confidence: ComplaintFieldConfidence): void {
     const boundary = party.displayName.search(/(?:,?\s+and\s+)?\ball other occupants\b/i);
     result.data.includeAllOtherOccupants = boundary >= 0;
     const name = cleanName(boundary >= 0 ? party.displayName.slice(0, boundary) : party.displayName);
@@ -585,29 +586,13 @@ export function parseComplaintText(
 
         const defendantIndex = phoneIndex >= 0 ? phoneIndex + 1 : attorneyIndex + 4;
         const rawDefendant = cleanName(filled[defendantIndex] ?? '');
-        const includesOccupants = /(?:,?\s+and\s+)?all other occupants\b/i.test(rawDefendant);
-        const defendantName = cleanName(
-            rawDefendant.replace(/(?:,?\s+and\s+)?all other occupants\b/ig, ''),
-        );
-        if (defendantName) {
+        if (rawDefendant) {
             const defendantCity = parseCityStateZip(filled[defendantIndex + 2] ?? '');
-            data.defendants = [{
-                displayName: defendantName,
-                ...personNameParts(defendantName),
+            applyDefendants({data,fieldConfidence,warnings},{
+                displayName: rawDefendant,
                 address1: filled[defendantIndex + 1],
                 ...defendantCity,
-            }];
-            data.includeAllOtherOccupants = includesOccupants;
-            fieldConfidence['defendants'] = /\s+(?:and|&)\s+/i.test(defendantName)
-                ? 'medium'
-                : 'high';
-            fieldConfidence['includeAllOtherOccupants'] = 'high';
-            if (/\s+(?:and|&)\s+/i.test(defendantName)) {
-                warnings.push({
-                    code: 'multiple_defendants_review',
-                    message: 'The Complaint may contain multiple Defendants; confirm how the name should be split.',
-                });
-            }
+            },'high');
         }
     }
 
@@ -787,6 +772,8 @@ export async function extractComplaintPdf(
         if (selections.money === undefined && recovered.textSource !== 'ocr' && recovered.data.moneyJudgmentRequested === false) {
             delete recovered.data.moneyJudgmentRequested;
             delete recovered.data.claimAmount;
+            delete recovered.fieldConfidence.moneyJudgmentRequested;
+            delete recovered.fieldConfidence.claimAmount;
             recovered.warnings.push({code:'claim_amount_review',message:'The paragraph 10 checkbox could not be verified from the page.'});
         }
         recovered = applyVisualComplaintSelections(recovered, selections, layoutPages);

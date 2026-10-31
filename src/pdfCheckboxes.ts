@@ -19,16 +19,17 @@ export function mergeComplaintSelections(observations: ComplaintSelections[]): C
 export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: number, height: number,
     anchor: CheckboxAnchor): boolean | undefined {
     const sx = width / 612, sy = height / 792;
-    const dark = (x: number, y: number) => {
+    const dark = (x: number, y: number, threshold = 175) => {
         const px = Math.round(x * sx), py = Math.round(y * sy);
         if (px < 0 || py < 0 || px >= width || py >= height) return false;
         const i = (py * width + px) * 4;
-        return pixels[i + 3] > 100 && (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3 < 175;
+        return pixels[i + 3] > 100 && (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3 < threshold;
     };
     let best: { score: number; x: number; y: number; side: number } | undefined;
-    for (let side = 7; side <= 11; side += 0.5) {
-        for (let x = anchor.x - 17; x <= anchor.x - side - 1; x += 0.5) {
-            for (let y = anchor.y - 3; y <= anchor.y + 3; y += 0.5) {
+    // Flattened SCAO forms include 8.75pt squares with thin, quarter-point borders.
+    for (let side = 7; side <= 11; side += 0.25) {
+        for (let x = anchor.x - 17; x <= anchor.x - side - 1; x += 0.25) {
+            for (let y = anchor.y - 3; y <= anchor.y + 3; y += 0.25) {
                 const edges = [0, 0, 0, 0];
                 for (let n = 1; n <= 10; n++) {
                     const offset = side * (0.1 + n * 0.075);
@@ -44,14 +45,14 @@ export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: numbe
         }
     }
     if (!best) return;
-    let ink = 0, samples = 0;
+    let ink = 0, faintInk = 0, samples = 0;
     for (let x = best.x + 2; x <= best.x + best.side - 2; x += 0.3) {
         for (let y = best.y + 2; y <= best.y + best.side - 2; y += 0.3) {
-            ink += Number(dark(x, y)); samples++;
+            ink += Number(dark(x, y)); faintInk += Number(dark(x, y,235)); samples++;
         }
     }
     const density = ink / samples;
-    return density > 0.14 ? true : density < 0.025 ? false : undefined;
+    return density > 0.14 ? true : density < 0.025 && faintInk / samples < 0.025 ? false : undefined;
 }
 
 export function readComplaintSelections(pixels: Uint8ClampedArray, width: number, height: number,
