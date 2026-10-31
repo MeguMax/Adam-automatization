@@ -357,6 +357,32 @@ async function main() {
         assert.equal(extracted.filingData.plaintiff.address1,'30850 Telegraph Rd Ste 250');
         assert.equal(extracted.filingData.plaintiff.email,'ajd@devlinlawpllc.com');
         const originalExtraction=structuredClone(extracted.complaintExtraction!);
+        const scanView=structuredClone(extracted);
+        scanView.complaintExtraction!.textSource='ocr';scanView.complaintExtraction!.extractionMethod='ocr';
+        scanView.complaintExtraction!.scanVerification={version:1,method:'independent_region_reads',complete:true,
+            verifiedFields:['courtDistrict','plaintiff','defendants','attorney'],unresolvedFields:[]};
+        db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,scanView.complaintExtraction!);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        await page.locator('#draftActivityTab').click();
+        assert.match(await page.locator('.draft-source-summary').textContent() || '',/Scan cross-check: Complete/);
+        await page.locator('.draft-source-summary').scrollIntoViewIfNeeded();
+        await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
+        await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
+        await page.screenshot({path:path.join(screenshots,'draft-scan-crosscheck-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        await page.locator('[data-draft-mobile-mode="fields"]').click();
+        await page.locator('.draft-source-summary').scrollIntoViewIfNeeded();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-scan-crosscheck-mobile.png'),fullPage:true});
+        scanView.complaintExtraction!.scanVerification.complete=false;
+        scanView.complaintExtraction!.scanVerification.unresolvedFields=['defendants'];
+        db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,scanView.complaintExtraction!);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('.draft-source-summary').textContent() || '',/Scan cross-check: Review needed/);
+        await page.locator('[data-draft-mobile-mode="document"]').click();
+        await page.setViewportSize({width:1440,height:1000});
+        db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,originalExtraction);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
         const lowConfidence=structuredClone(originalExtraction);
         lowConfidence.fieldConfidence.courtDistrict='low';lowConfidence.fieldConfidence.attorney='low';
         lowConfidence.warnings=[

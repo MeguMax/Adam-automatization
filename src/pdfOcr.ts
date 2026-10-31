@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { ComplaintSelections } from './pdfCheckboxes';
 
 export interface OcrLine {
+    verifiedByConsensus?: boolean;
     text: string;
     confidence: number;
     x: number;
@@ -23,6 +24,83 @@ export interface OcrPage {
 }
 
 export interface OcrRegion { left: number; top: number; right: number; bottom: number }
+
+export function ocrDistrictCode(value: string): string|null {
+    const normalized=value.trim().replace(/\s+/g,'').replace(/-(?=[AB](?:st|nd|rd|th)?$)/i,'');
+    return normalized.match(/^(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)?$/i)?.[1].toUpperCase() || null;
+}
+
+export function paragraph2Boundary(words: OcrLine[], attorneyY: number|undefined): number|undefined {
+    if (attorneyY===undefined) return;
+    const anchor=words.filter(word=>word.x<170 && word.y>attorneyY+35 && word.confidence>=50 &&
+        (/^2\.(?:\s|$)/.test(word.text) || /^There\b/i.test(word.text)) &&
+        words.some(other=>other.x>=word.x && Math.abs(other.y-word.y)<8 && /\b(?:pending|resolved|civil)\b/i.test(other.text)))
+        .sort((a,b)=>a.y-b.y)[0];
+    return anchor ? anchor.y-4 : undefined;
+}
+
+export interface OcrLineVerification {
+    region: OcrRegion;
+    pageNumber: number;
+    text: string;
+    confirmingReads: number;
+    kind: 'text'|'phone'|'district'|'money';
+}
+
+function regionWords(words: OcrLine[], region: OcrRegion, retainSigns=false): OcrLine[] {
+    return words.filter(word=>word.x+word.width/2>=region.left && word.x+word.width/2<region.right &&
+        word.y+word.height/2>=region.top && word.y+word.height/2<region.bottom &&
+        (/[a-z0-9&]/i.test(word.text) || retainSigns && /^[+-]$/.test(word.text)))
+        .sort((a,b)=>a.x-b.x);
+}
+
+function verificationText(words: OcrLine[], kind: OcrLineVerification['kind']): string {
+    const text=words.map(word=>word.text).join(' ').normalize('NFKC').replace(/[\u2018\u2019]/g,"'")
+        .replace(/\{/g,'(').replace(/\}/g,')').replace(/\s+/g,' ').trim().toLowerCase();
+    if (kind==='district') return ocrDistrictCode(text) || '';
+    if (kind==='money') {
+        const value=text.replace(/^\$\s*/, '').replace(/,/g,'');
+        if (!/^\d+(?:\.\d{1,6})?$/.test(value)) return '';
+        const [whole,decimal='']=value.split('.');
+        if (decimal.length>2 && /[1-9]/.test(decimal.slice(2))) return '';
+        return whole.replace(/^0+(?=\d)/,'')+'.'+decimal.padEnd(2,'0').slice(0,2);
+    }
+    if (kind==='text') return text;
+    if (!/^[+()\d .-]+$/.test(text)) return '';
+    const digits=text.replace(/\D/g,'').replace(/^1(?=\d{10}$)/,'');
+    return /^[2-9]\d{9}$/.test(digits) ? digits : '';
+}
+
+/** Two clear rereads must agree with the final line; any legible contrary read keeps review. */
+export function verifyOcrLineReads(words: OcrLine[], before: OcrLine[], reads: OcrLine[][],
+    region: OcrRegion, kind: OcrLineVerification['kind']='text'): OcrLineVerification | null {
+    const current=regionWords(words,region,kind==='money'), text=verificationText(current,kind);
+    if (!current.length || !text || new Set(current.map(word=>word.pageNumber)).size!==1) return null;
+    const pageNumber=current[0].pageNumber;
+    const original=regionWords(before,region,kind==='money');
+    if (original.length && original.every(word=>Number.isFinite(word.confidence) && word.confidence>=80) &&
+        verificationText(original,kind)!==text) return null;
+    let confirmingReads=0;
+    for (const read of reads) {
+        const candidates=regionWords(read,region,kind==='money');
+        if (!candidates.length || candidates.some(word=>word.pageNumber!==pageNumber || !Number.isFinite(word.confidence))) continue;
+        const value=verificationText(candidates,kind);
+        if (value && candidates.every(word=>word.confidence>=75) && value!==text) return null;
+        if (value===text && candidates.every(word=>word.confidence>=80)) confirmingReads++;
+    }
+    return confirmingReads>=2 ? {region,pageNumber,text,confirmingReads,kind} : null;
+}
+
+export function applyOcrLineVerifications(words: OcrLine[], verifications: OcrLineVerification[]): OcrLine[] {
+    const verified=new Set<OcrLine>();
+    for (const proof of verifications) {
+        const current=regionWords(words,proof.region,proof.kind==='money');
+        if (!Number.isInteger(proof.confirmingReads) || proof.confirmingReads<2 || current.some(word=>word.pageNumber!==proof.pageNumber) ||
+            verificationText(current,proof.kind)!==proof.text) continue;
+        current.forEach(word=>verified.add(word));
+    }
+    return words.map(word=>({...word,verifiedByConsensus:verified.has(word)}));
+}
 
 /** A second pass may repair missing words, but conflicting spellings stay uncertain. */
 export function mergeOcrRegionWords(words: OcrLine[], reread: OcrLine[], region: OcrRegion): OcrLine[] {

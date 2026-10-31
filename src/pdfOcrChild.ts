@@ -3,7 +3,8 @@ import { createCanvas } from '@napi-rs/canvas';
 import { createWorker, PSM } from 'tesseract.js';
 import type { Page as RecognizedPage } from 'tesseract.js';
 import sharp from 'sharp';
-import { mergeOcrLineReads, mergeOcrRegionWords, type OcrPage, type OcrLine } from './pdfOcr';
+import { mergeOcrLineReads, mergeOcrRegionWords, verifyOcrLineReads, applyOcrLineVerifications, paragraph2Boundary, ocrDistrictCode,
+    type OcrLineVerification, type OcrPage, type OcrLine } from './pdfOcr';
 import { pdfResourceOptions } from './pdfValidation';
 import { readComplaintSelections } from './pdfCheckboxes';
 
@@ -59,6 +60,7 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
             };
             let recognized = convert((await worker.recognize(image, { rotateAuto: true }, { text: true, blocks: true })).data);
             let passes = 1;
+            const verifiedLines: OcrLineVerification[] = [];
             if (recognized.confidence < 75 || !recognized.words.length) {
                 await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT });
                 const retry = convert((await worker.recognize(image, { rotateAuto: true }, { text: true, blocks: true })).data);
@@ -69,20 +71,47 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
             // Separate columns and form rules can confuse full-page segmentation.
             // Re-read caption blocks, not the whole document, for names/addresses.
             if (/complaint/i.test(recognized.text) && Math.abs(recognized.rotationRadians || 0) < 0.015) {
+                const initialRead=recognized.words.map(word=>({...word}));
+                const captionBlockReads: OcrLine[][]=[];
                 const districtLabels = recognized.words.filter(word => word.x < 220 && word.y > 45 && word.y < 110 && /^(?:judicial|district)$/i.test(word.text));
                 for (const word of recognized.words.filter(word => word.x < 200 && word.y > 45 && word.y < 110 &&
-                    word.confidence < 80 && (/^\d{1,3}[AB]?(?:-\d)?(?:st|nd|rd|th)$/i.test(word.text) ||
-                    districtLabels.some(label => label.x > word.x + word.width && label.x-word.x-word.width < 20 && Math.abs(label.y-word.y)<6)))) {
+                    (/^\d{1,3}[AB]?(?:-\d)?(?:st|nd|rd|th)?$/i.test(word.text) || word.confidence < 80 &&
+                    districtLabels.some(label => label.x > word.x + word.width && label.x-word.x-word.width < 20 && Math.abs(label.y-word.y)<6))).slice(0,4)) {
                     const crop = {left:Math.max(0,Math.floor((word.x-2)/xScale)),top:Math.max(0,Math.floor((word.y-2)/yScale)),
                         width:Math.ceil((word.width+4)/xScale),height:Math.ceil((word.height+4)/yScale)};
                     if (crop.left+crop.width>pixelWidth || crop.top+crop.height>pixelHeight) continue;
-                    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,tessedit_char_whitelist:'0123456789ABab-'});
-                    const bytes=await sharp(image).extract(crop).median(3).extend({top:24,bottom:24,left:24,right:24,background:'#fff'}).png().toBuffer();
-                    const reread=(await worker.recognize(bytes,{}, {text:true,blocks:true})).data;
-                    passes++;
-                    const district=reread.text.trim().toUpperCase().replace(/-(?=[AB]$)/,'');
-                    if (/^\d{1,3}[AB]?(?:-\d)?$/.test(district) && reread.confidence>=80) {
-                        word.text=district;word.confidence=reread.confidence;
+                    const original={...word}, reads: OcrLine[][]=[];
+                    await worker.setParameters({tessedit_pageseg_mode:PSM.SINGLE_LINE,tessedit_char_whitelist:''});
+                    for (const variant of ['cubic','median','lanczos3']) {
+                        let cropped=sharp(image).extract(crop);
+                        if(variant==='median')cropped=cropped.median(3);
+                        const width=Math.round((word.width+4)/xScale*2),resize=width/crop.width;
+                        const bytes=await cropped.resize({width,kernel:variant==='lanczos3'?'lanczos3':'cubic'})
+                            .extend({top:20,bottom:20,left:20,right:20,background:'#fff'}).png().toBuffer();
+                        const data=(await worker.recognize(bytes,{}, {text:true,blocks:true})).data;
+                        reads.push(convert(data,crop.left-20/resize,crop.top-20/resize,resize).words);passes++;
+                    }
+                    const code=ocrDistrictCode;
+                    const candidates=reads.filter(read=>read.length===1 && code(read[0].text) && read[0].confidence>=75).flat();
+                    const codes=new Set(candidates.map(candidate=>code(candidate.text)));
+                    const best=[...candidates].sort((a,b)=>b.confidence-a.confidence)[0];
+                    if (codes.size===1 && best?.confidence>=80 &&
+                        !(original.confidence>=80 && code(original.text) && code(original.text)!==code(best.text))) {
+                        word.text=best.text;word.confidence=best.confidence;
+                        const proof=verifyOcrLineReads([word],[original],reads,{left:word.x-1,top:word.y-1,
+                            right:word.x+word.width+1,bottom:word.y+word.height+1},'district');
+                        if(proof)verifiedLines.push(proof);
+                    } else if (codes.size<=1) {
+                        // Preserve the existing numeric recovery as an unverified value, never a consensus proof.
+                        await worker.setParameters({tessedit_char_whitelist:'0123456789ABab-'});
+                        const bytes=await sharp(image).extract(crop).median(3)
+                            .extend({top:24,bottom:24,left:24,right:24,background:'#fff'}).png().toBuffer();
+                        const data=(await worker.recognize(bytes,{}, {text:true,blocks:true})).data;passes++;
+                        const recovered=code(data.text);
+                        if (recovered && data.confidence>=80 &&
+                            !(original.confidence>=80 && code(original.text) && code(original.text)!==recovered)) {
+                            word.text=recovered;word.confidence=data.confidence;
+                        }
                     }
                 }
                 await worker.setParameters({tessedit_char_whitelist:''});
@@ -103,11 +132,11 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                 const defendant = right.find(row => /defendant.{0,8}name/i.test(row.text));
                 const attorney = left.find(row => /plaintiff.{0,8}attorney/i.test(row.text));
                 const states = rows(recognized.words).find(row => /\b(?:the\s+)?plaintiff\s+states\b/i.test(row.text));
-                const related = rows(recognized.words).find(row => /there is no other pending/i.test(row.text));
-                const captionLines:Array<{x:number;y:number;width:number;height:number;text:string}>=[];
+                const relatedY = paragraph2Boundary(recognized.words,attorney?.y);
+                const captionLines:Array<{x:number;y:number;width:number;height:number;text:string;kind?:'money'}>=[];
                 for (const [label, end, xMax, column] of [
                     [plaintiff, attorney?.y, 289, left], [defendant, states?.y, 585, right],
-                    [attorney, related?.y, 289, left],
+                    [attorney, relatedY, 289, left],
                 ] as const) {
                     if (!label || end === undefined || end <= label.y + 20) continue;
                     const xMin = Math.max(0, label.x - 1);
@@ -127,13 +156,19 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                     const block = convert(data, crop.left-padding, crop.top-padding);
                     passes++;
                     if (!block.words.length) continue;
+                    captionBlockReads.push(block.words);
                     recognized.words = mergeOcrRegionWords(recognized.words, block.words,
                         {left:xMin,top,right:xMax,bottom});
                     captionLines.push(...rows(recognized.words.filter(word=>word.x>=xMin && word.x+word.width<=xMax &&
                         word.y>=firstData.y && word.y<bottom)));
                 }
-                for (const line of captionLines.slice(0,18)) {
-                    const phone=/^[+()\d .-]{7,}$/.test(line.text),margin=phone?3.5:1.5,xMargin=phone?2:1;
+                const moneyLines=rows(recognized.words).filter(row=>/\bdamages\s+claimed|\btotal\s+rent\s+due\s+now/i.test(row.text))
+                    .flatMap(row=>recognized.words.filter(word=>word.x>row.x+60 && Math.abs(word.y-row.y)<8 &&
+                        /^\$?[\d,]+(?:\.\d{1,6})?$/.test(word.text)).map(word=>({...word,kind:'money' as const}))).slice(0,2);
+                for (const line of [...captionLines.slice(0,18),...moneyLines]) {
+                    const money=line.kind==='money';
+                    const phone=!money && /^[+()\d .-]{7,}$/.test(line.text) && [10,11].includes(line.text.replace(/\D/g,'').length);
+                    const margin=phone?3.5:money?3:1.5,xMargin=phone?2:money?3:1;
                     const crop={left:Math.max(0,Math.floor((line.x-xMargin)/xScale)),top:Math.max(0,Math.floor((line.y-margin)/yScale)),
                         width:Math.ceil((line.width+xMargin*2)/xScale),height:Math.ceil((line.height+margin*2)/yScale)};
                     if(crop.width<=0 || crop.height<=0 || crop.left+crop.width>pixelWidth || crop.top+crop.height>pixelHeight) continue;
@@ -165,11 +200,16 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                             word.text.replace(/\D/g,'').length<=11):reread);
                         passes++;
                     }
-                    recognized.words=mergeOcrLineReads(recognized.words,reads,{left:line.x-1,top:line.y-1.5,
-                        right:line.x+line.width+1,bottom:line.y+line.height+1.5},phone);
+                    const region={left:line.x-(money?4:1),top:line.y-1.5,right:line.x+line.width+1,bottom:line.y+line.height+1.5};
+                    const before=recognized.words;
+                    recognized.words=mergeOcrLineReads(before,reads,region,phone);
+                    const proof=verifyOcrLineReads(recognized.words,before,[...reads,initialRead,...captionBlockReads],region,
+                        phone?'phone':money?'money':'text');
+                    if(proof)verifiedLines.push(proof);
                 }
                 await worker.setParameters({tessedit_char_whitelist:''});
             }
+            recognized.words=applyOcrLineVerifications(recognized.words,verifiedLines);
             await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
             if (Math.abs(recognized.rotationRadians || 0) < 0.015) {
                 const raw = await sharp(image).toColourspace('srgb').ensureAlpha().raw().toBuffer({resolveWithObject:true});

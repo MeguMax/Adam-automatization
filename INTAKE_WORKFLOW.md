@@ -147,7 +147,7 @@ The Draft workspace opens on **Review**: court, parties, claim and included docu
 
 The primary action changes with the case: **Save & check**, **Review corrections**, **Confirm & prepare**, **View progress**, **Check result**, or **Open MiFILE**. Saving locks mutating controls until completion. Tab/disclosure selection, unsaved inputs and PDF navigation survive ordinary refreshes. Known-good new email intakes retain their existing automatic Unsubmitted preparation; incomplete packages still require correction, and uncertain remote results still require checking MiFILE before retrying.
 
-### Complaint confidence and source conflicts (version 9)
+### Complaint confidence and source conflicts (version 10)
 
 Flattened Complaints use the same person/entity splitting as interactive PDF
 fields and OCR, including comma-separated parties and company suffixes. The
@@ -161,8 +161,25 @@ A paragraph number beside the attorney's street address no longer becomes part
 of that address. Low-confidence court, Plaintiff, Defendant and attorney groups
 produce separate review notes. Each note opens the matching Case data control,
 including folded attorney/setup sections, instead of the generic source panel.
-Scanning still requires review; a high average OCR score is not proof that all
-party names, addresses or checkbox answers are correct.
+A high average OCR score alone never clears scan review. Version 10 records
+bounded repeat reads of caption regions/lines and the court code. At least two
+clear reads must agree with the final value, and any legible contrary result
+retains review. Phone formatting and the `32-A`/`32A` suffix are normalized, but
+different digits, party names and court divisions are not treated as equivalent.
+The paragraph-2 boundary tolerates split OCR rows. Local paper tone is separated
+from faint checkbox marks; missing geometry and underexposed boxes stay unknown.
+
+The generic scan warning clears only when all required field groups have been
+independently verified, addresses are complete, paragraphs 2/10 and the exact
+claim are known, and no other source warnings remain. Related-action scans
+requiring additional details and multi-page Complaint scans still need review.
+A nonzero money claim requires corroborating amount reads, not just one high
+OCR score. Uncorroborated totals remain filled but cannot clear automatic review;
+different digits, negative signs and nonzero fractional cents cannot be ignored.
+Stored `scanVerification`
+identifies complete/unresolved groups, and Activity shows **Scan cross-check**.
+This cross-check concerns the source PDF, not a waiver of package completeness,
+the authorized Devlin filer, manual-edit protection or the Unsubmitted limit.
 
 For standard LT Drafts, repeated PDF widgets with identical values are allowed. Conflicting values are
 not resolved by page order or by taking the last widget. Conflicting party or
@@ -183,7 +200,7 @@ replayed by this change. Final payment and court submission remain hard-disabled
 
 ### Scan recognition and package completeness (version 7)
 
-The extractor re-reads bounded caption rows with independent image preprocessings. A spelling supported by multiple reads can replace a conflicting OCR suggestion, but remains low-confidence for review. Repeated high-confidence words elsewhere in the same Complaint protect against a corrupted alternative reading. Small telephone rows are rendered separately at 300 DPI rather than losing detail to the full-page pixel cap. Court headings, party names, addresses, ZIP+4 values and telephone numbers remain Complaint-derived; no client-specific names or phone numbers are embedded in the extractor. The two most recent OCR results may be reused in memory for two minutes, by exact PDF hash and page selection, with defensive copies. This avoids reading the same scan twice during recognition and extraction.
+The extractor re-reads bounded caption rows with independent image preprocessings. A spelling supported by multiple reads can replace a conflicting OCR suggestion; unconfirmed changes remain low-confidence for review. Version 10 may verify a corrected row only with corroborating reads and no legible conflict. Repeated high-confidence words elsewhere in the same Complaint protect against a corrupted alternative reading. Small telephone rows are rendered separately at 300 DPI rather than losing detail to the full-page pixel cap. Court headings, party names, addresses, ZIP+4 values and telephone numbers remain Complaint-derived; no client-specific names or phone numbers are embedded in the extractor. The two most recent OCR results may be reused in memory for two minutes, by exact PDF hash and page selection, with defensive copies. This avoids reading the same scan twice during recognition and extraction.
 
 Document **contents** are independent of the MiFILE Filing Type and Other/Connected routing. Supporting titles can describe a Demand, Notice, Deed, Lease or Affidavit, but this is optional metadata, not a legal-sufficiency gate. As clarified by the attorney, one supplied supporting PDF remains one upload even if several ancillary kinds appear within it. Core-document conflicts and out-of-scope motions still require review.
 

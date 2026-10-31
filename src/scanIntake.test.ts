@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createCanvas } from '@napi-rs/canvas';
-import { recognizeScannedPdf, mergeOcrRegionWords, mergeOcrLineReads, type OcrLine } from './pdfOcr';
+import { recognizeScannedPdf, mergeOcrRegionWords, mergeOcrLineReads, verifyOcrLineReads, applyOcrLineVerifications,
+    paragraph2Boundary, ocrDistrictCode, type OcrLine } from './pdfOcr';
 import { parseScannedComplaint } from './complaintExtractor';
 import { inspectFilingPdf } from './pdfValidation';
 import { isProcessingReportSubject } from './processingReport';
@@ -13,6 +14,93 @@ import { districtCode, planFormImport, planFormImports, resolveCourt } from './c
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { recognizeDocumentText } from './documentRecognition';
+
+test('OCR verification needs two clear reads and rejects legible contradictions or a changed final line',()=>{
+    const word=(text:string,confidence=95,x=40):OcrLine=>({text,confidence,x,y:150,width:100,height:10,pageNumber:1});
+    const region={left:39,top:149,right:250,bottom:162},source=[word('Example Tenant')];
+    const proof=verifyOcrLineReads(source,source,[[word('Example Tenant')],[word('Example Tenant',91)]],region)!;
+    assert.ok(proof);assert.equal(proof.confirmingReads,2);
+    assert.equal(applyOcrLineVerifications(source,[proof])[0].verifiedByConsensus,true);
+    assert.equal(verifyOcrLineReads(source,source,[[word('Example Tenant')]],region),null);
+    assert.equal(verifyOcrLineReads(source,source,[[word('Example Tenant')],[word('Example Tenant')],[word('Other Tenant',76)]],region),null);
+    assert.equal(verifyOcrLineReads(source,[word('Other Tenant',93)],[[word('Example Tenant')],[word('Example Tenant')]],region),null);
+    assert.equal(applyOcrLineVerifications([word('Changed Tenant')],[proof])[0].verifiedByConsensus,false);
+    assert.equal(applyOcrLineVerifications(source,[{...proof,confirmingReads:NaN}])[0].verifiedByConsensus,false);
+    assert.equal(verifyOcrLineReads(source,source,[[{...word('Example Tenant'),pageNumber:2}],[word('Example Tenant')]],region),null);
+});
+
+test('phone verification ignores formatting, not differing digits, and may confirm a low-confidence repair',()=>{
+    const word=(text:string,confidence=95):OcrLine=>({text,confidence,x:40,y:150,width:100,height:10,pageNumber:1});
+    const region={left:39,top:149,right:250,bottom:162},source=[word('313-555-0123',79)];
+    const reads=[[word('(313) 555-0123')],[word('1 313 555 0123')]];
+    assert.ok(verifyOcrLineReads(source,[word('313-555-0128',50)],reads,region,'phone'));
+    assert.equal(verifyOcrLineReads(source,source,[...reads,[word('313-555-0128')]],region,'phone'),null);
+    assert.equal(verifyOcrLineReads(source,source,[[word('313555012300')],reads[0]],region,'phone'),null);
+});
+
+test('district verification normalizes a suffix separator without collapsing an actual division',()=>{
+    assert.equal(ocrDistrictCode('32-A'),'32A');assert.equal(ocrDistrictCode('29th'),'29');
+    assert.equal(ocrDistrictCode('41A-2'),'41A-2');assert.equal(ocrDistrictCode('az-a'),null);
+    const word=(text:string):OcrLine=>({text,confidence:95,x:40,y:80,width:20,height:10,pageNumber:1});
+    const region={left:39,top:79,right:65,bottom:92};
+    assert.ok(verifyOcrLineReads([word('32A')],[word('32A')],[[word('32-A')],[word('32A')]],region,'district'));
+    assert.equal(verifyOcrLineReads([word('41A-1')],[word('41A-1')],[[word('41A-2')],[word('41A-1')]],region,'district'),null);
+});
+
+test('money verification compares exact cents and rejects altered digits or nonzero fractional cents',()=>{
+    const word=(text:string):OcrLine=>({text,confidence:95,x:180,y:715,width:60,height:8,pageNumber:1});
+    const region={left:179,top:714,right:245,bottom:725},source=[word('1991.50')];
+    assert.ok(verifyOcrLineReads(source,source,[[word('1,991.50')],[word('1991.500000')]],region,'money'));
+    assert.equal(verifyOcrLineReads(source,source,[[word('1991.50')],[word('1997.50')]],region,'money'),null);
+    assert.equal(verifyOcrLineReads(source,source,[[word('1991.501')],[word('1991.50')]],region,'money'),null);
+    const signed=[{...word('-'),x:170,width:4},...source];
+    assert.equal(verifyOcrLineReads(signed,signed,[[word('1991.50')],[word('1991.50')]],
+        {...region,left:169},'money'),null,'A separate sign must not disappear from verification');
+});
+
+test('paragraph 2 bounds survive split OCR rows without treating an address as the boundary',()=>{
+    const word=(text:string,x:number,y:number):OcrLine=>({text,x,y,width:40,height:8,confidence:95,pageNumber:1});
+    const words=[word('There',40,230),word('Street',80,230),word('2.',45,275),word('There',70,275),
+        word('no',110,277),word('other pending civil action',130,275)];
+    assert.equal(paragraph2Boundary(words,200),271);
+    assert.equal(paragraph2Boundary(words.slice(0,2),200),undefined);
+    assert.equal(paragraph2Boundary(words,undefined),undefined);
+});
+
+function verifiedScanWords():OcrLine[] {
+    return [
+        ['25th',40,80],['Plaintiff name, address',40,130],['Example Property LLC',40,146],
+        ['Defendant name, address',326,130],['Morgan Tenant, and all other occupants',326,146],
+        ['200 Rental Avenue',326,160],['Lincoln Park, MI 48146',326,174],['v',307,165],
+        ["Plaintiff's attorney, bar no.",40,202],['Alex Attorney P70000',40,220],
+        ['200 Legal Street',40,232],['Lincoln Park, MI 48146',40,244],['313-555-0123',40,256],
+        ['The plaintiff states:',326,215],['2. There is no other pending civil action',40,280],
+    ].map(([text,x,y])=>({text:String(text),x:Number(x),y:Number(y),width:150,height:8,confidence:95,pageNumber:1,
+        verifiedByConsensus:!String(text).includes('name,') && !String(text).includes('attorney,')}));
+}
+
+test('only complete independently verified scans can clear the generic scan-review gate',()=>{
+    const run=(words:OcrLine[],selections={noRelated:true,previousRelated:false,money:false})=>parseScannedComplaint([{
+        text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT\n'+words.map(w=>w.text).join('\n'),
+        confidence:95,lines:words,words,selections,
+    }]);
+    const ready=run(verifiedScanWords());
+    assert.deepEqual(ready.scanVerification!.unresolvedFields,[]);
+    assert.equal(ready.warnings.length,0);
+    assert.equal(ready.data.claimAmount,'0.00');
+    const unchecked=run(verifiedScanWords().map(w=>({...w,verifiedByConsensus:false})));
+    assert.ok(unchecked.warnings.some(w=>w.code==='scan_review'),'High model confidence alone cannot waive review');
+    const missing=run(verifiedScanWords().filter(w=>w.text!=='200 Rental Avenue'));
+    assert.ok(missing.scanVerification!.unresolvedFields.includes('defendants'));
+    assert.ok(missing.warnings.some(w=>w.code==='scan_review'));
+    const uncertain=run(verifiedScanWords(),{noRelated:true,previousRelated:undefined as any,money:false});
+    assert.ok(uncertain.scanVerification!.unresolvedFields.includes('relatedCivilAction'));
+    assert.ok(uncertain.warnings.some(w=>w.code==='scan_review'));
+    const multiple=parseScannedComplaint([{text:'COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT\n'+verifiedScanWords().map(w=>w.text).join('\n'),
+        confidence:95,lines:[],words:verifiedScanWords(),selections:{noRelated:true,previousRelated:false,money:false}}],2);
+    assert.equal(multiple.scanVerification!.complete,false);
+    assert.ok(multiple.warnings.some(w=>w.code==='scan_review'));
+});
 
 test('Advice prose mentioning summons is not a second document title', () => {
     const advice = recognizeDocumentText(['Advice of Rights and Information (Landlord-Tenant)\nYou can file a motion before the date listed on the\nsummons, or ask the court in person at the first court hearing.'], '');

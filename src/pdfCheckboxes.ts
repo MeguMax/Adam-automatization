@@ -19,12 +19,13 @@ export function mergeComplaintSelections(observations: ComplaintSelections[]): C
 export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: number, height: number,
     anchor: CheckboxAnchor): boolean | undefined {
     const sx = width / 612, sy = height / 792;
-    const dark = (x: number, y: number, threshold = 175) => {
+    const shade = (x: number, y: number) => {
         const px = Math.round(x * sx), py = Math.round(y * sy);
-        if (px < 0 || py < 0 || px >= width || py >= height) return false;
+        if (px < 0 || py < 0 || px >= width || py >= height) return 255;
         const i = (py * width + px) * 4;
-        return pixels[i + 3] > 100 && (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3 < threshold;
+        return pixels[i + 3] > 100 ? (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3 : 255;
     };
+    const dark = (x: number, y: number) => shade(x,y) < 175;
     let best: { score: number; x: number; y: number; side: number } | undefined;
     // Flattened SCAO forms include 8.75pt squares with thin, quarter-point borders.
     for (let side = 7; side <= 11; side += 0.25) {
@@ -45,14 +46,20 @@ export function readCheckboxBeforeAnchor(pixels: Uint8ClampedArray, width: numbe
         }
     }
     if (!best) return;
-    let ink = 0, faintInk = 0, samples = 0;
+    const interior: number[] = [];
     for (let x = best.x + 2; x <= best.x + best.side - 2; x += 0.3) {
         for (let y = best.y + 2; y <= best.y + best.side - 2; y += 0.3) {
-            ink += Number(dark(x, y)); faintInk += Number(dark(x, y,235)); samples++;
+            interior.push(shade(x,y));
         }
     }
-    const density = ink / samples;
-    return density > 0.14 ? true : density < 0.025 && faintInk / samples < 0.025 ? false : undefined;
+    const density = interior.filter(value=>value<175).length / interior.length;
+    // A scan's paper tone is not a mark. Require visible contrast against the local background.
+    const background = [...interior].sort((a,b)=>a-b)[Math.floor(interior.length*0.9)];
+    if (background < 210) return;
+    if (density > 0.14) return true;
+    const faintThreshold = Math.min(235,background-12);
+    return density < 0.025 && interior.filter(value=>value<faintThreshold).length / interior.length < 0.025
+        ? false : undefined;
 }
 
 export function readComplaintSelections(pixels: Uint8ClampedArray, width: number, height: number,

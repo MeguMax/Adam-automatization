@@ -51,7 +51,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-10-31-archive-recognition-v93';
+const WORKER_BUILD_ID = '2026-10-31-scan-consensus-v94';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;

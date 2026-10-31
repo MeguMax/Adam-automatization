@@ -2,11 +2,11 @@ import { createHash } from 'crypto';
 import path from 'path';
 import { validatePdfBuffer, pdfResourceOptions } from './pdfValidation';
 import { documentLabel } from './documentRecognition';
-import { recognizeScannedPdf, OcrPage, OcrLine } from './pdfOcr';
+import { recognizeScannedPdf, paragraph2Boundary, ocrDistrictCode, OcrPage, OcrLine } from './pdfOcr';
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, mergeComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 9;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 10;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -61,7 +61,14 @@ export interface ComplaintExtractionWarning {
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
     contentHash?: string;
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+    scanVerification?: {
+        version: 1;
+        method: 'independent_region_reads';
+        complete: boolean;
+        verifiedFields: Array<keyof ComplaintExtractionData>;
+        unresolvedFields: Array<keyof ComplaintExtractionData>;
+    };
     extractionMethod?: 'form_fields' | 'positioned_text' | 'ocr';
     formType: string | null;
     pageCount: number;
@@ -776,7 +783,7 @@ export async function extractComplaintPdf(
             delete recovered.fieldConfidence.claimAmount;
             recovered.warnings.push({code:'claim_amount_review',message:'The paragraph 10 checkbox could not be verified from the page.'});
         }
-        recovered = applyVisualComplaintSelections(recovered, selections, layoutPages);
+        recovered = finalizeScanVerification(applyVisualComplaintSelections(recovered, selections, layoutPages));
         return {...recovered, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION,
             contentHash:createHash('sha256').update(buffer).digest('hex')};
     } finally {
@@ -814,6 +821,7 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
         if (selections.noRelated) result.warnings = result.warnings.filter(w => w.code !== 'related_action_review');
     }
     if (!conflicts.has('money') && selections.money !== undefined) {
+        let amountVerified=selections.money===false;
         result.data.moneyJudgmentRequested = selections.money;
         result.fieldConfidence.moneyJudgmentRequested = 'high';
         if (!selections.money) result.data.claimAmount = '0.00';
@@ -821,6 +829,7 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
             delete result.data.claimAmount;
             delete result.fieldConfidence.claimAmount;
             const candidates: string[] = [];
+            const verifiedAmounts=new Set<string>();
             for (const page of pages) {
                 for (const anchor of page.words.filter(word => /damages/i.test(word.text) && word.confidence >= 80)) {
                     const line = page.words.filter(word => word.pageNumber === anchor.pageNumber && Math.abs(word.y - anchor.y) < 5 && word.x >= anchor.x)
@@ -828,7 +837,10 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
                     if (!/^damages\s+claimed\s*:/i.test(line.map(word=>word.text).join(' '))) continue;
                     const amount = line.filter(word => word.confidence >= 90)
                         .map(word => normalizedMoney(word.text)).filter((value): value is string => !!value);
-                    if (amount.length === 1) candidates.push(amount[0]);
+                    if (amount.length === 1) {
+                        candidates.push(amount[0]);
+                        if(line.some(word=>word.verifiedByConsensus && normalizedMoney(word.text)===amount[0]))verifiedAmounts.add(amount[0]);
+                    }
                     else if (!amount.length && line.every(word=>word.confidence>=90)) {
                         const combined=line.map(word=>word.text).join(' ').match(/^damages\s+claimed\s*:\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*$/i);
                         const total=combined && normalizedMoney(combined[1]);
@@ -836,7 +848,7 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
                     }
                 }
             }
-            if (new Set(candidates).size === 1) result.data.claimAmount = candidates[0];
+            if (new Set(candidates).size === 1) {result.data.claimAmount = candidates[0];amountVerified=verifiedAmounts.has(candidates[0]);}
             else if (new Set(candidates).size > 1) result.warnings.push({code:'source_conflict',field:'claimAmount',
                 message:'The Complaint contains different damages totals. Check paragraph 10 and enter the correct total claim amount.'});
         } else if (!amountConflict && selections.rent === true && selections.damages === false) {
@@ -844,19 +856,23 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
             delete result.fieldConfidence.claimAmount;
             const words = pages.flatMap(page => page.words);
             const amounts: string[] = [];
+            const verifiedAmounts=new Set<string>();
             for (const label of words.filter(word => /total rent due now is/i.test(word.text) && word.confidence >= 80)) {
-                const candidates = words.filter(word => word.pageNumber === label.pageNumber &&
+                const candidateWords = words.filter(word => word.pageNumber === label.pageNumber &&
                     word.x >= label.x + label.width - 2 && word.x < label.x + label.width + 100 &&
-                    word.confidence >= 90 && Math.abs(word.y - label.y) < 8)
-                    .map(word => normalizedMoney(word.text)).filter((amount): amount is string => !!amount);
-                if (candidates.length === 1) amounts.push(candidates[0]);
+                    word.confidence >= 90 && Math.abs(word.y - label.y) < 8);
+                const candidates=candidateWords.map(word => normalizedMoney(word.text)).filter((amount): amount is string => !!amount);
+                if (candidates.length === 1) {
+                    amounts.push(candidates[0]);
+                    if(candidateWords.some(word=>word.verifiedByConsensus && normalizedMoney(word.text)===candidates[0]))verifiedAmounts.add(candidates[0]);
+                }
             }
-            if (new Set(amounts).size === 1) result.data.claimAmount = amounts[0];
+            if (new Set(amounts).size === 1) {result.data.claimAmount = amounts[0];amountVerified=verifiedAmounts.has(amounts[0]);}
             else if (new Set(amounts).size > 1) result.warnings.push({code:'source_conflict',field:'claimAmount',
                 message:'The Complaint contains different total-rent amounts. Check the source and enter the correct total claim amount.'});
         }
         if (result.data.claimAmount) {
-            result.fieldConfidence.claimAmount = 'high';
+            result.fieldConfidence.claimAmount = result.textSource==='ocr' && !amountVerified ? 'medium' : 'high';
             result.warnings = result.warnings.filter(w => w.code !== 'claim_amount_review');
         } else if (!result.warnings.some(warning => warning.code === 'claim_amount_review' ||
             (warning.code === 'source_conflict' && warning.field === 'claimAmount'))) {
@@ -868,8 +884,35 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
 }
 
 export function parseScannedComplaint(pages: OcrPage[], pageCount = pages.length): ComplaintExtractionResult {
-    return applyVisualComplaintSelections(parseLayoutComplaint(pages, pageCount, 'ocr'),
-        mergeComplaintSelections(pages.map(page => page.selections || {})), pages);
+    return finalizeScanVerification(applyVisualComplaintSelections(parseLayoutComplaint(pages, pageCount, 'ocr'),
+        mergeComplaintSelections(pages.map(page => page.selections || {})), pages));
+}
+
+export function finalizeScanVerification(result: ComplaintExtractionResult): ComplaintExtractionResult {
+    if (result.textSource!=='ocr') return result;
+    const data=result.data;
+    const address=(party:ComplaintPartyExtraction|undefined)=>Boolean(party?.address1 && party.city &&
+        /^[A-Z]{2}$/.test(party.state || '') && /^\d{5}(?:-\d{4})?$/.test(party.postalCode || ''));
+    const requirements: Array<[keyof ComplaintExtractionData,boolean]> = [
+        ['courtDistrict',Boolean(data.courtDistrict)],['plaintiff',Boolean(data.plaintiff?.displayName)],
+        ['defendants',Boolean(data.defendants?.length && data.defendants.every(party=>party.displayName && address(party)))],
+        ['attorney',Boolean(data.attorney?.displayName && data.attorney.barNumber && address(data.attorney))],
+        ['includeAllOtherOccupants',typeof data.includeAllOtherOccupants==='boolean'],
+        ['relatedCivilAction',data.relatedCivilAction==='none'],
+        ['moneyJudgmentRequested',typeof data.moneyJudgmentRequested==='boolean'],
+        ['claimAmount',typeof data.claimAmount==='string' && /^\d+\.\d{2}$/.test(data.claimAmount) &&
+            (data.moneyJudgmentRequested!==false || data.claimAmount==='0.00')],
+    ];
+    const verifiedFields=requirements.filter(([field,present])=>present && result.fieldConfidence[field]==='high').map(([field])=>field);
+    const unresolvedFields=requirements.filter(([field])=>!verifiedFields.includes(field)).map(([field])=>field);
+    const complete=result.pageCount===1 && !unresolvedFields.length && !result.warnings.some(warning=>warning.code!=='scan_review');
+    result.scanVerification={version:1,method:'independent_region_reads',complete,verifiedFields,unresolvedFields};
+    if (complete) {
+        result.warnings=result.warnings.filter(warning=>warning.code!=='scan_review');
+    } else if (!result.warnings.some(warning=>warning.code==='scan_review')) {
+        result.warnings.push({code:'scan_review',message:'Some scan values could not be independently verified. Review the unresolved fields against the PDF.'});
+    }
+    return result;
 }
 
 function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf' | 'ocr'): ComplaintExtractionResult {
@@ -882,7 +925,7 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     result.fieldConfidence = {};
     result.warnings = result.warnings.filter(warning => !['missing_filled_section', 'missing_plaintiff', 'missing_defendant'].includes(warning.code));
     const first = pages.find(page => /plaintiff.{0,10}name/i.test(page.text) && /defendant.{0,10}name/i.test(page.text));
-    const words = first?.words || [];
+    const words = (first?.words || []).filter(word=>!(word.x>=285 && word.x<325 && /^v\.?$/i.test(word.text)));
     const groupLines = (items: OcrLine[]) => {
         const rows: OcrLine[][] = [];
         for (const word of [...items].sort((a, b) => a.y - b.y || a.x - b.x)) {
@@ -891,6 +934,7 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
         }
         return rows.map(row => ({ x: Math.min(...row.map(word => word.x)), y: row[0].y,
             confidence: Math.min(100, ...row.filter(word => /[a-z0-9]/i.test(word.text)).map(word => word.confidence)),
+            verified:row.filter(word=>/[a-z0-9&]/i.test(word.text)).every(word=>word.verifiedByConsensus===true),
             text: row.sort((a, b) => a.x - b.x).map(word => word.text).join(' ') }));
     };
     const statesAnchor = words.find(word => word.x >= 260 && word.x <= 340 &&
@@ -904,6 +948,11 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     const plaintiffLabel = left.find(line => /plaintiff.{0,8}name/i.test(line.text));
     const defendantLabel = right.find(line => /defendant.{0,8}name/i.test(line.text));
     const attorneyLabel = left.find(line => /plaintiff.{0,8}attorney/i.test(line.text));
+    const verifiedBetween=(rows:Array<{y:number;verified:boolean}>,start:number|undefined,end:number|undefined)=>{
+        if (start===undefined || end===undefined) return false;
+        const values=rows.filter(line=>line.y>start+6 && line.y<end-2);
+        return values.length>0 && values.every(line=>line.verified);
+    };
     function party(rows: Array<{y: number; text: string}>, start?: number, end?: number): ComplaintPartyExtraction | undefined {
         if (start === undefined || end === undefined) return;
         const values = rows.filter(line => line.y > start + 6 && line.y < end - 2)
@@ -919,11 +968,11 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     const plaintiff = party(left, plaintiffLabel?.y, attorneyLabel?.y);
     if (plaintiff) {
         result.data.plaintiff = { ...plaintiff, entityName: plaintiff.displayName };
-        result.fieldConfidence.plaintiff = source === 'pdf' ? 'high' : 'medium';
+        result.fieldConfidence.plaintiff = source === 'pdf' || verifiedBetween(left,plaintiffLabel?.y,attorneyLabel?.y) ? 'high' : 'medium';
     }
     const defendant = party(right, defendantLabel?.y, statesLabel?.y);
     if (defendant) {
-        applyDefendants(result, defendant, source === 'pdf' ? 'high' : 'medium');
+        applyDefendants(result, defendant, source === 'pdf' || verifiedBetween(right,defendantLabel?.y,statesLabel?.y) ? 'high' : 'medium');
     }
     const headerRows = groupLines(words.filter(word => word.y < (plaintiffLabel?.y || 180)));
     const header = headerRows.map(line => line.text).join('\n');
@@ -931,22 +980,27 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
     if (district) {
         result.data.courtDistrict = district[1].toUpperCase();
         const line = headerRows.find(row => row.text.includes(district[0]));
-        result.fieldConfidence.courtDistrict = source === 'pdf' ? 'high' : line && line.confidence < 80 ? 'low' : 'medium';
+        const confirmed=words.some(word=>word.y<(plaintiffLabel?.y || 180) && word.verifiedByConsensus &&
+            ocrDistrictCode(word.text)===district[1].toUpperCase());
+        result.fieldConfidence.courtDistrict = source === 'pdf' || confirmed ? 'high' : line && line.confidence < 80 ? 'low' : 'medium';
     }
     if (!district) {
         const candidates = words.filter(word => word.x < 150 && word.y > 65 && word.y < 110 && word.confidence >= (source === 'ocr' ? 50 : 80));
-        const codes = candidates.map(word => word.text.match(/^(\d{1,3}[AB]?(?:-\d)?)(?:st|nd|rd|th)$/i)?.[1]).filter(Boolean);
+        const codes = candidates.map(word => ocrDistrictCode(word.text)).filter(Boolean);
         if (new Set(codes).size === 1) {
             result.data.courtDistrict = codes[0]!.toUpperCase();
-            result.fieldConfidence.courtDistrict = candidates.some(word=>word.confidence<80) ? 'low' : 'medium';
+            const confirmed=candidates.some(word=>word.verifiedByConsensus &&
+                ocrDistrictCode(word.text)===result.data.courtDistrict);
+            result.fieldConfidence.courtDistrict = confirmed ? 'high' : candidates.some(word=>word.confidence<80) ? 'low' : 'medium';
         }
     }
     if (attorneyLabel) {
-        const end = [...left, ...right].filter(line => line.y > attorneyLabel.y && /^2\.|^there is no other pending/i.test(line.text)).sort((a,b)=>a.y-b.y)[0]?.y || attorneyLabel.y + 120;
+        const end = paragraph2Boundary(words,attorneyLabel.y) || attorneyLabel.y + 120;
         const rows = attorneyRows.filter(line => line.y > attorneyLabel.y + 6 && line.y < end - 2).map(line => line.text);
         const bar = rows[0]?.match(/\(?\bP\d{5,8}\b\)?/i);
         const attorney = partyFromLines([rows[0]?.replace(/\(?\bP\d{5,8}\b\)?/i, '').trim() || '', ...rows.slice(1)]);
-        if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() }; result.fieldConfidence.attorney = source === 'pdf' ? 'high' : 'medium'; }
+        if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() };
+            result.fieldConfidence.attorney = source === 'pdf' || verifiedBetween(attorneyRows,attorneyLabel.y,end) ? 'high' : 'medium'; }
     }
     result.data.mailingRequested = true;
     delete result.data.moneyJudgmentRequested;
@@ -960,9 +1014,9 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
             ['defendants', defendantLabel?.y, statesLabel?.y, right],
         ] as const) {
             if (start === undefined || end === undefined) continue;
-            if (rows.some(line => line.y > start + 6 && line.y < end - 2 && line.confidence < 80)) result.fieldConfidence[key] = 'low';
+            if (result.fieldConfidence[key]!=='high' && rows.some(line => line.y > start + 6 && line.y < end - 2 && line.confidence < 80)) result.fieldConfidence[key] = 'low';
         }
-        if (attorneyLabel && attorneyRows.some(line => line.y > attorneyLabel.y + 6 &&
+        if (result.fieldConfidence.attorney!=='high' && attorneyLabel && attorneyRows.some(line => line.y > attorneyLabel.y + 6 &&
             line.y < attorneyLabel.y + 65 && line.confidence < 80)) result.fieldConfidence.attorney = 'low';
         const uncertain = (['courtDistrict','plaintiff','defendants','attorney'] as const).filter(key=>result.fieldConfidence[key]==='low');
         for (const field of uncertain) result.warnings.push({code:'caption_review',field,

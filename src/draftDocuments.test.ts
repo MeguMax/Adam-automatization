@@ -10,7 +10,7 @@ import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
 import { recognizeDocumentText, recognizeDocumentPdf, type DocumentRecognition } from './documentRecognition';
-import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
+import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, finalizeScanVerification, type ComplaintExtractionResult } from './complaintExtractor';
 import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
 import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
 import { validCompletenessSnapshot } from './packageCompleteness';
@@ -742,6 +742,45 @@ test('manual blank values and party-list changes remain protected on automatic r
         assert.deepEqual(final.filingData.defendants,[]);
         assert.ok(final.validationIssues.some(issue=>issue.field==='filingData.plaintiff.address1'));
     } finally {f.close();}
+});
+
+test('verified scan upgrades preserve manual amounts, contact blanks and Defendant addresses',async()=>{
+    const f=fixture();
+    try {
+        const filing=structuredClone(f.db.getDraftDetail(f.draftId)!.caseDraft!.filingData);
+        filing.plaintiff.phone=null;
+        filing.defendants[0].address1='210 Manually Corrected Avenue';
+        filing.moneyJudgmentRequested=true;filing.claimAmount='850.00';
+        f.db.updateCaseDraft(f.draftId,{},undefined,filing);
+        const scan=finalizeScanVerification({...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            textSource:'ocr',extractionMethod:'ocr',warnings:[{code:'scan_review',message:'Scan needs verification'}],
+            data:{...structuredClone(extraction.data),includeAllOtherOccupants:true,
+                attorney:{displayName:'Adam J Devlin',barNumber:'P72877',...ADAM_OFFICE}},
+            fieldConfidence:Object.fromEntries(['courtDistrict','plaintiff','defendants','attorney','includeAllOtherOccupants',
+                'relatedCivilAction','moneyJudgmentRequested','claimAmount'].map(field=>[field,'high']))});
+        assert.equal(scan.scanVerification!.complete,true);
+        const result=await ensureDraftComplaintExtraction(f.db,f.draftId,{force:true,content:Buffer.from('mock scan'),extract:async()=>scan});
+        assert.equal(result.caseDraft!.filingData.plaintiff.phone,null);
+        assert.equal(result.caseDraft!.filingData.defendants[0].address1,'210 Manually Corrected Avenue');
+        assert.equal(result.caseDraft!.filingData.moneyJudgmentRequested,true);
+        assert.equal(result.caseDraft!.filingData.claimAmount,'850.00');
+        assert.equal(result.caseDraft!.complaintExtraction!.scanVerification!.complete,true);
+        assert.equal(f.db.queueValidatedIntakes(),0,'Manual edits still require explicit package confirmation');
+    }finally{f.close();}
+});
+
+test('a verified OCR scan cannot bypass the authorized-attorney requirement',()=>{
+    const f=fixture();
+    try {
+        const scan:ComplaintExtractionResult={...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            textSource:'ocr',warnings:[],scanVerification:{version:1,method:'independent_region_reads',complete:true,
+                verifiedFields:['attorney'],unresolvedFields:[]},data:{...structuredClone(extraction.data),
+                attorney:{displayName:'Another Attorney',barNumber:'P70000',...ADAM_OFFICE}}};
+        const result=f.db.applyComplaintExtraction(f.draftId,f.complaint,scan);
+        assert.ok(result.caseDraft!.validationIssues.some(issue=>issue.field==='filingData.attorney.barNumber' && issue.severity==='error'));
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve/);
+    }finally{f.close();}
 });
 
 test('automatic failures back off persistently without changing successful PDF download status',async()=>{

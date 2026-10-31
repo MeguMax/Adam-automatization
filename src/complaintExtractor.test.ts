@@ -310,6 +310,20 @@ test('thin quarter-point SCAO squares are read without relaxing mark or border t
     }
 });
 
+test('gray paper is distinguished from a faint mark, while underexposed boxes remain unknown',()=>{
+    for(const paper of ['#e6e6e6','#aaaaaa']) {
+        const canvas=createCanvas(1836,2376),context=canvas.getContext('2d');context.scale(3,3);
+        context.fillStyle=paper;context.fillRect(0,0,612,792);context.strokeStyle='#000';context.lineWidth=0.6;
+        const anchor={text:'10.',x:60,y:100,width:14,height:10};context.strokeRect(48,100,9,9);
+        const read=()=>readCheckboxBeforeAnchor(context.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height,anchor);
+        assert.equal(read(),paper==='#e6e6e6'?false:undefined);
+        if(paper==='#aaaaaa')continue;
+        context.strokeStyle='#aaa';context.lineWidth=0.6;context.beginPath();
+        context.moveTo(50,104);context.lineTo(52,107);context.lineTo(55,102);context.stroke();
+        assert.equal(read(),undefined,'A faint stroke on gray paper still requires review');
+    }
+});
+
 test('paragraph 10 uses explicitly referenced total rent, never the monthly rent or unselected damages',()=>{
     const make=()=>parseComplaintText('COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT');
     const pages=[{text:'',confidence:100,lines:[],words:[
@@ -337,6 +351,27 @@ test('selected explicit damages are read from grouped OCR words, not the monthly
     assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},conflict).data.claimAmount,undefined);
     const combined=[{...pages[0],words:[{...words[0],text:'Damages claimed: 1991.50',width:140}]}];
     assert.equal(applyVisualComplaintSelections(make(),{money:true,damages:true},combined).data.claimAmount,'1991.50');
+});
+
+test('an OCR money total remains filled but cannot become high-confidence without corroboration',()=>{
+    const make=()=>({...parseComplaintText(POSSESSION_ONLY_TEXT),textSource:'ocr' as const});
+    const words=[{text:'Damages claimed:',x:90,y:716,width:80,height:8,pageNumber:1,confidence:96},
+        {text:'1991.50',x:174,y:713,width:30,height:8,pageNumber:1,confidence:95}];
+    const page={text:'',confidence:95,lines:[],words};
+    const unverified=applyVisualComplaintSelections(make(),{money:true,damages:true},[page]);
+    assert.equal(unverified.data.claimAmount,'1991.50');assert.equal(unverified.fieldConfidence.claimAmount,'medium');
+    const confirmed=applyVisualComplaintSelections(make(),{money:true,damages:true},[{...page,
+        words:words.map(word=>({...word,verifiedByConsensus:true}))}]);
+    assert.equal(confirmed.fieldConfidence.claimAmount,'high');
+});
+
+test('verification of an equal number in another column cannot confirm the rent total',()=>{
+    const source={...parseComplaintText(POSSESSION_ONLY_TEXT),textSource:'ocr' as const};
+    const words=[{text:'d. Total rent due now is $',x:268,y:610,width:111,height:10,pageNumber:1,confidence:95},
+        {text:'2350.07',x:383,y:606,width:39,height:10,pageNumber:1,confidence:95},
+        {text:'2350.07',x:50,y:606,width:39,height:10,pageNumber:1,confidence:95,verifiedByConsensus:true}];
+    const result=applyVisualComplaintSelections(source,{money:true,rent:true,damages:false},[{text:'',confidence:95,lines:[],words}]);
+    assert.equal(result.data.claimAmount,'2350.07');assert.equal(result.fieldConfidence.claimAmount,'medium');
 });
 
 test('conflicting rent totals and damaged amount text cannot retain a previous automatic claim', () => {

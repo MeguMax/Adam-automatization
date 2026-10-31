@@ -1,5 +1,41 @@
 # Offline acceptance and worker progress
 
+## Independently cross-checked scans (v94)
+
+Extractor version 10 verifies recognized caption lines with at least two clear
+OCR reads and rejects any legible contrary read, different page or changed final
+line. Original high-confidence disagreements are not silently corrected.
+Court codes receive enlarged crop reads; suffix punctuation may normalize, but
+different divisions remain distinct. Paragraph-2 boundaries tolerate row splits
+without including pleading text in the attorney block. Gray paper is measured
+against local background contrast; faint marks and underexposed boxes still
+retain uncertainty. A scan passes only with complete, cross-checked parties,
+addresses, court, paragraph answers and claim, without other source warnings.
+
+The real Warady scan now passes the full offline package workflow with all eight
+required groups cross-checked and no scan/field warnings. The supplied suite has
+nine passing scenarios and 64 exact field expectations: six ready and three
+correctly under review. Missing Request, Beatty's ambiguous paragraph 2 and the
+non-Devlin Pringle filer are not bypassed. The 17-file archived corpus retains
+all 138 checks. Payment and court submission remain disabled.
+
+Five additional archived Complaints were forced through rendered-image OCR
+without their usable text layers as an adversarial check. These difficult
+rasterizations did not match every expected value and are not counted as
+recognition successes. All retained review and none was automatically accepted.
+This is not a claim of universal scan accuracy or independent OCR models.
+
+Money totals also require corroboration of the exact cents, not a single model
+confidence score. Unverified totals remain available for correction but cannot
+clear scan review. Multi-page Complaint scans retain review even if their first
+page is legible.
+
+All 360 automated tests passed, including manual amount/address/blank-contact
+preservation, ambiguous marks, missing values, OCR disagreement, stale proof and
+authorized-filer gates. Evidence stays private under
+`output/qa-scan-confidence-2026-10-31/`. Verification creates no live MiFILE jobs,
+payments or submissions and never rewrites source files in OneDrive.
+
 ## Additional archived documents (v93)
 
 `npm run test:recognition-corpus -- --manifest C:\private\corpus.json --output C:\private\results`
