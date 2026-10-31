@@ -213,7 +213,7 @@ export class MiFileFilingRunner {
         }
         this.validateConnectedPackage(job.payload.documents);
         if (!validCompletenessSnapshot(job.payload)) {
-            throw new MiFileFilingError('Supporting-document completeness is missing or outdated. Review the Demand/Notice requirement before preparation.',
+            throw new MiFileFilingError('The supplied PDF package snapshot is missing or outdated. Review and confirm the current package before preparation.',
                 'PACKAGE_COMPLETENESS_UNCONFIRMED','starting');
         }
         const runtimeConfig = getMiFileRuntimeConfig();

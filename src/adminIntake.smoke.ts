@@ -475,7 +475,8 @@ async function main() {
             await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
         };
         const contents=ancillaryRow.locator('[data-document-field="supportingKind"]');
-        const requiredSupport=page.locator('[data-draft-field="supportingRequirement"]');
+        assert.equal(await page.locator('[data-draft-field="supportingRequirement"]').count(),0);
+        assert.match(await page.locator('[data-supporting-requirement-status]').innerText(),/1 supporting PDF/);
         assert.equal(await contents.inputValue(),'demand');
         const missingPins=await context.request.patch(`${url}/api/drafts/${draftId}`,{headers:{Origin:url},data:{fields:{},documents:[{
             id:ancillary.id,filingType:ancillary.filingType,filingName:ancillary.filingName,filingRelation:'separate',
@@ -491,22 +492,17 @@ async function main() {
         assert.equal(missingContext.status(),409);
         assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
         await contents.selectOption('deed');await saveSupporting();
-        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting'));
+        assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
         await ancillaryRow.locator('[data-document-field="filingType"]').fill('Other');await saveSupporting();
         assert.equal(db.getDraftDetail(draftId)!.documents.find(doc=>doc.id===ancillary.id)!.supportingEvidence!.kind,'deed');
-        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting'));
-        await requiredSupport.selectOption('none');
-        await page.locator('[data-draft-field="supportingRequirementReason"]').fill('Attorney reviewed the exception for this synthetic QA case.');
-        await saveSupporting();
         assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
-        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.source,'manual');
+        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.source,'attorney_policy');
         await contents.selectOption('other');await saveSupporting();
-        assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.reviewStale,true);
-        await page.locator('[data-review-supporting-requirement]').click();await saveSupporting();
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.packageCompleteness.reviewStale,false);
-        await requiredSupport.selectOption('auto');await saveSupporting();
-        assert.ok(db.getDraftDetail(draftId)!.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting'));
+        assert.deepEqual(db.getDraftDetail(draftId)!.caseDraft!.validationIssues,[]);
         await page.getByRole('heading',{name:'Supporting documents',exact:true}).click();
+        await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
+        await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
         await page.screenshot({path:path.join(screenshots,'draft-supporting-completeness-desktop.png'),fullPage:true});
         await page.setViewportSize({width:390,height:844});
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
     DOCUMENT_RECOGNITION_VERSION,
+    applySuppliedSupportingPolicy,
     recognizeDocumentPages,
     recognizeDocumentPdf,
     recognizeDocumentText,
@@ -13,6 +14,28 @@ import { testPdfFixture } from './testPdfFixture';
 import type { OcrPage } from './pdfOcr';
 
 const pdfOcr = require('./pdfOcr') as typeof import('./pdfOcr');
+
+test('verified supplied supporting PDFs need no semantic title, while core guesses, conflicts and motions remain protected',async()=>{
+    const pdf=testPdfFixture('Additional supporting evidence supplied by the attorney. '.repeat(3));
+    for(const name of ['Example T Other 01.pdf','exhibit-12.pdf','Lease.pdf']) {
+        const raw=await recognizeDocumentPdf(pdf,name),result=applySuppliedSupportingPolicy(raw,name);
+        assert.equal(raw.pdfVerified,true);assert.equal(result.role,'ancillary');assert.equal(result.source,'supplied');
+        assert.equal(result.contentHash,raw.contentHash);
+    }
+    for(const name of ['Complaint.pdf','Summons.pdf','Request.pdf','Advice.pdf','Local.pdf','Motion.pdf']) {
+        const raw=await recognizeDocumentPdf(pdf,name);
+        assert.deepEqual(applySuppliedSupportingPolicy(raw,name),raw);
+    }
+    const motion=await recognizeDocumentPdf(testPdfFixture('MOTION FOR SUMMARY DISPOSITION'),'Other.pdf');
+    assert.equal(motion.outOfScope,true);assert.deepEqual(applySuppliedSupportingPolicy(motion,'Other.pdf'),motion);
+    const conflict={...recognizeDocumentText(['COMPLAINT\nSUMMONS'],'Other.pdf'),pdfVerified:true,contentHash:'a'.repeat(64)};
+    assert.equal(applySuppliedSupportingPolicy(conflict,'Other.pdf').source,'conflict');
+    const broken=await recognizeDocumentPdf(Buffer.from('Not a PDF'),'Other.pdf');
+    assert.equal(broken.pdfVerified,false);assert.equal(applySuppliedSupportingPolicy(broken,'Other.pdf').role,'unknown');
+    const legacy={...recognizeDocumentText(['Additional evidence '.repeat(12)],'exhibit.pdf'),textSource:'pdf' as const,contentHash:'a'.repeat(64)};
+    assert.equal(applySuppliedSupportingPolicy(legacy,'exhibit.pdf').source,'unknown');
+    assert.equal(applySuppliedSupportingPolicy({...legacy,pdfVerified:true},'exhibit.pdf').source,'supplied');
+});
 
 function assertMetadata(result: DocumentRecognition, content: Buffer) {
     assert.equal(result.contentHash, createHash('sha256').update(content).digest('hex'));
@@ -104,7 +127,7 @@ test('supporting evidence is bounded to the first 24 nonempty lines on each page
     assert.equal(recognizeDocumentText(['Cover sheet', 'NOTICE TO QUIT'], '').supportingKind, 'notice_to_quit');
 });
 
-test('different ancillary kinds require review within one page or across pages', () => {
+test('different supporting kinds retain their source PDF without implying a split or a legal requirement', () => {
     for (const pages of [
         ['DEMAND FOR POSSESSION\nLEASE AGREEMENT'],
         ['DEMAND FOR POSSESSION', "SHERIFF'S DEED"],
@@ -115,7 +138,7 @@ test('different ancillary kinds require review within one page or across pages',
         assert.equal(result.role, 'ancillary');
         assert.equal(result.source, 'content');
         assert.equal(result.supportingKind, 'unknown');
-        assert.match(result.supportingMessage!, /several supporting-document kinds.*manual review/i);
+        assert.match(result.supportingMessage!, /several supporting-document kinds.*retained as supplied/i);
     }
     assert.equal(recognizeDocumentText(['DEMAND FOR POSSESSION', 'DEMAND FOR POSSESSION'], '').supportingKind, 'demand');
 });

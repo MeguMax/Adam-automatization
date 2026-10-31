@@ -54,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-31-excel-self-service-v89';
+const ADMIN_BUILD_ID = '2026-10-31-supplied-supporting-v90';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2633,12 +2633,15 @@ const html = String.raw`<!doctype html>
     }
     .draft-document-status {
       display: flex;
+      flex-wrap: wrap;
+      min-width: 0;
       align-items: center;
       gap: 6px;
       margin-top: 4px;
       color: var(--muted);
       font-size: 10px;
     }
+    .draft-document-status > span { max-width: 100%; overflow-wrap: anywhere; }
     .draft-document-status .status {
       font-size: 9px;
     }
@@ -5369,36 +5372,13 @@ const html = String.raw`<!doctype html>
           '</div>' +
         '</section>';
 
-      const completeness = draft.packageCompleteness || {};
-      const supportingLabels = {unknown:'Review required', demand:'Demand for possession',
-        notice_to_quit:'Notice to quit', none:'No Demand or Notice required'};
-      const supportingSource = {manual:'Manual', complaint:'Complaint', documents:'Document contents', unknown:'Unknown'};
+      const supportingCount = documents.filter(document => document.requiredForFiling && document.packageRole === 'ancillary').length;
       const supportingRequirement =
         '<section class="draft-field-section" data-draft-section="supporting">' +
           '<div class="draft-section-heading"><h3>Supporting documents</h3>' +
-            '<span class="field-source ' + (completeness.source === 'manual' ? 'manual' :
-              completeness.source === 'complaint' ? 'complaint' : completeness.source === 'documents' ? 'derived' : 'empty') + '">' +
-              escapeHtml(supportingSource[completeness.source] || 'Unknown') + '</span></div>' +
-          '<div class="draft-field-grid">' +
-            renderDraftSelect('Required supporting document',
-              'data-draft-field="supportingRequirement" data-reviewed="' + Boolean(draft.supportingRequirementReviewed) + '"',
-              data.supportingRequirement || 'auto', [
-                {value:'auto',label:'Automatic'},
-                {value:'demand',label:'Demand for possession'},
-                {value:'notice_to_quit',label:'Notice to quit'},
-                {value:'none',label:'No Demand or Notice required'},
-              ], true) +
-            renderDraftInput('Exception reason (10 characters minimum)',
-              'data-draft-field="supportingRequirementReason" maxlength="1000"',
-              data.supportingRequirementReason, true) +
-          '</div><div class="draft-field-source draft-supporting-status">' +
-            '<span data-supporting-requirement-status>' + escapeHtml(
-              draft.supportingRequirementReviewed ? 'Review pending save' :
-                (supportingLabels[completeness.requirement] || 'Review required') +
-                (completeness.reviewStale ? ' - review required after package changes' : '')) + '</span>' +
-            (completeness.reviewStale ? '<button type="button" class="icon-button" data-review-supporting-requirement' +
-              (draft.supportingRequirementReviewed ? ' disabled' : '') +
-              ' title="Reconfirm supporting requirement" aria-label="Reconfirm supporting requirement">' + icon('check-check') + '</button>' : '') +
+            '<span class="field-source derived">Supplied PDFs</span></div>' +
+          '<div class="draft-field-source draft-supporting-status">' +
+            '<span data-supporting-requirement-status>' + supportingCount + ' supporting PDF' + (supportingCount === 1 ? '' : 's') + ' included</span>' +
           '</div></section>';
 
       const documentMappings =
@@ -5502,30 +5482,6 @@ const html = String.raw`<!doctype html>
         };
         input.addEventListener('change', markReviewed);
         input.addEventListener('input', markReviewed);
-      });
-      const requirement = document.querySelector('[data-draft-field="supportingRequirement"]');
-      const requirementReason = document.querySelector('[data-draft-field="supportingRequirementReason"]');
-      const reconfirmRequirement = document.querySelector('[data-review-supporting-requirement]');
-      const markRequirementReviewed = () => {
-        requirement.dataset.reviewed = 'true';
-        document.querySelector('[data-supporting-requirement-status]').textContent = 'Review pending save';
-        if (reconfirmRequirement) reconfirmRequirement.disabled = true;
-      };
-      const syncRequirementReason = () => {
-        const exception = requirement.value === 'none';
-        requirementReason.closest('.draft-field').classList.toggle('hidden', !exception);
-        requirementReason.required = exception;
-        requirementReason.minLength = exception ? 10 : 0;
-      };
-      [requirement, requirementReason].forEach(input => {
-        input.addEventListener('input', markRequirementReviewed);
-        input.addEventListener('change', markRequirementReviewed);
-      });
-      requirement.addEventListener('change', syncRequirementReason);
-      syncRequirementReason();
-      if (reconfirmRequirement) reconfirmRequirement.addEventListener('click', () => {
-        markRequirementReviewed();
-        setDraftDirty(true);
       });
       const claimAmount = document.querySelector('[data-filing-field="claimAmount"]');
       const syncClaimAmount = () => {
@@ -5801,7 +5757,7 @@ const html = String.raw`<!doctype html>
       const supportingSource = document.supportingKindReviewed ? 'Review pending save' :
         !supportingReady ? 'Recognition pending' :
         document.supportingEvidence?.source === 'content' ? 'PDF contents' :
-        document.supportingEvidence?.source === 'manual' ? 'Manual' : 'Unclassified';
+        document.supportingEvidence?.source === 'manual' ? 'Manual' : 'Supplied PDF';
       return '<details class="draft-doc-details" data-disclosure="document-' + escapeHtml(document.id) + '">' +
         '<summary>' + icon('chevron-right') + '<span><strong>' +
         escapeHtml(document.currentFilename || document.documentType || ('Document ' + (index + 1))) +
@@ -5867,13 +5823,13 @@ const html = String.raw`<!doctype html>
             (coreDocument || document.packageRole === 'fee' ? ' disabled' : '') + '>' +
         '</label>' +
         (supportingDocument ? '<label class="draft-field document-contents-field">' +
-          '<span class="draft-field-label"><span>Document contents</span><span class="field-source ' +
+          '<span class="draft-field-label"><span>Document contents (optional)</span><span class="field-source ' +
             (document.supportingKindReviewed || document.supportingEvidence?.source === 'manual' ? 'manual' :
               document.supportingEvidence?.source === 'content' ? 'derived' : 'empty') + '">' +
             escapeHtml(supportingSource) + '</span></span>' +
           '<select data-document-field="supportingKind" data-reviewed="' + Boolean(document.supportingKindReviewed) + '"' +
             (!supportingReady ? ' disabled title="Waiting for automatic PDF content recognition"' : '') + '>' +
-            [{value:'unknown',label:'Unknown / review required'}, {value:'demand',label:'Demand for possession'},
+            [{value:'unknown',label:'Unspecified supporting contents'}, {value:'demand',label:'Demand for possession'},
               {value:'notice_to_quit',label:'Notice to quit'}, {value:'lease',label:'Lease'},
               {value:'deed',label:'Deed'}, {value:'affidavit',label:'Affidavit'}, {value:'other',label:'Other'}]
               .map(option => '<option value="' + option.value + '"' + (supportingKind === option.value ? ' selected' : '') +

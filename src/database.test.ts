@@ -45,7 +45,7 @@ test(`supporting review checks concurrent ${concurrentChange} changes inside its
         assert.equal(after.caseDraft!.editableData.caseTitle,concurrentChange==='fields'?'Newer case title':'Original case');
         assert.equal(after.caseDraft!.editableData.supportingRequirement,null);
         assert.equal(after.documents[0].requiredForFiling,concurrentChange!=='pdf');
-        assert.equal(after.caseDraft!.packageCompleteness.source,concurrentChange==='pdf'?'unknown':'documents');
+        assert.equal(after.caseDraft!.packageCompleteness.source,'attorney_policy');
     } finally { writer.close();db.close();fs.rmSync(tempDir,{recursive:true,force:true}); }
 });
 }
@@ -1392,7 +1392,7 @@ test('duplicate, missing, and unknown documents block automatic nonpayment filin
         const messages = blocked.caseDraft?.validationIssues.map(issue => issue.message) ?? [];
         assert.equal(blocked.caseDraft?.status, 'needs_review');
         assert.ok(messages.some(message => message.includes('2 Summons documents')));
-        assert.ok(messages.some(message => message.includes('at least one demand')));
+        assert.ok(messages.some(message => message.includes('at least one supporting PDF')));
         assert.ok(messages.some(message => message.includes('is not recognized')));
         assert.throws(
             () => db.reviewCaseDraft(draftId, 'approve'),

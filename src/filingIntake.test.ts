@@ -338,8 +338,17 @@ test('automatic preparation only queues complete new intakes once and never skip
     } finally { f.close(); }
 });
 
-test('email pipeline reads PDF fields, inserts library forms, connects both supporting PDFs, and queues only the complete intake', async () => {
-    const names = ['Complaint.pdf', 'Summons.pdf', 'Request.pdf', 'Demand.pdf', 'Lease.pdf'];
+test('a supplied fee-named PDF remains an included supporting file, not a virtual fee notification',()=>{
+    const f=fixture(['Mailing Fee.pdf']);
+    try {
+        const document=f.db.getDraftDetail(f.draftId)!.documents[0];
+        assert.equal(document.documentType,'Other');assert.equal(document.packageRole,'ancillary');
+        assert.equal(document.requiredForFiling,true);
+    }finally{f.close();}
+});
+
+test('email pipeline keeps five supplied supporting PDFs separate, adds library forms, and queues only the complete intake without a Demand gate', async () => {
+    const names = ['Complaint.pdf', 'Summons.pdf', 'Request.pdf', 'Deed.pdf', 'Lease.pdf','Exhibit 01.pdf','Exhibit 02.pdf','Exhibit 03.pdf'];
     const f = fixture(names.filter(name => name !== 'Request.pdf'));
     const court = 'MI Oakland County - Oak Park - 45th District Court';
     const content = new Map([
@@ -348,8 +357,9 @@ test('email pipeline reads PDF fields, inserts library forms, connects both supp
             7: 'Jamie Pipeline, and all other occupants\r101 Rental Street\rOak Park, MI 48237' })],
         ['Summons.pdf', testPdfFixture('Summons, Landlord-Tenant/Land Contract')],
         ['Request.pdf', testPdfFixture('Request for Court Mailing and Record (Landlord-Tenant)')],
-        ['Demand.pdf', testPdfFixture('DEMAND FOR POSSESSION')],
+        ['Deed.pdf', testPdfFixture("SHERIFF'S DEED")],
         ['Lease.pdf', testPdfFixture('RESIDENTIAL LEASE AGREEMENT')],
+        ...[1,2,3].map(index=>['Exhibit 0'+index+'.pdf',testPdfFixture('Attorney supplied supporting evidence '+index+'. Additional case materials retained exactly as provided. '.repeat(2))] as [string,Buffer]),
     ]);
     const uploads: string[] = [];
     const upload = async (_key: string, filename: string) => {
@@ -374,7 +384,7 @@ test('email pipeline reads PDF fields, inserts library forms, connects both supp
         await saveFormPdf(f.db, { role: 'local', courtName: court, filename: '45 Local.pdf',
             content: testPdfFixture('Local Rental and Housing Information') });
         const incomplete = await processFilingIntake(f.db, f.email.id, f.draftId, f.parsed, dependencies);
-        assert.equal(incomplete.documents.length, 6);
+        assert.equal(incomplete.documents.length, 9);
         assert.ok(incomplete.caseDraft?.validationIssues.some(issue => /missing Request/.test(issue.message)));
         assert.equal(f.db.queueValidatedIntakes(), 0);
 
@@ -388,7 +398,7 @@ test('email pipeline reads PDF fields, inserts library forms, connects both supp
         assert.equal(complete.caseDraft?.filingData.defendants[0].displayName, 'Jamie Pipeline');
         assert.equal(complete.caseDraft?.filingData.claimAmount, '1991.50');
         assert.deepEqual(complete.caseDraft?.validationIssues, []);
-        assert.equal(complete.documents.length, 7);
+        assert.equal(complete.documents.length, 10);
         assert.ok(complete.documents.every(document => document.status === 'uploaded'));
         assert.equal(complete.documents.filter(document => document.formTemplate).length, 2);
         const uploadCount = uploads.length;
@@ -400,11 +410,14 @@ test('email pipeline reads PDF fields, inserts library forms, connects both supp
         assert.equal(job.caseDraftId, draftId);
         assert.equal(job.mode, 'prepare');
         assert.equal(job.triggerSource, 'validated_intake');
-        assert.equal(job.payload?.documents.length, 7);
+        assert.equal(job.payload?.documents.length, 10);
         assert.equal(validCompletenessSnapshot(job.payload!),true);
         const complaint = job.payload!.documents.find(document => document.packageRole === 'complaint')!;
         const connected = job.payload!.documents.filter(document => document.packageRole === 'ancillary');
-        assert.equal(connected.length, 2);
+        assert.equal(connected.length, 5);
+        assert.ok(connected.every(document=>document.filingType==='Other'));
+        assert.ok(!complete.documents.some(document=>document.supportingEvidence?.kind==='demand'));
+        assert.deepEqual(new Set(complete.documents.filter(document=>document.packageRole==='ancillary').map(document=>document.originalFilename)),new Set(names.slice(3)));
         assert.equal(complaint.isPrimary, true);
         assert.ok(connected.every(document => document.filingRelation === 'connected_to_complaint'));
         assert.equal(f.db.getDraftDetail(f.draftId)?.caseDraft?.filingStatus, 'not_started');

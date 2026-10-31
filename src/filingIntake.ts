@@ -79,7 +79,9 @@ export function buildFilingIntake(
         filedAt: null,
         filedDocuments: pdfs.map(attachment => ({
             documentName: attachment.name,
-            documentType: attachment.name.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' '),
+            // A real PDF attachment is not a notification's virtual, linkless fee item.
+            documentType: /\b(?:mailing|filing) fee\b/i.test(attachment.name.replace(/[_-]+/g,' ')) ? 'Other' :
+                attachment.name.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' '),
             status: 'Received',
             comments: null,
             downloadUrl: createEmailAttachmentSource(attachment.name, attachment.id),

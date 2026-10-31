@@ -375,6 +375,7 @@ test('old queued snapshots with unknown answers or document relations are stoppe
         [{...payload,filingData:{...payload.filingData,moneyJudgmentRequested:true,claimAmount:'0'}},'CLAIM_AMOUNT_UNCONFIRMED'],
         [{...payload,documents:[{...filingDocument(0),isPrimary:false},filingDocument(1,true)]},'CONNECTED_COMPLAINT_REQUIRED'],
         [payload,'PACKAGE_COMPLETENESS_UNCONFIRMED'],
+        [{...payload,courtName:'Court',completeness:{...evaluatePackageCompleteness('Court',payload.documents,null),version:1}},'PACKAGE_COMPLETENESS_UNCONFIRMED'],
     ] as const) {
         await assert.rejects(runner.prepare({mode:'prepare',payload:invalid} as FilingJobView),
             (error:any)=>error.code===code && error.checkpoint==='starting');

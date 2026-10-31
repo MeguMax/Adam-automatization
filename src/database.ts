@@ -3,7 +3,7 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { ParsedEmailInfo } from './emailProcessor';
-import { DOCUMENT_LABELS, documentLabel, DocumentRecognition } from './documentRecognition';
+import { DOCUMENT_LABELS, documentLabel, DocumentRecognition, applySuppliedSupportingPolicy } from './documentRecognition';
 import { completenessContext, evaluatePackageCompleteness, supportingEvidence, SUPPORTING_KINDS, type PackageCompleteness, type SupportingEvidence } from './packageCompleteness';
 import { LibraryForm, FormRole, courtKey } from './formLibraryTypes';
 import { isProcessingReportSubject } from './processingReport';
@@ -1520,6 +1520,9 @@ function validateManualDraftDocuments(
     for (const document of included) {
         const label = document.currentFilename || document.originalFilename ||
             document.documentType || 'Document';
+        if(document.recognition?.pdfVerified===false) {
+            issues.push({field:`document.${document.id}`,severity:'error',message:`${label} is not a readable PDF. Replace it before preparation.`});
+        }
         if (!document.oneDriveUrl || !['uploaded', 'downloaded', 'replaced'].includes(document.status)) {
             issues.push({
                 field: `document.${document.id}`,
@@ -1606,13 +1609,19 @@ function validateDraftDocuments(
         issues.push({
             field: 'package.ancillary',
             severity: 'error',
-            message: 'Attach at least one demand, notice, lease, deed, or other ancillary document.',
+            message: 'Attach at least one supporting PDF to the standard landlord-tenant package.',
         });
     }
 
     for (const document of documents) {
         if (document.packageRole === 'fee' || !document.requiredForFiling) continue;
-        if (document.recognition && document.recognition.source !== 'content' && document.filingTypeSource !== 'manual') {
+        if(document.recognition?.pdfVerified===false || document.recognition?.outOfScope) {
+            issues.push({field:`document.${document.id}`,severity:'error',message:document.recognition.outOfScope ?
+                'Motion packages are outside the supported landlord-tenant intake workflow. Review this document separately.' :
+                'This document is not a readable PDF. Replace it before preparation.'});
+        }
+        if (document.recognition && document.recognition.source !== 'content' &&
+            !(document.packageRole==='ancillary' && document.recognition.source==='supplied') && document.filingTypeSource !== 'manual') {
             issues.push({ field: `document.${document.id}`, severity: 'error', message: document.recognition.message });
         }
         if (document.packageRole === 'unknown') {
@@ -2728,6 +2737,7 @@ export class WorkflowDatabase {
               AND COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.status'), '') != 'running'
               AND COALESCE(json_extract(c.normalized_data_json, '$.intake.manual'), 0) = 0
               AND COALESCE(json_extract(c.normalized_data_json, '$.manualDocumentEdits'), 0) = 0
+              AND json_extract(c.normalized_data_json, '$.supportingPolicyVersion') = 2
               AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status = 'processed')
               AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = c.id)
             ORDER BY c.created_at LIMIT ?`).all(CURRENT_COMPLAINT_EXTRACTOR_VERSION, limit) as Array<{id:string}>;
@@ -2735,7 +2745,7 @@ export class WorkflowDatabase {
         for (const row of rows) {
             const detail = this.getDraftDetail(row.id);
             if (!detail?.caseDraft?.filingEligible || detail.caseDraft.validationIssues.length ||
-                detail.caseDraft.packageCompleteness.source === 'manual') continue;
+                ['demand','notice_to_quit','none'].includes(String(detail.caseDraft.editableData.supportingRequirement))) continue;
             this.queueFilingJob(row.id, 'prepare', 'validated_intake', 'worker');
             queued++;
         }
@@ -2875,8 +2885,16 @@ export class WorkflowDatabase {
         const row = this.db.prepare('SELECT * FROM document_records WHERE id = ? AND is_active = 1').get(documentId) as any;
         if (!row?.case_draft_id) throw new Error('Document not found');
         this.assertEditableIntake(row.case_draft_id);
+        recognition=applySuppliedSupportingPolicy(recognition,row.original_filename || row.current_filename || 'document.pdf');
         const label = DOCUMENT_LABELS[recognition.role];
-        const metadata = { ...this.safeJson(row.metadata_json), recognition };
+        const previous=this.safeJson(row.metadata_json);
+        const metadata = { ...previous, recognition };
+        if(previous?.recognition?.contentHash && recognition.contentHash && previous.recognition.contentHash!==recognition.contentHash) {
+            this.db.prepare(`UPDATE case_drafts SET reviewed_at=NULL, normalized_data_json=json_set(normalized_data_json,'$.manualDocumentEdits',json('true')),updated_at=? WHERE id=?`)
+                .run(nowIso(),row.case_draft_id);
+            this.insertAuditLog('document_record',documentId,'document_content_pin_changed',{
+                previousHash:previous.recognition.contentHash,contentHash:recognition.contentHash,approvalCleared:true});
+        }
         if (row.filing_type_source === 'manual') {
             this.db.prepare('UPDATE document_records SET metadata_json = ?, updated_at = ? WHERE id = ?').run(toJson(metadata),nowIso(),documentId);
             this.insertAuditLog('document_record',documentId,'document_content_recognized',recognition);
@@ -2891,6 +2909,7 @@ export class WorkflowDatabase {
                 .run(row.case_draft_id, documentId);
         } else this.assignPrimaryComplaint(row.case_draft_id, documentId, label, null);
         this.insertAuditLog('document_record', documentId, 'document_type_recognized', recognition);
+        if(recognition.role==='ancillary') this.applyCourtFilingRule(row.case_draft_id);
     }
 
     listPendingDocumentRecognitions(limit=1):string[] {
@@ -2901,6 +2920,8 @@ export class WorkflowDatabase {
               AND EXISTS(SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1 AND d.required_for_filing=1
                 AND d.upload_source!='form_library' AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','downloaded','replaced')
                 AND (COALESCE(json_extract(d.metadata_json,'$.recognition.recognitionVersion'),0)<2
+                  OR (json_extract(d.metadata_json,'$.recognition.pdfVerified') IS NULL
+                    AND COALESCE(json_extract(d.metadata_json,'$.recognition.source'),'')!='content')
                   OR length(COALESCE(json_extract(d.metadata_json,'$.recognition.contentHash'),''))!=64))
             ORDER BY c.updated_at`).all(nowIso()) as Array<{id:string;normalized_data_json:string;subject:string|null;sender:string|null}>;
         return rows.filter(row=>!validateNewCaseSource(this.safeJson(row.normalized_data_json),row.subject,row.sender).length)
@@ -5254,30 +5275,34 @@ export class WorkflowDatabase {
             ? complaintExtractionFromDraft(normalizedDraftData)
             : null;
         const documentViews: DocumentRecordView[] = documents.map(row => {
+            const metadata = this.safeJson(row.metadata_json);
+            const recognition=metadata?.recognition && normalizedDraftData?.sourceKind==='new_filing_intake' ?
+                applySuppliedSupportingPolicy(metadata.recognition,row.original_filename || row.current_filename || 'document.pdf') : metadata?.recognition || null;
+            const supplied=recognition?.source==='supplied' && row.filing_type_source!=='manual';
+            const documentType=supplied ? DOCUMENT_LABELS.ancillary : row.document_type;
             const suggestedFilingType = suggestMiFileFilingType(
-                row.document_type,
+                documentType,
                 row.current_filename || row.original_filename,
                 normalizedFilingData.moneyJudgmentRequested,
             );
             const suggestedRelation = suggestedFilingRelation(
-                row.document_type,
+                documentType,
                 row.current_filename || row.original_filename,
             );
             const packageRole = filingPackageRole(
-                row.document_type,
+                documentType,
                 row.current_filename || row.original_filename,
             );
             const suggestedSequence = suggestedDocumentSequence(
                 row.document_type,
                 row.current_filename || row.original_filename,
             );
-            const metadata = this.safeJson(row.metadata_json);
             const sourceVersion = toJson([row.id,row.one_drive_url,row.file_size,metadata?.replacement?.token || metadata?.lastReplacement?.token || null])!;
             const libraryHash=metadata?.formTemplate?.id ? (this.db.prepare('SELECT sha256 FROM filing_forms WHERE id=?')
                 .get(metadata.formTemplate.id) as {sha256:string} | undefined)?.sha256 : undefined;
             return {
                 sourceVersion,
-                supportingEvidence:supportingEvidence(metadata?.recognition || null,metadata?.supportingKindReview,sourceVersion,libraryHash),
+                supportingEvidence:supportingEvidence(recognition,metadata?.supportingKindReview,sourceVersion,libraryHash),
                 id: row.id,
                 originalFilename: row.original_filename,
                 currentFilename: row.current_filename,
@@ -5287,9 +5312,9 @@ export class WorkflowDatabase {
                 storagePath: row.storage_path,
                 mimeType: row.mime_type,
                 fileSize: row.file_size === null ? null : Number(row.file_size),
-                documentType: row.document_type,
+                documentType,
                 filingName: row.filing_name || row.current_filename || row.original_filename,
-                filingType: row.filing_type || suggestedFilingType,
+                filingType: supplied ? suggestedFilingType : row.filing_type || suggestedFilingType,
                 filingTypeSource: row.filing_type
                     ? row.filing_type_source === 'manual'
                         ? 'manual'
@@ -5316,11 +5341,11 @@ export class WorkflowDatabase {
                 requiredForFiling: Number(row.required_for_filing ?? 0) === 1,
                 isPrimary: caseDraft?.primary_document_id === row.id,
                 documentRole: draftDocumentRole(
-                    row.document_type,
+                    documentType,
                     row.current_filename || row.original_filename,
                 ),
                 packageRole,
-                recognition: this.safeJson(row.metadata_json)?.recognition || null,
+                recognition,
                 formTemplate: this.safeJson(row.metadata_json)?.formTemplate || null,
                 uploadSource: row.upload_source,
                 status: row.status,
@@ -6804,6 +6829,7 @@ export class WorkflowDatabase {
             if (Array.isArray(oldNormalizedObject.manualFilingPaths)) nextNormalized.manualFilingPaths = oldNormalizedObject.manualFilingPaths;
             if (Array.isArray(oldNormalizedObject.manualEditableFields)) nextNormalized.manualEditableFields = oldNormalizedObject.manualEditableFields;
             if (oldNormalizedObject.manualDocumentEdits === true) nextNormalized.manualDocumentEdits = true;
+            if (oldNormalizedObject.supportingPolicyVersion === 2) nextNormalized.supportingPolicyVersion = 2;
             if (oldNormalizedObject.complaintExtractionError) {
                 nextNormalized.complaintExtractionError = oldNormalizedObject.complaintExtractionError;
             }
@@ -6844,6 +6870,7 @@ export class WorkflowDatabase {
         const workflowMode = process.env.WORKFLOW_MODE || 'review_before_submission';
         const normalizedJson = toJson({
             ...parsed,
+            ...(parsed.sourceKind === 'new_filing_intake' ? {supportingPolicyVersion:2} : {}),
             filingData: draftFilingData(parsed),
         });
 

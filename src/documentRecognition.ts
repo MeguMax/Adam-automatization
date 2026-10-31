@@ -13,13 +13,15 @@ export type SupportingDocumentKind = 'demand' | 'notice_to_quit' | 'lease' | 'de
 export const DOCUMENT_RECOGNITION_VERSION = 2;
 export interface DocumentRecognition {
     role: RecognizedRole;
-    source: 'content' | 'filename' | 'conflict' | 'unknown';
+    source: 'content' | 'filename' | 'conflict' | 'unknown' | 'supplied';
     message: string;
     textSource?: 'pdf' | 'ocr';
     supportingKind?: SupportingDocumentKind;
     contentHash?: string;
     recognitionVersion?: number;
     supportingMessage?: string;
+    pdfVerified?: boolean;
+    outOfScope?: boolean;
 }
 
 const SUPPORTING_TITLES: Array<[SupportingDocumentKind, RegExp]> = [
@@ -73,12 +75,16 @@ export function recognizeDocumentText(pages: string[], filename: string): Docume
         }
     }
     const named = filenameRole(filename);
-    const supporting: Pick<DocumentRecognition, 'supportingKind' | 'supportingMessage' | 'recognitionVersion'> = {
+    const outOfScope = /\bmotion\b/i.test(filename.replace(/[_-]/g,' ')) ||
+        (!roles.size && pages.some(page=>page.split(/\r?\n/).map(line=>line.trim()).filter(Boolean).slice(0,24)
+            .some(line=>/^(?:ex parte\s+)?motion(?:\s+(?:for|to|and)\b.*)?$/i.test(line))));
+    const supporting: Pick<DocumentRecognition, 'supportingKind' | 'supportingMessage' | 'recognitionVersion' | 'outOfScope'> = {
         recognitionVersion: DOCUMENT_RECOGNITION_VERSION,
         supportingKind: supportingKinds.size === 1 ? [...supportingKinds][0] : 'unknown',
+        ...(outOfScope ? {outOfScope:true} : {}),
     };
     if (supportingKinds.size > 1) {
-        supporting.supportingMessage = `Several supporting-document kinds were found (${[...supportingKinds].join(', ')}). Manual review is required; split or classify the PDF.`;
+        supporting.supportingMessage = `Several supporting-document kinds were found (${[...supportingKinds].join(', ')}). The supporting PDF is retained as supplied.`;
     } else if (!supportingKinds.size && (roles.has('ancillary') || named === 'ancillary')) {
         supporting.supportingMessage = 'No recognized supporting-document title was found. Manual review is required; filenames and Other/Connected mappings do not establish the supporting kind.';
     }
@@ -102,13 +108,13 @@ function contentMetadata(buffer: Buffer) {
 
 export async function recognizeDocumentPdf(buffer: Buffer, filename: string): Promise<DocumentRecognition> {
     try { return await recognizeDocumentPages(buffer, await inspectFilingPdf(buffer), filename); }
-    catch { return { ...contentMetadata(buffer), supportingKind: 'unknown', role: 'unknown', source: 'unknown',
+    catch { return { ...contentMetadata(buffer), pdfVerified:false, supportingKind: 'unknown', role: 'unknown', source: 'unknown',
         supportingMessage: 'PDF text recognition failed. Manual review is required to identify the supporting kind.',
         message: 'PDF text recognition failed. Check the document and confirm its Filing Type.' }; }
 }
 
 export async function recognizeDocumentPages(buffer: Buffer, pages: string[], filename: string): Promise<DocumentRecognition> {
-    const metadata = contentMetadata(buffer);
+    const metadata = { ...contentMetadata(buffer), pdfVerified:pages.length>0 };
     const initial = recognizeDocumentText(pages, filename);
     if (initial.source === 'content' && pages.every(text => text.trim().length > 0)) return { ...initial, ...metadata, textSource: 'pdf' };
     const scanned = pages.flatMap((text, index) => text.replace(/\s/g, '').length < 80 ? [index + 1] : []);
@@ -132,4 +138,15 @@ export async function recognizeDocumentPages(buffer: Buffer, pages: string[], fi
             textSource: 'ocr', source: 'unknown',
             message: `Scan needs review: ${error instanceof Error ? error.message : String(error)}` };
     }
+}
+
+export function applySuppliedSupportingPolicy(recognition:DocumentRecognition, filename:string):DocumentRecognition {
+    const named=filenameRole(filename);
+    const core=['complaint','summons','request','advice','local'];
+    const verified=recognition.pdfVerified === true;
+    if(!verified || !/^[a-f0-9]{64}$/.test(recognition.contentHash || '') || recognition.outOfScope ||
+        /\bmotion\b/i.test(filename.replace(/[_-]/g,' ')) || core.includes(recognition.role) || core.includes(named) || recognition.source==='conflict') return recognition;
+    if(recognition.role==='ancillary' && recognition.source==='content') return recognition;
+    return {...recognition,role:'ancillary',source:'supplied',message:'Supporting PDF included as supplied; Other/Connected follows the court rule.',
+        supportingMessage:'The supporting PDF is retained as supplied. Contents classification is optional.'};
 }

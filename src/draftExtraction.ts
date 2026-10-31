@@ -24,6 +24,7 @@ export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:stri
         try {
             for(const candidate of initial.documents.filter(doc=>doc.requiredForFiling && doc.uploadSource!=='form_library' && doc.oneDriveUrl &&
                 ['uploaded','downloaded','replaced'].includes(doc.status) && ((doc.recognition?.recognitionVersion || 0)<2 ||
+                    (doc.recognition?.pdfVerified===undefined && doc.recognition?.source!=='content') ||
                     !/^[a-f0-9]{64}$/.test(doc.recognition?.contentHash || ''))).slice(0,20)) {
                 const current=db.getDraftDetail(draftId);
                 if(!current || !editable(current))return current || initial;

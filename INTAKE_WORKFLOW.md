@@ -151,11 +151,11 @@ The primary action changes with the case: **Save & check**, **Review corrections
 
 The extractor re-reads bounded caption rows with independent image preprocessings. A spelling supported by multiple reads can replace a conflicting OCR suggestion, but remains low-confidence for review. Repeated high-confidence words elsewhere in the same Complaint protect against a corrupted alternative reading. Small telephone rows are rendered separately at 300 DPI rather than losing detail to the full-page pixel cap. Court headings, party names, addresses, ZIP+4 values and telephone numbers remain Complaint-derived; no client-specific names or phone numbers are embedded in the extractor. The two most recent OCR results may be reused in memory for two minutes, by exact PDF hash and page selection, with defensive copies. This avoids reading the same scan twice during recognition and extraction.
 
-Document **contents** are independent of the MiFILE Filing Type and Other/Connected routing. Supporting titles distinguish Demand for possession, Notice to quit, Deed, Lease and Affidavit. A filename, an incidental reference in a Complaint, generic Other mapping or a page count cannot establish that a Demand is present. Mixed or low-confidence contents require explicit review.
+Document **contents** are independent of the MiFILE Filing Type and Other/Connected routing. Supporting titles can describe a Demand, Notice, Deed, Lease or Affidavit, but this is optional metadata, not a legal-sufficiency gate. As clarified by the attorney, one supplied supporting PDF remains one upload even if several ancillary kinds appear within it. Core-document conflicts and out-of-scope motions still require review.
 
-Nonpayment Complaints require a verified Demand. Other supported cases can use a positively identified Demand or Notice; if neither establishes the package requirement, the Draft stops for review. **Documents > Supporting documents** allows the attorney to state the requirement. A no-Demand/Notice exception needs a recorded reason and explicit manual confirmation; it never enters automatic preparation. This is a technical completeness check, not a guarantee of legal sufficiency or court acceptance.
+Release v90 removes the former inferred Demand/Notice requirement for all supported LT variants. The standard package still requires Complaint, Summons, Request, Advice, the approved court-specific Local form(s), and at least one included supporting PDF. Each supplied supporting PDF uses Other or Connected to Complaint under the approved court rule; none is silently merged, split or dropped. Verified PDFs without a recognized supporting title do not need a manual semantic classification. Complaint/other core-role guesses, invalid PDFs and Motion packages do not inherit this fallback. The sender remains responsible for substantive sufficiency.
 
-Every included PDF must have an exact content hash. Library forms use their pinned approved version's hash. Manually confirmed document contents and requirement reviews are bound to the source version, court and included PDFs. Replacement, removal, inclusion changes and court changes invalidate the relevant review. Stale browser confirmations are rejected rather than applied to newly replaced bytes. The preparation snapshot carries this evidence, and the worker verifies it before external access and compares downloaded PDF hashes before opening MiFILE. Older queued jobs lacking completeness evidence stop for review; historical prepared bundles are not rewritten.
+Every included PDF must have an exact content hash. Library forms use their pinned approved version's hash. Optional manually confirmed document contents remain bound to the exact source version and hash. The version-2 completeness snapshot additionally binds the court, included document IDs, roles, Filing Types and relations. Replacement, removal, inclusion changes and court changes invalidate the prior snapshot. A newly observed changed content pin also clears approval and requires manual package confirmation instead of automatic preparation. Stale browser confirmations are rejected rather than applied to newly replaced bytes. The worker validates the snapshot before remote access and rechecks downloaded PDF hashes before opening MiFILE. Queued version-1 snapshots stop for review; historical prepared, rejected and reconciled bundles are not rewritten or replayed.
 
 Unfinished eligible Drafts receive missing content recognition automatically, with retry backoff for read failures. Extracted Complaint facts carry their input PDF hash. A legacy recognition refresh that finds changed Complaint bytes re-extracts the same downloaded PDF while automatic preparation is blocked; stale in-flight reads cannot overwrite a newer pin. Recognition refreshes do not overwrite manual Filing Types, source replacements, manual field corrections or locked/prepared cases. Supporting review checks run inside the SQLite write transaction, so a concurrent writer cannot bind approval to unseen PDFs. Payment and final court submission remain disabled.
 
@@ -267,7 +267,7 @@ Before inviting live client packages, deploy the update, confirm the inbox and a
 - Settings supports bulk Advice/Local import using verified MiFILE court names. Existing form components are not silently replaced. Shared county forms can be assigned to each applicable MiFILE court, while court-specific supplemental Local files remain separate components.
 - `MIFILE_AUTO_PREPARE_ENABLED=false` disables automatic preparation. Otherwise, completed email intakes with zero current validation issues and no previous filing job can queue **prepare only**. Failed/uncertain jobs are not automatically resubmitted. Court submission and payment remain disabled.
 
-## Attorney clarification received October 31: pending policy alignment
+## Attorney clarification applied October 31 (v90)
 
 The attorney clarified that substantive supporting-document sufficiency belongs
 to the sender, not this automation. The intended package remains Complaint,
@@ -278,11 +278,16 @@ or split them, infer a separate Demand obligation, or automate outlier motions.
 Incoming names use Last Name, First Initial and Document Type; PDF titles remain
 recognition evidence, not legal determinations.
 
-This clarification is recorded for the next main-workflow policy change. The v89
-Excel release does not remove the existing Demand/Notice gate or mutate existing
-Drafts. That gate still needs to be aligned and regression-tested against the
-supplied-package policy, retaining missing core-PDF, duplicate, unreadable-file,
-source-version, account and filer protections. A court's acknowledged mistaken
+The v90 workflow applies this supplied-package policy without requiring a
+Demand/Notice exception or attorney reason. The editor shows the included
+supporting-PDF count; contents classification remains optional metadata. Existing
+legacy requirement notes are retained but do not create validation errors or
+authorize automatic replays. New intakes record supporting policy version 2;
+older intakes are excluded from automatic preparation and can be confirmed
+explicitly in the Draft Editor. Legacy unclassified PDFs are freshly inspected
+before receiving the fallback; a missing old verification flag alone is not
+proof of a valid supporting PDF. Missing core-PDF, duplicate, unreadable-file,
+source-version, account and filer protections remain. A court's acknowledged mistaken
 rejection is not grounds for automatic preparation or a duplicate resubmission.
 Corrected/rejected filing handling remains attorney-managed until its separate
 workflow is confirmed. A suggested retention of a few weeks does not authorize

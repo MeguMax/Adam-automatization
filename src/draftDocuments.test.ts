@@ -9,10 +9,11 @@ import { createHash } from 'node:crypto';
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
-import { recognizeDocumentText, type DocumentRecognition } from './documentRecognition';
+import { recognizeDocumentText, recognizeDocumentPdf, type DocumentRecognition } from './documentRecognition';
 import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
 import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
 import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
+import { validCompletenessSnapshot } from './packageCompleteness';
 
 const court = 'MI Example County - 25th District Court';
 const otherCourt = 'MI Example County - 29th District Court';
@@ -83,6 +84,106 @@ function fixture(initialCourt: string | null = court, packageMode?: 'standard_lt
     db.markEmailProcessed(email.id);
     return {db,parsed,email,draftId,complaint,ancillary,add,close(){db.close();fs.rmSync(directory,{recursive:true,force:true});}};
 }
+
+for(const district of ['25','45']) {
+test(`five supplied supporting PDFs remain distinct and use the approved ${district==='45'?'Connected':'Other'} court route`,async()=>{
+    const f=fixture(`MI Example County - ${district}th District Court`);
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        for(let index=1;index<=4;index++) {
+            const filename='Supporting '+index+'.pdf',pdf=testPdfFixture('Case evidence '+index+' supplied by the attorney. Additional materials for this filing package. '.repeat(2));
+            const recognition=await recognizeDocumentPdf(pdf,filename);
+            const id=f.add('Unclassified PDF',filename,'uploaded',{pdf,recognition});
+            f.db.recordDocumentRecognition(id,recognition);
+        }
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            data:{...structuredClone(extraction.data),courtDistrict:district}});
+        const detail=f.db.applyCourtFilingRule(f.draftId);
+        assert.deepEqual(detail.caseDraft!.validationIssues,[]);
+        const supporting=detail.documents.filter(document=>document.packageRole==='ancillary');
+        assert.equal(supporting.length,5);assert.equal(new Set(supporting.map(document=>document.oneDriveUrl)).size,5);
+        assert.ok(supporting.every(document=>document.filingType==='Other' && document.filingRelation===
+            (district==='45'?'connected_to_complaint':'separate')));
+        assert.ok(!supporting.some(document=>document.supportingEvidence!.kind==='demand'));
+        assert.equal(detail.documents.length,10);
+        const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true);
+        assert.equal(job.payload!.documents.length,10);assert.equal(validCompletenessSnapshot(job.payload!),true);
+        assert.equal(job.mode,'prepare');
+    }finally{f.close();}
+});
+}
+
+test('the supplied-package policy keeps every standard core PDF and at least one supporting PDF mandatory',()=>{
+    for(const role of ['complaint','advice','local','summons','request','ancillary']) {
+        const f=fixture();
+        try {
+            const document=f.db.getDraftDetail(f.draftId)!.documents.find(document=>document.packageRole===role)!;
+            const detail=f.db.removeDraftDocument(f.draftId,document.id);
+            assert.ok(detail.caseDraft!.validationIssues.some(issue=>issue.field==='package.'+role));
+            assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft/);
+            assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        }finally{f.close();}
+    }
+});
+
+test('an unreadable supporting PDF or out-of-scope Motion cannot be certified by selecting Other',()=>{
+    for(const recognition of [{...deedRecognition,pdfVerified:false},{...deedRecognition,outOfScope:true}]) {
+        const f=fixture();
+        try {
+            f.db.recordDocumentRecognition(f.ancillary,recognition);
+            const detail=f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate',filingTypeReviewed:true}]);
+            assert.ok(detail.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+f.ancillary));
+            assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft/);
+        }finally{f.close();}
+    }
+});
+
+test('a changed content pin clears prior approval and cannot automatically prepare the updated package',()=>{
+    const f=fixture();
+    try {
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
+        f.db.applyCourtFilingRule(f.draftId);f.db.reviewCaseDraft(f.draftId,'approve');
+        const old=f.db.buildFilingPayload(f.draftId);
+        f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        const current=f.db.getDraftDetail(f.draftId)!;
+        assert.equal(current.caseDraft!.reviewedAt,null);
+        assert.equal(JSON.parse(current.caseDraft!.normalizedDataJson!).manualDocumentEdits,true);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId),/Approve the Draft/);
+        assert.equal(validCompletenessSnapshot({...f.db.buildFilingPayload(f.draftId),completeness:old.completeness}),false);
+    }finally{f.close();}
+});
+
+test('existing unstarted intakes are not bulk requeued when the supplied-package policy changes',()=>{
+    const f=fixture();
+    try {
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
+        f.db.applyCourtFilingRule(f.draftId);f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        (f.db as any).db.prepare("UPDATE case_drafts SET normalized_data_json=json_remove(normalized_data_json,'$.supportingPolicyVersion','$.manualDocumentEdits') WHERE id=?").run(f.draftId);
+        const detail=f.db.refreshCaseDraftValidation(f.draftId);
+        assert.deepEqual(detail.caseDraft!.validationIssues,[]);assert.equal(detail.caseDraft!.status,'ready_to_file');
+        assert.equal(f.db.queueValidatedIntakes(),0);assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true);
+        assert.equal(job.mode,'prepare');assert.equal(validCompletenessSnapshot(job.payload!),true);
+    }finally{f.close();}
+});
+
+test('legacy unclassified PDFs are freshly inspected before receiving the supplied-supporting fallback',async()=>{
+    const f=fixture();
+    try {
+        const pdf=testPdfFixture('Additional supporting evidence retained exactly as provided by the attorney. '.repeat(3));
+        f.db.recordDocumentRecognition(f.ancillary,{role:'unknown',source:'unknown',textSource:'pdf',recognitionVersion:2,
+            contentHash:createHash('sha256').update(pdf).digest('hex'),message:'Legacy unclassified PDF'});
+        assert.ok(f.db.listPendingDocumentRecognitions().includes(f.draftId));
+        let reads=0;
+        const detail=await ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>{reads++;return pdf;});
+        assert.equal(reads,1);
+        const supporting=detail.documents.find(document=>document.id===f.ancillary)!;
+        assert.equal(supporting.packageRole,'ancillary');assert.equal(supporting.filingType,'Other');
+        assert.equal(supporting.recognition!.pdfVerified,true);assert.equal(supporting.recognition!.source,'supplied');
+        assert.ok(!f.db.listPendingDocumentRecognitions().includes(f.draftId));
+    }finally{f.close();}
+});
 
 test('legacy recognition refresh re-extracts changed Complaint bytes at a stable OneDrive URL without overwriting manual fields',async()=>{
     const f=fixture();
@@ -268,7 +369,7 @@ test('every included core PDF needs its own content hash before package approval
     }
 });
 
-test('a stale Demand semantic review cannot certify a same-size same-URL replacement deed',()=>{
+test('stale semantic edits cannot change a replacement PDF, while a newly pinned deed needs no Demand exception',()=>{
     const f=fixture();
     try {
         f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
@@ -301,7 +402,9 @@ test('a stale Demand semantic review cannot certify a same-size same-URL replace
         assert.deepEqual(final.documents.find(item=>item.id===f.ancillary)!.supportingEvidence,{
             kind:'deed',source:'content',contentHash:replacementRecognition.contentHash,
         });
-        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/missing a verified Demand/);
+        assert.equal(final.caseDraft!.reviewedAt,null);
+        assert.deepEqual(final.caseDraft!.validationIssues,[]);
+        f.db.reviewCaseDraft(f.draftId,'approve');
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
     } finally { f.close(); }
 });
@@ -427,8 +530,8 @@ test('an old requirement context is rejected atomically after another included P
         const current=f.db.updateCaseDraft(f.draftId,{supportingRequirement:'demand',
             supportingRequirementReason:'Attorney reviewed the current PDFs and verified the included Demand.'},
         undefined,undefined,[],undefined,before.caseDraft!.packageCompleteness.contextHash);
-        assert.equal(current.caseDraft!.packageCompleteness.source,'manual');
-        assert.equal(current.caseDraft!.packageCompleteness.requirement,'demand');
+        assert.equal(current.caseDraft!.packageCompleteness.source,'attorney_policy');
+        assert.equal(current.caseDraft!.packageCompleteness.requirement,'supplied');
         assert.equal(current.caseDraft!.packageCompleteness.reviewStale,false);
         assert.deepEqual(current.caseDraft!.validationIssues,[]);
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
@@ -436,7 +539,7 @@ test('an old requirement context is rejected atomically after another included P
 });
 
 for(const packageMode of ['standard_lt','custom'] as const) {
-test(`${packageMode} deed-only support cannot pass approval through a generic manual Other mapping`,()=>{
+test(`${packageMode} supplied deed passes as Other without a separate Demand`,()=>{
     const f=fixture(court,packageMode);
     try {
         f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
@@ -450,19 +553,19 @@ test(`${packageMode} deed-only support cannot pass approval through a generic ma
         assert.deepEqual(document.supportingEvidence,{
             kind:'deed',source:'content',contentHash:deedRecognition.contentHash,
         });
-        assert.equal(detail.caseDraft!.packageCompleteness.requirement,'demand');
-        assert.deepEqual(detail.caseDraft!.validationIssues.filter(issue=>issue.severity==='error').map(issue=>issue.field),['package.supporting']);
-        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/missing a verified Demand/);
-        assert.throws(()=>f.db.buildFilingPayload(f.draftId),/missing a verified Demand/);
-        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft:.*missing a verified Demand/);
+        assert.equal(detail.caseDraft!.packageCompleteness.requirement,'supplied');
+        assert.deepEqual(detail.caseDraft!.validationIssues,[]);
+        assert.equal(f.db.buildFilingPayload(f.draftId).documents.length,6);
         assert.equal(f.db.queueValidatedIntakes(),0);
         assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
+        const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true);
+        assert.equal(job.mode,'prepare');assert.equal(validCompletenessSnapshot(job.payload!),true);
     } finally { f.close(); }
 });
 }
 
-test('a none supporting exception needs an attorney reason and explicit manual package confirmation',()=>{
+test('legacy Demand exception fields are optional metadata and cannot bypass PDF pins or manual confirmation',()=>{
     const f=fixture();
     const reason='Attorney reviewed this synthetic package and confirmed no Demand or Notice is required.';
     try {
@@ -471,28 +574,27 @@ test('a none supporting exception needs an attorney reason and explicit manual p
         f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{id:f.ancillary,filingType:'Other',filingRelation:'separate'}]);
         for(const invalidReason of [null,'Short']) {
             const invalid=f.db.updateCaseDraft(f.draftId,{supportingRequirement:'none',supportingRequirementReason:invalidReason});
-            assert.equal(invalid.caseDraft!.packageCompleteness.requirement,'none');
-            assert.equal(invalid.caseDraft!.packageCompleteness.source,'manual');
-            assert.match(invalid.caseDraft!.packageCompleteness.issues[0].message,/reason why no Demand or Notice is required/);
-            assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft:.*reason/);
+            assert.equal(invalid.caseDraft!.packageCompleteness.requirement,'supplied');
+            assert.equal(invalid.caseDraft!.packageCompleteness.source,'attorney_policy');
+            assert.deepEqual(invalid.caseDraft!.packageCompleteness.issues,[]);
             assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt,null);
             assert.equal(f.db.listFilingJobs(f.draftId).length,0);
         }
         const reviewed=f.db.updateCaseDraft(f.draftId,{supportingRequirement:'none',supportingRequirementReason:reason});
         assert.deepEqual(reviewed.caseDraft!.validationIssues,[]);
-        assert.equal(reviewed.caseDraft!.packageCompleteness.reason,reason);
+        assert.equal(reviewed.caseDraft!.packageCompleteness.reason,null);
         assert.equal(reviewed.caseDraft!.reviewedAt,null);
         assert.throws(()=>f.db.queueFilingJob(f.draftId),/Approve the Draft/);
         const ready=f.db.refreshCaseDraftValidation(f.draftId);
         assert.equal(ready.caseDraft!.status,'ready_to_file');
-        assert.equal(JSON.parse(ready.caseDraft!.normalizedDataJson!).manualDocumentEdits,undefined);
+        assert.equal(JSON.parse(ready.caseDraft!.normalizedDataJson!).manualDocumentEdits,true);
         assert.equal(f.db.queueValidatedIntakes(),0,'manual completeness decisions must not enter automatic preparation');
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
         const job=f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true,ready.caseDraft!.updatedAt);
         assert.equal(job.mode,'prepare');
-        assert.equal(job.payload!.completeness!.requirement,'none');
-        assert.equal(job.payload!.completeness!.source,'manual');
-        assert.equal(job.payload!.completeness!.reason,reason);
+        assert.equal(job.payload!.completeness!.requirement,'supplied');
+        assert.equal(job.payload!.completeness!.source,'attorney_policy');
+        assert.equal(job.payload!.completeness!.reason,null);
         assert.ok(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt);
         assert.equal(f.db.listFilingJobs(f.draftId).length,1);
     } finally { f.close(); }
@@ -500,7 +602,7 @@ test('a none supporting exception needs an attorney reason and explicit manual p
 
 for(const operation of ['replace','remove'] as const) {
 for(const requirement of ['demand','none'] as const) {
-test(`${operation} supporting PDF invalidates semantic evidence and the manual ${requirement} requirement review`,()=>{
+test(`${operation} supporting PDF invalidates its snapshot and approval without reviving a legacy ${requirement} gate`,()=>{
     const f=fixture();
     try {
         const deed=f.add('Ancillary document','Deed.pdf','uploaded',{pdf:deedPdf,recognition:deedRecognition});
@@ -514,24 +616,25 @@ test(`${operation} supporting PDF invalidates semantic evidence and the manual $
             {id:deed,filingType:'Other',filingRelation:'separate'},
         ]);
         assert.deepEqual(before.caseDraft!.validationIssues,[]);
-        assert.equal(before.caseDraft!.packageCompleteness.source,'manual');
+        assert.equal(before.caseDraft!.packageCompleteness.source,'attorney_policy');
         assert.equal(before.caseDraft!.packageCompleteness.reviewStale,false);
         assert.deepEqual(before.documents.find(item=>item.id===f.ancillary)!.supportingEvidence,{
             kind:'demand',source:'manual',contentHash:demandRecognition.contentHash,
         });
         const contextHash=before.caseDraft!.packageCompleteness.contextHash;
+        const oldPayload=f.db.buildFilingPayload(f.draftId);
         f.db.reviewCaseDraft(f.draftId,'approve');
         assert.ok(f.db.getDraftDetail(f.draftId)!.caseDraft!.reviewedAt);
         if(operation==='replace') {
             const reservation=f.db.beginDocumentReplacement(f.ancillary);
             const processing=f.db.getDraftDetail(f.draftId)!.caseDraft!;
-            assert.equal(processing.packageCompleteness.reviewStale,true);
+            assert.ok(processing.packageCompleteness.issues.length);
             assert.equal(processing.reviewedAt,null);
             const replaced=f.db.recordDocumentReplacement(f.ancillary,{token:reservation.token,fileSize:deedPdf.length});
             const unrecognized=replaced.documents.find(item=>item.id===f.ancillary)!;
             assert.equal(unrecognized.recognition,null);
             assert.deepEqual(unrecognized.supportingEvidence,{kind:'unknown',source:'unknown',contentHash:null});
-            assert.equal(replaced.caseDraft!.packageCompleteness.reviewStale,true);
+            assert.ok(replaced.caseDraft!.packageCompleteness.issues.length);
             f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
             const remapped=f.db.updateCaseDraft(f.draftId,{},undefined,undefined,[{
                 id:f.ancillary,filingType:'Other',filingTypeReviewed:true,filingRelation:'separate',
@@ -548,12 +651,13 @@ test(`${operation} supporting PDF invalidates semantic evidence and the manual $
         assert.equal(after.documents.length,operation==='replace'?7:6);
         assert.ok(!after.documents.some(item=>item.supportingEvidence?.kind==='demand'));
         assert.notEqual(after.caseDraft!.packageCompleteness.contextHash,contextHash);
-        assert.equal(after.caseDraft!.packageCompleteness.reviewStale,true);
+        assert.equal(after.caseDraft!.packageCompleteness.reviewStale,false);
         assert.equal(after.caseDraft!.reviewedAt,null);
-        assert.ok(after.caseDraft!.validationIssues.some(issue=>issue.field==='package.supporting' && issue.severity==='error'));
-        assert.throws(()=>f.db.reviewCaseDraft(f.draftId,'approve'),/supporting-document review is outdated/);
-        assert.throws(()=>f.db.buildFilingPayload(f.draftId),/supporting-document review is outdated/);
-        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/supporting-document review is outdated/);
+        assert.deepEqual(after.caseDraft!.validationIssues,[]);
+        const newPayload=f.db.buildFilingPayload(f.draftId);
+        assert.equal(validCompletenessSnapshot({...newPayload,completeness:oldPayload.completeness}),false);
+        assert.equal(validCompletenessSnapshot(newPayload),true);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId),/Approve the Draft/);
         assert.equal(f.db.queueValidatedIntakes(),0);
         assert.equal(f.db.listFilingJobs(f.draftId).length,0);
     } finally { f.close(); }
