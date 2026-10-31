@@ -167,7 +167,7 @@ export function excelManifest(base = process.env.EXCEL_PDF_PUBLIC_URL || 'https:
 <OfficeApp xmlns="http://schemas.microsoft.com/office/appforoffice/1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="TaskPaneApp">
 <Id>05cdad5d-041d-41c4-b8c9-9c33cf9d7c93</Id><Version>1.2.0.0</Version><ProviderName>Devlin Law PLLC</ProviderName><DefaultLocale>en-US</DefaultLocale>
 <DisplayName DefaultValue="Devlin Law PDF Forms"/><Description DefaultValue="Generate fillable court PDFs from the selected Excel row."/>
-<IconUrl DefaultValue="${origin}/excel/icon.png"/><SupportUrl DefaultValue="${origin}/excel/"/>
+<IconUrl DefaultValue="${origin}/excel/icon.png"/><SupportUrl DefaultValue="${origin}/excel/help"/>
 <Hosts><Host Name="Workbook"/></Hosts><Requirements><Sets DefaultMinVersion="1.9"><Set Name="ExcelApi" MinVersion="1.9"/></Sets></Requirements>
 <DefaultSettings><SourceLocation DefaultValue="${origin}/excel/"/></DefaultSettings><Permissions>ReadWriteDocument</Permissions>
 <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0" xsi:type="VersionOverridesV1_0">
@@ -206,6 +206,7 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
         if (!pathname.startsWith('/excel/') && pathname !== '/excel') return false;
         const assets: Record<string, [string, string]> = {
             '/excel/': ['taskpane.html', 'text/html; charset=utf-8'], '/excel': ['taskpane.html', 'text/html; charset=utf-8'],
+            '/excel/help': ['help.html', 'text/html; charset=utf-8'], '/excel/help.css': ['help.css', 'text/css'],
             '/excel/app.js': ['app.js', 'text/javascript'], '/excel/row.js': ['row.js', 'text/javascript'],
             '/excel/workbook.js': ['workbook.js', 'text/javascript'],
             '/excel/session.js': ['session.js', 'text/javascript'],

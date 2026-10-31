@@ -75,6 +75,79 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await framedPage.goto('https://onedrive.live.com/devlin-qa');
         await framedPage.frameLocator('iframe').frameLocator('iframe').getByRole('heading',{name:'Connect Excel',exact:true}).waitFor({state:'visible'});
         await framedPage.close();
+        const startupPage=await browser.newPage({viewport:{width:360,height:740}});
+        startupPage.on('pageerror',error=>errors.push(error.message));
+        let startupLogins=0,startupGeneration=0;
+        startupPage.on('request',request=>{if(request.url().endsWith('/excel/session'))startupLogins++;
+            if(/\/excel\/(generate|generate-package)$/.test(request.url()))startupGeneration++;});
+        await startupPage.route('**/*',async route=>{
+            if(route.request().url().startsWith('https://appsforoffice.microsoft.com/'))await route.fulfill({contentType:'text/javascript',body:fake});
+            else if(route.request().url().startsWith(base))await route.continue();else await route.abort();
+        });
+        await startupPage.route('**/excel/catalog',route=>route.fulfill({status:502,contentType:'text/html',body:'Gateway unavailable'}));
+        await startupPage.goto(base+'/excel/');await startupPage.waitForSelector('#retryCatalog:visible');
+        await startupPage.fill('#username','excel-qa');await startupPage.fill('#password','excel-qa-only');await startupPage.click('#login');
+        await startupPage.waitForSelector('#workspace:visible');
+        assert.equal(await startupPage.locator('#generate').isEnabled(),false);
+        assert.ok((await startupPage.locator('#catalogStatus').innerText()).includes('Forms are unavailable'));
+        assert.equal(await startupPage.locator('#form').innerText(),'Forms unavailable');
+        await startupPage.screenshot({path:path.join(output,'forms-outage.png'),fullPage:true});
+        await startupPage.unroute('**/excel/catalog');await startupPage.click('#retryCatalog');
+        await startupPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(startupLogins,1);assert.equal(startupGeneration,0);
+        await startupPage.route('**/excel/catalog',route=>route.fulfill({contentType:'application/json',body:'[{}]'}));
+        await startupPage.reload();await startupPage.waitForSelector('#retryCatalog:visible');
+        assert.ok((await startupPage.locator('#catalogStatus').innerText()).includes('forms list is invalid'));
+        assert.equal(await startupPage.locator('#signIn').isVisible(),false);
+        await startupPage.unroute('**/excel/catalog');await startupPage.evaluate(()=>window.dispatchEvent(new Event('online')));
+        await startupPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(startupLogins,1);assert.equal(startupGeneration,0);
+        await startupPage.clock.install();let releaseCatalog:(()=>void)|undefined;
+        await startupPage.route('**/excel/catalog',route=>new Promise<void>(resolve=>{releaseCatalog=()=>{route.abort().catch(()=>{}).finally(resolve);};}));
+        const catalogStalled=startupPage.waitForRequest(request=>request.url().endsWith('/excel/catalog'));
+        await startupPage.reload();await catalogStalled;await startupPage.waitForSelector('#workspace:visible');
+        await startupPage.clock.fastForward(20001);await startupPage.clock.resume();
+        await startupPage.waitForSelector('#retryCatalog:visible');
+        assert.ok((await startupPage.locator('#catalogStatus').innerText()).includes('timed out'));
+        releaseCatalog!();await startupPage.unroute('**/excel/catalog');await startupPage.click('#retryCatalog');
+        await startupPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(startupLogins,1);assert.equal(startupGeneration,0);
+        await startupPage.close();
+        for(const scenario of ['browser','unsupported','office-missing','office-stalled']) {
+            const hostPage=await browser.newPage({viewport:{width:340,height:600}});
+            hostPage.on('pageerror',error=>errors.push(error.message));
+            let privateRequests=0;hostPage.on('request',request=>{if(request.method()==='POST')privateRequests++;});
+            const hostScript=scenario==='browser'?"window.Office={HostType:{Excel:'Excel'},onReady:cb=>Promise.resolve().then(()=>cb({host:null}))};":
+                scenario==='unsupported'?fake.replace("&&!qa.unsupported","&&false"):
+                scenario==='office-missing'?'/* No Office library for this failure test. */':
+                fake.replace("onReady:callback=>Promise.resolve().then(()=>callback({host:'Excel'}))","onReady:()=>new Promise(()=>{})");
+            await hostPage.route('**/*',async route=>{
+                if(route.request().url().startsWith('https://appsforoffice.microsoft.com/'))await route.fulfill({contentType:'text/javascript',body:hostScript});
+                else if(route.request().url().startsWith(base))await route.continue();else await route.abort();
+            });
+            if(scenario==='office-stalled')await hostPage.clock.install();
+            await hostPage.goto(base+'/excel/');
+            if(scenario==='office-stalled'){await hostPage.clock.fastForward(20001);await hostPage.clock.resume();}
+            await hostPage.waitForSelector('#hostActions:visible');
+            const expected=scenario==='browser'?'Open in Excel':scenario==='unsupported'?'Update Excel':'Excel connection unavailable';
+            assert.equal(await hostPage.locator('#hostTitle').innerText(),expected);
+            assert.equal(await hostPage.locator('#signIn').isVisible(),false);
+            assert.equal(privateRequests,0);
+            assert.equal(await hostPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+            await hostPage.screenshot({path:path.join(output,scenario+'-startup.png'),fullPage:true});
+            await hostPage.close();
+        }
+        const helpPage=await browser.newPage();
+        await helpPage.route('**/*',route=>route.request().url().startsWith(base)?route.continue():route.abort());
+        await helpPage.goto(base+'/excel/help');
+        assert.equal(await helpPage.locator('script').count(),0);
+        assert.equal(await helpPage.locator('a[download]').getAttribute('href'),'/excel/manifest.xml');
+        for(const width of [340,1280]){
+            await helpPage.setViewportSize({width,height:800});
+            assert.equal(await helpPage.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+            await helpPage.screenshot({path:path.join(output,'help-'+width+'.png'),fullPage:true});
+        }
+        await helpPage.close();
         await page.goto(base + '/excel/');
         await page.screenshot({ path: path.join(output, 'sign-in.png') });
         let loginRequests = 0;
@@ -106,6 +179,12 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(() => !(document.getElementById('generate') as HTMLButtonElement).disabled);
         assert.equal(loginRequests, 1);
         await page.screenshot({path:path.join(output,'auto-reconnected.png')});
+        await page.route('**/excel/resume',route=>route.fulfill({status:503,contentType:'text/html',body:'Temporary outage'}));
+        await page.reload();await page.waitForSelector('#connection:visible');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('temporarily unavailable'));
+        await page.unroute('**/excel/resume');await page.evaluate(()=>{window.dispatchEvent(new Event('online'));window.dispatchEvent(new Event('online'));});
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+        assert.equal(loginRequests,1,'Network recovery never resends credentials');
         await page.selectOption('#form', 'mc202');
         await page.waitForFunction(() => !(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.reload();
@@ -456,7 +535,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.ok((await page.locator('#error').innerText()).includes('12-hour Excel connection expired'));
         assert.equal(await page.locator('#result').isVisible(), false);
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: a local three-form ZIP (101 fillable fields, four pages), ZIP change guards and partial-failure recovery, 12-hour session restoration after reload and reopening, password-free outage recovery, logout and expired-session cleanup, disabled-storage fallback, individual fillable downloads, all 31 checkbox marks rendered and compared on/off, source-cell errors, formula PDF readback, simulated OneDrive delivery, responsive previews, calculation/change guards and network recovery. No real OneDrive uploads.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: catalog timeout/schema/outage recovery, ordinary-browser and unavailable/unsupported/stalled Office startup states, mobile/desktop help, password-free online recovery, a local three-form ZIP (101 fillable fields, four pages), ZIP change guards and partial-failure recovery, 12-hour session restoration after reload and reopening, logout and expired-session cleanup, disabled-storage fallback, individual fillable downloads, all 31 checkbox marks rendered and compared on/off, source-cell errors, formula PDF readback, simulated OneDrive delivery, responsive previews and calculation/change guards. No real OneDrive uploads.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

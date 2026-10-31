@@ -10,12 +10,16 @@
     let storage;
     try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
     const sessions = DevlinExcelSession.create(storage);
-    let connecting = false, connectionRevision = 0, expiryTimer;
+    let connecting = false, connectionRevision = 0, expiryTimer, resumePending = false;
+    let catalogBusy = false, catalogError = '';
     function message(error, status = '') {
         $('error').textContent = error; $('status').textContent = status;
         $('sourceIssues').hidden=true; $('sourceIssueList').replaceChildren();
     }
     function controls() {
+        $('catalogState').hidden = !officeReady || (!catalogBusy && !catalogError);
+        $('retryCatalog').hidden = !catalogError;
+        $('retryCatalog').disabled = catalogBusy;
         $('generate').disabled = busy || connecting || !officeReady || !token || !forms.length || !selectedData;
         $('generatePackage').disabled = busy || connecting || !officeReady || !token || forms.length !== 3 || !selectedData;
         $('downloadPackage').setAttribute('aria-disabled', String(busy || !packageUrl));
@@ -45,7 +49,7 @@
         selectedData = null; deliveryAvailable = false; $('autoSave').checked = false; $('deliveryOptions').hidden = true;
         filenameOwner = ''; $('filename').value = ''; $('fileNaming').hidden = true;
         $('cloudActions').hidden = true; clearResult(); $('workspace').hidden = true; $('connection').hidden = true;
-        $('signIn').hidden = false; $('logout').hidden = true; controls();
+        $('signIn').hidden = !officeReady; $('logout').hidden = true; controls();
     }
     function watchExpiry(expiresAt) {
         clearTimeout(expiryTimer);
@@ -168,6 +172,10 @@
     async function refresh(keepMessage = false, readOptions = {}) {
         const current = ++revision;
         selectedData = null; clearResult(); controls();
+        if (!officeReady || !forms.length) {
+            $('selection').textContent = 'Waiting for court forms'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true;
+            return;
+        }
         if (keepMessage !== true) message('');
         try { const data = await readSelection(readOptions); if (current === revision) showSelection(data); }
         catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true; showSourceError(error); } }
@@ -218,24 +226,26 @@
         message(''); controls(); await refresh(); await loadDelivery();
     }
     async function reconnect() {
+        if (!officeReady || resumePending) return;
         const saved = sessions.read();
         if (!saved) { signedOut(); return; }
         const attempt = ++connectionRevision;
         token = saved.token; connecting = true; watchExpiry(saved.expiresAt);
         $('signIn').hidden = true; $('workspace').hidden = true; $('connection').hidden = false;
         $('logout').hidden = false; $('reconnect').disabled = true;
-        controls(); message('', 'Restoring connection...');
+        resumePending = true; controls(); message('', 'Restoring connection...');
         try {
             const session = await api('/excel/resume', {});
             if (attempt !== connectionRevision || token !== saved.token) return;
             await connected(saved.token, session.expiresIn);
         } catch(error) {
             if (error.status === 401 || attempt === connectionRevision) message(error.message);
-        } finally { $('reconnect').disabled = false; }
+        } finally { resumePending = false; $('reconnect').disabled = false; }
     }
     $('loginForm').addEventListener('submit', async event => {
         event.preventDefault(); $('login').disabled = true; message('');
         try {
+            if (!officeReady) throw new Error('Open the panel in a supported Excel workbook.');
             const session = await api('/excel/session', { username:$('username').value, password:$('password').value });
             await connected(session.token, session.expiresIn);
         } catch(error) { message(error.message); }
@@ -372,17 +382,62 @@
         catch(error) { message(error.message, pdfUrl ? 'PDF ready. You can still download it or retry saving.' : ''); }
         finally { busy = false; controls(); if (!selectedData && token) refresh(true); }
     });
-    fetch('/excel/catalog').then(response => { if (!response.ok) throw new Error('Forms are unavailable.'); return response.json(); }).then(data => {
-        forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; }));
-        try { const previous = storage?.getItem(FORM_KEY); if (forms.some(form => form.id === previous)) $('form').value = previous; } catch { /* Use the first available form. */ }
-        controls(); if (token && !connecting) refresh();
-    }).catch(error => message(error.message));
+    async function loadCatalog() {
+        if (catalogBusy) return;
+        catalogBusy = true; catalogError = ''; $('catalogStatus').textContent = 'Loading court forms...'; controls();
+        if (!forms.length) $('form').options[0].text = 'Loading forms...';
+        let loaded = false;
+        const abort = new AbortController(), timer = setTimeout(() => abort.abort(), 20000);
+        try {
+            const response = await fetch('/excel/catalog', {credentials:'omit', signal:abort.signal});
+            if (!response.ok) throw new Error('Forms are unavailable. Check your connection and reload forms.');
+            const data = await response.json();
+            if (!Array.isArray(data) || data.length !== 3 || new Set(data.map(form => form?.id)).size !== 3 || data.some(form =>
+                !['dc105','dc508','mc202'].includes(form?.id) || typeof form.title !== 'string' || !form.title || form.title.length > 120 ||
+                !Array.isArray(form.fields) || !form.fields.length || form.fields.length > 200 || new Set(form.fields).size !== form.fields.length ||
+                form.fields.some(field => typeof field !== 'string' || !/^[a-z0-9]+_\d{2}$/.test(field)) ||
+                !Array.isArray(form.dateFields) || form.dateFields.some(field => !form.fields.includes(field)))) {
+                throw new Error('The forms list is invalid. Reload forms to try again.');
+            }
+            forms = data; $('form').replaceChildren(...forms.map(form => { const option = document.createElement('option'); option.value = form.id; option.textContent = form.title; return option; }));
+            try { const previous = storage?.getItem(FORM_KEY); if (forms.some(form => form.id === previous)) $('form').value = previous; } catch { /* Use the first available form. */ }
+            loaded = true;
+        } catch(error) {
+            catalogError = abort.signal.aborted ? 'Loading forms timed out. Reload forms to try again.' :
+                error instanceof TypeError ? 'Forms are unavailable. Check your connection and reload forms.' :
+                error instanceof SyntaxError ? 'The forms list is invalid. Reload forms to try again.' : error.message;
+            $('catalogStatus').textContent = catalogError;
+            if (!forms.length) $('form').options[0].text = 'Forms unavailable';
+        } finally { clearTimeout(timer); catalogBusy = false; controls(); }
+        if (loaded && token && !connecting && officeReady) refresh();
+    }
+    $('retryCatalog').addEventListener('click', loadCatalog);
+    $('reloadHost').addEventListener('click', () => window.location.reload());
+    window.addEventListener('online', () => {
+        if (catalogError) loadCatalog();
+        if (token && connecting && !resumePending) reconnect();
+    });
+    loadCatalog();
     if (window.lucide) lucide.createIcons();
-    if (window.Office) Office.onReady(info => {
+    function hostUnavailable(title, detail) {
+        $('hostTitle').textContent = title; $('hostMessage').textContent = detail;
+        $('hostNotice').hidden = false; $('hostActions').hidden = false;
+    }
+    const hostTimer = setTimeout(() => {
+        if (!officeReady) hostUnavailable('Excel connection unavailable', 'Excel did not finish connecting. Reload the panel to try again.');
+    }, 20000);
+    if (window.Office) Promise.resolve(Office.onReady(info => {
+        clearTimeout(hostTimer);
         officeReady = info.host === Office.HostType.Excel && Office.context.requirements.isSetSupported('ExcelApi', DevlinExcelWorkbook.MIN_EXCEL_API);
+        $('hostNotice').hidden = officeReady;
         controls();
-        if (!officeReady) message('This panel requires Excel with Excel API '+DevlinExcelWorkbook.MIN_EXCEL_API+' or newer.');
-        if (token && !connecting) refresh();
+        if (!officeReady) {
+            hostUnavailable(info.host === Office.HostType.Excel ? 'Update Excel' : 'Open in Excel', info.host === Office.HostType.Excel ?
+                'Excel API '+DevlinExcelWorkbook.MIN_EXCEL_API+' or newer is required. Use a current Microsoft 365 version of Excel.' :
+                'No Excel workbook is connected to this browser tab.');
+            return;
+        }
+        reconnect();
         if (officeReady) Excel.run(async context => {
             const sheets = context.workbook.worksheets;
             const changed = () => {
@@ -396,8 +451,8 @@
             sheets.onDeleted.add(changed);
             await context.sync();
         }).catch(() => { /* Before/after generation and download rechecks also protect hosts without change events. */ });
-    });
-    reconnect();
+    })).catch(() => { clearTimeout(hostTimer); hostUnavailable('Excel connection unavailable', 'Reload the panel to try again.'); });
+    else { clearTimeout(hostTimer); hostUnavailable('Excel connection unavailable', 'The Office library did not load. Check your connection and reload the panel.'); }
     window.addEventListener('beforeunload', () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); if (packageUrl) URL.revokeObjectURL(packageUrl); });
     let resizeTimer;
     window.addEventListener('resize', () => {

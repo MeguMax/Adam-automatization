@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Excel PDF Forms Guide | Devlin Law</title>
+  <link rel="icon" href="/excel/icon.png">
+  <link rel="stylesheet" href="/excel/style.css">
+  <link rel="stylesheet" href="/excel/help.css">
+</head>
+<body class="help-page">
+  <header><img src="/excel/icon.png" width="40" height="40" alt=""><div><strong>Devlin Law PDF Forms</strong><span>Installation and quick guide</span></div></header>
+  <main>
+    <h1>Excel PDF Forms</h1>
+    <p>Select one case row in your workbook to generate DC105 Judgment, DC508 Conditional Dismissal (two pages), or MC202 Certification of Records. PDFs stay fillable and are downloaded to your computer.</p>
+    <p class="actions"><a class="save" href="/excel/manifest.xml" download="devlin-law-excel.xml">Download Excel add-in</a><a href="https://admin.microsoft.com/" target="_blank" rel="noopener noreferrer">Microsoft 365 admin center</a></p>
+    <section>
+      <h2>1. Install Once</h2>
+      <p>For your Microsoft 365 work account, sign in to the admin center as your organization's administrator. Open <strong>Settings &gt; Integrated apps &gt; Add-ins &gt; Deploy Add-in</strong>, choose a custom add-in, and upload the downloaded <code>devlin-law-excel.xml</code>. Assign it to <strong>Just me</strong> for your first test. Review the workbook permission and finish deployment yourself.</p>
+      <p>For a browser-only pilot, open Excel Online and your workbook, then use <strong>Home &gt; Add-ins &gt; More Settings &gt; Upload My Add-in</strong> if your tenant permits it. This test installation belongs to that browser; Microsoft 365 deployment is preferable for ongoing desktop and web use.</p>
+      <p>Open Excel with the same Microsoft 365 account. After the add-in appears, select <strong>Home &gt; Devlin Law &gt; PDF Forms</strong>. If needed, look under <strong>Home &gt; Add-ins</strong>. Microsoft notes that administrator-deployed add-ins can take 24-72 hours to appear; save your work and restart Excel after installation.</p>
+    </section>
+    <section>
+      <h2>2. Connect</h2>
+      <p>In the right-hand panel, enter your <strong>Legal Workflow admin username and password</strong> and select <strong>Connect for 12 hours</strong>. Do not use your MiFILE or Microsoft password here. Passwords are not stored in the add-in or workbook.</p>
+      <p>The panel restores its valid connection when reopened. Desktop Excel and Excel Online may each need an initial connection. After 12 hours, connect again. <strong>Disconnect</strong> ends the current connection.</p>
+    </section>
+    <section>
+      <h2>3. Generate and Save</h2>
+      <ol>
+        <li>Open your current workbook. Click any cell in one case's data row, not the header or several rows. Check the selected name and case number in the panel.</li>
+        <li>Choose a <strong>Court form</strong>, optionally edit <strong>File name</strong>, then select <strong>Generate PDF</strong>. Alternatively, select <strong>Generate all 3 forms (ZIP)</strong>.</li>
+        <li>Review the preview for an individual PDF. Select <strong>Download PDF</strong> or <strong>Download ZIP</strong>. Open the ZIP to find the three separate PDFs.</li>
+        <li>Find the file in Excel's or your browser's download location, or the folder selected in its save dialog. PDF fields and checkboxes remain editable.</li>
+      </ol>
+      <p>Saving is currently <strong>local only</strong>. Nothing is automatically saved to OneDrive, emailed, paid, or filed in court. Generating again never changes your workbook. A change to the selected row or its data invalidates the old result so it cannot be downloaded for the wrong case.</p>
+    </section>
+    <section>
+      <h2>Workbook Requirements</h2>
+      <p>Use your supplied workbook with its existing formulas and PDF column names. Row 1 must contain unique headers and a <code>Defendant</code> column. Form columns are <code>dc105_01</code>-<code>dc105_48</code>, <code>dc508_01</code>-<code>dc508_28</code>, and <code>mc202_01</code>-<code>mc202_25</code>. Keep their names unchanged. Optional filename columns are <code>Landlord</code>, <code>Court_Name</code> (or <code>Court</code>), and <code>Case_Number</code>.</p>
+      <p>Each form uses only its matching columns; ZIP generation checks all three sets. The panel reads the calculated selected row, not a previously saved copy of the workbook. Keep Excel connected to the internet during generation.</p>
+    </section>
+    <section>
+      <h2>When Something Stops</h2>
+      <dl>
+        <dt>Forms are unavailable or loading timed out</dt><dd>Use <strong>Reload forms</strong> beside the message. When your internet connection returns, the panel also retries this check automatically. It does not generate or download files on its own.</dd>
+        <dt>Reconnecting</dt><dd>Use <strong>Reconnect</strong> or wait for your connection to return. A temporary outage does not discard a valid 12-hour connection. Do not reinstall the add-in.</dd>
+        <dt>No case selected</dt><dd>Select one data row. Use the refresh icon beside <strong>Selected case</strong> if the name has not updated.</dd>
+        <dt>Source issues</dt><dd>Use the cell button beside the issue to select the affected worksheet cell, or <strong>Header row</strong> for a missing column. Correct the source value or formula in Excel, select the case row again, and regenerate. The add-in does not overwrite or guess the correction.</dd>
+        <dt>Excel is still calculating</dt><dd>Wait for the workbook's calculations to finish, then retry. Unfinished or error values are not exported silently.</dd>
+        <dt>Text does not fit or preview is unavailable</dt><dd>For a text-fit error, correct the identified cell without losing the required content. If only the preview fails and a download button remains, download and inspect the PDF in your normal PDF application.</dd>
+        <dt>Open in Excel or Update Excel</dt><dd>A normal browser tab is not connected to your workbook. Open the installed panel inside Excel. Older Excel versions without Excel API 1.9 support need a current Microsoft 365 Excel version.</dd>
+      </dl>
+      <p>For support, send Artem the exact error text and a screenshot of the panel, plus the form and worksheet row involved. Do not send passwords or payment details. Send case documents only through the agreed private channel.</p>
+    </section>
+    <footer>Microsoft references: <a href="https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-deployment-of-add-ins?view=o365-worldwide" target="_blank" rel="noopener noreferrer">Administrator deployment</a> &middot; <a href="https://learn.microsoft.com/en-us/office/dev/add-ins/testing/sideload-office-add-ins-for-testing" target="_blank" rel="noopener noreferrer">Excel Online test installation</a>. Menu labels can vary with Office language and tenant policy.</footer>
+  </main>
+</body>
+</html>

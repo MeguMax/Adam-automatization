@@ -74,6 +74,13 @@ Protocol references:
 
 ## Installation and first live test
 
+Customer guide: https://legal-workflow-admin.onrender.com/excel/help
+
+The same English guide opens from the question-mark icon in the panel. It covers
+Microsoft 365 installation, initial connection, single-PDF and ZIP downloads,
+workbook requirements and common recovery actions. It contains no credentials,
+customer workbook values or PDF templates and works without the Office runtime.
+
 Manifest: https://legal-workflow-admin.onrender.com/excel/manifest.xml
 
 Task pane: https://legal-workflow-admin.onrender.com/excel/
@@ -464,3 +471,35 @@ Generation remains on Render and PDF delivery remains local-only. No customer
 workbook was uploaded, no OneDrive copy was created, and no MiFILE preparation,
 payment or court submission was performed by this acceptance run. No runtime,
 manifest, permission or environment changes were required.
+
+## Self-service startup and recovery (v89)
+
+The panel waits for a supported Excel host before showing the credential form or
+restoring a saved PDF session. Opening its URL in an ordinary browser instead
+shows Open in Excel and the installation guide. Unsupported Excel versions,
+missing Office.js, and an unresolved Office.onReady callback have distinct
+recovery states; initialization has a 20-second watchdog. A failure to download
+the initial Office.js script is still subject to the browser's network handling
+before our own deferred application script can run.
+
+The public form catalog has a separate 20-second fetch/body deadline and schema
+validation. Temporary gateway errors, malformed data and stalled responses show
+Reload forms without discarding a valid PDF session. Connecting while the
+catalog is unavailable cannot generate from stale mappings. Once the catalog
+returns, the current row is read again. An online event retries only an unavailable
+catalog or failed session restoration, never a PDF request, download or cloud
+write. Concurrent session-restoration attempts are suppressed. The explicit
+Reconnect and Reload forms actions remain available when the server recovers
+without a browser connectivity event. No credentials are resent automatically.
+
+The manifest's support link now points to the guide. Existing installed manifests
+continue to work, with unchanged API requirements and workbook permissions; the
+panel's guide link does not require reinstallation. PDF saving remains local-only.
+
+All 313 project tests passed without skips. The simulated Excel 1.9 browser smoke
+also passed catalog gateway/schema/deadline recovery, password-free online resume,
+ordinary-browser and unsupported/missing/stalled Office states, and the guide at
+340 px and 1280 px. It reran all three PDFs, the 101-field ZIP, editable field and
+checkbox checks, source navigation, expired-session guards and download-only mode.
+The runtime dependency audit reported zero known vulnerabilities. These checks
+do not replace installation and acceptance in Adam's own Microsoft 365 tenant.

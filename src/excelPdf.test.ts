@@ -404,10 +404,24 @@ test('Excel shell supports Office framing but never exposes templates or general
     assert.ok(!csp.includes('https://*.live.com'));
     assert.equal(shell.headers.get('x-frame-options'),null);
     assert.ok(!csp.includes('unsafe-inline'));
-    for (const asset of ['app.js', 'row.js', 'workbook.js', 'session.js', 'commands.html', 'commands.js', 'style.css', 'icon.png', 'icon-16.png', 'icon-32.png', 'icon-80.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
+    for (const asset of ['app.js', 'row.js', 'workbook.js', 'session.js', 'commands.html', 'commands.js', 'style.css', 'help', 'help.css', 'icon.png', 'icon-16.png', 'icon-32.png', 'icon-80.png', 'lucide.js', 'catalog', 'manifest.xml', 'pdfjs/pdf.mjs', 'pdfjs/pdf.worker.mjs']) assert.equal((await fetch(base + '/excel/' + asset)).status, 200);
     assert.equal((await fetch(base + '/excel/pdfjs/standard_fonts/nonexistent')).status, 404);
     assert.equal((await fetch(base + '/excel/templates/dc105.pdf')).status, 404);
     assert.equal((await post(base, 'generate', { form: 'dc105', values: {} }, await login(base))).status, 422);
+}));
+
+test('public Excel help provides installation and local-download instructions without credentials, Office runtime or workbook data', async () => fixture(async base => {
+    const response = await fetch(base + '/excel/help');
+    assert.equal(response.status,200);
+    assert.equal(response.headers.get('cache-control'),'no-store');
+    const html=await response.text();
+    for (const text of ['href="/excel/manifest.xml"','Just me','Legal Workflow admin username and password','local only',
+        'Download ZIP','Source issues','dc105_01','dc508_01','mc202_01']) assert.ok(html.includes(text),text);
+    assert.ok(!html.includes('<script'));
+    assert.ok(!html.includes('test-password'));
+    assert.ok(!html.includes('loginForm'));
+    assert.ok((await (await fetch(base+'/excel/manifest.xml')).text()).includes('/excel/help"'));
+    assert.equal((await fetch(base+'/excel/help/../../.env')).status,401);
 }));
 
 test('Excel ribbon opens the task pane without running generation or requiring new permissions', async () => fixture(async base => {

@@ -266,3 +266,30 @@ Before inviting live client packages, deploy the update, confirm the inbox and a
 - PDF.js WASM decoders, fonts and character maps are provided for both server extraction and browser preview, including JBIG2 scans.
 - Settings supports bulk Advice/Local import using verified MiFILE court names. Existing form components are not silently replaced. Shared county forms can be assigned to each applicable MiFILE court, while court-specific supplemental Local files remain separate components.
 - `MIFILE_AUTO_PREPARE_ENABLED=false` disables automatic preparation. Otherwise, completed email intakes with zero current validation issues and no previous filing job can queue **prepare only**. Failed/uncertain jobs are not automatically resubmitted. Court submission and payment remain disabled.
+
+## Attorney clarification received October 31: pending policy alignment
+
+The attorney clarified that substantive supporting-document sufficiency belongs
+to the sender, not this automation. The intended package remains Complaint,
+Summons, Request, library Advice/Local, and the supporting PDFs actually supplied.
+Each additional source PDF is a distinct Other/Connected item under the approved
+court routing. One supporting PDF means one upload; five mean five. Do not merge
+or split them, infer a separate Demand obligation, or automate outlier motions.
+Incoming names use Last Name, First Initial and Document Type; PDF titles remain
+recognition evidence, not legal determinations.
+
+This clarification is recorded for the next main-workflow policy change. The v89
+Excel release does not remove the existing Demand/Notice gate or mutate existing
+Drafts. That gate still needs to be aligned and regression-tested against the
+supplied-package policy, retaining missing core-PDF, duplicate, unreadable-file,
+source-version, account and filer protections. A court's acknowledged mistaken
+rejection is not grounds for automatic preparation or a duplicate resubmission.
+Corrected/rejected filing handling remains attorney-managed until its separate
+workflow is confirmed. A suggested retention of a few weeks does not authorize
+an unspecified automatic deletion schedule.
+
+The colleague-attorney scan is an extraction sample for future expansion, not
+authorization to substitute the configured Devlin filer or use the current
+MiFILE account for another attorney. Payment and final court submission remain
+disabled. No automatic retry, deletion, payment or court action follows from
+this clarification alone.

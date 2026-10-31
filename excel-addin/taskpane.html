@@ -15,9 +15,15 @@
 </head>
 <body>
   <header><img src="/excel/icon.png" width="32" height="32" alt=""><div><strong>PDF Forms</strong><span>Devlin Law PLLC</span></div>
-    <button id="logout" class="icon" title="Disconnect" aria-label="Disconnect" hidden><i data-lucide="log-out"></i></button>
+    <div class="header-actions"><a class="icon" href="/excel/help" target="_blank" rel="noopener noreferrer" title="Installation and help" aria-label="Installation and help"><i data-lucide="circle-help"></i></a><button id="logout" class="icon" title="Disconnect" aria-label="Disconnect" hidden><i data-lucide="log-out"></i></button></div>
   </header>
   <main>
+    <section id="hostNotice">
+      <h1 id="hostTitle">Connecting to Excel</h1>
+      <p id="hostMessage" class="secondary" role="status"></p>
+      <div id="hostActions" hidden><a class="save" href="/excel/help" target="_blank" rel="noopener noreferrer">Installation guide</a><button id="reloadHost" class="icon" title="Reload panel" aria-label="Reload panel"><i data-lucide="refresh-cw"></i></button></div>
+    </section>
+    <div id="catalogState" class="catalog-state" role="status" hidden><span id="catalogStatus"></span><button id="retryCatalog" class="icon" title="Reload forms" aria-label="Reload forms" hidden><i data-lucide="refresh-cw"></i></button></div>
     <section id="signIn" hidden>
       <h1>Connect Excel</h1>
       <form id="loginForm">
