@@ -12,6 +12,8 @@ import { changedFieldPaths, mergeExtractedField, protectedFieldPaths } from './d
 import { ADAM_OFFICE, ADAM_ATTORNEY, ADAM_FILING_POLICY_VERSION, approvedSupportingRelation } from './adamFilingPolicy';
 import { filingPreparationProgress, type FilingPreparationProgress } from './filingProgress';
 import { CheckoutStore } from './checkoutStore';
+import { migrateBundleActivity } from './mifileBundleSafety';
+import type { CheckoutAccount } from './mifileCheckout';
 import {
     ComplaintExtractionResult,
     CURRENT_COMPLAINT_EXTRACTOR_VERSION,
@@ -2602,6 +2604,24 @@ const migrations: Migration[] = [
         name: 'readonly_status_refresh_origin',
         up: db => db.exec(`ALTER TABLE mifile_checkout_inspections ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'manual'
             CHECK(trigger_source IN ('manual','automatic'));`),
+    },
+    {
+        version: 32,
+        name: 'automatic_checkout_readiness_and_bundle_safety',
+        up: db => {
+            db.exec(`CREATE TABLE mifile_readiness_runs (
+                filing_job_id TEXT PRIMARY KEY REFERENCES filing_jobs(id) ON DELETE CASCADE,
+                account_identity TEXT NOT NULL, created_at TEXT NOT NULL, finished_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','completed','review_required')),
+                issue TEXT
+            );
+            CREATE INDEX idx_readiness_active ON mifile_readiness_runs(status, created_at);
+            CREATE TABLE mifile_bundle_activity (
+                execution_key TEXT PRIMARY KEY, account_email TEXT NOT NULL, bundle_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL, source_filing_job_id TEXT NOT NULL, evidence_json TEXT NOT NULL
+            );`);
+            migrateBundleActivity(db);
+        },
     },
 ];
 
@@ -5813,6 +5833,7 @@ export class WorkflowDatabase {
         temporaryCaseNumber?: string | null;
         result?: Record<string, unknown> | null;
         debugArtifactPath?: string | null;
+        readinessAccount?: CheckoutAccount;
     }): FilingJobView {
         const existing = this.getFilingJob(input.filingJobId);
         if (!existing) throw new Error('MiFILE job not found');
@@ -5863,6 +5884,9 @@ export class WorkflowDatabase {
                 timestamp,
                 existing.caseDraftId,
             );
+            if (input.status === 'prepared' && input.readinessAccount) {
+                this.checkout().startAutomaticReadiness(input.filingJobId,input.readinessAccount);
+            }
             this.insertAuditLog('filing_job', input.filingJobId, `filing_job_${input.status}`, {
                 caseDraftId: existing.caseDraftId,
                 checkpoint: input.checkpoint,

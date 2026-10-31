@@ -41,12 +41,21 @@ export async function runFilingWorker(options: {
             try { db.queueValidatedIntakes(); }
             catch (error) { console.error('Automatic Unsubmitted preparation could not be queued:', error); }
         }
+        const autoStatus = !['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase());
+        const autoCheckout = !['false','0','no','off'].includes((process.env.MIFILE_AUTO_CHECKOUT_ENABLED || 'true').toLowerCase());
+        if (autoStatus && autoCheckout && getMiFileRuntimeConfig().ready) {
+            try { db.checkout().advanceAutomaticReadiness(getCheckoutAccount()); }
+            catch (error) { console.error('Automatic read-only checkout checks could not be queued:',error); }
+        }
         const inspection = db.checkout().claim();
         if (inspection) {
             workerHealth.work('mifile', 'checking_bundle', 300_000);
             try {
                 const job = db.getFilingJob(inspection.filingJobId);
                 if (!job) throw new Error('The prepared MiFILE job no longer exists.');
+                if (inspection.kind === 'quote' && !db.checkout().state(job.id,getCheckoutAccount()).canInspect) {
+                    throw new Error('The bundle needs reconciliation before checkout. Do not retry payment.');
+                }
                 const runner = new MiFileCheckoutRunner(stage => {
                     workerHealth.work('mifile', 'checking_bundle', 300_000);
                     db.checkout().progress(inspection.id, stage);
@@ -104,12 +113,13 @@ export async function runFilingWorker(options: {
                     savedBundleEvidence: result.savedBundleEvidence || null,
                 },
                 debugArtifactPath: result.screenshotPath,
+                readinessAccount: autoStatus && autoCheckout ? getCheckoutAccount() : undefined,
             });
             console.log(`MiFILE job ${job.id} prepared and saved as an unsubmitted bundle.`);
             workerHealth.finish('mifile');
             try {
-                if (!['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase())) {
-                    db.checkout().refreshReceiptsIfDue(job.id,getCheckoutAccount());
+                if (autoStatus) {
+                    if (!autoCheckout) db.checkout().refreshReceiptsIfDue(job.id,getCheckoutAccount());
                 }
             } catch {
                 console.warn('The initial read-only MiFILE status check could not be queued. The prepared bundle is unchanged.');

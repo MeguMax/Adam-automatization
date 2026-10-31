@@ -13,6 +13,7 @@ import {testPdfFixture} from './testPdfFixture';
 import {readPaymentMethods,selectPaymentMethodForQuote} from './mifilePaymentMethods';
 import {mifileOutcome} from './mifileOutcome';
 import {matchesMiFileAccountHeader} from './mifileSession';
+import {bundleExecutionKey,migrateBundleActivity} from './mifileBundleSafety';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -432,7 +433,8 @@ test('preflight records a primary-account real package only after fresh quote, e
         const snapshot=JSON.parse(f.sql.prepare('SELECT snapshot_json FROM mifile_submission_preflights').get().snapshot_json);
         assert.equal(snapshot.paymentMethodFingerprint,available[0].fingerprint);
         assert.equal(snapshot.paymentAuthorized,false);assert.equal(snapshot.courtSubmissionAuthorized,false);
-        assert.equal(snapshot.executionKey,digest([primary.identity,f.job.externalBundleId]));
+        assert.equal(snapshot.version,2);
+        assert.equal(snapshot.executionKey,bundleExecutionKey(primary.username,f.job.externalBundleId!));
         assert.equal(f.store.state(f.job.id,primary,Date.now()+900001).preflight.complete,false);
         assert.equal(f.store.state(f.job.id,account).preflight.complete,false);
         assert.equal(f.store.state(f.job.id,primary).preflight.executionEnabled,false);
@@ -521,6 +523,291 @@ function makePrimaryFixture() {
     evidence.packageDigest=preparationDigest(f.job.payload!,evidence.sources);
     return {...f,primary};
 }
+
+test('bundle execution identity is stable across credentials, local jobs and checkout quotes',()=>{
+    const bundle=prepared().externalBundleId!;
+    assert.equal(bundleExecutionKey(' QA@EXAMPLE.COM ',bundle.toUpperCase()),bundleExecutionKey(account.username,bundle));
+    assert.notEqual(bundleExecutionKey('another@example.com',bundle),bundleExecutionKey(account.username,bundle));
+    assert.notEqual(bundleExecutionKey(account.username,'11111111-2222-3333-4444-555555555555'),bundleExecutionKey(account.username,bundle));
+    assert.throws(()=>bundleExecutionKey(account.username,'TEMP-QA'));
+    assert.throws(()=>bundleExecutionKey('not-an-account',bundle));
+});
+
+function clonePreparedJob(f:ReturnType<typeof storeFixture>) {
+    const second=structuredClone(f.job);second.id='another-local-job';
+    second.payload!.documents[0].id='different-local-document';
+    (second.result!.documentManifest as any[])[0].documentId='different-local-document';
+    const evidence=second.result!.savedBundleEvidence as any;
+    evidence.sources[0].documentId='different-local-document';evidence.packageDigest=preparationDigest(second.payload!,evidence.sources);
+    f.jobs.set(second.id,second);
+    f.sql.prepare(`INSERT INTO filing_jobs(id,case_draft_id,attempt_number,mode,status,created_at,updated_at)
+        VALUES(?, ?, 2, 'prepare','prepared',?,?)`).run(second.id,second.caseDraftId,new Date().toISOString(),new Date().toISOString());
+    return second;
+}
+
+test('observed bundle activity blocks a second local record after password rotation and local deletion',()=>{
+    for(const status of ['Paid','Submitted','Payment Rejected','Rejected','Refunded','Filed'] as const) {
+        const f=makePrimaryFixture();
+        try {
+            const second=clonePreparedJob(f),work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+            f.store.complete(work.id,{kind:'receipts',state:'found',observations:[{...receipt(status),documentId:'doc-1'}],
+                checkedAt:new Date().toISOString(),issue:null},f.primary);
+            const rotated={...f.primary,identity:digest('rotated-primary-password')};
+            const state=f.store.state(second.id,rotated);
+            assert.equal(state.receiptSummary.submissionObserved,true);
+            assert.equal(state.priorBundleActivity!.fromAnotherRecord,true);
+            assert.deepEqual(state.receiptSummary.courtFiledDocumentIds,[],'Do not map a different local document to Filed');
+            assert.equal(state.canInspect,false);assert.equal(state.canConfirm,false);
+            assert.throws(()=>f.store.queue(second.id,'quote',rotated),/Reconcile/);
+            f.sql.prepare('DELETE FROM filing_jobs WHERE id=?').run(f.job.id);
+            assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_receipt_events').get().n,0);
+            assert.equal(f.store.state(second.id,rotated).canInspect,false,'Deletion must not erase the bundle safety hold');
+            assert.equal(f.store.queue(second.id,'receipts',rotated).kind,'receipts');
+        } finally {f.db.close();}
+    }
+});
+
+test('bundle activity is isolated by real account and bundle, and corrupted safety evidence fails closed',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+        f.store.complete(work.id,{kind:'receipts',state:'found',observations:[receipt('Paid')],
+            checkedAt:new Date().toISOString(),issue:null},f.primary);
+        const second=clonePreparedJob(f),evidence=second.result!.savedBundleEvidence as any;
+        evidence.accountEmail='other@example.com';
+        const other={...f.primary,username:'other@example.com'};
+        assert.equal(f.store.state(second.id,other).canInspect,true);
+        evidence.accountEmail=account.username;
+        f.sql.prepare("UPDATE mifile_bundle_activity SET evidence_json='{invalid'").run();
+        assert.equal(f.store.state(second.id,f.primary).canInspect,false);
+        assert.ok(f.store.state(second.id,f.primary).issues.some(issue=>issue.startsWith('Stored receipt evidence')));
+    } finally {f.db.close();}
+});
+
+test('legacy receipt migration backfills durable holds idempotently without hiding corrupt evidence',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+        f.store.complete(work.id,{kind:'receipts',state:'found',observations:[receipt('Paid')],
+            checkedAt:new Date().toISOString(),issue:null},f.primary);
+        f.sql.prepare('UPDATE filing_jobs SET external_bundle_id=?,result_json=? WHERE id=?')
+            .run(f.job.externalBundleId,JSON.stringify(f.job.result),f.job.id);
+        f.sql.prepare('DELETE FROM mifile_bundle_activity').run();
+        migrateBundleActivity(f.sql);migrateBundleActivity(f.sql);
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_bundle_activity').get().n,1);
+        f.sql.prepare('DELETE FROM mifile_bundle_activity').run();
+        f.sql.prepare("UPDATE mifile_receipt_events SET event_json='{invalid'").run();
+        migrateBundleActivity(f.sql);
+        const second=clonePreparedJob(f);
+        assert.equal(f.store.state(second.id,f.primary).canInspect,false);
+    } finally {f.db.close();}
+});
+
+test('a queued quote cannot complete after another local record discovers payment activity',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const second=clonePreparedJob(f),work=f.store.queue(second.id,'quote',f.primary);f.store.claim();
+        const observation=receipt('Paid');
+        const {rememberBundleActivity}=require('./mifileBundleSafety') as typeof import('./mifileBundleSafety');
+        rememberBundleActivity(f.sql,observation,f.job.id);
+        const q=buildCheckoutQuote(second,f.primary,fees,method,(second.result!.savedBundleEvidence as any).packageDigest,10300);
+        assert.throws(()=>f.store.complete(work.id,{kind:'quote',quote:q},f.primary),/reconciliation/);
+        assert.equal(f.store.state(second.id,f.primary).canConfirm,false);
+    } finally {f.db.close();}
+});
+
+test('a valid payment observation survives a later inconsistent inspection result without approving its receipt',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+        assert.throws(()=>f.store.complete(work.id,{kind:'receipts',state:'unsubmitted',observations:[receipt('Paid')],
+            checkedAt:new Date().toISOString(),issue:null},f.primary),/could not be verified/);
+        f.store.fail(work.id,'Inconsistent MiFILE status');
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_receipt_events').get().n,0);
+        assert.equal(f.store.state(f.job.id,f.primary).receiptSummary.submissionObserved,true);
+        assert.equal(f.store.state(f.job.id,f.primary).canInspect,false);
+        assert.equal(f.store.state(f.job.id,f.primary).receiptSummary.verifiedPaymentReceipt,false);
+        assert.throws(()=>f.store.queue(f.job.id,'quote',f.primary),/Reconcile/);
+    } finally {f.db.close();}
+    const mixed=makePrimaryFixture();
+    try {
+        const work=mixed.store.queue(mixed.job.id,'receipts',mixed.primary);mixed.store.claim();
+        assert.throws(()=>mixed.store.complete(work.id,{kind:'receipts',state:'found',observations:[
+            {...receipt(),documentId:'unknown-local-pdf'},receipt('Paid')],checkedAt:new Date().toISOString(),issue:null},mixed.primary),/different document/);
+        mixed.store.fail(work.id,'A receipt could not be matched');
+        assert.equal(mixed.store.state(mixed.job.id,mixed.primary).canInspect,false);
+    } finally {mixed.db.close();}
+});
+
+test('a durable hold cannot turn an old individual document rejection into a current bundle rejection',()=>{
+    const f=makePrimaryFixture();
+    try {
+        for(const [status,time] of [['Rejected','2026-10-28T10:00:00Z'],['Filed','2026-10-28T11:00:00Z']] as const) {
+            const work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+            f.store.complete(work.id,{kind:'receipts',state:'found',observations:[{...receipt(status),documentId:'doc-1',occurredAt:time}],
+                checkedAt:new Date().toISOString(),issue:null},f.primary);
+        }
+        assert.equal(f.store.state(f.job.id,f.primary).outcome.code,'filed');
+        assert.equal(f.store.state(f.job.id,f.primary).canInspect,false);
+    } finally {f.db.close();}
+});
+
+test('old or corrupted preflight snapshots cannot be reused as current payment readiness',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const q=completeQuote(f,'selected',Date.now(),f.primary);completeUnsubmitted(f,f.primary);
+        f.store.confirm(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents},f.primary,'qa');
+        const row=f.sql.prepare('SELECT snapshot_json FROM mifile_submission_preflights').get();
+        for(const corrupted of [{...JSON.parse(row.snapshot_json),version:1},{...JSON.parse(row.snapshot_json),totalCents:1}]) {
+            f.sql.prepare('UPDATE mifile_submission_preflights SET snapshot_json=?').run(JSON.stringify(corrupted));
+            assert.equal(f.store.state(f.job.id,f.primary).preflight.complete,false);
+            assert.equal(f.store.state(f.job.id,f.primary).canConfirm,false);
+            assert.equal(f.store.state(f.job.id,f.primary).preflight.recordedAt,null);
+        }
+    } finally {f.db.close();}
+});
+
+test('fresh quotes after password rotation retain the same bundle execution key but require a new amount review',()=>{
+    const f=makePrimaryFixture();
+    try {
+        const first=completeQuote(f,'selected',Date.now(),f.primary);completeUnsubmitted(f,f.primary);
+        f.store.confirm(f.job.id,{quoteId:first.id,quoteDigest:first.quoteDigest,totalCents:first.totalCents},f.primary,'qa');
+        const rotated={...f.primary,identity:digest('new-primary-credentials')};
+        assert.equal(f.store.state(f.job.id,rotated).canConfirm,false);
+        const next=completeQuote(f,'selected',Date.now(),rotated);completeUnsubmitted(f,rotated);
+        assert.equal(f.store.state(f.job.id,rotated).confirmedAt,null);
+        f.store.confirm(f.job.id,{quoteId:next.id,quoteDigest:next.quoteDigest,totalCents:next.totalCents},rotated,'qa');
+        const records=f.sql.prepare('SELECT snapshot_json FROM mifile_submission_preflights').all()
+            .map((row:any)=>JSON.parse(row.snapshot_json));
+        assert.equal(records.length,2);assert.equal(new Set(records.map((row:any)=>row.executionKey)).size,1);
+        assert.notEqual(records[0].accountIdentity,records[1].accountIdentity);
+        assert.equal(f.store.state(f.job.id,rotated).preflight.complete,true);
+    } finally {f.db.close();}
+});
+
+test('new verified primary packages automatically check Unsubmitted then exact fees without authorizing payment',()=>{
+    for(const methodState of ['selected','not_selected'] as const) {
+        const f=makePrimaryFixture();
+        try {
+            assert.equal(f.store.advanceAutomaticReadiness(f.primary),0,'Old packages do not enroll themselves');
+            assert.equal(f.store.startAutomaticReadiness(f.job.id,f.primary),true);
+            assert.equal(f.store.startAutomaticReadiness(f.job.id,f.primary),false);
+            assert.equal(f.store.advanceAutomaticReadiness(f.primary),1);
+            assert.equal(f.store.advanceAutomaticReadiness(f.primary),0);
+            const status=f.store.claim()!;assert.equal(status.kind,'receipts');
+            f.store.complete(status.id,{kind:'receipts',state:'unsubmitted',observations:[receipt()],
+                checkedAt:new Date().toISOString(),issue:null},f.primary);
+            const {CheckoutStore}=require('./checkoutStore') as typeof import('./checkoutStore');
+            const restarted=new CheckoutStore(f.sql,id=>f.jobs.get(id)||null,()=>{});
+            assert.equal(restarted.advanceAutomaticReadiness(f.primary),1);
+            const exact=restarted.claim()!;assert.equal(exact.kind,'quote');assert.equal(exact.triggerSource,'automatic');
+            const q=buildCheckoutQuote(f.job,f.primary,fees,{state:methodState,available,
+                fingerprint:methodState==='selected'?available[0].fingerprint:null},
+                (f.job.result!.savedBundleEvidence as any).packageDigest,10300);
+            restarted.complete(exact.id,{kind:'quote',quote:q},f.primary);
+            assert.equal(restarted.advanceAutomaticReadiness(f.primary),0);
+            const state=restarted.state(f.job.id,f.primary);
+            assert.equal(state.automaticReadiness!.status,'completed');assert.equal(state.quote!.totalCents,12669);
+            assert.equal(state.canConfirm,methodState==='selected');
+            assert.equal(state.confirmedAt,null);assert.equal(state.preflight.complete,false);
+            assert.equal(state.paymentMethodChoice,null,'Do not automatically select a new payment account');
+            assert.equal(state.paymentExecutionEnabled,false);assert.equal(state.courtSubmissionEnabled,false);
+            assert.equal(restarted.advanceAutomaticReadiness(f.primary,Date.now()+16*60_000),0,'Do not renew quotes forever');
+        } finally {f.db.close();}
+    }
+});
+
+test('Prepared and its automatic readiness enrollment commit atomically and resume after reopening SQLite',()=>{
+    const f=makePrimaryFixture();
+    try {
+        f.sql.prepare("UPDATE filing_jobs SET status='running',payload_json=? WHERE id=?").run(JSON.stringify(f.job.payload),f.job.id);
+        const input={filingJobId:f.job.id,status:'prepared' as const,checkpoint:'saved_unsubmitted',
+            externalBundleId:f.job.externalBundleId,temporaryCaseNumber:f.job.temporaryCaseNumber,
+            result:f.job.result,readinessAccount:f.primary};
+        const audit=(f.db as any).insertAuditLog;
+        (f.db as any).insertAuditLog=()=>{throw new Error('Simulated transaction interruption');};
+        assert.throws(()=>f.db.completeFilingJob(input),/interruption/);
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_readiness_runs').get().n,0);
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'running');
+        (f.db as any).insertAuditLog=audit;
+        f.db.completeFilingJob(input);
+        const reopened=new WorkflowDatabase(f.db.getPath());
+        try {
+            assert.equal(reopened.checkout().state(f.job.id,f.primary).automaticReadiness!.status,'active');
+            assert.equal(reopened.checkout().advanceAutomaticReadiness(f.primary),1);
+            assert.equal(reopened.checkout().claim()!.kind,'receipts');
+        } finally {reopened.close();}
+    } finally {f.db.close();}
+});
+
+test('automatic readiness uses durable bounded backoff, leaves manual recovery and respects account changes',()=>{
+    const f=makePrimaryFixture();
+    try {
+        f.store.startAutomaticReadiness(f.job.id,f.primary);
+        for(let i=0;i<3;i++) {
+            assert.equal(f.store.advanceAutomaticReadiness(f.primary,Date.now()+i*12*60_000),1);
+            const check=f.store.claim()!;f.store.fail(check.id,'Temporary MiFILE outage');
+            // Simulate elapsed time for the completed attempt without waiting in the test.
+            f.sql.prepare('UPDATE mifile_checkout_inspections SET finished_at=? WHERE id=?')
+                .run(new Date(Date.now()+i*12*60_000).toISOString(),check.id);
+            if(i<2) assert.equal(f.store.advanceAutomaticReadiness(f.primary,Date.now()+i*12*60_000+60_000),0);
+        }
+        assert.equal(f.store.advanceAutomaticReadiness(f.primary,Date.now()+36*60_000),0);
+        assert.equal(f.store.state(f.job.id,f.primary).automaticReadiness!.status,'review_required');
+        assert.equal(f.store.queue(f.job.id,'receipts',f.primary).triggerSource,'manual');
+    } finally {f.db.close();}
+    const changed=makePrimaryFixture();
+    try {
+        changed.store.startAutomaticReadiness(changed.job.id,changed.primary);
+        assert.equal(changed.store.advanceAutomaticReadiness({...changed.primary,identity:digest('new-login')}),0);
+        assert.equal(changed.store.state(changed.job.id,changed.primary).automaticReadiness!.status,'review_required');
+    } finally {changed.db.close();}
+});
+
+test('automatic readiness stops on observed activity, expiry, QA and non-primary accounts',()=>{
+    const f=makePrimaryFixture();
+    try {
+        assert.equal(f.store.startAutomaticReadiness(f.job.id,account),false);
+        f.store.startAutomaticReadiness(f.job.id,f.primary);
+        f.store.advanceAutomaticReadiness(f.primary);
+        const status=f.store.claim()!;
+        f.store.complete(status.id,{kind:'receipts',state:'found',observations:[receipt('Paid')],
+            checkedAt:new Date().toISOString(),issue:null},f.primary);
+        assert.equal(f.store.advanceAutomaticReadiness(f.primary),0);
+        assert.equal(f.store.state(f.job.id,f.primary).automaticReadiness!.status,'review_required');
+    } finally {f.db.close();}
+    const old=makePrimaryFixture();
+    try {
+        old.store.startAutomaticReadiness(old.job.id,old.primary);
+        assert.equal(old.store.advanceAutomaticReadiness(old.primary,Date.now()+24*60*60_000),0);
+        assert.equal(old.store.state(old.job.id,old.primary).automaticReadiness!.status,'review_required');
+    } finally {old.db.close();}
+    const qa=storeFixture();
+    try {assert.equal(qa.store.startAutomaticReadiness(qa.job.id,{...account,accountEnvironment:'production',productionConfirmed:true}),false);}
+    finally {qa.db.close();}
+});
+
+test('automatic exact-fee failures back off and cannot hold up a queued preparation',()=>{
+    const f=makePrimaryFixture();
+    try {
+        f.store.startAutomaticReadiness(f.job.id,f.primary);f.store.advanceAutomaticReadiness(f.primary);
+        const status=f.store.claim()!;
+        f.store.complete(status.id,{kind:'receipts',state:'unsubmitted',observations:[receipt()],
+            checkedAt:new Date().toISOString(),issue:null},f.primary);
+        assert.equal(f.store.advanceAutomaticReadiness(f.primary),1);
+        f.sql.prepare("UPDATE filing_jobs SET status='queued' WHERE id=?").run(f.job.id);
+        assert.equal(f.store.claim(),null);
+        f.sql.prepare("UPDATE filing_jobs SET status='prepared' WHERE id=?").run(f.job.id);
+        const exact=f.store.claim()!;assert.equal(exact.kind,'quote');
+        f.store.fail(exact.id,'Checkout fee table could not be read');
+        assert.equal(f.store.advanceAutomaticReadiness(f.primary,Date.now()+4*60_000),0);
+        assert.equal(f.store.advanceAutomaticReadiness(f.primary,Date.now()+6*60_000),1);
+        assert.equal(f.store.claim()!.kind,'quote');
+        assert.equal(f.store.recover(),1);
+        assert.equal(f.store.advanceAutomaticReadiness(f.primary,Date.now()+9*60_000),0);
+        assert.equal(f.store.state(f.job.id,f.primary).confirmedAt,null);
+    } finally {f.db.close();}
+});
 
 test('automatic status refresh is receipts-only, deduplicated, durable and restricted to verified primary real packages',()=>{
     const f=makePrimaryFixture();

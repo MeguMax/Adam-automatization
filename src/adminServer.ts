@@ -54,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-31-complaint-review-v91';
+const ADMIN_BUILD_ID = '2026-10-31-auto-checkout-v92';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4782,6 +4782,14 @@ const html = String.raw`<!doctype html>
     document.getElementById('newCustomDraftBtn').addEventListener('click', () => createDraft('custom'));
 
 
+    function checkoutReadinessLabel(checkout) {
+      if (checkout.priorBundleActivity || checkout.issues.some(issue => issue.startsWith('Stored receipt evidence'))) return 'Check MiFILE before continuing';
+      if (checkout.active || checkout.automaticReadiness?.status === 'active') return 'Checking package and fees';
+      if (checkout.confirmedAt) return 'Exact amount reviewed';
+      if (checkout.canConfirm) return 'Exact amount ready for review';
+      return checkout.quote && checkout.checkoutVerified ? 'Choose or verify payment account' : 'Checkout needs review';
+    }
+
     function renderCheckoutReview(job, open) {
       const checkout = job.checkout;
       const quote = checkout.quote;
@@ -4791,11 +4799,18 @@ const html = String.raw`<!doctype html>
       return '<details class="draft-optional" data-checkout-review' + (open ? ' open' : '') + '><summary>Checkout & receipts' +
         (quote ? ' · ' + escapeHtml(money(quote.totalCents)) : '') + '</summary>' +
         '<div class="checkout-review-body"><strong>No payment or court submission is enabled.</strong>' +
+        '<strong data-checkout-readiness>' + escapeHtml(checkoutReadinessLabel(checkout)) + '</strong>' +
+        (checkout.automaticReadiness?.issue ? '<span class="draft-filing-job-error">' + escapeHtml(checkout.automaticReadiness.issue) + '</span>' : '') +
+        (checkout.priorBundleActivity ? '<span class="draft-filing-job-error">MiFILE previously reported ' +
+          escapeHtml(checkout.priorBundleActivity.status) + ' for this bundle' +
+          (checkout.priorBundleActivity.fromAnotherRecord ? ' in another local record' : '') + '. Check MiFILE; do not repeat payment.</span>' : '') +
         (checkout.active ? '<span role="status">Checking MiFILE: ' + escapeHtml(checkout.inspection.stage.replace(/_/g,' ')) + '</span>' : '') +
         (quote ? '<span>MiFILE account: ' + escapeHtml(quote.accountEmail) + '</span>' +
           '<dl class="checkout-fees">' + quote.lines.map(line => '<dt>' + escapeHtml(line.label) + '</dt><dd>' + escapeHtml(money(line.cents)) + '</dd>').join('') +
           '<dt class="checkout-total">Checkout total:</dt><dd class="checkout-total">' + escapeHtml(money(quote.totalCents)) + ' USD</dd></dl>' +
-          '<span>Quote expires: ' + escapeHtml(fmtDate(quote.expiresAt)) + '</span>' : '<span>Check checkout to retrieve the exact total, including MiFILE processing fees.</span>') +
+          '<span>Quote expires: ' + escapeHtml(fmtDate(quote.expiresAt)) + '</span>' :
+          '<span>' + (checkout.automaticReadiness?.status === 'active' ? 'The exact total is being checked automatically, including MiFILE processing fees.' :
+          'Check checkout to retrieve the exact total, including MiFILE processing fees.') + '</span>') +
         (quote?.totalCents > 0 ? '<span>Payment account: ' + escapeHtml(checkout.selectedPaymentMethodLabel ||
           (quote.paymentMethodState === 'selected' ? 'Selected in MiFILE' : quote.paymentMethodState === 'missing' ? 'No payment account verified in this quote' :
             quote.paymentMethodState === 'unverified' ? 'Linked account not independently verified' : 'Not selected')) + '</span>' : '') +
@@ -4883,6 +4898,7 @@ const html = String.raw`<!doctype html>
           : '') + '</span></div>';
       const latest = jobs[0];
       const outcome = latest?.status === 'prepared' ? latest.checkout?.outcome : null;
+      const checkout = latest?.status === 'prepared' ? latest.checkout : null;
       document.getElementById('draftPreparationStatus').innerHTML = latest
         ? '<div class="draft-validation draft-result' + (outcome?.tone === 'warning' ? ' has-errors' :
             outcome?.tone === 'success' || outcome?.code === 'unsubmitted' ? ' is-ready' : '') + '"><strong>' +
@@ -4895,9 +4911,21 @@ const html = String.raw`<!doctype html>
             (outcome.checkedAt ? '<span>Last checked: ' + escapeHtml(fmtDate(outcome.checkedAt)) + (outcome.fresh ? '' : ' · Refresh needed') + '</span>' : '') +
             (outcome.filedDocuments || outcome.rejectedDocuments ? '<span>Filed documents: ' + outcome.filedDocuments + ' / ' + outcome.expectedDocuments +
               ' · Rejected documents: ' + outcome.rejectedDocuments + '</span>' : '') : '') +
-          '<button type="button" data-show-preparation>View activity</button></div>' : '';
+          (checkout && !checkout.receiptSummary.submissionObserved ? '<p data-checkout-summary>' +
+            escapeHtml(checkoutReadinessLabel(checkout)) +
+            (checkout.checkoutVerified && checkout.quote ? ' · ' + escapeHtml(new Intl.NumberFormat('en-US',
+              {style:'currency',currency:'USD'}).format(checkout.quote.totalCents / 100)) + ' USD' : '') + '</p>' : '') +
+          '<button type="button" data-show-preparation>' + icon(checkout && !checkout.receiptSummary.submissionObserved ? 'receipt' : 'activity') +
+          (checkout && !checkout.receiptSummary.submissionObserved ? 'Review fees' : 'View activity') + '</button></div>' : '';
       const progressButton = document.querySelector('[data-show-preparation]');
-      if (progressButton) progressButton.onclick = () => setDraftSection('activity', true);
+      if (progressButton) progressButton.onclick = () => {
+        setDraftSection('activity', true);
+        const details = document.querySelector('[data-checkout-review]');
+        if (details && checkout && !checkout.receiptSummary.submissionObserved) {
+          details.open = true;
+          details.scrollIntoView({block:'nearest'});
+        }
+      };
       if (!jobs.length) {
         const eligibilityIssues = state.draftDetail.caseDraft.filingEligibilityIssues || [];
         root.innerHTML = accountStrip + '<div class="draft-filing-job-panel">' +

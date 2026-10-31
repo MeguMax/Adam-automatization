@@ -695,6 +695,11 @@ async function main() {
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         await page.locator('[data-checkout-review] summary').click();
         assert.match(await page.locator('[data-checkout-review]').innerText(),/Checkout total:\s+\$126.69 USD/);
+        assert.equal(await page.locator('[data-checkout-readiness]').innerText(),'Exact amount ready for review');
+        await page.locator('#draftReviewTab').click();
+        assert.match(await page.locator('[data-checkout-summary]').innerText(),/Exact amount ready for review.*\$126.69 USD/);
+        await page.getByRole('button',{name:'Review fees',exact:true}).click();
+        assert.equal(await page.locator('[data-checkout-review]').evaluate(element=>(element as HTMLDetailsElement).open),true);
         assert.match(await page.locator('[data-release-checks]').textContent() || '',
             /Checkout total and processing fee: Read from MiFILE/);
         const denied=await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/pay`,{headers:{Origin:url},data:{}});
@@ -707,6 +712,7 @@ async function main() {
         await page.locator('#draftConfirmAccept').click();
         await page.locator('[data-checkout-action="confirm"]').waitFor({state:'visible'});
         await page.waitForFunction(()=>document.querySelector('[data-checkout-review]')?.textContent?.includes('Amount reviewed:'));
+        assert.equal(await page.locator('[data-checkout-readiness]').innerText(),'Exact amount reviewed');
         assert.ok(db.checkout().state(job.id,checkoutAccount).confirmedAt);
         assert.equal(db.checkout().state(job.id,checkoutAccount).paymentExecutionEnabled,false);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
@@ -724,6 +730,7 @@ async function main() {
         assert.equal(invalidMethod.status(),409);
         await page.locator('[data-checkout-action="payment-method"]').click();
         await page.waitForFunction(()=>document.querySelector('[data-checkout-review]')?.textContent?.includes('Checking MiFILE:'));
+        assert.equal(await page.locator('[data-checkout-readiness]').innerText(),'Checking package and fees');
         assert.equal(db.checkout().state(job.id,checkoutAccount).confirmedAt,null);
         assert.equal(db.checkout().paymentMethodChoice(job.id,checkoutAccount),paymentMethods[1].fingerprint);
         const nextInspection=db.checkout().claim()!;
@@ -833,6 +840,7 @@ async function main() {
         assert.equal(db.getDraftDetail(draftId)!.caseDraft!.filingStatus,'prepared');
         await page.locator('#draftActivityTab').click();
         assert.equal(await page.locator('[data-checkout-action="inspect"]').isEnabled(),false);
+        assert.equal(await page.locator('[data-checkout-readiness]').innerText(),'Check MiFILE before continuing');
         assert.equal(await page.locator('[data-checkout-review] a').getAttribute('href'),'https://mifile.courts.michigan.gov/receipts/qa-only.pdf');
         await page.locator('#draftReviewTab').click();
         await page.screenshot({path:path.join(screenshots,'draft-payment-result-desktop.png'),fullPage:true});

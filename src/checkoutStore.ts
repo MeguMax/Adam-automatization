@@ -3,7 +3,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { FilingJobView } from './database';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { mifileOutcome } from './mifileOutcome';
-import { checkoutReviewIssues, digest, receiptEventKey, receiptSummary, validateReceipt,
+import { bundleExecutionKey, rememberBundleActivity } from './mifileBundleSafety';
+import { checkoutReviewIssues, receiptEventKey, receiptSummary, validateReceipt,
     type CheckoutAccount, type CheckoutInspection, type CheckoutInspectionResult, type CheckoutQuote,
     type MiFileReceiptObservation } from './mifileCheckout';
 
@@ -52,7 +53,7 @@ export class CheckoutStore {
     clearPaymentMethod(filingJobId: string, account: CheckoutAccount, chosenBy = 'admin', now = Date.now()): void {
         this.transaction(() => {
             const job = this.getFilingJob(filingJobId), state = this.state(filingJobId,account);
-            if (!job || !filingReleaseChecks(job,account).sameAccount || state.active || state.receiptSummary.submissionObserved) {
+            if (!job || !state.canInspect || state.active) {
                 throw new Error('The verified bundle must be idle and Unsubmitted before changing its payment account choice.');
             }
             if (!this.paymentMethodChoice(filingJobId,account)) return;
@@ -132,6 +133,70 @@ export class CheckoutStore {
         });
     }
 
+    startAutomaticReadiness(filingJobId: string, account: CheckoutAccount, now = Date.now()): boolean {
+        const job = this.getFilingJob(filingJobId), checks = job && filingReleaseChecks(job,account);
+        if (!checks?.primaryAccountConfirmed || checks.testOnly) return false;
+        return Boolean(this.db.prepare(`INSERT INTO mifile_readiness_runs
+            (filing_job_id,account_identity,created_at) VALUES(?,?,?) ON CONFLICT(filing_job_id) DO NOTHING`)
+            .run(filingJobId,account.identity,new Date(now).toISOString()).changes);
+    }
+
+    advanceAutomaticReadiness(account: CheckoutAccount, now = Date.now()): number {
+        return this.transaction(() => {
+            const runs = this.db.prepare(`SELECT filing_job_id, account_identity, created_at FROM mifile_readiness_runs
+                WHERE status = 'active' ORDER BY created_at LIMIT 20`).all() as
+                Array<{filing_job_id:string;account_identity:string;created_at:string}>;
+            let queued = 0;
+            for (const run of runs) {
+                const finish = (status: 'completed'|'review_required', issue: string|null) => {
+                    this.db.prepare(`UPDATE mifile_readiness_runs SET status = ?, issue = ?, finished_at = ?
+                        WHERE filing_job_id = ? AND status = 'active'`)
+                        .run(status,issue,new Date(now).toISOString(),run.filing_job_id);
+                };
+                const job = this.getFilingJob(run.filing_job_id), checks = job && filingReleaseChecks(job,account);
+                if (run.account_identity !== account.identity || !checks?.primaryAccountConfirmed || checks.testOnly) {
+                    finish('review_required','The account or prepared package changed. Check the package before refreshing checkout.');
+                    continue;
+                }
+                const started = Date.parse(run.created_at);
+                if (!Number.isFinite(started) || started > now || now - started >= 24 * 60 * 60_000) {
+                    finish('review_required','Automatic checks have stopped. Refresh checkout when you are ready to review the amount.');
+                    continue;
+                }
+                const state = this.state(run.filing_job_id,account,now);
+                if (state.active) continue;
+                if (!state.canInspect) {
+                    finish('review_required','Check the reported bundle activity in MiFILE. Do not retry payment.');
+                    continue;
+                }
+                const inspections = (this.db.prepare(`SELECT id FROM mifile_checkout_inspections
+                    WHERE filing_job_id = ? AND account_identity = ? AND created_at >= ? ORDER BY created_at DESC, rowid DESC`)
+                    .all(run.filing_job_id,account.identity,run.created_at) as Array<{id:string}>).map(row => this.get(row.id)!);
+                const lastQuote = inspections.find(item => item.kind === 'quote');
+                const recentUnsubmitted = state.preflight.checks.find(check => check.id === 'receipt')?.passed;
+                if (lastQuote?.status === 'completed' && lastQuote.result?.kind === 'quote' && state.checkoutVerified && recentUnsubmitted) {
+                    finish('completed',null);
+                    continue;
+                }
+                const kind = recentUnsubmitted ? 'quote' : 'receipts';
+                const attempts = inspections.filter(item => item.kind === kind);
+                if (attempts.length >= 3) {
+                    finish('review_required','MiFILE could not be verified after three checks. Review the last error and refresh manually.');
+                    continue;
+                }
+                const latest = attempts[0], lastAt = latest && Date.parse(latest.finishedAt || latest.createdAt);
+                const delay = latest ? Math.min(30,5 * 2 ** (attempts.length - 1)) * 60_000 : 0;
+                if (lastAt !== undefined && (!Number.isFinite(lastAt) || now - lastAt < delay)) continue;
+                const backlog = this.db.prepare(`SELECT count(*) AS n FROM mifile_checkout_inspections
+                    WHERE trigger_source = 'automatic' AND status IN ('queued','running')`).get() as {n:number};
+                if (backlog.n >= 5) break;
+                this.insertInspection(run.filing_job_id,kind,account,'automatic',now);
+                queued++;
+            }
+            return queued;
+        });
+    }
+
     claim(): CheckoutInspection | null {
         return this.transaction(() => {
             if (this.db.prepare("SELECT 1 FROM filing_jobs WHERE status = 'running' LIMIT 1").get() ||
@@ -159,13 +224,17 @@ export class CheckoutStore {
     }
 
     complete(id: string, result: CheckoutInspectionResult, account: CheckoutAccount): void {
-        this.transaction(() => {
+        const observedActivity: Array<{observation:MiFileReceiptObservation;filingJobId:string}> = [];
+        try { this.transaction(() => {
             const inspection = this.get(id), job = inspection && this.getFilingJob(inspection.filingJobId);
             if (!inspection || inspection.status !== 'running' || !job || inspection.kind !== result.kind ||
                 inspection.accountIdentity !== account.identity || !filingReleaseChecks(job, account).sameAccount) {
                 throw new Error('The inspection account or prepared bundle changed.');
             }
             if (result.kind === 'quote') {
+                if (!this.state(job.id,account).canInspect) {
+                    throw new Error('Reported bundle activity requires reconciliation. Do not retry payment.');
+                }
                 const issues = checkoutReviewIssues(result.quote, job, account);
                 const choice = this.paymentMethodChoice(job.id,account);
                 if (choice && result.quote.totalCents > 0 && result.quote.paymentMethodFingerprint !== choice) {
@@ -180,7 +249,14 @@ export class CheckoutStore {
                     throw new Error('Unrecognized receipt result.');
                 }
                 for (const observation of result.observations) {
+                    try {
+                        validateReceipt(observation,job,account);
+                        if (receiptSummary([observation]).submissionObserved) observedActivity.push({observation,filingJobId:job.id});
+                    } catch { /* Validate the complete result below, retaining any independently verified activity. */ }
+                }
+                for (const observation of result.observations) {
                     validateReceipt(observation, job, account);
+                    rememberBundleActivity(this.db,observation,job.id);
                     const key = receiptEventKey(observation);
                     const prior = this.db.prepare(`SELECT event_key, event_json FROM mifile_receipt_events WHERE filing_job_id = ?
                         AND external_reference = ? AND receipt_kind = ? AND remote_status = ? AND document_id = ?`)
@@ -217,7 +293,11 @@ export class CheckoutStore {
                 paymentAttempted: false, courtSubmissionAttempted: false });
             this.recordPreflight(job.id,account);
             this.pruneAutomaticHistory(job.id);
-        });
+        }); } catch (error) {
+            // A later malformed/conflicting result must not erase a valid observation of money/submission activity.
+            for (const item of observedActivity) rememberBundleActivity(this.db,item.observation,item.filingJobId);
+            throw error;
+        }
     }
 
     fail(id: string, error: string): void {
@@ -258,8 +338,28 @@ export class CheckoutStore {
                 receipts.push(observation);
             } catch { receiptEvidenceInvalid = true; }
         }
+        let bundleActivity: {source_filing_job_id:string;evidence_json:string;observed_at:string}|undefined;
+        try {
+            if (job?.externalBundleId) bundleActivity = this.db.prepare(`SELECT source_filing_job_id, evidence_json, observed_at
+                FROM mifile_bundle_activity WHERE execution_key = ?`)
+                .get(bundleExecutionKey(account.username,job.externalBundleId)) as typeof bundleActivity;
+        } catch { receiptEvidenceInvalid = true; }
+        let priorActivity: MiFileReceiptObservation|null = null;
+        if (bundleActivity && job) {
+            try {
+                const observation = JSON.parse(bundleActivity.evidence_json) as MiFileReceiptObservation;
+                validateReceipt({...observation,documentId:null},job,account);
+                if (!receiptSummary([observation]).submissionObserved) throw new Error('Invalid bundle activity');
+                priorActivity = {...observation,documentId:null};
+            } catch { receiptEvidenceInvalid = true; }
+        }
         if (receiptEvidenceInvalid) issues.push('Stored receipt evidence needs reconciliation. Check MiFILE; do not retry payment.');
-        const summary = receiptSummary(receipts);
+        const localSummary = receiptSummary(receipts);
+        const bundleReceipts = priorActivity ? [...receipts,priorActivity] : receipts;
+        const summary = {...receiptSummary(bundleReceipts),
+            verifiedPaymentReceipt:localSummary.verifiedPaymentReceipt,
+            courtFiledDocumentIds:localSummary.courtFiledDocumentIds,
+            courtRejectedDocumentIds:localSummary.courtRejectedDocumentIds};
         const choiceRecord = this.methodChoiceRecord(filingJobId,account);
         const choice = choiceRecord?.method_fingerprint || null;
         if (quote && choiceRecord && (!Number.isFinite(Date.parse(choiceRecord.chosen_at)) ||
@@ -268,6 +368,25 @@ export class CheckoutStore {
             issues.push('The chosen payment account needs a fresh checkout check.');
         }
         if (summary.submissionObserved) issues.push('MiFILE has already reported submission or payment activity. Reconcile receipts; do not retry payment.');
+        const preflight = quote ? this.db.prepare(`SELECT created_at, snapshot_json FROM mifile_submission_preflights
+            WHERE quote_id = ? AND account_identity = ?`).get(quote.id,account.identity) as
+            {created_at:string;snapshot_json:string}|undefined : undefined;
+        if (preflight) {
+            try {
+                const snapshot = JSON.parse(preflight.snapshot_json);
+                if (snapshot.version !== 2 || snapshot.filingJobId !== filingJobId || snapshot.bundleId !== quote!.bundleId ||
+                    snapshot.quoteId !== quote!.id || snapshot.quoteDigest !== quote!.quoteDigest ||
+                    snapshot.packageDigest !== quote!.packageDigest || snapshot.totalCents !== quote!.totalCents ||
+                    snapshot.currency !== 'USD' || snapshot.accountIdentity !== account.identity ||
+                    snapshot.accountEmail !== account.username.trim().toLowerCase() ||
+                    snapshot.paymentMethodFingerprint !== quote!.paymentMethodFingerprint || snapshot.expiresAt !== quote!.expiresAt ||
+                    snapshot.executionKey !== bundleExecutionKey(account.username,quote!.bundleId) ||
+                    snapshot.paymentAuthorized !== false || snapshot.courtSubmissionAuthorized !== false ||
+                    !Number.isFinite(Date.parse(preflight.created_at)) || Date.parse(preflight.created_at) > now) {
+                    throw new Error('Preflight snapshot changed');
+                }
+            } catch { issues.push('The stored preflight requires a fresh checkout check. No payment is authorized.'); }
+        }
         const publicQuote = quote && !issues.includes('The stored checkout snapshot is invalid.')
             ? (({ accountIdentity: privateIdentity, paymentMethodFingerprint: privateMethod, ...rest }) => rest)(quote) : null;
         const last = inspections[0];
@@ -287,8 +406,12 @@ export class CheckoutStore {
             {id:'receipt',label:'Recent Unsubmitted status checked; no prior payment reported',
                 passed:Boolean(recentUnsubmitted && !summary.submissionObserved && !receiptEvidenceInvalid)},
         ];
-        const preflight = quote ? this.db.prepare(`SELECT created_at FROM mifile_submission_preflights
-            WHERE quote_id = ? AND account_identity = ?`).get(quote.id,account.identity) as {created_at:string} | undefined : undefined;
+        const readiness = this.db.prepare(`SELECT status, issue FROM mifile_readiness_runs WHERE filing_job_id = ?`)
+            .get(filingJobId) as {status:'active'|'completed'|'review_required';issue:string|null}|undefined;
+        const activityWithoutLocalReceipts = Boolean(priorActivity && !localSummary.submissionObserved);
+        const outcome = mifileOutcome(receipts,job?.payload?.documents.map(document => document.id) || [],receiptCheck ? {
+            status:receiptCheck.status,state:receiptResult?.state || null,checkedAt:receiptResult?.checkedAt || null,
+        } : null,receiptEvidenceInvalid || activityWithoutLocalReceipts,now);
         return {
             inspection: last ? { id: last.id, kind: last.kind, status: last.status, stage: last.stage, createdAt: last.createdAt,
                 startedAt: last.startedAt, finishedAt: last.finishedAt, error: last.error } : null,
@@ -300,12 +423,14 @@ export class CheckoutStore {
                 issues.every(issue => /^(Add a payment method|Select the intended payment method|Verify the payment account)/.test(issue))),
             paymentMethodChoice:choice,
             selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
+            automaticReadiness:readiness || null,
+            priorBundleActivity:priorActivity ? {status:priorActivity.status,observedAt:bundleActivity!.observed_at,
+                fromAnotherRecord:bundleActivity!.source_filing_job_id !== filingJobId} : null,
             preflight:{checks:preflightChecks,complete:preflightChecks.every(check=>check.passed),
                 recordedAt:preflightChecks.every(check=>check.passed) ? preflight?.created_at || null : null,
                 executionEnabled:false as const},
-            outcome:mifileOutcome(receipts,job?.payload?.documents.map(document => document.id) || [],receiptCheck ? {
-                status:receiptCheck.status,state:receiptResult?.state || null,checkedAt:receiptResult?.checkedAt || null,
-            } : null,receiptEvidenceInvalid,now),
+            outcome:{...outcome,submissionObserved:summary.submissionObserved,
+                message:activityWithoutLocalReceipts ? 'Earlier submission or payment activity is recorded for this bundle. Check MiFILE; do not repeat payment or filing.' : outcome.message},
             receipts, receiptSummary:summary, receiptCheckState: receiptResult?.state || null,
             receiptCheckIssue: quote && receipts.some(receipt => receipt.kind === 'payment' && receipt.status === 'Paid' && receipt.totalCents !== quote.totalCents)
                 ? 'The payment receipt amount differs from the reviewed checkout quote. Check MiFILE; do not retry payment.' : receiptResult?.issue || null,
@@ -343,11 +468,11 @@ export class CheckoutStore {
                 if (!privateQuote || privateQuote.totalCents > 0 && !/^[a-f0-9]{64}$/.test(privateQuote.paymentMethodFingerprint || '')) {
                     throw new Error('The reviewed payment account could not be verified. Refresh checkout.');
                 }
-                const snapshot = {version:1,filingJobId,bundleId:quote.bundleId,quoteId:quote.id,
+                const snapshot = {version:2,filingJobId,bundleId:quote.bundleId,quoteId:quote.id,
                     quoteDigest:quote.quoteDigest,packageDigest:quote.packageDigest,totalCents:quote.totalCents,
-                    currency:quote.currency,accountIdentity:account.identity,
+                    currency:quote.currency,accountIdentity:account.identity,accountEmail:account.username.trim().toLowerCase(),
                     paymentMethodFingerprint:privateQuote.paymentMethodFingerprint,
-                    expiresAt:quote.expiresAt,executionKey:digest([account.identity,quote.bundleId]),
+                    expiresAt:quote.expiresAt,executionKey:bundleExecutionKey(account.username,quote.bundleId),
                     paymentAuthorized:false,courtSubmissionAuthorized:false};
                 this.db.prepare(`INSERT INTO mifile_submission_preflights
                     (quote_id,filing_job_id,account_identity,created_at,snapshot_json) VALUES(?,?,?,?,?) ON CONFLICT(quote_id) DO NOTHING`)

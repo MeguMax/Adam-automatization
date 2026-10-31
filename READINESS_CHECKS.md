@@ -1,5 +1,30 @@
 # Offline acceptance and worker progress
 
+## Automatic checkout readiness (v92)
+
+New verified primary-account packages continue automatically from Unsubmitted
+status verification to a read-only exact-fee inspection. This is not payment
+automation: no payment or court submission action is enabled. Failed checks use
+bounded retries and persistent backoff; stale or uncertain results require
+review. Existing bundles are not bulk-enrolled, and completed quotes are not
+renewed forever. The Review screen exposes the amount/readiness state and links
+directly to fee review without replacing the recorded court outcome.
+
+Checkout regression fixtures cover the automatic sequence, unselected payment
+methods, restarts, expiry, account changes, preparation priority, exact-amount
+review and legacy/corrupt preflights. Durable account/bundle holds are tested
+across password changes, duplicate local jobs and local-history deletion. A paid,
+rejected or refunded observation never becomes permission to charge again.
+These tests are not a real payment or court-submission acceptance test.
+
+Release acceptance: 344/344 automated tests passed without skips; desktop/mobile
+admin smoke passed; all nine supplied cases passed their explicit outcomes with
+63 Complaint values compared (five ready, four retained review gates). No live
+MiFILE preparation, payment or court submission was performed by this acceptance
+run. Evidence is private under `output/qa-auto-checkout-v92-2026-10-31/` and the
+`output/auto-checkout-v92-*-release.log` files. Runtime dependency audit: zero
+known vulnerabilities.
+
 ## Supplied intake examples
 
 Run a private acceptance manifest after building:
