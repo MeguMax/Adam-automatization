@@ -134,9 +134,12 @@ export async function dismissMifilePreparationNotice(page: Page): Promise<void> 
         }
         if (!await dialog.isVisible()) continue;
         const knownInformation = text.includes('Do any of your public documents contain Protected Personal Identifying Information (PII)?') ||
-            (text.includes('TrueFiling Notification') && text.includes('New Courts Going Live on MiFILE'));
+            (text.includes('TrueFiling Notification') && (text.includes('New Courts Going Live on MiFILE') ||
+                /Training!\s+Please\s+register for the upcoming MiFILE training webinar\s+on\s+/i.test(text) &&
+                /MiFILE currently supports\s+\d+\s+trial courts!/i.test(text)));
         if (!knownInformation ||
-            /\b(accept|agree|authorize|payment|consent|terms of (?:use|service))\b/i.test(text)) {
+            /\b(accept|agree|authorize|payment|consent|terms of (?:use|service))\b/i.test(text) ||
+            await dialog.locator('input:not([type="hidden"]),select,textarea').filter({visible:true}).count()) {
             throw new MiFileNoticeRequiresReviewError('MiFILE displayed an unexpected notice. Review it manually before preparation continues.');
         }
         const element = await dialog.elementHandle();

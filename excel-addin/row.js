@@ -37,7 +37,9 @@
         return { values, columns };
     }
     function assertSelection(selection) {
-        if (!Number.isInteger(selection.rowIndex) || selection.rowCount !== 1 || selection.rowIndex < 1) throw new Error('Select one data row, not the header or multiple rows.');
+        if (!Number.isInteger(selection.rowIndex) || selection.rowCount !== 1 || selection.rowIndex < 1) {
+            throw Object.assign(new Error('Select one data row, not the header or multiple rows.'),{code:'selection'});
+        }
     }
     function caseMetadata(headers, values, types) {
         const issues=[];

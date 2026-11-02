@@ -622,6 +622,25 @@ test('Save Progress acknowledges only its own success dialog and never an unrela
     } finally {await page.close();}
 });
 
+test('the November webinar information notice is acknowledged but agreements or data-entry notices are never accepted',async()=>{
+    const {dismissMifilePreparationNotice}=require('./mifileSession') as typeof import('./mifileSession');
+    const page=await browser.newPage();
+    const news='Training! Please register for the upcoming MiFILE training webinar on November 10th, 2026. Did you Know? MiFILE currently supports 133 trial courts! Attention Antrim, Grand Traverse, Leelanau County Filers There is a known issue impacting some cases in the MiFile system.';
+    try {
+        for(const extra of ['',' I agree to terms of service.','<input type="checkbox">']) {
+            await page.setContent('<div role="dialog"><h3>TrueFiling Notification</h3>'+news+extra+
+                '<button onclick="window.acknowledged=true;this.parentElement.remove()">OK</button></div>');
+            if(extra) {
+                await assert.rejects(dismissMifilePreparationNotice(page),/unexpected notice/);
+                assert.equal(await page.locator('[role="dialog"]').count(),1);
+            }else {
+                await dismissMifilePreparationNotice(page);
+                assert.equal(await page.locator('[role="dialog"]').count(),0);
+            }
+        }
+    }finally{await page.close();}
+});
+
 test('preparation waits for a loading notice and rechecks nested containers without accepting unfamiliar content',async()=>{
     const {dismissMifilePreparationNotice}=require('./mifileSession') as typeof import('./mifileSession');
     for(const agreement of [false,true]) {

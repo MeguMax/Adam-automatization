@@ -16,6 +16,7 @@ import { createExcelOneDriveDelivery, excelPdfFilename, ExcelPdfDelivery } from 
 
 const row = require('../excel-addin/row.js');
 const workbook = require('../excel-addin/workbook.js');
+const batch = require('../excel-addin/batch.js');
 const clientSessions = require('../excel-addin/session.js');
 const values = (id = 'dc105'): Record<string, unknown> => Object.fromEntries(EXCEL_FORMS.find(form => form.id === id)!.fields.map(field => [field, '']));
 const packageInput = () => ({forms: EXCEL_FORMS.map(form => ({form:form.id,values:values(form.id),filename:form.id.toUpperCase()+' - QA example.pdf'}))});
@@ -25,12 +26,14 @@ function officeFixture() {
     const state={headers:['Defendant','Landlord','Court_Name','Case_Number',...form.fields],
         values:['Morgan Tenant','Example Property LLC','29th','26-00001-LT',...form.fields.map(()=>'' as string|number|boolean|null)],
         rowIndex:35,rowCount:1,width:form.fields.length+4,calculations:0,waits:0,reads:0,selectionReads:0,
-        states:['Done'],date:'10/5/2026',dateCalls:[] as string[],moveSelection:false,moveSheet:false};
+        states:['Done'],date:'10/5/2026',dateCalls:[] as string[],moveSelection:false,moveSheet:false,
+        rows:{} as Record<number,Array<string|number|boolean|null>>,hiddenRows:[] as number[]};
     let currentState='Done';
     const sheet={id:'sheet-1',name:'Working Document',load(){return this;},getUsedRange(){return {
         columnIndex:0,get columnCount(){return state.width;},load(){return this;}};},
-        getRangeByIndexes(index:number){return {get values(){state.reads++;return [index===0?state.headers:[...state.values]];},
-            get valueTypes(){return [state.values.map(value=>typeof value==='number'?'Double':'String')];},
+        getRangeByIndexes(index:number){return {get values(){state.reads++;return [index===0?state.headers:[...(state.rows[index] || state.values)]];},
+            get rowHidden(){return state.hiddenRows.includes(index);},
+            get valueTypes(){return [(state.rows[index] || state.values).map(value=>typeof value==='number'?'Double':'String')];},
             getCell(){return {};},load(){return this;}};}};
     const excel={CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async(callback:any)=>callback({
         sync:async()=>{},application:{calculate(){state.calculations++;},get calculationState(){return currentState;},
@@ -93,6 +96,55 @@ test('three-form adapter reads one calculated row, formats both form date sets a
     state.headers.splice(state.headers.indexOf('mc202_01'),1);state.width--;
     await assert.rejects(workbook.readPackage(excel,EXCEL_FORMS,{sleep}),/Missing column: mc202_01/);
     await assert.rejects(workbook.readPackage(excel,EXCEL_FORMS.slice(1),{sleep}),/All three/);
+});
+
+test('batch adapter isolates invalid rows, skips hidden rows and never changes the Excel selection',async()=>{
+    const {state,excel,form,sleep}=officeFixture();state.rowCount=3;
+    state.rows[35]=[...state.values];state.rows[36]=[...state.values];state.rows[37]=[...state.values];
+    state.rows[36][state.headers.indexOf('Defendant')]='';state.hiddenRows=[37];
+    const result=await workbook.readBatch(excel,[form],{sleep});
+    assert.equal(state.calculations,1);assert.equal(state.rowIndex,35);assert.equal(state.rowCount,3);
+    assert.equal(result.rows[0].data.name,'Morgan Tenant');assert.equal(result.rows[0].row,36);
+    assert.match(result.rows[1].error.message,/no Defendant/);assert.equal(result.rows[1].error.source.row,37);
+    assert.equal(result.rows[2].error.code,'hidden_row');
+    assert.equal(workbook.sameBatchSnapshot(result,structuredClone(result)),true);
+    state.rows[35][state.headers.indexOf('Landlord')]='Changed Owner';
+    assert.equal(workbook.sameBatchSnapshot(result,await workbook.readBatch(excel,[form],{recalculate:false,sleep})),false);
+    for(const count of [0,11]){state.rowCount=count;await assert.rejects(workbook.readBatch(excel,[form],{sleep}),/1 and 10/);}
+    state.rowCount=2;state.rowIndex=0;await assert.rejects(workbook.readBatch(excel,[form],{sleep}),/without the header/);
+});
+
+test('case ZIP retains successful cases, isolates a failed form, and includes a local results report',async()=>{
+    const form={id:'dc105',fields:['dc105_01'],dateFields:[]};
+    const data=(row:number)=>({form:'batch',row,name:'Tenant '+row,values:{dc105_01:String(row)},
+        metadata:{defendant:'Tenant '+row,plaintiff:'Owner / Unsafe',caseNumber:'26-'+row}});
+    const source={sheet:'Cases',sheetId:'sheet-1',startRow:2,rowCount:3,formIds:['dc105'],
+        rows:[{row:2,data:data(2),error:null},{row:3,data:data(3),error:null},{row:4,data:null,error:{message:'Missing required value',code:'source'}}]};
+    const progress:any[]=[];
+    const result=await batch.generate(source,[form],{readCurrent:async()=>structuredClone(source),
+        generate:async(input:any)=>{if(input.values.dc105_01==='3')throw new Error('Fictional form error');return Buffer.from('%PDF-editable-fixture');},
+        onProgress:(record:any)=>progress.push(record)});
+    const files=unzipSync(result.bytes);
+    assert.equal(Object.keys(files).filter(name=>name.endsWith('.pdf')).length,1);
+    assert.ok(Object.keys(files).every(name=>!name.includes('..') && name.split('/').length<=2));
+    assert.match(Buffer.from(files['results.txt']).toString(),/Row 3.*failed.*Fictional form error/);
+    assert.match(Buffer.from(files['results.txt']).toString(),/Row 4.*Missing required value/);
+    assert.deepEqual(result.results.map((record:any)=>record.status),['ready','failed','failed']);
+    assert.ok(progress.some(record=>record.status==='generating'));
+});
+
+test('batch cancellation, changed data, invalid PDF responses and oversized output cannot expose a ZIP',async()=>{
+    const form={id:'dc105',fields:['dc105_01'],dateFields:[]};
+    const source={sheet:'Cases',sheetId:'sheet-1',startRow:2,rowCount:1,formIds:['dc105'],rows:[{row:2,error:null,
+        data:{form:'batch',row:2,name:'Tenant',values:{dc105_01:'26-1'},metadata:{defendant:'Tenant'}}}]};
+    const base={readCurrent:async()=>structuredClone(source),generate:async()=>Buffer.from('%PDF-fixture')};
+    const abort=new AbortController();
+    await assert.rejects(batch.generate(source,[form],{...base,signal:abort.signal,generate:async()=>{abort.abort();return Buffer.from('%PDF-fixture');}}),/canceled/);
+    let reads=0;
+    await assert.rejects(batch.generate(source,[form],{...base,readCurrent:async()=>{
+        const latest=structuredClone(source);if(++reads>1)latest.rows[0].data.values.dc105_01='26-2';return latest;}}),/worksheet changed/);
+    await assert.rejects(batch.generate(source,[form],{...base,generate:async()=>Buffer.from('<html>Gateway</html>')}),/No cases generated/);
+    await assert.rejects(batch.generate(source,[form],{...base,generate:async()=>Buffer.concat([Buffer.from('%PDF-'),Buffer.alloc(9*1024*1024)])}),/exceeds 16 MB/);
 });
 
 test('ZIP endpoint validates all three forms before generation and is authenticated and same-origin', async () => {

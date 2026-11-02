@@ -34,6 +34,25 @@ Downloads remain available independently of OneDrive. The panel does **not**
 silently write to `C:\Users\adamj\OneDrive\Documents`; that local path cannot
 identify the correct cloud folder on Render.
 
+## Multiple-case local ZIP (v96)
+
+Select 1-10 adjacent data rows, choose any subset of DC105/DC508/MC202 under
+**Multiple cases**, then **Generate selected cases**. One Excel calculation reads
+all selected rows; generation uses the existing authenticated PDF service
+sequentially. Each successful case has a Windows-safe row-prefixed folder with
+its selected fillable PDFs. Hidden rows are skipped. Invalid rows and failed
+PDFs omit that entire case while preserving other successful cases; `results.txt`
+lists every outcome. Progress and Cancel are available. No partial failed case
+or cloud copy is delivered. Archives are limited to 16 MiB and each PDF to 8 MiB.
+
+Before starting, after each case and before download, the panel checks all mapped
+values, case identities, selection and chosen forms. Any change discards the old
+archive. It never changes the worksheet selection or source values to iterate
+cases. Numeric dates retain the existing Excel-calendar conversion. ZIPs stay
+in the browser until an explicit local download; no batch archive is stored on
+Render or OneDrive. The existing single-PDF and single-case three-form ZIP
+remain available unchanged.
+
 ## Optional OneDrive delivery
 
 The current rollout remains **download-only**, as requested. No Excel delivery

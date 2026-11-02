@@ -14,6 +14,7 @@ import {readPaymentMethods,selectPaymentMethodForQuote} from './mifilePaymentMet
 import {mifileOutcome} from './mifileOutcome';
 import {matchesMiFileAccountHeader} from './mifileSession';
 import {bundleExecutionKey,migrateBundleActivity} from './mifileBundleSafety';
+import {SubmissionStore,executeSubmission,type SubmissionTransport} from './mifileSubmission';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -1115,4 +1116,147 @@ test('refund receipts are distinct from paid receipts, and untrusted receipt URL
         assert.equal(receiptSummary(result.observations).verifiedPaymentReceipt,false);
         assert.equal(receiptSummary(result.observations).refundReported,true);
     }finally{await page.close();}
+});
+
+function submissionFixture(enabled=false) {
+    const f=storeFixture(),primary={...account,accountEnvironment:'production',productionConfirmed:true};
+    f.job.payload!.subject='NEW LT FILING - Example Plaintiff v Example Defendant';
+    const evidence=f.job.result!.savedBundleEvidence as any;
+    evidence.packageDigest=preparationDigest(f.job.payload!,evidence.sources);
+    const q=completeQuote(f,'selected',Date.now(),primary);
+    const input={quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents};
+    f.store.confirm(f.job.id,input,primary,'qa');completeUnsubmitted(f,primary);
+    const submissions=new SubmissionStore(f.sql,f.store,id=>f.jobs.get(id)||null,(_id,action)=>f.audit.push(action),
+        enabled?()=>true:undefined);
+    return {...f,primary,q,input,submissions};
+}
+
+test('no-payment rehearsal is durable, exact and idempotent but never authorizes live execution',async()=>{
+    const f=submissionFixture();let calls=0;
+    try {
+        const input={...f.input,noPaymentAcknowledged:true};
+        assert.throws(()=>f.submissions.rehearse(f.job.id,{...input,noPaymentAcknowledged:false},f.primary,'qa'));
+        assert.throws(()=>f.submissions.rehearse(f.job.id,{...input,totalCents:1},f.primary,'qa'));
+        const intent=f.submissions.rehearse(f.job.id,input,f.primary,'qa');
+        assert.equal(f.submissions.rehearse(f.job.id,input,f.primary,'qa').id,intent.id);
+        assert.equal(f.audit.filter(action=>action==='submission_rehearsed').length,1);
+        const state=f.submissions.state(f.job.id,f.primary);
+        assert.equal(state.status,'rehearsed');assert.equal(state.paymentAuthorized,false);assert.equal(state.executionEnabled,false);
+        assert.ok(!JSON.stringify(state).includes(f.primary.identity));
+        assert.throws(()=>f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary),/disabled/);
+        const transport:SubmissionTransport={inspect:async()=>{calls++;return {quote:f.q,observations:[receipt()],account:f.primary};},
+            submitOnce:async()=>{calls++;},receipts:async()=>[],close:async()=>{}};
+        await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,transport),/disabled/);
+        assert.equal(calls,0);assert.equal(f.submissions.get(intent.id)!.attempts,0);
+    }finally{f.db.close();}
+});
+
+test('rehearsal is invalidated by changed amount, package, account, expiry and corrupt evidence',()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        const approve={...f.input,paymentAndSubmissionApproved:true};
+        assert.throws(()=>f.submissions.authorize(intent.id,{...approve,paymentAndSubmissionApproved:false},f.primary));
+        assert.throws(()=>f.submissions.authorize(intent.id,{...approve,totalCents:1},f.primary));
+        assert.throws(()=>f.submissions.authorize(intent.id,approve,{...f.primary,identity:digest('changed')}));
+        assert.throws(()=>f.submissions.authorize(intent.id,approve,f.primary,Date.now()+900001));
+        f.job.payload!.courtName='Changed court';assert.throws(()=>f.submissions.authorize(intent.id,approve,f.primary));
+        f.job.payload!.courtName='Court';
+        f.sql.prepare("UPDATE mifile_submission_intents SET snapshot_json='{}'").run();
+        assert.throws(()=>f.submissions.get(intent.id),/invalid/);
+        assert.equal(f.submissions.state(f.job.id,f.primary).canRehearse,false);
+    }finally{f.db.close();}
+});
+
+test('fixture execution verifies live checkout and records the committing checkpoint before its one transport call',async()=>{
+    const f=submissionFixture(true);let calls=0,closed=0;
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        const transport:SubmissionTransport={inspect:async()=>({quote:f.q,observations:[receipt()],account:f.primary}),
+            submitOnce:async()=>{calls++;assert.equal(f.submissions.get(intent.id)!.status,'committing');assert.equal(f.submissions.get(intent.id)!.attempts,1);},
+            receipts:async()=>[receipt('Submitted'),{...receipt('Paid'),kind:'payment',totalCents:f.q.totalCents,currency:'USD'}],
+            close:async()=>{closed++;}};
+        await executeSubmission(f.submissions,intent.id,f.primary,transport);
+        assert.equal(calls,1);assert.equal(f.submissions.get(intent.id)!.status,'submitted');
+        await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,transport));
+        assert.equal(calls,1);assert.equal(closed,2);
+        assert.equal(f.store.state(f.job.id,f.primary).canInspect,false);
+        assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_bundle_activity').get().n,1);
+    }finally{f.db.close();}
+});
+
+test('changed live quotes, stale receipts and existing remote activity stop before the irreversible call',async()=>{
+    for(const scenario of ['changed','stale','activity','forged'] as const) {
+        const f=submissionFixture(true);let calls=0;
+        try {
+            const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+            f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+            const q={...f.q};if(scenario==='changed')q.totalCents++;
+            const observation=receipt(scenario==='activity'?'Submitted':'Unsubmitted');
+            if(scenario==='stale')observation.observedAt=new Date(Date.now()-65_000).toISOString();
+            if(scenario==='forged')observation.accountEmail='wrong@example.com';
+            await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,{inspect:async()=>({quote:q,observations:[observation],account:f.primary}),
+                submitOnce:async()=>{calls++;},receipts:async()=>[],close:async()=>{}}),/No payment attempted/);
+            assert.equal(calls,0);assert.equal(f.submissions.get(intent.id)!.status,'blocked');
+            if(scenario==='activity')assert.equal(f.store.state(f.job.id,f.primary).canInspect,false);
+        }finally{f.db.close();}
+    }
+});
+
+test('a timeout after committing cannot be retried, including after local history deletion or credential rotation',async()=>{
+    const f=submissionFixture(true);let calls=0;
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        const transport:SubmissionTransport={inspect:async()=>({quote:f.q,observations:[receipt()],account:f.primary}),
+            submitOnce:async()=>{calls++;throw new Error('Connection lost after commit');},receipts:async()=>[],close:async()=>{}};
+        await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,transport),/Connection lost/);
+        assert.equal(f.submissions.get(intent.id)!.status,'reconciliation_required');
+        await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,transport));assert.equal(calls,1);
+        f.sql.prepare('DELETE FROM filing_jobs WHERE id=?').run(f.job.id);
+        assert.ok(f.submissions.get(intent.id));
+        const another={...f.job,id:'new-local-job'};f.jobs.set(another.id,another);
+        const rotated={...f.primary,identity:digest('rotated-credentials')};
+        assert.equal(f.submissions.state(another.id,rotated).id,intent.id);
+        assert.equal(f.submissions.state(another.id,rotated).canRehearse,false);
+        assert.equal(f.store.state(another.id,rotated).canInspect,false);
+    }finally{f.db.close();}
+});
+
+test('partial and mismatched financial receipts retain verified evidence and a durable hold',async()=>{
+    for(const mismatch of [false,true]) {
+        const f=submissionFixture(true);
+        try {
+            const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+            f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+            await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,{inspect:async()=>({quote:f.q,observations:[receipt()],account:f.primary}),
+                submitOnce:async()=>{},receipts:async()=>[{...receipt('Paid'),kind:'payment',totalCents:f.q.totalCents+(mismatch?1:0),currency:'USD'},
+                    ...(mismatch?[receipt('Submitted')]:[]),{...receipt(),accountEmail:'wrong@example.com'}],close:async()=>{}}),/Do not retry/);
+            assert.equal(f.submissions.get(intent.id)!.status,'reconciliation_required');
+            const stored=f.sql.prepare('SELECT result_json FROM mifile_submission_intents WHERE id=?').get(intent.id);
+            assert.equal(JSON.parse(stored.result_json)[0].status,'Paid');
+            assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_bundle_activity').get().n,1);
+            assert.equal(f.store.state(f.job.id,f.primary).canInspect,false);
+        }finally{f.db.close();}
+    }
+});
+
+test('process interruption during either execution phase requires reconciliation, never an automatic retry',()=>{
+    for(const phase of ['checking','committing'] as const) {
+        const f=submissionFixture(true);
+        try {
+            const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+            f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+            f.submissions.begin(intent.id,f.primary);
+            assert.equal(f.db.hasActiveFilingJobs(),true);
+            assert.equal(f.db.claimNextFilingJob(),null);assert.equal(f.store.claim(),null);
+            assert.throws(()=>f.db.deleteEmailRecord(f.email.id),/active MiFILE/);
+            if(phase==='committing')f.submissions.commitStarted(intent.id,f.primary);
+            assert.equal(f.submissions.recover(),1);assert.equal(f.submissions.recover(),0);
+            assert.equal(f.submissions.get(intent.id)!.status,'reconciliation_required');
+            assert.throws(()=>f.submissions.begin(intent.id,f.primary));
+            assert.equal(f.submissions.state(f.job.id,f.primary).canRehearse,false);
+        }finally{f.db.close();}
+    }
 });

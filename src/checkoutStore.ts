@@ -82,7 +82,7 @@ export class CheckoutStore {
             const job = this.getFilingJob(filingJobId);
             if (!job || !filingReleaseChecks(job, account).sameAccount) throw new Error('A verified Prepared bundle in the current account is required.');
             const state = this.state(filingJobId,account);
-            if (kind === 'quote' && (state.receiptSummary.submissionObserved || state.issues.some(issue => issue.startsWith('Stored receipt evidence')))) {
+            if (kind === 'quote' && !state.canInspect) {
                 throw new Error('Reconcile the reported submission or payment in MiFILE before another checkout check. Do not retry payment.');
             }
             const active = this.db.prepare("SELECT id FROM mifile_checkout_inspections WHERE filing_job_id = ? AND status IN ('queued','running')")
@@ -200,6 +200,7 @@ export class CheckoutStore {
     claim(): CheckoutInspection | null {
         return this.transaction(() => {
             if (this.db.prepare("SELECT 1 FROM filing_jobs WHERE status = 'running' LIMIT 1").get() ||
+                this.db.prepare("SELECT 1 FROM mifile_submission_intents WHERE status IN ('checking','committing') LIMIT 1").get() ||
                 this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status = 'running' LIMIT 1").get()) return null;
             const row = this.db.prepare(`SELECT id FROM mifile_checkout_inspections WHERE status = 'queued'
                 AND (trigger_source = 'manual' OR NOT EXISTS(SELECT 1 FROM filing_jobs WHERE status = 'queued'))
@@ -344,6 +345,13 @@ export class CheckoutStore {
                 FROM mifile_bundle_activity WHERE execution_key = ?`)
                 .get(bundleExecutionKey(account.username,job.externalBundleId)) as typeof bundleActivity;
         } catch { receiptEvidenceInvalid = true; }
+        let executionHold:{status:string;updated_at:string}|undefined;
+        try {
+            if(job?.externalBundleId)executionHold=this.db.prepare(`SELECT status, updated_at FROM mifile_submission_intents
+                WHERE execution_key = ? AND (attempt_count > 0 OR status = 'reconciliation_required')`)
+                .get(bundleExecutionKey(account.username,job.externalBundleId)) as typeof executionHold;
+        }catch {receiptEvidenceInvalid=true;}
+        if (executionHold) issues.push('An execution attempt requires reconciliation. Check MiFILE; do not repeat payment or submission.');
         let priorActivity: MiFileReceiptObservation|null = null;
         if (bundleActivity && job) {
             try {
@@ -404,7 +412,7 @@ export class CheckoutStore {
             {id:'quote',label:'Fresh exact quote and payment account verified',passed:Boolean(quote && !issues.length)},
             {id:'review',label:'Exact amount reviewed for this package',passed:Boolean(reviewedAt)},
             {id:'receipt',label:'Recent Unsubmitted status checked; no prior payment reported',
-                passed:Boolean(recentUnsubmitted && !summary.submissionObserved && !receiptEvidenceInvalid)},
+                passed:Boolean(recentUnsubmitted && !summary.submissionObserved && !receiptEvidenceInvalid && !executionHold)},
         ];
         const readiness = this.db.prepare(`SELECT status, issue FROM mifile_readiness_runs WHERE filing_job_id = ?`)
             .get(filingJobId) as {status:'active'|'completed'|'review_required';issue:string|null}|undefined;
@@ -417,13 +425,14 @@ export class CheckoutStore {
                 startedAt: last.startedAt, finishedAt: last.finishedAt, error: last.error } : null,
             active: Boolean(active), quote: publicQuote, issues,
             canConfirm: Boolean(quote && !issues.length),
-            canInspect:Boolean(job && filingReleaseChecks(job,account).sameAccount && !summary.submissionObserved && !receiptEvidenceInvalid),
+            canInspect:Boolean(job && filingReleaseChecks(job,account).sameAccount && !summary.submissionObserved && !receiptEvidenceInvalid && !executionHold),
             confirmedAt: reviewedAt,
             checkoutVerified: Boolean(quote && job && latestQuote?.id === quoteInspection?.id &&
                 issues.every(issue => /^(Add a payment method|Select the intended payment method|Verify the payment account)/.test(issue))),
             paymentMethodChoice:choice,
             selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
             automaticReadiness:readiness || null,
+            executionHold:executionHold || null,
             priorBundleActivity:priorActivity ? {status:priorActivity.status,observedAt:bundleActivity!.observed_at,
                 fromAnotherRecord:bundleActivity!.source_filing_job_id !== filingJobId} : null,
             preflight:{checks:preflightChecks,complete:preflightChecks.every(check=>check.passed),

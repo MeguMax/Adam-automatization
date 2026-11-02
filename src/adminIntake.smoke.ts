@@ -365,13 +365,13 @@ async function main() {
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         await page.locator('#draftActivityTab').click();
         assert.match(await page.locator('.draft-source-summary').textContent() || '',/Scan cross-check: Complete/);
-        await page.locator('.draft-source-summary').scrollIntoViewIfNeeded();
+        await page.waitForFunction(()=>{const source=document.querySelector('.draft-source-summary');source?.scrollIntoView({block:'nearest'});return Boolean(source);});
         await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
         await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
         await page.screenshot({path:path.join(screenshots,'draft-scan-crosscheck-desktop.png'),fullPage:true});
         await page.setViewportSize({width:390,height:844});
         await page.locator('[data-draft-mobile-mode="fields"]').click();
-        await page.locator('.draft-source-summary').scrollIntoViewIfNeeded();
+        await page.waitForFunction(()=>{const source=document.querySelector('.draft-source-summary');source?.scrollIntoView({block:'nearest'});return Boolean(source);});
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
         await page.screenshot({path:path.join(screenshots,'draft-scan-crosscheck-mobile.png'),fullPage:true});
         scanView.complaintExtraction!.scanVerification.complete=false;
@@ -858,6 +858,34 @@ async function main() {
         await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/refresh-status`,{headers:{Origin:url},data:{}});
         assert.equal(db.checkout().claim(),null);
         process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED='false';
+        const rehearsalQuote=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
+            ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
+            {state:'selected',fingerprint:paymentMethods[0].fingerprint,available:paymentMethods},packageDigest,10300);
+        const rehearsalInspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
+        db.checkout().complete(rehearsalInspection.id,{kind:'quote',quote:rehearsalQuote},checkoutAccount);
+        const reviewInput={quoteId:rehearsalQuote.id,quoteDigest:rehearsalQuote.quoteDigest,totalCents:rehearsalQuote.totalCents};
+        db.checkout().confirm(job.id,reviewInput,checkoutAccount,'qa');
+        for(const data of [{...reviewInput,noPaymentAcknowledged:false},{...reviewInput,noPaymentAcknowledged:true,paymentAuthorized:true}]) {
+            assert.equal((await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/rehearse`,{headers:{Origin:url},data})).status(),409);
+        }
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        await page.locator('#draftActivityTab').click();
+        await page.locator('[data-checkout-review]').evaluate(element=>(element as HTMLDetailsElement).open=true);
+        await page.locator('[data-checkout-action="rehearse"]').click();
+        assert.match(await page.locator('#draftConfirmDialog').innerText(),/No payment or court submission will be made/);
+        assert.match(await page.locator('#draftConfirmDialog').innerText(),/\$126.69/);
+        await page.locator('#draftConfirmAccept').click();
+        await page.waitForFunction(()=>document.querySelector('[data-checkout-review]')?.textContent?.includes('Submission rehearsal: rehearsed'));
+        assert.equal(db.submissions().state(job.id,checkoutAccount).paymentAuthorized,false);
+        assert.equal(await page.locator('[data-checkout-action="rehearse"]').isEnabled(),false);
+        for(const action of ['authorize','execute','pay','submit']) {
+            assert.equal((await context.request.post(`${url}/api/filing-jobs/${job.id}/checkout/${action}`,{headers:{Origin:url},data:{}})).status(),403);
+        }
+        await page.screenshot({path:path.join(screenshots,'draft-no-payment-rehearsal-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-no-payment-rehearsal-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
         const paidCheck=db.checkout().queue(job.id,'receipts',checkoutAccount);db.checkout().claim();
         db.checkout().complete(paidCheck.id,{kind:'receipts',state:'found',checkedAt:new Date().toISOString(),issue:null,
             observations:[{bundleId,accountEmail:checkoutAccount.username,kind:'payment',externalReference:'QA-PAID-ONLY',

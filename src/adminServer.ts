@@ -54,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-02-review-recovery-v95';
+const ADMIN_BUILD_ID = '2026-11-02-batch-checkout-v96';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4783,7 +4783,7 @@ const html = String.raw`<!doctype html>
 
 
     function checkoutReadinessLabel(checkout) {
-      if (checkout.priorBundleActivity || checkout.issues.some(issue => issue.startsWith('Stored receipt evidence'))) return 'Check MiFILE before continuing';
+      if (checkout.executionHold || checkout.priorBundleActivity || checkout.issues.some(issue => issue.startsWith('Stored receipt evidence'))) return 'Check MiFILE before continuing';
       if (checkout.active || checkout.automaticReadiness?.status === 'active') return 'Checking package and fees';
       if (checkout.confirmedAt) return 'Exact amount reviewed';
       if (checkout.canConfirm) return 'Exact amount ready for review';
@@ -4838,10 +4838,15 @@ const html = String.raw`<!doctype html>
           '<li>' + icon(check.passed ? 'circle-check' : 'circle') + '<span>' + escapeHtml(check.label) + '</span></li>').join('') + '</ul>' +
           (checkout.preflight.complete ? '<span>Preflight complete. Live submission remains disabled.</span>' : '') +
           (checkout.preflight.recordedAt ? '<span>Preflight recorded: ' + escapeHtml(fmtDate(checkout.preflight.recordedAt)) + '</span>' : '') : '') +
+        (checkout.submission?.status ? '<span>Submission rehearsal: ' + escapeHtml(checkout.submission.status.replaceAll('_',' ')) +
+          ' · ' + escapeHtml(fmtDate(checkout.submission.updatedAt)) + '</span>' : '') +
+        (checkout.submission?.status && checkout.submission.issue ? '<span>' + escapeHtml(checkout.submission.issue) + '</span>' : '') +
         '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active || !checkout.canInspect ? ' disabled' : '') + '>' +
         icon('refresh-cw') + 'Check checkout</button>' +
         '<button type="button" data-checkout-action="confirm"' + (!checkout.canConfirm || checkout.confirmedAt ? ' disabled' : '') + '>' +
         icon('check') + 'Confirm amount</button>' +
+        '<button type="button" data-checkout-action="rehearse"' + (!checkout.submission?.canRehearse || checkout.submission.status === 'rehearsed' && !checkout.submission.issue ? ' disabled' : '') + '>' +
+        icon('shield-check') + 'Rehearse submission</button>' +
         '<button type="button" data-checkout-action="receipts"' + (checkout.active ? ' disabled' : '') + '>' +
         icon('receipt') + 'Refresh receipts</button></div></details>';
     }
@@ -4853,10 +4858,18 @@ const html = String.raw`<!doctype html>
         if (!quote || !job.checkout.canConfirm) throw new Error('Refresh checkout before confirming the amount.');
         const amount = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(quote.totalCents / 100);
         if (!await confirmDraftAction('Review exact checkout amount?',
-          'Total: ' + amount + ' USD\\nAccount: ' + quote.accountEmail + '\\nTemporary case: ' + job.temporaryCaseNumber +
-          '\\nPayment account: ' + (job.checkout.selectedPaymentMethodLabel || (quote.totalCents ? 'Selected in MiFILE' : 'Not required')) +
-          '\\nThis records your review only. It does not authorize payment or submission to court.', 'Confirm ' + amount)) return;
+          ['Total: ' + amount + ' USD', 'Account: ' + quote.accountEmail, 'Temporary case: ' + job.temporaryCaseNumber,
+          'Payment account: ' + (job.checkout.selectedPaymentMethodLabel || (quote.totalCents ? 'Selected in MiFILE' : 'Not required')),
+          'This records your review only. It does not authorize payment or submission to court.'].join('\n'), 'Confirm ' + amount)) return;
         payload = {quoteId:quote.id,quoteDigest:quote.quoteDigest,totalCents:quote.totalCents};
+      } else if (action === 'rehearse') {
+        const quote=job.checkout.quote;
+        if(!quote || !job.checkout.submission?.canRehearse)throw new Error('Complete the package, exact amount and Unsubmitted checks first.');
+        const amount=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(quote.totalCents/100);
+        if(!await confirmDraftAction('Record a no-payment rehearsal?',
+          ['Package: '+job.temporaryCaseNumber,'Account: '+quote.accountEmail,'Exact total: '+amount,
+          'This checks and records readiness only. No payment or court submission will be made.'].join('\n'), 'Rehearse without payment'))return;
+        payload={quoteId:quote.id,quoteDigest:quote.quoteDigest,totalCents:quote.totalCents,noPaymentAcknowledged:true};
       } else if (action === 'payment-method') {
         const quote = job.checkout.quote;
         const fingerprint = document.getElementById('checkoutPaymentMethod')?.value;
@@ -7611,7 +7624,7 @@ export function createAdminServer(
     const decorateFilingJob = (job: NonNullable<ReturnType<typeof db.getFilingJob>>) => {
         let account = null;
         try { account = getCheckoutAccount(); } catch { /* Settings are shown separately. */ }
-        const checkout = account ? db.checkout().state(job.id, account) : null;
+        const checkout = account ? {...db.checkout().state(job.id, account),submission:db.submissions().state(job.id,account)} : null;
         return { ...job, checkout, releaseChecks: {...filingReleaseChecks(job, account),
             checkoutVerified: checkout?.checkoutVerified || false,
             currentSourceContentVerified: checkout?.checkoutVerified || false} };
@@ -7999,14 +8012,14 @@ export function createAdminServer(
             const checkoutMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/checkout\/([^/]+)$/);
             if (req.method === 'POST' && checkoutMatch) {
                 const action = checkoutMatch[2];
-                if (!['inspect','confirm','receipts','payment-method','clear-method','refresh-status'].includes(action)) {
+                if (!['inspect','confirm','receipts','payment-method','clear-method','refresh-status','rehearse'].includes(action)) {
                     sendJson(res, 403, {error:'Payment and final court submission are disabled in this release.'});
                     return;
                 }
                 try {
                     const body = await readRequestBody(req);
                     const input = body ? JSON.parse(body) : {};
-                    const allowed = action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] :
+                    const allowed = action === 'rehearse' ? ['quoteId','quoteDigest','totalCents','noPaymentAcknowledged'] : action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] :
                         action === 'payment-method' ? ['quoteId','quoteDigest','paymentMethodFingerprint'] : [];
                     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !allowed.includes(key))) {
                         throw new Error('Only a read-only checkout inspection or amount review is allowed.');
@@ -8018,6 +8031,8 @@ export function createAdminServer(
                         if (automaticStatusRefreshAvailable()) {
                             db.checkout().refreshReceiptsIfDue(id,account);
                         }
+                    } else if (action === 'rehearse') {
+                        db.submissions().rehearse(id,input,account,process.env.ADMIN_USERNAME || 'admin');
                     } else if (action === 'confirm') {
                         db.checkout().confirm(id, input, account, process.env.ADMIN_USERNAME || 'admin');
                     } else {
@@ -8029,7 +8044,8 @@ export function createAdminServer(
                         if (action === 'clear-method') db.checkout().clearPaymentMethod(id,account,process.env.ADMIN_USERNAME || 'admin');
                         db.checkout().queue(id, action === 'receipts' ? 'receipts' : 'quote', account);
                     }
-                    sendJson(res, ['confirm','refresh-status'].includes(action) ? 200 : 202, db.checkout().state(id,account));
+                    sendJson(res, ['confirm','refresh-status','rehearse'].includes(action) ? 200 : 202,
+                        {...db.checkout().state(id,account),submission:db.submissions().state(id,account)});
                 } catch (error) { sendJson(res,409,{error:(error as Error).message}); }
                 return;
             }

@@ -28,12 +28,15 @@
     <section>
       <h2>3. Generate and Save</h2>
       <ol>
-        <li>Open your current workbook. Click any cell in one case's data row, not the header or several rows. Check the selected name and case number in the panel.</li>
+        <li>Open your current workbook. Click any cell in one case's data row, not the header. Check the selected name and case number in the panel.</li>
         <li>Choose a <strong>Court form</strong>, optionally edit <strong>File name</strong>, then select <strong>Generate PDF</strong>. Alternatively, select <strong>Generate all 3 forms (ZIP)</strong>.</li>
         <li>Review the preview for an individual PDF. Select <strong>Download PDF</strong> or <strong>Download ZIP</strong>. Open the ZIP to find the three separate PDFs.</li>
         <li>Find the file in Excel's or your browser's download location, or the folder selected in its save dialog. PDF fields and checkboxes remain editable.</li>
       </ol>
       <p>Saving is currently <strong>local only</strong>. Nothing is automatically saved to OneDrive, emailed, paid, or filed in court. Generating again never changes your workbook. A change to the selected row or its data invalidates the old result so it cannot be downloaded for the wrong case.</p>
+      <h3>Several Cases at Once</h3>
+      <p>Select up to 10 adjacent data rows. Under <strong>Multiple cases</strong>, check the forms you need and select <strong>Generate selected cases</strong>. Download the cases ZIP: each successful case has its own folder. Hidden rows are skipped; failed cases appear in the panel and <code>results.txt</code> without preventing the other cases from downloading. A failed case is omitted as a whole, not exported with missing forms. Correct it in Excel and regenerate. Cancel discards the pending archive.</p>
+      <p>The panel checks the selected rows again during generation and before download. Changing the selection, mapped values or chosen forms invalidates the archive. All PDF fields remain editable; batch generation also saves locally only.</p>
     </section>
     <section>
       <h2>Workbook Requirements</h2>

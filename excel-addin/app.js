@@ -6,6 +6,7 @@
     let generationId = '', deliveryAvailable = false, savedCopy = null;
     let filenameOwner = '', resultFilename = '';
     let packageUrl = '', packageSnapshot = null, packageFilename = '';
+    let batchData=null,batchUrl='',batchSnapshot=null,batchFilename='',batchController=null;
     const FORM_KEY = 'devlin.excel.form.v1';
     let storage;
     try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
@@ -22,6 +23,11 @@
         $('retryCatalog').disabled = catalogBusy;
         $('generate').disabled = busy || connecting || !officeReady || !token || !forms.length || !selectedData;
         $('generatePackage').disabled = busy || connecting || !officeReady || !token || forms.length !== 3 || !selectedData;
+        $('generateBatch').disabled=busy || connecting || !officeReady || !token || !batchForms().length ||
+            (!selectedData && !batchData?.rows.some(row=>row.data));
+        $('batchForms').disabled=busy;
+        $('downloadBatch').setAttribute('aria-disabled',String(busy || !batchUrl));
+        $('cancelBatch').hidden=!batchController;
         $('downloadPackage').setAttribute('aria-disabled', String(busy || !packageUrl));
         $('refresh').disabled = busy || !officeReady; $('form').disabled = busy || !forms.length;
         $('filename').disabled = busy || !selectedData; $('resetFilename').disabled = busy || !selectedData;
@@ -33,6 +39,9 @@
         $('sourceIssueList').querySelectorAll('button').forEach(button=>{button.disabled=busy || !officeReady || !token;});
     }
     function clearResult() {
+        if(batchUrl)URL.revokeObjectURL(batchUrl);
+        batchUrl='';batchSnapshot=null;batchFilename='';$('downloadBatch').hidden=true;
+        $('downloadBatch').removeAttribute('href');$('downloadBatch').removeAttribute('download');
         if (packageUrl) URL.revokeObjectURL(packageUrl);
         packageUrl = ''; packageSnapshot = null; packageFilename = '';
         $('packageResult').hidden = true; $('packageFiles').replaceChildren();
@@ -46,6 +55,7 @@
     }
     function signedOut() {
         ++revision; ++connectionRevision; token = ''; connecting = false; sessions.clear(); clearTimeout(expiryTimer);
+        batchController?.abort();batchData=null;$('batchRows').replaceChildren();$('batchStatus').textContent='';
         selectedData = null; deliveryAvailable = false; $('autoSave').checked = false; $('deliveryOptions').hidden = true;
         filenameOwner = ''; $('filename').value = ''; $('fileNaming').hidden = true;
         $('cloudActions').hidden = true; clearResult(); $('workspace').hidden = true; $('connection').hidden = true;
@@ -55,9 +65,11 @@
         clearTimeout(expiryTimer);
         expiryTimer = setTimeout(() => { signedOut(); message('Your 12-hour Excel connection expired. Connect again.'); }, Math.max(0, expiresAt - Date.now()));
     }
-    async function api(url, data) {
+    async function api(url, data, signal) {
         const owner = token;
         const abort = new AbortController();
+        const cancel=()=>abort.abort();
+        signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)abort.abort();
         // Include response-body reads in the deadline, not only the HTTP headers.
         const timer = setTimeout(() => abort.abort(), url === '/excel/generate-package' ? 105000 : url === '/excel/generate' ? 45000 : url === '/excel/save' ? 55000 : 20000);
         try {
@@ -84,10 +96,11 @@
             if ((await blob.slice(0,5).text()) !== '%PDF-') throw new Error('The generated PDF is invalid. Please try again.');
             return { blob, generationId:response.headers.get('x-excel-generation-id') || '' };
         } catch(error) {
+            if (signal?.aborted)throw Object.assign(new Error('Generation canceled. No archive created.'),{code:'batch_cancelled'});
             if (abort.signal.aborted) throw new Error('The request timed out. Check your connection, then try again.');
             if (error instanceof TypeError) throw new Error('Could not reach the PDF service. Check your connection and try again.');
             throw error;
-        } finally { clearTimeout(timer); }
+        } finally { clearTimeout(timer);signal?.removeEventListener('abort',cancel); }
     }
     async function readSelection(options = {}) {
         if (!officeReady) throw new Error('Excel connection unavailable.');
@@ -171,14 +184,28 @@
     }
     async function refresh(keepMessage = false, readOptions = {}) {
         const current = ++revision;
-        selectedData = null; clearResult(); controls();
+        selectedData = null;batchData=null; clearResult();$('batchRows').replaceChildren();$('batchStatus').textContent=''; controls();
         if (!officeReady || !forms.length) {
             $('selection').textContent = 'Waiting for court forms'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true;
             return;
         }
         if (keepMessage !== true) message('');
         try { const data = await readSelection(readOptions); if (current === revision) showSelection(data); }
-        catch(error) { if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true; showSourceError(error); } }
+        catch(error) {
+            if(error.code==='selection' && batchForms().length) {
+                try {
+                    const snapshot=await DevlinExcelWorkbook.readBatch(Excel,batchForms(),readOptions);
+                    if(current!==revision)return;
+                    batchData=snapshot;$('batchControls').open=true;$('fileNaming').hidden=true;
+                    $('selection').textContent=snapshot.sheet+' / Rows '+snapshot.startRow+'-'+(snapshot.startRow+snapshot.rowCount-1);
+                    $('caseName').textContent=snapshot.rowCount+' selected rows';$('caseContext').textContent='';
+                    renderBatchRows(snapshot.rows.map(row=>({row:row.row,name:row.data?.name || '',
+                        status:row.error?row.error.code==='hidden_row'?'skipped':'failed':'queued',error:row.error?.message || ''})));
+                    return;
+                }catch(batchError){error=batchError;}
+            }
+            if (current === revision) { $('selection').textContent = 'No case selected'; $('caseName').textContent = ''; $('caseContext').textContent = ''; $('fileNaming').hidden = true; showSourceError(error); }
+        }
         finally { controls(); }
     }
     async function loadDelivery() {
@@ -356,6 +383,58 @@
         } catch(error) {clearResult(); message(error.message);}
         finally {busy=false; controls(); if (!selectedData && token) refresh(true);}
     });
+    function batchForms() {return forms.filter(form=>Array.from($('batchForms').querySelectorAll('input:checked')).some(input=>input.value===form.id));}
+    function renderBatchRows(records) {
+        $('batchRows').replaceChildren(...records.map(record=>{
+            const li=document.createElement('li'),name=document.createElement('strong'),status=document.createElement('span');
+            name.textContent='Row '+record.row+(record.name?' / '+record.name:'');
+            status.dataset.status=record.status;
+            status.textContent=record.status==='generating'?'Generating '+record.completed+' / '+record.total:
+                record.status==='ready'?'Ready':record.status==='queued'?'Queued':record.status==='skipped'?'Skipped':'Failed';
+            if(record.error)status.textContent+=': '+record.error;
+            li.append(name,status);return li;
+        }));
+    }
+    $('batchForms').addEventListener('change',()=>{++revision;clearResult();batchData=null;controls();if(token)refresh();});
+    $('cancelBatch').addEventListener('click',()=>batchController?.abort());
+    $('generateBatch').addEventListener('click',async()=>{
+        if(busy)return;
+        clearTimeout(refreshTimer);clearResult();const current=++revision,owner=token,chosen=batchForms();
+        batchController=new AbortController();busy=true;controls();message('','Reading selected cases...');
+        const progress=new Map();
+        try {
+            const source=await DevlinExcelWorkbook.readBatch(Excel,chosen);
+            if(current!==revision || !owner || token!==owner)throw new Error('The worksheet changed. Generate the cases again.');
+            batchData=source;$('batchControls').open=true;
+            const generated=await DevlinExcelBatch.generate(source,chosen,{
+                signal:batchController.signal,isCurrent:()=>current===revision && owner===token,
+                readCurrent:()=>DevlinExcelWorkbook.readBatch(Excel,chosen,{recalculate:false}),
+                generate:async(input,signal)=>new Uint8Array(await (await api('/excel/generate',input,signal)).blob.arrayBuffer()),
+                onProgress:record=>{progress.set(record.row,record);renderBatchRows([...progress.values()]);
+                    $('batchStatus').textContent=[...progress.values()].filter(row=>row.status==='ready').length+' / '+source.rowCount+' cases ready';},
+            });
+            batchSnapshot=source;batchUrl=URL.createObjectURL(new Blob([generated.bytes],{type:'application/zip'}));
+            batchFilename='CASES - Rows '+source.startRow+'-'+(source.startRow+source.rowCount-1)+'.zip';
+            $('downloadBatch').href=batchUrl;$('downloadBatch').download=batchFilename;$('downloadBatch').hidden=false;
+            const ready=generated.results.filter(row=>row.status==='ready').length;
+            $('batchStatus').textContent=ready+' of '+source.rowCount+' cases ready / '+ready*chosen.length+' PDFs';
+            message('',ready===source.rowCount?'Cases ZIP is ready.':'Cases ZIP is ready. Check the failed or skipped rows.');
+            $('downloadBatch').scrollIntoView({block:'nearest'});
+        }catch(error){clearResult();message(error.message);}
+        finally{batchController=null;busy=false;controls();if(!selectedData && !batchData && token)refresh(true);}
+    });
+    $('downloadBatch').addEventListener('click',async event=>{
+        event.preventDefault();if(busy || !batchUrl || !batchSnapshot)return;
+        const source=batchSnapshot,url=batchUrl,current=revision;busy=true;controls();
+        try {
+            const chosen=source.formIds.map(id=>forms.find(form=>form.id===id));
+            const latest=await DevlinExcelWorkbook.readBatch(Excel,chosen,{recalculate:false});
+            if(!token || current!==revision || url!==batchUrl || !DevlinExcelWorkbook.sameBatchSnapshot(source,latest))throw new Error('The worksheet changed since this ZIP was generated. Generate the cases again.');
+            const link=document.createElement('a');link.href=url;link.download=batchFilename;document.body.append(link);link.click();link.remove();
+            message('','Cases ZIP download requested. PDFs remain fillable.');
+        }catch(error){clearResult();message(error.message);}
+        finally{busy=false;controls();}
+    });
     async function download(event) {
         event.preventDefault();
         if (busy || !pdfUrl || !resultSnapshot) return;
@@ -441,7 +520,7 @@
         if (officeReady) Excel.run(async context => {
             const sheets = context.workbook.worksheets;
             const changed = () => {
-                ++revision; selectedData = null; clearResult(); controls(); clearTimeout(refreshTimer);
+                ++revision;batchController?.abort();batchData=null; selectedData = null; clearResult(); controls(); clearTimeout(refreshTimer);
                 if (!busy && token && !connecting) refreshTimer = setTimeout(() => refresh(),150);
             };
             sheets.onSelectionChanged.add(changed);
@@ -453,7 +532,7 @@
         }).catch(() => { /* Before/after generation and download rechecks also protect hosts without change events. */ });
     })).catch(() => { clearTimeout(hostTimer); hostUnavailable('Excel connection unavailable', 'Reload the panel to try again.'); });
     else { clearTimeout(hostTimer); hostUnavailable('Excel connection unavailable', 'The Office library did not load. Check your connection and reload the panel.'); }
-    window.addEventListener('beforeunload', () => { if (pdfUrl) URL.revokeObjectURL(pdfUrl); if (packageUrl) URL.revokeObjectURL(packageUrl); });
+    window.addEventListener('beforeunload', () => {batchController?.abort();if(batchUrl)URL.revokeObjectURL(batchUrl);if (pdfUrl) URL.revokeObjectURL(pdfUrl); if (packageUrl) URL.revokeObjectURL(packageUrl); });
     let resizeTimer;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimer);

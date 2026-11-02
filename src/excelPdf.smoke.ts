@@ -5,6 +5,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import {unzipSync} from 'fflate';
 import { chromium } from 'playwright';
 import { createExcelPdfHandler, EXCEL_FORMS, generateExcelPdf } from './excelPdf';
 
@@ -42,8 +43,8 @@ window.qa.events = []; window.qa.calculations = 0; window.qa.pending = 0;
 const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(callback)}};
 const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'},load(){return this},
  getUsedRange(){return {columnIndex:0,columnCount:qa.headers.length,load(){return this}}},
- activate(){qa.activatedSheet='sheet-1'},getRangeByIndexes(row,column=0){return {get values(){return [row===0?qa.headers:qa.values]},get valueTypes(){return [qa.values.map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}},select(){qa.sourceSelection=[row,column];qa.rowIndex=row;qa.events.forEach(callback=>callback())}}}};
-window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const field of ['dc105_05','dc508_06','mc202_08']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) qa.values[qa.headers.indexOf(field)]=qa.values[qa.headers.indexOf('Defendant')];},load(){}},workbook:{
+ activate(){qa.activatedSheet='sheet-1'},getRangeByIndexes(row,column=0){return {get values(){return [row===0?qa.headers:(qa.rows?.[row] || qa.values)]},get rowHidden(){return (qa.hiddenRows || []).includes(row)},get valueTypes(){return [(qa.rows?.[row] || qa.values).map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}},select(){qa.sourceSelection=[row,column];qa.rowIndex=row;qa.events.forEach(callback=>callback())}}}};
+window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const values of [qa.values,...Object.values(qa.rows || {})]) {for(const field of ['dc105_05','dc508_06','mc202_08']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Defendant')];}},load(){}},workbook:{
  getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
  worksheets:{getItem(id){if(id!=='sheet-1')throw new Error('Unknown source sheet');return sheet},onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
  functions:Object.fromEntries(['month','day','year'].map((name,index)=>[name,()=>({value:Number((qa.date || '10/5/2026').split('/')[index]),load(){return this}})]))
@@ -205,7 +206,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.screenshot({path:path.join(output,'multiple-source-issues.png'),fullPage:true});
         const calculationsBeforeSource=await page.evaluate(()=>(window as any).qa.calculations);
         await page.locator('#sourceIssueList button').first().click();
-        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('header or multiple rows'));
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('without the header'));
         assert.deepEqual(await page.evaluate(()=>(window as any).qa.sourceSelection),[0,0]);
         assert.equal(await page.evaluate(()=>JSON.stringify((window as any).qa.values)),valuesBeforeIssues);
         assert.equal(await page.evaluate(()=>(window as any).qa.calculations),calculationsBeforeSource);
@@ -435,7 +436,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(() => (document.querySelector('#preview canvas') as HTMLCanvasElement)?.width > 600);
         await page.screenshot({ path: path.join(output, 'generated-desktop.png'), fullPage: true });
         await page.evaluate(() => { const qa = (window as any).qa; qa.rowCount = 2; qa.events[0](); });
-        await page.waitForFunction(() => document.getElementById('error')?.textContent?.includes('multiple rows'));
+        await page.waitForFunction(() => document.getElementById('selection')?.textContent?.includes('Rows 36-37'));
         assert.equal(await page.locator('#result').isVisible(), false);
         await page.evaluate(() => { const qa = (window as any).qa; qa.rowCount = 1; qa.rowIndex = 53; qa.values[0] = 'Second Tenant'; qa.events[0](); });
         await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
@@ -519,6 +520,55 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(()=>document.getElementById('status')?.textContent?.includes('Fillable fields retained'));
         assert.equal(await page.locator('#cloudActions').isVisible(),false);assert.equal(savedCopies.length,previousSaves);
         await page.screenshot({path:path.join(output,'download-only-short-taskpane.png')});
+        await page.evaluate(()=>{
+            const qa=(window as any).qa;qa.rowIndex=35;qa.rowCount=3;qa.rows={};
+            for(let offset=0;offset<3;offset++){
+                const data=[...qa.values];data[qa.headers.indexOf('Defendant')]=offset===2?'':offset===0?'Batch Morgan':'Batch Taylor';
+                for(const field of ['Case_Number','dc105_02','dc508_02','mc202_04'])data[qa.headers.indexOf(field)]='26-BATCH-'+offset;
+                qa.rows[35+offset]=data;
+            }
+            qa.events[0]();
+        });
+        await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
+        assert.equal(await page.locator('#generate').isDisabled(),true);
+        await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
+        await page.click('#generateBatch');await page.locator('#downloadBatch').waitFor({state:'visible'});
+        assert.match(await page.locator('#batchStatus').innerText(),/2 of 3 cases ready \/ 6 PDFs/);
+        assert.match(await page.locator('#batchRows').innerText(),/Row 38.*\nFailed: The selected row has no Defendant/);
+        assert.equal(savedCopies.length,previousSaves);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.screenshot({path:path.join(output,'batch-cases-mobile.png'),fullPage:true});
+        const batchEvent=page.waitForEvent('download');await page.click('#downloadBatch');const batchDownload=await batchEvent;
+        const batchPath=path.join(output,batchDownload.suggestedFilename());await batchDownload.saveAs(batchPath);
+        const members=unzipSync(fs.readFileSync(batchPath)),pdfNames=Object.keys(members).filter(name=>name.endsWith('.pdf'));
+        assert.equal(pdfNames.length,6);assert.ok(members['results.txt']);
+        const batchSource=await page.evaluate(()=>{const qa=(window as any).qa;return {headers:qa.headers,rows:qa.rows};});
+        const verification=[];
+        for(const [index,name] of pdfNames.entries()){
+            const filename=path.join(output,'batch-member-'+index+'.pdf');fs.writeFileSync(filename,members[name]);
+            const form=EXCEL_FORMS.find(form=>name.includes('/'+form.id.toUpperCase()))!;
+            const raw=batchSource.rows[name.includes('Row 36')?35:36];
+            const expected=Object.fromEntries(form.fields.map(field=>[field,form.dateFields.includes(field) && typeof raw[batchSource.headers.indexOf(field)]==='number'
+                ? '10/5/2026' : raw[batchSource.headers.indexOf(field)]]));
+            verification.push({file:filename,expected});
+        }
+        const batchCheck=spawnSync(process.env.EXCEL_PDF_PYTHON||'python3',['-c',
+            'import sys,json; from pypdf import PdfReader\nfor x in json.loads(sys.argv[1]):\n r=PdfReader(x["file"]); f=r.get_fields(); assert len(f)==len(x["expected"]); assert all(not (int(v.get("/Ff",0)) & 1) for v in f.values())\n for name,value in x["expected"].items():\n  actual=f[name].get("/V", ""); expected=("/Yes" if value else "/Off") if f[name]["/FT"]=="/Btn" else str(value); assert str(actual)==expected,(name,actual,expected)\nprint("All 202 batch fields remain fillable and match their case")',JSON.stringify(verification)],{windowsHide:true});
+        assert.equal(batchCheck.status,0,batchCheck.stderr.toString());
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.rows[36][qa.headers.indexOf('Defendant')]='Silent change';});
+        await page.click('#downloadBatch');await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since this ZIP'));
+        assert.equal(await page.locator('#downloadBatch').isVisible(),false);
+        await page.uncheck('#batchForms input[value="mc202"]');
+        await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
+        let cancelRelease!:()=>void;
+        await page.route('**/excel/generate',route=>new Promise<void>(resolve=>{cancelRelease=()=>{route.abort().catch(()=>{}).finally(resolve);};}));
+        const cancelRequest=page.waitForRequest(request=>request.url().endsWith('/excel/generate'));
+        await page.click('#generateBatch');await cancelRequest;await page.click('#cancelBatch');
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('canceled'));
+        cancelRelease();await page.unroute('**/excel/generate');
+        assert.equal(await page.locator('#downloadBatch').isVisible(),false);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.rowCount=1;qa.rows={};qa.events[0]();});
+        await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.click('#logout');await page.waitForSelector('#signIn:visible');
         assert.equal(await page.evaluate(()=>sessionStorage.length),0);
         await page.evaluate(token => localStorage.setItem('devlin.excel.session.v1', JSON.stringify({token,expiresAt:Date.now()-1})), remembered.token);

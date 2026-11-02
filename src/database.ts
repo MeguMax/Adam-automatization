@@ -12,6 +12,7 @@ import { changedFieldPaths, mergeExtractedField, protectedFieldPaths } from './d
 import { ADAM_OFFICE, ADAM_ATTORNEY, ADAM_FILING_POLICY_VERSION, approvedSupportingRelation } from './adamFilingPolicy';
 import { filingPreparationProgress, type FilingPreparationProgress } from './filingProgress';
 import { CheckoutStore } from './checkoutStore';
+import {SubmissionStore} from './mifileSubmission';
 import { migrateBundleActivity } from './mifileBundleSafety';
 import type { CheckoutAccount } from './mifileCheckout';
 import {
@@ -2625,6 +2626,15 @@ const migrations: Migration[] = [
             migrateBundleActivity(db);
         },
     },
+    {
+        version:33,name:'controlled_submission_intents',
+        up:db=>db.exec(`CREATE TABLE mifile_submission_intents (
+            id TEXT PRIMARY KEY,execution_key TEXT NOT NULL UNIQUE,filing_job_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('rehearsed','authorized','checking','committing','blocked','reconciliation_required','submitted')),
+            snapshot_json TEXT NOT NULL,snapshot_digest TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+            actor TEXT NOT NULL,attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count IN (0,1)),error_message TEXT,result_json TEXT
+        );`),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -3094,12 +3104,18 @@ export class WorkflowDatabase {
 
     hasActiveFilingJobs(): boolean {
         return Boolean(this.db.prepare("SELECT 1 FROM filing_jobs WHERE status IN ('queued', 'running') LIMIT 1").get() ||
+            this.db.prepare("SELECT 1 FROM mifile_submission_intents WHERE status IN ('checking','committing') LIMIT 1").get() ||
             this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status IN ('queued','running') LIMIT 1").get());
     }
 
     checkout(): CheckoutStore {
         return new CheckoutStore(this.db, id => this.getFilingJob(id),
             (_id, action, details) => this.insertAuditLog('filing_job', String(details.filingJobId), action, details));
+    }
+
+    submissions():SubmissionStore {
+        return new SubmissionStore(this.db,this.checkout(),id=>this.getFilingJob(id),
+            (_id,action,details)=>this.insertAuditLog('filing_job',String(details.filingJobId),action,details));
     }
 
     close(): void {
@@ -5075,7 +5091,8 @@ export class WorkflowDatabase {
                   )
                   AND NOT EXISTS (SELECT 1 FROM case_drafts c JOIN filing_jobs f ON f.case_draft_id = c.id
                     WHERE c.email_id = e.id AND (f.status IN ('queued','running') OR EXISTS
-                      (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running'))))
+                      (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running')) OR EXISTS
+                      (SELECT 1 FROM mifile_submission_intents si WHERE si.filing_job_id = f.id AND si.status IN ('checking','committing'))))
             `)
             .get(cutoff) as { count: number };
         return Number(row.count ?? 0);
@@ -5110,7 +5127,8 @@ export class WorkflowDatabase {
         }
         if (this.db.prepare(`SELECT 1 FROM case_drafts c JOIN filing_jobs f ON f.case_draft_id = c.id
             WHERE c.email_id = ? AND (f.status IN ('queued','running') OR EXISTS
-              (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running'))) LIMIT 1`).get(emailId)) {
+              (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running')) OR EXISTS
+              (SELECT 1 FROM mifile_submission_intents si WHERE si.filing_job_id = f.id AND si.status IN ('checking','committing'))) LIMIT 1`).get(emailId)) {
             throw new Error('An email with an active MiFILE job or checkout inspection cannot be deleted');
         }
 
@@ -5140,7 +5158,8 @@ export class WorkflowDatabase {
                   )
                   AND NOT EXISTS (SELECT 1 FROM case_drafts c JOIN filing_jobs f ON f.case_draft_id = c.id
                     WHERE c.email_id = e.id AND (f.status IN ('queued','running') OR EXISTS
-                      (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running'))))
+                      (SELECT 1 FROM mifile_checkout_inspections ci WHERE ci.filing_job_id = f.id AND ci.status IN ('queued','running')) OR EXISTS
+                      (SELECT 1 FROM mifile_submission_intents si WHERE si.filing_job_id = f.id AND si.status IN ('checking','committing'))))
                 ORDER BY COALESCE(e.received_at, e.created_at)
             `)
             .all(cutoff) as Array<{ id: string; external_message_id: string }>;
@@ -5740,7 +5759,8 @@ export class WorkflowDatabase {
 
     claimNextFilingJob(): FilingJobView | null {
         const jobId = this.runInTransaction(() => {
-            if (this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status = 'running' LIMIT 1").get()) return null;
+            if (this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status = 'running' LIMIT 1").get() ||
+                this.db.prepare("SELECT 1 FROM mifile_submission_intents WHERE status IN ('checking','committing') LIMIT 1").get()) return null;
             const queued = this.db.prepare(`
                 SELECT id, case_draft_id
                 FROM filing_jobs

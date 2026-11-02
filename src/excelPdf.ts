@@ -209,6 +209,7 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
             '/excel/help': ['help.html', 'text/html; charset=utf-8'], '/excel/help.css': ['help.css', 'text/css'],
             '/excel/app.js': ['app.js', 'text/javascript'], '/excel/row.js': ['row.js', 'text/javascript'],
             '/excel/workbook.js': ['workbook.js', 'text/javascript'],
+            '/excel/batch.js': ['batch.js', 'text/javascript'],
             '/excel/session.js': ['session.js', 'text/javascript'],
             '/excel/commands.html': ['commands.html', 'text/html; charset=utf-8'], '/excel/commands.js': ['commands.js', 'text/javascript'],
             '/excel/icon-16.png': ['icon-16.png', 'image/png'], '/excel/icon-32.png': ['icon-32.png', 'image/png'], '/excel/icon-80.png': ['icon-80.png', 'image/png'],
@@ -219,6 +220,9 @@ export function createExcelPdfHandler(options: { now?: () => number; generate?: 
         }
         if (req.method === 'GET' && pathname === '/excel/lucide.js') {
             publicAsset(res, require.resolve('lucide/dist/umd/lucide.min.js'), 'text/javascript'); return true;
+        }
+        if (req.method === 'GET' && pathname === '/excel/fflate.js') {
+            publicAsset(res,path.join(path.dirname(require.resolve('fflate/package.json')),'umd','index.js'),'text/javascript');return true;
         }
         if (req.method === 'GET' && ['/excel/pdfjs/pdf.mjs', '/excel/pdfjs/pdf.worker.mjs'].includes(pathname)) {
             publicAsset(res, require.resolve('pdfjs-dist/build/' + (pathname.endsWith('pdf.worker.mjs') ? 'pdf.worker.mjs' : 'pdf.mjs')), 'text/javascript'); return true;

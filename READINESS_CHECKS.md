@@ -1,5 +1,46 @@
 # Offline acceptance and worker progress
 
+## Batch Excel and controlled execution journal (v96)
+
+Excel supports a local cases ZIP for 1-10 adjacent selected rows and any subset
+of the three approved forms. Invalid/hidden rows are isolated and each valid
+case is exported only when all its selected forms succeed. All mapped values
+and the selection are rechecked before generation, after every case and before
+download. Cancellation discards the archive. No Excel cloud saving is enabled.
+
+After a fresh verified bundle, primary account, checkout quote, exact-amount
+review and Unsubmitted receipt check, **Rehearse submission** records a durable
+no-payment snapshot. It binds the job, bundle, source package digest, credential
+revision, account, exact USD cents, quote expiry and opaque selected payment
+method. Rehearsal is idempotent and is not financial authorization. Changed
+evidence requires a new review/rehearsal. The HTTP API exposes no authorize,
+pay, execute or submit operation: those requests return 403.
+
+The execution state machine is exercised only with an injected fixture
+transport. It checks live quote/receipt identity, writes a committing checkpoint
+before the single irreversible call, and refuses a retry after an uncertain
+result. Partial/mismatched receipts retain independently verified activity and
+require reconciliation. Intent/hold records survive local job deletion and
+credential rotation; interrupted checks/commits become reconciliation-required
+at production startup. This is groundwork, not a certified live payment
+adapter: the real MiFILE commit transport and controlled financial pilot remain
+pending. `FINAL_MIFILE_ACTIONS_ENABLED` remains a code-level false constant.
+
+A production read-only check identified MiFILE's new November training notice
+as a login blocker. The strict notice handler recognizes that informational
+announcement while still stopping on unknown notices, agreements, payment
+authorization or data-entry controls. No acceptance of terms or payment occurs.
+
+Release verification: all 375 project tests passed with no skips. The admin
+desktop/mobile smoke passed the rehearsal dialog, exact amount, repeated-click
+guard and HTTP rejection of live actions. The simulated Excel 1.9 smoke passed
+a two-case ZIP with six PDFs and all 202 canonical fields checked for the
+correct case and editable flags, plus an invalid third row, changed-source
+download rejection and cancellation. Runtime dependency audit: zero known
+vulnerabilities. This release has not yet received a new native-Excel or
+Excel-Online batch pilot; earlier single-case native acceptance is documented
+separately. Tests create no real MiFILE bundles, charges or court submissions.
+
 ## Remaining review packages (v95)
 
 The three remaining supplied examples are not equivalent OCR failures:

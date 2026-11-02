@@ -38,6 +38,7 @@ function closeServer(server: http.Server): Promise<void> {
 
 async function main(): Promise<void> {
     importPlaintiffMappingSeed();
+    getWorkflowDatabase().submissions().recover();
     try {
         console.log('MiFILE account encryption:', initializeMiFileAccountEncryption(getWorkflowDatabase()));
     } catch (error) {
