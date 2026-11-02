@@ -65,7 +65,8 @@ function verificationText(words: OcrLine[], kind: OcrLineVerification['kind']): 
         if (decimal.length>2 && /[1-9]/.test(decimal.slice(2))) return '';
         return whole.replace(/^0+(?=\d)/,'')+'.'+decimal.padEnd(2,'0').slice(0,2);
     }
-    if (kind==='text') return text;
+    // A caption frame can attach a bracket/vertical bar to the street number.
+    if (kind==='text') return text.replace(/^[|\[\]]+(?=\d+\s)/,'');
     if (!/^[+()\d .-]+$/.test(text)) return '';
     const digits=text.replace(/\D/g,'').replace(/^1(?=\d{10}$)/,'');
     return /^[2-9]\d{9}$/.test(digits) ? digits : '';

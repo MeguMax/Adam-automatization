@@ -1,5 +1,47 @@
 # Offline acceptance and worker progress
 
+## Remaining review packages (v95)
+
+The three remaining supplied examples are not equivalent OCR failures:
+
+- Clark has three source PDFs and is missing its case-specific Request. Advice
+  and Local are added from the library, but Request is never borrowed from a
+  different case or manufactured from an unsigned blank form. The missing-PDF
+  action in Review opens the existing upload flow; adding a readable Request
+  revalidates the package automatically.
+- Beatty's paragraph 2 has both related-action options unmarked. The extractor
+  stores visual checkbox observations and distinguishes an unmarked answer
+  from unreadable geometry or a contradictory mark. The Draft shows one precise
+  error instead of a generic error plus a duplicate warning. A subsequent empty
+  read cannot erase earlier observations; contradictory observations still
+  retain review. Reading only paragraph 2 again cannot clear an already verified
+  paragraph-10 amount or recompute it from a page without amount text.
+- Pringle identifies Robert Novak (P58044), not the configured Devlin filer.
+  Repeated OCR readings also disagree on parts of the caption and contact data.
+  The source values are retained for review; they are not replaced with Devlin
+  or a guessed spelling. A frame glyph attached to a numbered street may
+  normalize for corroboration, but names and different digits remain distinct.
+
+The source summary lists the field groups not corroborated by OCR. Reviewing a
+Complaint field restores that Complaint in the preview even if a supporting
+document was selected. Manual paragraph answers, addresses, money values and
+intentional contact blanks remain protected after re-extraction. A manual
+correction does not enter automatic preparation without package confirmation.
+
+These cases remain blocked until their specific missing input is corrected;
+the release does not increase the ready count by bypassing a validation rule.
+All verification is offline or against a local mocked admin server. Payment
+and final submission remain hard-disabled. Private evidence is kept under
+`output/qa-remaining-packages-2026-11-02/`.
+
+Release checks: 364 automated tests and the desktop/mobile admin smoke passed.
+The nine intake scenarios retain all 64 field expectations (six ready, three
+under review); the 17-file archive retains all 138 checks. Failed individual
+cases were explicitly rechecked after fixes, with earlier failure logs retained
+in the private acceptance history. Parallel CPU-heavy runs reached the existing
+OCR deadline on two large scans; sequential rechecks passed without changing the
+deadline or treating unreadable text as successful recognition.
+
 ## Independently cross-checked scans (v94)
 
 Extractor version 10 verifies recognized caption lines with at least two clear

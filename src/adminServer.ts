@@ -54,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-10-31-scan-consensus-v94';
+const ADMIN_BUILD_ID = '2026-11-02-review-recovery-v95';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -5184,8 +5184,9 @@ const html = String.raw`<!doctype html>
                 icon(severity === 'error' ? 'circle-alert' : 'triangle-alert') +
                 '<span>' + escapeHtml(item.issue.message) + '</span>' +
                 '<button type="button" class="icon-button" data-review-issue="' + item.index +
-                '" title="Review this item" aria-label="Review: ' + escapeHtml(item.issue.message) + '">' +
-                  icon('arrow-right') + '</button></div>').join('') + '</div></div>';
+                '" title="' + (missingDraftUploadRole(item.issue) ? 'Add missing PDF' : 'Review this item') +
+                '" aria-label="' + (missingDraftUploadRole(item.issue) ? 'Add missing ' + missingDraftUploadRole(item.issue) + ' PDF' : 'Review: ' + escapeHtml(item.issue.message)) + '">' +
+                  icon(missingDraftUploadRole(item.issue) ? 'file-plus-2' : 'arrow-right') + '</button></div>').join('') + '</div></div>';
           }).join('') +
           (errorCount ? '' : '<span>Required checks passed. Review the notes before confirming the package.</span>') + '</div>';
       } else if (draft.status === 'filing_prepared') {
@@ -5200,6 +5201,8 @@ const html = String.raw`<!doctype html>
 
       const primaryDocument = documents.find(document => document.isPrimary) || null;
       const extraction = draft.complaintExtraction || null;
+      const unresolvedScanFields = Array.isArray(extraction?.scanVerification?.unresolvedFields)
+        ? extraction.scanVerification.unresolvedFields : [];
       const extractionSummary = draft.manualPackage
         ? '<section class="draft-field-section" data-draft-section="source"><div class="draft-section-heading">' +
             '<h3>Manual filing package</h3><span class="field-source manual">Manual</span>' +
@@ -5224,7 +5227,13 @@ const html = String.raw`<!doctype html>
                 ' | ' + escapeHtml((extraction.appliedFields || []).length) +
                 ' field groups applied</span>' +
                 (extraction.textSource === 'ocr' && extraction.scanVerification ? '<span>Scan cross-check: ' +
-                  (extraction.scanVerification.complete ? 'Complete' : 'Review needed') + '</span>' : '') +
+                  (extraction.scanVerification.complete ? 'Complete' : 'Review needed') + '</span>' +
+                  (!extraction.scanVerification.complete && unresolvedScanFields.length
+                    ? '<span>Not verified by OCR: ' + unresolvedScanFields.map(field => escapeHtml(({
+                      courtDistrict:'court',plaintiff:'Plaintiff',defendants:'Defendants',attorney:'attorney',
+                      includeAllOtherOccupants:'other occupants',relatedCivilAction:'paragraph 2',
+                      moneyJudgmentRequested:'paragraph 10',claimAmount:'claim amount',
+                    })[field] || field)).join(', ') + '</span>' : '') : '') +
                 '<span>' + escapeHtml(extraction.formType || 'Unknown Complaint type') +
                 ' | Paragraph 10: ' + escapeHtml(
                   extraction.data && extraction.data.moneyJudgmentRequested === true
@@ -5576,6 +5585,12 @@ const html = String.raw`<!doctype html>
       }
     }
 
+    function missingDraftUploadRole(issue) {
+      const role = issue.field && issue.field.startsWith('package.') ? issue.field.slice(8) : '';
+      return ['complaint', 'request', 'summons', 'ancillary'].includes(role) &&
+        !(state.draftDetail?.documents || []).some(document => document.packageRole === role) ? role : null;
+    }
+
     function draftIssueTarget(issue) {
       const field = issue.reviewField || issue.field;
       const root = document.getElementById('draftFieldGroups');
@@ -5608,6 +5623,13 @@ const html = String.raw`<!doctype html>
 
     function focusDraftIssue(issue) {
       if (!issue) return;
+      if (missingDraftUploadRole(issue)) {
+        if (state.draftMutationBusy) return;
+        setDraftSection('documents');
+        setDraftMobileMode('document');
+        document.getElementById('draftAddDocumentBtn').click();
+        return;
+      }
       const target = draftIssueTarget(issue);
       if (!target) return;
       const pane = target.closest('[data-draft-pane]');
@@ -5622,6 +5644,13 @@ const html = String.raw`<!doctype html>
       if (row) {
         state.activeDraftDocumentId = row.dataset.draftDocumentId;
         renderDraftDocuments(state.draftDetail.documents || []);
+      } else if ((issue.reviewField || issue.field || '').startsWith('filingData.') ||
+          (issue.field || '').startsWith('complaintExtraction.')) {
+        const primary = (state.draftDetail.documents || []).find(document => document.isPrimary);
+        if (primary && state.activeDraftDocumentId !== primary.id) {
+          state.activeDraftDocumentId = primary.id;
+          renderDraftDocuments(state.draftDetail.documents);
+        }
       }
       setDraftMobileMode('fields');
       document.querySelectorAll('.draft-review-target').forEach(element => element.classList.remove('draft-review-target'));

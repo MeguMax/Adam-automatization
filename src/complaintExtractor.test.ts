@@ -337,6 +337,37 @@ test('paragraph 10 uses explicitly referenced total rent, never the monthly rent
     assert.equal(applyVisualComplaintSelections(make(),{noRelated:false,previousRelated:false},pages).data.relatedCivilAction,undefined);
 });
 
+test('visually blank or doubly marked paragraph 2 cannot retain a prior automatic answer',()=>{
+    for(const checked of [false,true]) {
+        const prior=parseComplaintText(POSSESSION_ONLY_TEXT);
+        prior.data.relatedCivilAction='none';prior.fieldConfidence.relatedCivilAction='high';
+        const result=applyVisualComplaintSelections(prior,{noRelated:checked,previousRelated:checked},[]);
+        assert.equal(result.data.relatedCivilAction,undefined);
+        assert.equal(result.fieldConfidence.relatedCivilAction,'low');
+        assert.equal(result.warnings.filter(w=>w.code==='related_action_review').length,1);
+        assert.match(result.warnings.find(w=>w.code==='related_action_review')!.message,checked?/Both related-action/:/Neither related-action/);
+        assert.equal(result.warnings.find(w=>w.code==='related_action_review')!.field,'relatedCivilAction');
+        assert.deepEqual(result.checkboxSelections,{noRelated:checked,previousRelated:checked});
+    }
+    const unreadable=applyVisualComplaintSelections(parseComplaintText(POSSESSION_ONLY_TEXT),{noRelated:false},[]);
+    assert.ok(!unreadable.warnings.some(w=>w.message.startsWith('Neither')));
+    const conflict=applyVisualComplaintSelections(parseComplaintText(POSSESSION_ONLY_TEXT),
+        {noRelated:false,previousRelated:false,conflicts:['noRelated']},[]);
+    assert.ok(conflict.warnings.some(w=>w.code==='source_conflict'));
+    assert.ok(!conflict.warnings.some(w=>w.message.startsWith('Neither')));
+    const confirmed=applyVisualComplaintSelections(parseComplaintText(POSSESSION_ONLY_TEXT),{noRelated:true,previousRelated:false},[]);
+    assert.equal(applyVisualComplaintSelections(confirmed,{},[]).data.relatedCivilAction,'none');
+    const laterConflict=applyVisualComplaintSelections(confirmed,{noRelated:false,previousRelated:true},[]);
+    assert.equal(laterConflict.data.relatedCivilAction,undefined);
+    assert.ok(laterConflict.warnings.some(w=>w.code==='source_conflict'));
+    const money=parseComplaintText(POSSESSION_ONLY_TEXT);
+    money.checkboxSelections={money:true,damages:true};
+    money.data.moneyJudgmentRequested=true;money.data.claimAmount='915.50';money.fieldConfidence.claimAmount='high';
+    assert.equal(applyVisualComplaintSelections(money,{},[]).data.claimAmount,'915.50');
+    assert.equal(applyVisualComplaintSelections(money,{noRelated:true,previousRelated:false},[]).data.claimAmount,'915.50');
+    assert.equal(money.fieldConfidence.claimAmount,'high');
+});
+
 test('selected explicit damages are read from grouped OCR words, not the monthly rental rate',()=>{
     const make=()=>parseComplaintText('COMPLAINT, NONPAYMENT OF RENT\nSUPPLEMENTAL COMPLAINT');
     const words=[{text:'Damages',x:90,y:716,width:40,height:9,pageNumber:1,confidence:96},

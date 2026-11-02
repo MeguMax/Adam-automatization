@@ -10,7 +10,7 @@ import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
 import { recognizeDocumentText, recognizeDocumentPdf, type DocumentRecognition } from './documentRecognition';
-import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, finalizeScanVerification, type ComplaintExtractionResult } from './complaintExtractor';
+import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, finalizeScanVerification, applyVisualComplaintSelections, type ComplaintExtractionResult } from './complaintExtractor';
 import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
 import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
 import { validCompletenessSnapshot } from './packageCompleteness';
@@ -778,8 +778,47 @@ test('a verified OCR scan cannot bypass the authorized-attorney requirement',()=
                 attorney:{displayName:'Another Attorney',barNumber:'P70000',...ADAM_OFFICE}}};
         const result=f.db.applyComplaintExtraction(f.draftId,f.complaint,scan);
         assert.ok(result.caseDraft!.validationIssues.some(issue=>issue.field==='filingData.attorney.barNumber' && issue.severity==='error'));
+        assert.match(result.caseDraft!.validationIssues.find(issue=>issue.field==='filingData.attorney.barNumber')!.message,/Another Attorney \(P70000\)/);
         assert.equal(f.db.queueValidatedIntakes(),0);
         assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve/);
+    }finally{f.close();}
+});
+
+test('unmarked paragraph 2 reports one actionable error and preserves the manual answer on rereading',()=>{
+    const f=fixture();
+    try {
+        const blank=applyVisualComplaintSelections({...structuredClone(extraction),extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION},
+            {noRelated:false,previousRelated:false},[]);
+        const blocked=f.db.applyComplaintExtraction(f.draftId,f.complaint,blank);
+        const issues=blocked.caseDraft!.validationIssues.filter(issue=>issue.field.includes('related'));
+        assert.equal(issues.length,1);assert.equal(issues[0].field,'filingData.relatedCivilAction');
+        assert.match(issues[0].message,/Neither related-action option/);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve/);
+        f.db.updateCaseDraft(f.draftId,{},undefined,{...blocked.caseDraft!.filingData,relatedCivilAction:'none',
+            defendants:blocked.caseDraft!.filingData.defendants.map(party=>({...party,address1:'210 Manual Avenue'})),
+            plaintiff:{...blocked.caseDraft!.filingData.plaintiff,phone:null}});
+        const reread=f.db.applyComplaintExtraction(f.draftId,f.complaint,blank);
+        assert.equal(reread.caseDraft!.filingData.relatedCivilAction,'none');
+        assert.equal(reread.caseDraft!.filingData.defendants[0].address1,'210 Manual Avenue');
+        assert.equal(reread.caseDraft!.filingData.plaintiff.phone,null);
+        assert.ok(!reread.caseDraft!.validationIssues.some(issue=>issue.field.includes('related')));
+        assert.equal(f.db.queueValidatedIntakes(),0,'The manual correction still requires package confirmation');
+    }finally{f.close();}
+});
+
+test('a missing Request remains blocked until a case-specific Request is added',()=>{
+    const f=fixture();
+    try {
+        const request=f.db.getDraftDetail(f.draftId)!.documents.find(document=>document.packageRole==='request')!;
+        const missing=f.db.removeDraftDocument(f.draftId,request.id);
+        assert.match(missing.caseDraft!.validationIssues.find(issue=>issue.field==='package.request')!.message,/case-specific Request PDF/);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve/);
+        f.add('Request','Corrected Request.pdf');
+        const complete=f.db.refreshCaseDraftValidation(f.draftId);
+        assert.ok(!complete.caseDraft!.validationIssues.some(issue=>issue.field==='package.request'));
+        assert.equal(complete.documents.filter(document=>document.packageRole==='request').length,1);
     }finally{f.close();}
 });
 

@@ -1197,10 +1197,11 @@ function validateDraftData(data: unknown): DraftValidationIssue[] {
         });
     }
     if (filing.relatedCivilAction === 'unknown') {
+        const sourceReview=complaintExtractionFromDraft(data)?.warnings.find(warning=>warning.code==='related_action_review');
         issues.push({
             field: 'filingData.relatedCivilAction',
             severity: 'error',
-            message: 'Paragraph 2 could not be read; confirm whether a related civil action exists.',
+            message: sourceReview?.message || 'Paragraph 2 could not be read; confirm whether a related civil action exists.',
         });
     }
     if (filing.relatedCivilAction === 'previously_filed') {
@@ -1422,7 +1423,7 @@ function validatePrimaryComplaint(
     if (extraction?.documentId === primary.id) {
         if (filing.attorney.barNumber && filing.attorney.barNumber.replace(/\s/g,'').toUpperCase() !== ADAM_ATTORNEY.barNumber) {
             issues.push({field:'filingData.attorney.barNumber',severity:'error',
-                message:'This workflow requires Adam Devlin (P72877). The Complaint identifies another attorney; verify the source and authorized attorney before preparation.'});
+                message:`This workflow requires Adam Devlin (P72877). The Draft identifies ${filing.attorney.name || 'another attorney'} (${filing.attorney.barNumber}); use a corrected Complaint or an authorized workflow for that attorney. The system will not substitute the filer automatically.`});
         }
         if (extraction.extractorVersion < 2) {
             issues.push({
@@ -1442,7 +1443,7 @@ function validatePrimaryComplaint(
             if (warning.code === 'source_conflict' && warning.field &&
                 !['plaintiff','defendants','attorney'].includes(warning.field) && manualFields.has(warning.field as DraftFilingDataKey)) continue;
             if (
-                (warning.code === 'related_action_review' && filing.relatedCivilAction !== 'unknown') ||
+                warning.code === 'related_action_review' ||
                 (warning.code === 'claim_amount_review' &&
                     filing.moneyJudgmentRequested !== null &&
                     (!filing.moneyJudgmentRequested || Boolean(filing.claimAmount))) ||
@@ -1587,7 +1588,8 @@ function validateDraftDocuments(
             issues.push({
                 field: `package.${role}`,
                 severity: 'error',
-                message: `The standard landlord-tenant package is missing ${label}.`,
+                message: `The standard landlord-tenant package is missing ${label}.` +
+                    (['complaint','request','summons'].includes(role) ? ` Upload the case-specific ${label} PDF; it cannot be copied from another case.` : ''),
             });
             continue;
         }

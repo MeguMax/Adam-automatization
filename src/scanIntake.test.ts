@@ -38,6 +38,15 @@ test('phone verification ignores formatting, not differing digits, and may confi
     assert.equal(verifyOcrLineReads(source,source,[[word('313555012300')],reads[0]],region,'phone'),null);
 });
 
+test('caption-frame artifacts may normalize only before a numbered street, never names or changed digits',()=>{
+    const word=(text:string):OcrLine=>({text,confidence:95,x:40,y:150,width:160,height:8,pageNumber:1});
+    const region={left:39,top:149,right:210,bottom:162},source=[word('200 Rental Street')];
+    assert.ok(verifyOcrLineReads(source,source,[[word('[200 Rental Street')],[word('|200 Rental Street')]],region));
+    assert.equal(verifyOcrLineReads(source,source,[[word('[200 Rental Street')],[word('201 Rental Street')]],region),null);
+    assert.equal(verifyOcrLineReads([word('Morgan Tenant')],[word('Morgan Tenant')],
+        [[word('[Morgan Tenant')],[word('Morgan Tenant')]],region),null);
+});
+
 test('district verification normalizes a suffix separator without collapsing an actual division',()=>{
     assert.equal(ocrDistrictCode('32-A'),'32A');assert.equal(ocrDistrictCode('29th'),'29');
     assert.equal(ocrDistrictCode('41A-2'),'41A-2');assert.equal(ocrDistrictCode('az-a'),null);

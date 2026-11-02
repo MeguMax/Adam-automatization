@@ -379,6 +379,7 @@ async function main() {
         db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,scanView.complaintExtraction!);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         assert.match(await page.locator('.draft-source-summary').textContent() || '',/Scan cross-check: Review needed/);
+        assert.match(await page.locator('.draft-source-summary').textContent() || '',/Not verified by OCR: Defendants/);
         await page.locator('[data-draft-mobile-mode="document"]').click();
         await page.setViewportSize({width:1440,height:1000});
         db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,originalExtraction);
@@ -392,10 +393,13 @@ async function main() {
         db.applyComplaintExtraction(draftId,extracted.primaryDocumentId!,lowConfidence);
         await page.evaluate(() => (window as any).refreshDraftFilingState());
         let scanIssues=db.getDraftDetail(draftId)!.caseDraft!.validationIssues;
+        const otherPreview=db.getDraftDetail(draftId)!.documents.find(document=>!document.isPrimary)!;
+        await page.locator('#draftDocumentSelect').selectOption(otherPreview.id);
         await page.locator('#draftReviewTab').click();
         await page.locator('[data-review-issue="'+scanIssues.findIndex(issue=>issue.reviewField==='filingData.courtDistrict')+'"]').click();
         await page.waitForFunction(()=>document.activeElement?.getAttribute('data-filing-field')==='courtDistrict');
         assert.equal(await page.locator('#draftDataTab').getAttribute('aria-selected'),'true');
+        assert.equal(await page.locator('#draftDocumentSelect').inputValue(),extracted.primaryDocumentId);
         await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
         await page.waitForFunction(()=>{
             const canvas=document.querySelector<HTMLCanvasElement>('#draftPdfViewer canvas');
@@ -914,6 +918,19 @@ async function main() {
         assert.equal((await context.request.post(`${url}/api/drafts/${standard.caseDraft.id}/filing-jobs`,
             {headers:{Origin:url},data:{mode:'prepare'}})).status(), 409);
         await page.locator('#draftWorkspaceView').waitFor({state:'visible'});
+        await page.locator('#draftReviewTab').click();
+        await page.getByRole('button',{name:'Add missing request PDF',exact:true}).scrollIntoViewIfNeeded();
+        await page.screenshot({path:path.join(screenshots,'draft-missing-request-action.png'),fullPage:true});
+        const missingRequestUpload=page.waitForEvent('filechooser');
+        await page.getByRole('button',{name:'Add missing request PDF',exact:true}).click();
+        const requestAdded=page.waitForResponse(response=>response.url().endsWith('/documents') && response.request().method()==='POST');
+        await (await missingRequestUpload).setFiles({name:'Case Request.pdf',mimeType:'application/pdf',
+            buffer:testPdfFixture('Request for Court Mailing and Record (Landlord-Tenant)')});
+        assert.equal((await requestAdded).status(),201);
+        await page.waitForFunction(()=>document.getElementById('closeDraftBtn')?.hasAttribute('disabled')===false);
+        const requestRepaired=db.getDraftDetail(standard.caseDraft.id)!;
+        assert.equal(requestRepaired.documents.filter(document=>document.packageRole==='request').length,1);
+        assert.ok(!requestRepaired.caseDraft!.validationIssues.some(issue=>issue.field==='package.request'));
         await page.screenshot({path:path.join(screenshots,'draft-standard-upload-desktop.png'),fullPage:true});
         await page.locator('#closeDraftBtn').click();
         const created = page.waitForResponse(response => response.url().endsWith('/api/drafts') && response.request().method() === 'POST');

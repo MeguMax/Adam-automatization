@@ -6,7 +6,7 @@ import { recognizeScannedPdf, paragraph2Boundary, ocrDistrictCode, OcrPage, OcrL
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, mergeComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 10;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 11;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -61,7 +61,8 @@ export interface ComplaintExtractionWarning {
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
     contentHash?: string;
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
+    checkboxSelections?: ComplaintSelections;
     scanVerification?: {
         version: 1;
         method: 'independent_region_reads';
@@ -793,6 +794,9 @@ export async function extractComplaintPdf(
 
 export function applyVisualComplaintSelections(result: ComplaintExtractionResult, selections: ComplaintSelections,
     pages: OcrPage[]): ComplaintExtractionResult {
+    const moneyObserved=typeof selections.money==='boolean' || typeof selections.rent==='boolean' || typeof selections.damages==='boolean';
+    selections=mergeComplaintSelections([result.checkboxSelections || {},selections]);
+    result.checkboxSelections=structuredClone(selections);
     const conflicts = new Set(selections.conflicts || []);
     if (conflicts.has('noRelated') || conflicts.has('previousRelated')) {
         delete result.data.relatedCivilAction;
@@ -815,12 +819,20 @@ export function applyVisualComplaintSelections(result: ComplaintExtractionResult
             message:'The rent or damages selection has conflicting readings. Check paragraph 10 and enter the total claim amount.'});
     }
     if (!conflicts.has('noRelated') && !conflicts.has('previousRelated') &&
-        selections.noRelated !== undefined && selections.previousRelated !== undefined && selections.noRelated !== selections.previousRelated) {
-        result.data.relatedCivilAction = selections.noRelated ? 'none' : 'previously_filed';
-        result.fieldConfidence.relatedCivilAction = 'high';
-        if (selections.noRelated) result.warnings = result.warnings.filter(w => w.code !== 'related_action_review');
+        selections.noRelated !== undefined && selections.previousRelated !== undefined) {
+        result.warnings=result.warnings.filter(w=>w.code!=='related_action_review');
+        if(selections.noRelated!==selections.previousRelated) {
+            result.data.relatedCivilAction = selections.noRelated ? 'none' : 'previously_filed';
+            result.fieldConfidence.relatedCivilAction = 'high';
+        } else {
+            delete result.data.relatedCivilAction;
+            result.fieldConfidence.relatedCivilAction='low';
+            result.warnings.push({code:'related_action_review',field:'relatedCivilAction',message:selections.noRelated
+                ? 'Both related-action options are selected in paragraph 2. Check the Complaint and confirm the correct answer.'
+                : 'Neither related-action option is selected in paragraph 2. Confirm the answer; an empty box is not a No answer.'});
+        }
     }
-    if (!conflicts.has('money') && selections.money !== undefined) {
+    if (moneyObserved && !conflicts.has('money') && selections.money !== undefined) {
         let amountVerified=selections.money===false;
         result.data.moneyJudgmentRequested = selections.money;
         result.fieldConfidence.moneyJudgmentRequested = 'high';
