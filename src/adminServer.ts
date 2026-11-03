@@ -54,7 +54,7 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-02-batch-checkout-v96';
+const ADMIN_BUILD_ID = '2026-11-03-filing-review-v97';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3154,12 +3154,28 @@ const html = String.raw`<!doctype html>
     .toast-region.draft-toast-region { top: 74px; bottom: auto; }
     #draftDocumentCount { font-size: 11px; color: var(--muted); }
     #draftFieldsForm { flex: 1; min-height: 0; overflow: auto; padding: 18px 16px; }
-    .draft-next-action { display: flex; gap: 12px; align-items: center; justify-content: space-between; border-top: 1px solid var(--line); padding: 12px 16px; background: #f8faf9; flex: 0 0 auto; }
+    .draft-next-action { display: flex; flex-direction: column; gap: 10px; align-items: stretch; border-top: 1px solid var(--line); padding: 12px 16px; background: #f8faf9; flex: 0 0 auto; }
     .draft-next-action > div { min-width: 0; }
     .draft-next-action strong, .draft-next-action span { display: block; overflow-wrap: anywhere; }
     .draft-next-action strong { font-size: 12px; }
     .draft-next-action span { font-size: 11px; color: var(--muted); margin-top: 3px; }
-    #draftPrepareBtn { max-width: 100%; white-space: normal; min-width: 150px; justify-content: center; }
+    .draft-main-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
+    .draft-main-actions button { max-width: 100%; min-width: 0; min-height: 42px; white-space: normal; justify-content: center; font-size: 12px; }
+    .draft-payment-dialog { width: min(620px,calc(100vw - 24px)); max-height: calc(100dvh - 32px); padding: 0; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+    .draft-payment-dialog::backdrop { background: rgba(15,23,20,.42); }
+    .draft-payment-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+    .draft-payment-heading h2 { font-size: 18px; margin: 0; }
+    .draft-payment-body { padding: 16px 20px; display: grid; gap: 14px; }
+    .draft-payment-body p { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+    .draft-payment-identity { display: grid; grid-template-columns: 110px minmax(0,1fr); gap: 6px 12px; margin: 0; font-size: 13px; }
+    .draft-payment-identity dt { color: var(--muted); }
+    .draft-payment-identity dd { margin: 0; overflow-wrap: anywhere; }
+    .draft-payment-body h3 { font-size: 13px; margin: 0 0 8px; }
+    .draft-payment-issues { margin: 0; padding-left: 20px; font-size: 12px; color: #8a3d24; }
+    .draft-payment-issues li + li { margin-top: 5px; }
+    .draft-payment-notice { color: #8a3d24; }
+    .draft-payment-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--line); }
+    .draft-payment-actions button { min-height: 40px; white-space: normal; }
     .draft-overview-row { padding: 13px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
     .draft-overview-row > div { min-width: 0; }
     .draft-overview-row small, .draft-overview-row span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; white-space: pre-line; overflow-wrap: anywhere; }
@@ -3539,7 +3555,10 @@ const html = String.raw`<!doctype html>
             </form>
             <div class="draft-next-action">
               <div><strong id="draftNextActionTitle"></strong><span id="draftNextActionNote"></span></div>
-              <button id="draftPrepareBtn" class="primary" type="button"><i data-lucide="check-check"></i>Confirm &amp; prepare</button>
+              <div class="draft-main-actions">
+                <button id="draftPrepareBtn" class="primary" type="button"><i data-lucide="save"></i>Save to Unsubmitted</button>
+                <button id="draftPaymentBtn" type="button" title="Review the package, exact fees and submission requirements"><i data-lucide="credit-card"></i>Pay &amp; submit</button>
+              </div>
             </div>
           </section>
         </div>
@@ -3551,6 +3570,19 @@ const html = String.raw`<!doctype html>
           <div id="draftConfirmSummary"></div>
           <div class="draft-confirm-actions"><button value="cancel">Cancel</button><button id="draftConfirmAccept" class="primary" value="confirm">Confirm</button></div>
         </form>
+      </dialog>
+      <dialog id="draftPaymentDialog" class="draft-payment-dialog" aria-labelledby="draftPaymentTitle" aria-describedby="draftPaymentNotice">
+        <div class="draft-payment-heading"><h2 id="draftPaymentTitle">Review payment and submission</h2><button id="draftPaymentClose" type="button" title="Close payment review" aria-label="Close payment review"><i data-lucide="x"></i></button></div>
+        <div class="draft-payment-body">
+          <p id="draftPaymentNotice" class="draft-payment-notice"><strong>Live payment and court submission are disabled. This screen cannot charge an account or submit a filing.</strong></p>
+          <div id="draftPaymentSummary"></div>
+          <p id="draftPaymentError" class="draft-payment-notice" role="alert"></p>
+        </div>
+        <div class="draft-payment-actions">
+          <button id="draftPaymentInspect" type="button"><i data-lucide="refresh-cw"></i>Check checkout</button>
+          <button id="draftPaymentDetails" type="button"><i data-lucide="list-checks"></i>Checkout details</button>
+          <button id="draftPaymentCommit" type="button" class="primary" disabled aria-describedby="draftPaymentNotice"><i data-lucide="lock-keyhole"></i>Pay &amp; submit unavailable</button>
+        </div>
       </dialog>
     </section>
     <section id="settingsPane" class="full-span hidden settings-layout">
@@ -4668,10 +4700,70 @@ const html = String.raw`<!doctype html>
       const label = unavailable ? (draft.status === 'rejected' ? 'Rejected' : 'Download history only') :
         prepared ? 'Open MiFILE' : reconcile ? 'Check result' : running ? 'View progress' :
         state.draftDirty ? 'Save & check' : errors ? 'Review corrections' : !ready ? 'Account settings' :
-        draft.status === 'filing_failed' ? 'Retry preparation' : 'Confirm & prepare';
+        draft.status === 'filing_failed' ? 'Retry in Unsubmitted' : 'Save to Unsubmitted';
       button.innerHTML = icon(prepared ? 'external-link' : reconcile ? 'search' : running ? 'activity' :
         state.draftDirty ? 'save' : errors ? 'arrow-right' : !ready ? 'settings' : 'check-check') + escapeHtml(label);
       button.disabled = state.draftMutationBusy || draft.filingEligible === false || draft.status === 'rejected';
+      const paymentButton=document.getElementById('draftPaymentBtn');
+      paymentButton.innerHTML=icon('credit-card')+escapeHtml(filed || state.draftFilingJobs[0]?.checkout?.receiptSummary.submissionObserved ? 'Payment & receipts' : 'Pay & submit');
+      paymentButton.disabled = Boolean(state.draftMutationBusy || unavailable || running || reconcile);
+      if (document.getElementById('draftPaymentDialog').open) renderDraftPaymentReview();
+    }
+
+    function renderDraftPaymentReview() {
+      const detail=state.draftDetail,draft=detail?.caseDraft,job=state.draftFilingJobs[0];
+      if(!draft)return;
+      const checkout=job?.status==='prepared'?job.checkout:null,quote=checkout?.quote;
+      const money=cents=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(cents/100);
+      const errors=(draft.validationIssues || []).filter(issue=>issue.severity==='error').map(issue=>issue.message);
+      if(state.draftDirty)errors.unshift('Save and validate your changes before payment review.');
+      if(job?.status!=='prepared')errors.unshift('Save the complete package to MiFILE Unsubmitted first.');
+      if(draft.filingEligible===false || draft.status==='rejected')errors.unshift('This record is not eligible for a new filing.');
+      if(checkout?.executionHold || checkout?.priorBundleActivity || checkout?.receiptSummary.submissionObserved || draft.status==='filed_successfully') {
+        errors.unshift('This bundle has reported or uncertain payment/submission activity. Check MiFILE; do not repeat payment.');
+      }
+      if(checkout)errors.push(...(checkout.issues || []));
+      const checks=checkout?.preflight?.checks || [];
+      const fresh=quote && Number.isSafeInteger(quote.totalCents) && quote.currency==='USD' && Date.parse(quote.expiresAt)>Date.now() && checkout.checkoutVerified;
+      const included=(job?.payload?.documents || detail.documents?.filter(document=>document.requiredForFiling!==false) || []);
+      const complaint=included.find(document=>document.isPrimary);
+      const identity=[['Case',draft.editableData?.caseTitle || detail.email.subject || 'New case'],
+        ['Court',job?.payload?.courtName || draft.editableData?.courtName || 'Not entered'],
+        ['MiFILE account',quote?.accountEmail || state.mifileConfig?.accountLabel || 'Not verified'],
+        ['Filer','Devlin, Adam (P72877)'],['Bundle',job?.temporaryCaseNumber || 'Not saved in Unsubmitted'],
+        ['Documents',String(included.length)+' included PDFs'],
+        ['Payment account',checkout?.selectedPaymentMethodLabel || (quote?.totalCents===0?'Not required for a zero total':'Not independently verified')]];
+      document.getElementById('draftPaymentSummary').innerHTML='<dl class="draft-payment-identity">'+identity.map(([label,value])=>
+        '<dt>'+escapeHtml(label)+'</dt><dd>'+escapeHtml(value)+'</dd>').join('')+'</dl>'+
+        (included.length?'<details class="draft-optional" style="margin-top:14px"><summary>Included PDFs ('+included.length+')</summary><ul class="reconciliation-files">'+
+          included.map(document=>'<li>'+escapeHtml(document.filingName || document.currentFilename || document.originalFilename || 'PDF')+
+            '<small>'+escapeHtml(document.filingRelation==='connected_to_complaint'?'Connected to '+(complaint?.filingName || 'Complaint'):
+              document.filingType || document.documentType || 'Filing type needs review')+'</small></li>').join('')+'</ul></details>':'')+
+        (quote?'<h3 style="margin-top:16px">'+(fresh?'Checkout total':'Last checked total')+'</h3><dl class="checkout-fees">'+
+          quote.lines.map(line=>'<dt>'+escapeHtml(line.label)+'</dt><dd>'+escapeHtml(money(line.cents))+'</dd>').join('')+
+          '<dt class="checkout-total">Total including fees</dt><dd class="checkout-total">'+escapeHtml(money(quote.totalCents))+' USD</dd></dl>'+
+          '<p>Quote expires: '+escapeHtml(fmtDate(quote.expiresAt))+(fresh?'':'. Refresh checkout before confirming any amount.')+'</p>':
+          '<p style="margin-top:14px"><strong>The exact total has not been checked.</strong> No estimated amount can authorize payment.</p>')+
+        (checks.length?'<h3 style="margin-top:16px">Before payment and submission</h3><ul class="checkout-preflight">'+checks.map(check=>
+          '<li>'+icon(check.passed?'circle-check':'circle')+'<span>'+escapeHtml(check.label)+'</span></li>').join('')+'</ul>':'')+
+        (errors.length?'<ul class="draft-payment-issues" style="margin-top:14px">'+[...new Set(errors)].map(error=>'<li>'+escapeHtml(error)+'</li>').join('')+'</ul>':'')+
+        '<p style="margin-top:14px">A completed checklist is not payment authorization. The final payment adapter and a controlled live test are still required.</p>';
+      document.getElementById('draftPaymentInspect').disabled=Boolean(state.draftMutationBusy || !checkout?.canInspect || checkout.active);
+      document.getElementById('draftPaymentDetails').disabled=job?.status!=='prepared';
+      document.getElementById('draftPaymentCommit').disabled=true;
+      renderIcons();
+    }
+
+    async function openDraftPaymentReview() {
+      if(!state.selectedDraftId || state.draftMutationBusy)return;
+      const dialog=document.getElementById('draftPaymentDialog'),owner=state.selectedDraftId;
+      document.getElementById('draftPaymentError').textContent='';
+      renderDraftPaymentReview();if(!dialog.open)dialog.showModal();
+      try {
+        const jobs=await api('/api/filing-jobs?caseDraftId='+encodeURIComponent(owner));
+        if(owner!==state.selectedDraftId){dialog.close();return;}
+        state.draftFilingJobs=jobs;renderDraftPaymentReview();
+      }catch(error){document.getElementById('draftPaymentError').textContent=error.message;}
     }
 
     function setDraftSection(section, scroll = false) {
@@ -5107,7 +5199,7 @@ const html = String.raw`<!doctype html>
         'Account: ' + state.mifileConfig.accountLabel + '\nFiler: Devlin, Adam (P72877).\n' +
         'The package will be saved to History > Unsubmitted. No payment or court submission will be made.' +
         (issues.length ? '\nReview notes: ' + issues.map(issue => issue.message).join(' ') : ''),
-        isRetry ? 'Retry in Unsubmitted' : 'Confirm & prepare',
+        isRetry ? 'Retry in Unsubmitted' : 'Save to Unsubmitted',
         '<div class="draft-overview-row"><div><strong>' + escapeHtml(detail.caseDraft.editableData.caseTitle || detail.email.subject || 'New case') +
         '</strong><span>' + escapeHtml(detail.caseDraft.editableData.courtName || '') + '</span><span>' +
         (detail.documents || []).filter(doc => doc.requiredForFiling !== false).length + ' included PDFs</span></div></div>',
@@ -6223,7 +6315,7 @@ const html = String.raw`<!doctype html>
       };
       state.draftMutationBusy = true;
       const controls = Array.from(document.querySelectorAll(
-        '#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source]):not([data-preview-draft-document]), #closeDraftBtn, #draftRejectBtn, #draftApproveBtn, #draftPrepareBtn, .draft-preview-actions button',
+        '#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source]):not([data-preview-draft-document]), #closeDraftBtn, #draftRejectBtn, #draftApproveBtn, #draftPrepareBtn, #draftPaymentBtn, .draft-preview-actions button',
       )).map(control => ({ control, disabled: control.disabled }));
       controls.forEach(({control}) => { control.disabled = true; });
       const button = document.getElementById('draftSaveBtn');
@@ -7428,6 +7520,20 @@ const html = String.raw`<!doctype html>
     });
     document.getElementById('draftPrepareBtn').addEventListener('click', () => {
       handleDraftNextAction().catch(showDraftError);
+    });
+    document.getElementById('draftPaymentBtn').addEventListener('click',openDraftPaymentReview);
+    document.getElementById('draftPaymentClose').addEventListener('click',()=>document.getElementById('draftPaymentDialog').close());
+    document.getElementById('draftPaymentDetails').addEventListener('click',()=>{
+      document.getElementById('draftPaymentDialog').close();setDraftSection('activity',true);
+      const details=document.querySelector('[data-checkout-review]');if(details){details.open=true;details.scrollIntoView({block:'nearest'});}
+    });
+    document.getElementById('draftPaymentInspect').addEventListener('click',async()=>{
+      const button=document.getElementById('draftPaymentInspect'),job=state.draftFilingJobs[0];
+      if(button.disabled || !job || job.status!=='prepared')return;
+      button.disabled=true;document.getElementById('draftPaymentError').textContent='';
+      try {await checkoutAction(job,'inspect');}
+      catch(error){document.getElementById('draftPaymentError').textContent=error.message;}
+      finally{renderDraftPaymentReview();}
     });
     document.querySelectorAll('[data-draft-tab]').forEach(button => {
       button.addEventListener('click', () => setDraftSection(button.dataset.draftTab, true));

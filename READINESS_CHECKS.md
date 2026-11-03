@@ -1,5 +1,28 @@
 # Offline acceptance and worker progress
 
+## Explicit Draft actions and payment review v97
+
+Drafts expose **Save to Unsubmitted** and **Pay & submit** as separate actions.
+The first retains the existing package confirmation, validation, source-version
+and duplicate-preparation checks. Prepared packages show Open MiFILE instead
+of creating another copy. The second opens a read-only payment review dialog:
+case, court, account, filer, bundle, included PDFs and Connected relationships,
+masked payment account, fee components, exact total, expiry and server preflight
+checks. Missing or stale data and prior/uncertain activity remain visible.
+
+The review dialog cannot authorize or execute payment. Its final action remains
+disabled and the server continues rejecting pay/submit/authorize/execute. The
+dialog can queue the existing read-only checkout inspection or open the full
+checkout details. No notification channel is enabled without Adam's decision.
+This interface is suitable for demonstrating the proposed review workflow; it
+is not certification of the unfinished live payment adapter.
+
+Verification: 72 checkout/runtime tests passed with no skips. The admin smoke
+passed on desktop/mobile with both actions, missing-package review, exact fees,
+PDF list, inspection-error recovery, prior-payment warnings and the disabled
+commit action. Existing server tests still reject live financial actions. No
+real MiFILE bundles, charges or court submissions were created for this release.
+
 ## Batch Excel and controlled execution journal (v96)
 
 Excel supports a local cases ZIP for 1-10 adjacent selected rows and any subset

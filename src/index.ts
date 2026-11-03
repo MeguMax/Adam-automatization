@@ -51,7 +51,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-11-02-batch-checkout-v96';
+const WORKER_BUILD_ID = '2026-11-03-filing-review-v97';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
