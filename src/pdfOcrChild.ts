@@ -3,7 +3,7 @@ import { createCanvas } from '@napi-rs/canvas';
 import { createWorker, PSM } from 'tesseract.js';
 import type { Page as RecognizedPage } from 'tesseract.js';
 import sharp from 'sharp';
-import { mergeOcrLineReads, mergeOcrRegionWords, verifyOcrLineReads, applyOcrLineVerifications, paragraph2Boundary, ocrDistrictCode,
+import { mergeOcrLineReads, mergeOcrRegionWords, recoverOcrCaptionBlock, verifyOcrLineReads, applyOcrLineVerifications, paragraph2Boundary, ocrDistrictCode,
     type OcrLineVerification, type OcrPage, type OcrLine } from './pdfOcr';
 import { pdfResourceOptions } from './pdfValidation';
 import { readComplaintSelections } from './pdfCheckboxes';
@@ -32,6 +32,9 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
         const pages: OcrPage[] = [];
         for (const number of numbers) {
             const page = await pdf.getPage(number);
+            const operators=await page.getOperatorList();
+            const imageOperators=[pdfJs.OPS.paintImageXObject,pdfJs.OPS.paintInlineImageXObject,pdfJs.OPS.paintImageMaskXObject];
+            const printedImageStrips=operators.fnArray.filter((op:number)=>imageOperators.includes(op)).length>=16;
             const base = page.getViewport({ scale: 1 });
             const scale = Math.min(300 / 72, Math.sqrt(8_000_000 / (base.width * base.height)));
             const viewport = page.getViewport({ scale });
@@ -153,12 +156,32 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                     const cropped = await sharp(image).extract(crop).extend({top:padding,bottom:padding,left:padding,right:padding,
                         background:'#fff'}).png().toBuffer();
                     const data = (await worker.recognize(cropped, {}, { text: true, blocks: true })).data;
-                    const block = convert(data, crop.left-padding, crop.top-padding);
+                    let block = convert(data, crop.left-padding, crop.top-padding);
                     passes++;
                     if (!block.words.length) continue;
                     captionBlockReads.push(block.words);
+                    const region = {left:xMin,top,right:xMax,bottom};
+                    if (printedImageStrips && xMax-xMin <= 300 && bottom-top <= 160 && initialRead.some(word =>
+                        word.x >= xMin && word.x < xMax && word.y >= top && word.y < bottom && word.confidence < 75)) {
+                        // Some PDF printers emit tiny image strips. Detail rendering avoids full-page downsampling.
+                        const detailScale=600/72,detailViewport=page.getViewport({scale:detailScale});
+                        const detailX=612/detailViewport.width,detailY=792/detailViewport.height;
+                        const originX=Math.floor(xMin/detailX),originY=Math.floor(top/detailY);
+                        const detail=createCanvas(Math.ceil((xMax-xMin)/detailX),Math.ceil((bottom-top)/detailY));
+                        try {
+                            await page.render({canvasContext:detail.getContext('2d'),viewport:detailViewport,
+                                transform:[1,0,0,1,-originX,-originY]}).promise;
+                            const bytes=await sharp(detail.toBuffer('image/png')).flatten({background:'#fff'}).greyscale()
+                                .extend({top:padding,bottom:padding,left:padding,right:padding,background:'#fff'}).png().toBuffer();
+                            const data=(await worker.recognize(bytes,{}, {text:true,blocks:true})).data;
+                            const reread=convert(data,originX-padding,originY-padding,1,detailX,detailY);
+                            passes++;captionBlockReads.push(reread.words);
+                            const recovered=recoverOcrCaptionBlock(recognized.words,reread.words,region);
+                            if(recovered!==recognized.words) {recognized.words=recovered;block=reread;}
+                        } finally {detail.width=1;detail.height=1;}
+                    }
                     recognized.words = mergeOcrRegionWords(recognized.words, block.words,
-                        {left:xMin,top,right:xMax,bottom});
+                        region);
                     captionLines.push(...rows(recognized.words.filter(word=>word.x>=xMin && word.x+word.width<=xMax &&
                         word.y>=firstData.y && word.y<bottom)));
                 }
@@ -174,9 +197,11 @@ process.once('message', async (input: { pdf: string; pageNumbers?: number[] }) =
                     if(crop.width<=0 || crop.height<=0 || crop.left+crop.width>pixelWidth || crop.top+crop.height>pixelHeight) continue;
                     let lineImage=await sharp(phone?sourceImage:image).extract(crop).png().toBuffer();
                     let originX=crop.left,originY=crop.top,coordinateX=xScale,coordinateY=yScale,lineWidth=crop.width;
-                    if(phone && line.width<300 && line.height<30) {
-                        // Re-render only the small number row: the full-page pixel cap must not blur fine digits.
-                        const highViewport=page.getViewport({scale:300/72});
+                    const unclearCaption=printedImageStrips && !money && !phone && initialRead.some(word=>word.confidence<75 &&
+                        word.x>=line.x-1 && word.x<line.x+line.width+1 && Math.abs(word.y-line.y)<12);
+                    if((phone || unclearCaption) && line.width<300 && line.height<30) {
+                        // Re-render a small row without increasing the full-page pixel/memory cap.
+                        const highViewport=page.getViewport({scale:(phone?300:600)/72});
                         coordinateX=612/highViewport.width;coordinateY=792/highViewport.height;
                         originX=Math.floor((line.x-2)/coordinateX);originY=Math.floor((line.y-2.5)/coordinateY);
                         lineWidth=Math.ceil((line.width+4)/coordinateX);

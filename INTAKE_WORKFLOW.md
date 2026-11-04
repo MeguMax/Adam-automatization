@@ -380,3 +380,26 @@ authorization to substitute the configured Devlin filer or use the current
 MiFILE account for another attorney. Payment and final court submission remain
 disabled. No automatic retry, deletion, payment or court action follows from
 this clarification alone.
+
+## Electronically printed image PDFs (November 5, v104)
+
+Non-selectable text is routed through offline OCR even when the sender printed
+directly from case-management software rather than scanning paper. A PDF printer
+can encode individual text rows as small raster strips. On pages with at least
+16 raster paint operations, low-confidence caption blocks receive a bounded
+600-DPI detail render. Single-image scans keep their existing preprocessing;
+the full-page eight-million
+pixel cap, serialized worker and timeout remain unchanged. Clear original words
+must survive a replacement block. Detail recovery does not itself establish
+consensus: independent line checks and contradiction/review gates still apply.
+
+The extractor keeps adjacent paragraph numbers and body-column words out of the
+attorney's name/address. A district-prefixed Summons title can establish its role
+from content, without relying on a filename. Core-title conflicts still block
+preparation. Extractor version 12 and recognition version 3 distinguish the new
+evidence; re-extraction retains manual edits.
+
+The supplied colleague-attorney example remains recognition-only under the
+Devlin-only filer policy. Missing supporting PDFs and unresolved OCR values
+remain review issues. These changes do not create, repay or resubmit existing
+cases, and final payment/court submission remain disabled.

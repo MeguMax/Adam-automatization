@@ -6,7 +6,7 @@ import { recognizeScannedPdf, paragraph2Boundary, ocrDistrictCode, OcrPage, OcrL
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, mergeComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 11;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 12;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -61,7 +61,7 @@ export interface ComplaintExtractionWarning {
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
     contentHash?: string;
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
     checkboxSelections?: ComplaintSelections;
     scanVerification?: {
         version: 1;
@@ -953,7 +953,10 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
         /^(?:the\s+)?plaintiff\s+states\b/i.test(words.filter(other => other.x >= word.x - 0.5 &&
             Math.abs(other.y - word.y) < 5).sort((a,b) => a.x-b.x).map(other => other.text).join(' ')));
     const statesLabel = statesAnchor || groupLines(words).find(line => /\b(?:the\s+)?plaintiff\s+states\b/i.test(line.text));
-    const divider = statesLabel && statesLabel.x >= 280 && statesLabel.x <= 320 ? Math.min(300, statesLabel.x) : 300;
+    const paragraph1 = words.find(word => word.x >= 260 && word.x <= 320 && /^1\.$/.test(word.text) &&
+        words.some(other => /^Attached$/i.test(other.text) && other.x > word.x && other.x - word.x < 30 && Math.abs(other.y-word.y)<8));
+    const divider = Math.min(statesLabel && statesLabel.x >= 280 && statesLabel.x <= 320 ? statesLabel.x : 300,
+        paragraph1 ? paragraph1.x-1 : 300, 300);
     const left = groupLines(words.filter(word => word.x + word.width / 2 < 300));
     const right = groupLines(words.filter(word => word.x + word.width / 2 >= 300));
     const attorneyRows = groupLines(words.filter(word => word.x + word.width / 2 < divider));
@@ -1010,7 +1013,7 @@ function parseLayoutComplaint(pages: OcrPage[], pageCount: number, source: 'pdf'
         const end = paragraph2Boundary(words,attorneyLabel.y) || attorneyLabel.y + 120;
         const rows = attorneyRows.filter(line => line.y > attorneyLabel.y + 6 && line.y < end - 2).map(line => line.text);
         const bar = rows[0]?.match(/\(?\bP\d{5,8}\b\)?/i);
-        const attorney = partyFromLines([rows[0]?.replace(/\(?\bP\d{5,8}\b\)?/i, '').trim() || '', ...rows.slice(1)]);
+        const attorney = partyFromLines([bar ? rows[0].slice(0,bar.index).trim() : '', ...rows.slice(1)]);
         if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() };
             result.fieldConfidence.attorney = source === 'pdf' || verifiedBetween(attorneyRows,attorneyLabel.y,end) ? 'high' : 'medium'; }
     }

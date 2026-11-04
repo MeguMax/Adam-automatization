@@ -10,7 +10,7 @@ export const DOCUMENT_LABELS = {
 } as const;
 export type RecognizedRole = keyof typeof DOCUMENT_LABELS;
 export type SupportingDocumentKind = 'demand' | 'notice_to_quit' | 'lease' | 'deed' | 'affidavit' | 'other' | 'unknown';
-export const DOCUMENT_RECOGNITION_VERSION = 2;
+export const DOCUMENT_RECOGNITION_VERSION = 3;
 export interface DocumentRecognition {
     caseIdentity?: import('./batchCaseMatching').SupportingCaseIdentity;
     role: RecognizedRole;
@@ -64,6 +64,8 @@ export function recognizeDocumentText(pages: string[], filename: string): Docume
         // A scan can merge the two-column heading. The printed SCAO footer is a second title anchor.
         if (allLines.some(line=>/^DC\s*102[ac]\s*(?:\([^)]*\)\s*)?COMPLAINT\b/i.test(line))) roles.add('complaint');
         const lines = allLines.slice(0, 24);
+        // Printed PDFs can merge the district and form title into one OCR line.
+        if (lines.some(line=>/^(?:STATE OF MICHIGAN\s+)?\d{1,3}[AB]?(?:-\d)?(?:st|nd|rd|th)?\s+JUDICIAL DISTRICT\s+SUMMONS(?:\s+Landlord[-\s]Tenant)?$/i.test(line))) roles.add('summons');
         const candidates = lines.flatMap((line, index) => [line, `${line} ${lines[index + 1] || ''}`.trim()]);
         for (const line of candidates) {
             for (const [role, pattern] of patterns) if (pattern.test(line)) roles.add(role);

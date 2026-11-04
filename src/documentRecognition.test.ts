@@ -39,8 +39,8 @@ test('verified supplied supporting PDFs need no semantic title, while core guess
 
 function assertMetadata(result: DocumentRecognition, content: Buffer) {
     assert.equal(result.contentHash, createHash('sha256').update(content).digest('hex'));
-    assert.equal(result.recognitionVersion, 2);
-    assert.equal(DOCUMENT_RECOGNITION_VERSION, 2);
+    assert.equal(result.recognitionVersion, 3);
+    assert.equal(DOCUMENT_RECOGNITION_VERSION, 3);
 }
 
 function scannedPage(text: string, confidence = 95): OcrPage {
@@ -74,7 +74,7 @@ test('anchored supporting titles identify content kinds independently of generic
         assert.equal(result.role, 'ancillary', title);
         assert.equal(result.source, 'content', title);
         assert.equal(result.supportingKind, kind, title);
-        assert.equal(result.recognitionVersion, 2);
+        assert.equal(result.recognitionVersion, 3);
         assert.equal(result.contentHash, undefined, 'Text-only recognition cannot attest to PDF bytes');
     }
 });
@@ -175,6 +175,20 @@ test('core title conflicts and the existing DC102 Complaint footer anchor remain
     ], 'scan.pdf');
     assert.equal(footer.role, 'complaint');
     assert.equal(footer.source, 'content');
+});
+
+test('district-prefixed Summons headings are content evidence without accepting prose or hiding conflicts', () => {
+    for (const district of ['52-1ST','41A','29TH']) {
+        const heading=`${district} JUDICIAL DISTRICT SUMMONS\nCOUNTY Landlord-Tenant`;
+        assert.equal(recognizeDocumentText([heading],'document.pdf').role,'summons');
+        assert.equal(recognizeDocumentText([heading],'document.pdf').source,'content');
+        assert.equal(recognizeDocumentText([heading],'Complaint.pdf').source,'conflict');
+        assert.equal(recognizeDocumentText([heading+'\nCOMPLAINT'],'bundle.pdf').source,'conflict');
+    }
+    for(const prose of ['A summons was issued by the 52-1ST JUDICIAL DISTRICT',
+        '52-1ST JUDICIAL DISTRICT SUMMONS must be attached', 'Please file the SUMMONS']) {
+        assert.equal(recognizeDocumentText([prose],'document.pdf').source,'unknown');
+    }
 });
 
 test('PDF and pre-inspected PDF paths return the exact byte hash and recognition version', async () => {

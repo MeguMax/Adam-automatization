@@ -130,6 +130,26 @@ export function mergeOcrRegionWords(words: OcrLine[], reread: OcrLine[], region:
     return [...words.filter(word => !inside(word)), ...merged];
 }
 
+/** Repair collapsed caption rows only when detail adds clear words without losing a legible original. */
+export function recoverOcrCaptionBlock(words: OcrLine[], reread: OcrLine[], region: OcrRegion): OcrLine[] {
+    const inside = (word: OcrLine) => word.x + word.width / 2 >= region.left &&
+        word.x + word.width / 2 < region.right && word.y + word.height / 2 >= region.top &&
+        word.y + word.height / 2 < region.bottom;
+    const prior = words.filter(inside), next = reread.filter(inside);
+    const token = (word: OcrLine) => word.text.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    const clear = (word: OcrLine) => Number.isFinite(word.confidence) && word.confidence >= 80 && Boolean(token(word));
+    if (!prior.some(word => Number.isFinite(word.confidence) && word.confidence < 75) ||
+        next.filter(clear).length < prior.filter(clear).length + 2 ||
+        prior.some(word => clear(word) && word.confidence >= 85 && !next.some(candidate =>
+            clear(candidate) && candidate.pageNumber === word.pageNumber && token(candidate) === token(word) &&
+            Math.abs(candidate.y - word.y) < 8))) return words;
+    if (!next.length || next.some(word => !Number.isFinite(word.confidence) ||
+        !Number.isFinite(word.x + word.y + word.width + word.height) || word.width <= 0 || word.height <= 0 ||
+        word.pageNumber !== prior[0].pageNumber)) return words;
+    // This changes the tentative reading, not its verified status. Independent line reads still gate confidence.
+    return [...words.filter(word => !inside(word)), ...next.map(word => ({...word, verifiedByConsensus:false}))];
+}
+
 /** Independent line preprocessings may repair a spelling, but disagreement still requires review. */
 export function mergeOcrLineReads(words: OcrLine[], reads: OcrLine[][], region: OcrRegion, numericFallback=false): OcrLine[] {
     const inside = (word:OcrLine) => word.x + word.width/2 >= region.left && word.x + word.width/2 < region.right &&

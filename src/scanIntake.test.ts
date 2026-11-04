@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createCanvas } from '@napi-rs/canvas';
-import { recognizeScannedPdf, mergeOcrRegionWords, mergeOcrLineReads, verifyOcrLineReads, applyOcrLineVerifications,
+import { recognizeScannedPdf, mergeOcrRegionWords, recoverOcrCaptionBlock, mergeOcrLineReads, verifyOcrLineReads, applyOcrLineVerifications,
     paragraph2Boundary, ocrDistrictCode, type OcrLine } from './pdfOcr';
 import { parseScannedComplaint } from './complaintExtractor';
 import { inspectFilingPdf } from './pdfValidation';
@@ -14,6 +14,28 @@ import { districtCode, planFormImport, planFormImports, resolveCourt } from './c
 import { WorkflowDatabase } from './database';
 import { buildFilingIntake } from './filingIntake';
 import { recognizeDocumentText } from './documentRecognition';
+
+test('detail caption recovery repairs collapsed rows but cannot discard legible words or grant consensus',()=>{
+    const word=(text:string,x:number,y:number,confidence=95):OcrLine=>
+        ({text,x,y,confidence,width:35,height:8,pageNumber:1});
+    const region={left:20,top:170,right:290,bottom:240};
+    const outside=word('Unrelated',330,180);
+    const prior=[outside,word('Attorney',30,175),word('garbled',30,186,5),word('555-0100',30,218)];
+    const next=[word('Attorney',30,175),word('200',30,187),word('Legal',70,187),word('Street',110,187),
+        word('Example',30,200),word('MI',90,200),word('48025',130,200),word('555-0100',30,218)];
+    const result=recoverOcrCaptionBlock(prior,next.map(w=>({...w,verifiedByConsensus:true})),region);
+    assert.equal(result[0],outside);
+    assert.ok(result.some(w=>w.text==='Legal'));
+    assert.ok(!result.some(w=>w.text==='garbled'));
+    assert.ok(result.filter(w=>w!==outside).every(w=>w.verifiedByConsensus===false));
+    assert.equal(recoverOcrCaptionBlock(prior,next.filter(w=>w.text!=='Attorney'),region),prior);
+    assert.equal(recoverOcrCaptionBlock(prior,next.map(w=>w.text==='555-0100'?{...w,text:'555-0199'}:w),region),prior);
+    assert.equal(recoverOcrCaptionBlock(prior,next.map(w=>({...w,pageNumber:2})),region),prior);
+    assert.equal(recoverOcrCaptionBlock(prior,next.map(w=>({...w,width:NaN})),region),prior);
+    assert.equal(recoverOcrCaptionBlock(prior,prior,region),prior);
+    const clear=prior.map(w=>({...w,confidence:95}));
+    assert.equal(recoverOcrCaptionBlock(clear,next,region),clear);
+});
 
 test('OCR verification needs two clear reads and rejects legible contradictions or a changed final line',()=>{
     const word=(text:string,confidence=95,x=40):OcrLine=>({text,confidence,x,y:150,width:100,height:10,pageNumber:1});
@@ -293,6 +315,24 @@ test('caption column boundaries exclude a paragraph number aligned with the atto
     assert.equal(result.data.attorney?.phone,'248-555-0101');
     assert.equal(result.data.defendants?.[0].address1,'300 Rental Street');
     assert.ok(result.warnings.some(warning=>warning.code==='caption_review'&&warning.field==='courtDistrict'));
+});
+
+test('a narrow printed caption cannot append right-column words or paragraph numbers to attorney details',()=>{
+    const word=(text:string,x:number,y:number,width=120):OcrLine=>({text,x,y,width,height:8,confidence:95,pageNumber:1});
+    const words=[word('Plaintiff name(s), address(es)',28,111,200),word('Example Owner LLC',29,121,140),
+        word('Defendant name(s) and address',310,111,200),word('Morgan Tenant',310,125,180),
+        word('300 Rental Street',310,138,160),word('Example City, MI 48002',310,150,180),
+        word('Plaintiff attorney, bar no.',28,164,200),word('Alex Attorney (P70000)',29,175,180),
+        word(']',279,175,4),word('The',285,175,14),word('plaintiff states:',303,175,100),
+        word('200 Legal Avenue',29,187,180),word('1.',286,188,8),word('Attached',299,188,50),
+        word('to this complaint',352,188,100),word('Example City, MI 48001',29,198,180),word('248-555-0101',29,210,100),
+        word('2. There is no other pending civil action',29,241,300),word('25th District Court',29,55,140)];
+    const result=parseScannedComplaint([{text:'COMPLAINT, NONPAYMENT OF RENT\n'+words.map(w=>w.text).join('\n'),
+        confidence:90,words,lines:words,selections:{money:false,noRelated:true,previousRelated:false}}]);
+    assert.equal(result.data.attorney?.displayName,'Alex Attorney');
+    assert.equal(result.data.attorney?.address1,'200 Legal Avenue');
+    assert.equal(result.data.attorney?.city,'Example City');
+    assert.equal(result.data.attorney?.barNumber,'P70000');
 });
 
 test('a later scanned page cannot overwrite a contradictory paragraph answer', () => {

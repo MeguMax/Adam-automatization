@@ -336,3 +336,30 @@ Connected children of the Complaint in the primary account's Unsubmitted area.
 The v91 recognition acceptance is offline and does not create another MiFILE
 bundle, charge a payment account or submit anything to court. Both releases
 retain the unsubmitted-only preparation limit.
+
+## Printed image PDF recognition (v104)
+
+The supplied 22-PDF email batch was processed offline into four complete
+packages, containing 30 PDFs after library enrichment. Each original source
+hash was retained, all supplied supporting PDFs stayed separate, repeated intake
+did not upload duplicates, and no network calls, filing jobs or notifications
+were made. This is intake validation, not proof that these are new unpaid cases.
+
+The three-PDF electronically printed OCR sample identified Complaint, Summons
+and Request from content and matched 21 explicit Complaint values, including
+the recovered attorney street/city/ZIP. Manual corrections survived forced
+re-extraction. The non-Devlin filer, missing supporting PDF and unresolved scan
+values still require review. No artificial completeness exception was added.
+
+High-resolution caption recovery is limited to fragmented raster pages. A
+regression run caught a changed suite digit on a conventional single-image scan;
+that scan retains its established preprocessing and passed the final readback.
+Six previous full intake examples passed 43 value comparisons. Three additional
+Complaints passed a separate recognition corpus with 27 checks; their legacy
+sample packages mix filename prefixes and are not claimed as batch-intake passes.
+
+The release regression contains 420 tests: 416 passed, four skipped, no failures.
+Private PDF inputs, read-only payment-audit results and QA logs remain under
+`output/client-intake-2026-11-05/` and are not part of the repository. Payment
+and final court submission are still compiled off. Historical payment
+authorizations are not bank settlement confirmations or permission to pay again.
