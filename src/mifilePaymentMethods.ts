@@ -1,8 +1,9 @@
 import type { Page } from 'playwright';
 import { digest, type CheckoutQuote, type CheckoutPaymentMethod } from './mifileCheckout';
+import {observedPaymentAccounts} from './mifilePaymentEvidence';
 
 function safePaymentLabel(text: string, fingerprint: string): string {
-    const kind = /\b(?:visa|master\s*card|amex|american express|discover|credit|debit|card)\b/i.test(text)
+    const kind = /\b(?:visa|mc|master\s*card|amex|american express|discover|credit|debit|card)\b/i.test(text)
         ? 'Card' : /\b(?:bank|checking|savings|ach)\b/i.test(text) ? 'Bank account' : 'Payment account';
     const lastFour = text.match(/(?:ending(?:\s+in)?|last\s*(?:four|4)|[*x\u2022]{2,})[\s:.-]*(\d{4})(?!\d)/i)?.[1];
     return lastFour ? `${kind} ending ${lastFour}` : `${kind} ${fingerprint.slice(0, 8)}`;
@@ -12,11 +13,13 @@ async function paymentOptions(page: Page) {
     const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading', {name:'Checkout', exact:true})}).last();
     const group = dialog.getByRole('group', {name:'Available Payment Accounts', exact:true});
     // MiFILE can render the card table as a sibling of the fieldset containing its legend and Add button.
+    const angularRadios=page.locator('input[type="radio"][name="selectedPaymentAccount"][ng-model="modal.selectedPaymentAccount"][ng-value="item"]');
     const tables=dialog.getByRole('table').filter({has:page.getByRole('columnheader',{name:'Card Nickname',exact:true})})
+        .or(dialog.locator('#paymentInfoForm table').filter({has:angularRadios}))
         .filter({visible:true});
     if(await tables.count()>1)throw new Error('MiFILE shows ambiguous payment account tables. Check checkout manually.');
     const hasTable=await tables.count()===1;
-    if(hasTable && JSON.stringify((await tables.getByRole('columnheader').allTextContents()).map(text=>text.trim().replace(/\s+/g,' ')))!==
+    if(hasTable && JSON.stringify((await tables.locator('thead th').allTextContents()).map(text=>text.trim().replace(/\s+/g,' ')))!==
         JSON.stringify(['Select','Type','Card Nickname','Number','Expiration Date'])) {
         throw new Error('MiFILE payment table has an unfamiliar layout. Check checkout manually.');
     }
@@ -25,7 +28,7 @@ async function paymentOptions(page: Page) {
         if (element instanceof HTMLSelectElement) {
             if (element.disabled || !element.getClientRects().length) return [];
             return Array.from(element.options).filter(option => !option.disabled).map(option => ({
-                kind:'select', token:option.value, selected:option.selected, text:option.label,
+                kind:'select', token:option.value, selected:option.selected, text:option.label,angular:false,
             }));
         }
         const radio = element as HTMLInputElement;
@@ -36,8 +39,16 @@ async function paymentOptions(page: Page) {
         const text = [radio.getAttribute('aria-label'),Array.from(radio.labels || []).map(label => label.innerText).join(' '),
             radio.closest('label')?.textContent,rowText,radio.closest('td, li')?.textContent]
             .find(text=>text?.trim()) || '';
-        return [{kind:'radio', token:radio.value, selected:radio.checked, text}];
+        const angular=radio.name==='selectedPaymentAccount' && radio.getAttribute('ng-model')==='modal.selectedPaymentAccount' &&
+            radio.getAttribute('ng-value')==='item';
+        return [{kind:'radio', token:radio.value, selected:radio.checked, text,angular}];
     }));
+    const accounts=observedPaymentAccounts(page);
+    for(const control of controls.filter(control=>control.angular)) {
+        const matches=accounts?.filter(account=>account.label.replace(/\s+/g,' ').trim()===control.text.replace(/\s+/g,' ').trim());
+        if(matches?.length!==1)throw new Error('MiFILE payment accounts are not readable yet. The selected card requires matching current account evidence.');
+        control.token=matches[0].id;
+    }
     // Only observed opaque MiFILE account IDs are accepted; labels and card data never become IDs.
     const usable = controls.filter(control => /^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(control.token));
     if (controls.some(control => control.selected && control.token && !usable.includes(control))) {
@@ -49,7 +60,8 @@ async function paymentOptions(page: Page) {
     }
     return {dialog, group, scope, controls, usable, methods:usable.map(control => {
         const fingerprint = digest(control.token);
-        return {fingerprint, label:safePaymentLabel(control.text, fingerprint)};
+        return {fingerprint, label:control.angular ? accounts!.find(account=>account.id===control.token)!.publicLabel :
+            safePaymentLabel(control.text, fingerprint)};
     })};
 }
 
@@ -79,7 +91,8 @@ export async function selectPaymentMethodForQuote(page: Page, fingerprint: strin
     const target = matches[0];
     try {
     if (target.kind === 'radio') {
-        const radio = snapshot.scope.locator('input[type="radio"][value="' + target.token + '"]');
+        const radio = target.angular ? snapshot.scope.getByRole('radio',{name:target.text,exact:true}) :
+            snapshot.scope.locator('input[type="radio"][value="' + target.token + '"]');
         if (await radio.isVisible()) await radio.check();
         else {
             const id = await radio.getAttribute('id');

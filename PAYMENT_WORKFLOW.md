@@ -72,3 +72,24 @@ holds and the consumed attempt are retained.
 
 Official status definitions:
 https://www.courts.michigan.gov/495d58/siteassets/mifile/mifile-quick-reference-guide-filer-experience.pdf
+
+## Payment-account recognition (v100)
+
+The current MiFILE template renders its card table with `role="presentation"`,
+hidden column headers, and Angular object-valued radios. The heading-only
+Available Payment Accounts group does not contain the table. Neither an empty
+group nor a transient `object:...` radio value proves that no card is linked.
+
+The reader validates the actual table structure directly. For object-valued
+radios it observes the existing same-origin GET `/api/payment/getcourt` made
+by checkout, then matches each enabled visible radio's exact accessible label
+to one account record. The stable account ID is hashed; transient Angular IDs
+are never stored as payment identities. Default-account metadata is not used
+as a substitute for reading which radio is actually checked.
+
+Evidence is bound to the current bundle, expires after two minutes and is
+discarded when inspection ends. Unknown, duplicate, stale or unmatched records
+block verification. Only masked suffixes and opaque fingerprints reach the
+quote; full account metadata stays in memory. Structural diagnostics contain
+no field values, account IDs, cardholder names or card numbers. No payment
+account is added, changed or made default by this discovery.

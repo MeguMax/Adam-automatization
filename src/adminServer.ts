@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-04-payment-lifecycle-v99';
+const ADMIN_BUILD_ID = '2026-11-04-payment-detection-v100';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4948,6 +4948,8 @@ const html = String.raw`<!doctype html>
         (checkout.submission?.result ? '<span>Payment: '+escapeHtml(checkout.submission.result.paymentState.replaceAll('_',' '))+
           '. Court filing is verified separately. No automatic payment retry.</span>' : '')+
         (checkout.submission?.status && checkout.submission.issue ? '<span>' + escapeHtml(checkout.submission.issue) + '</span>' : '') +
+        (checkout.paymentDiagnostics ? '<details><summary>Payment detection diagnostics</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+
+          escapeHtml(JSON.stringify(checkout.paymentDiagnostics,null,2))+'</pre></details>' : '')+
         '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active || !checkout.canInspect ? ' disabled' : '') + '>' +
         icon('refresh-cw') + 'Check checkout</button>' +
         '<button type="button" data-checkout-action="confirm"' + (!checkout.canConfirm || checkout.confirmedAt ? ' disabled' : '') + '>' +

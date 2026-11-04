@@ -17,6 +17,8 @@ import {bundleExecutionKey,migrateBundleActivity} from './mifileBundleSafety';
 import {SubmissionStore,executeSubmission,type SubmissionTransport} from './mifileSubmission';
 import {submissionOutcome} from './mifileSubmissionOutcome';
 import {inspectCheckoutSubmitControl,waitForCheckoutSubmissionResult} from './mifileCheckoutControl';
+import {readPaymentDiagnostics} from './mifilePaymentDiagnostics';
+import {observePaymentAccounts,observedPaymentAccounts,parseObservedPaymentAccounts} from './mifilePaymentEvidence';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -1470,6 +1472,77 @@ test('an unfamiliar sibling payment table cannot silently become an authorized a
             '<table><thead><tr><th>Card Nickname</th><th>Unknown choice</th></tr></thead><tbody><tr><td><input type="radio" value="12345678123412341234123456789abc" checked></td></tr></tbody></table></div>');
         await assert.rejects(readPaymentMethods(page),/unfamiliar layout/);
     }finally{await page.close();}
+});
+
+test('payment DOM diagnostics retain structure only, never card details, tokens, names or input values',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent('<div role="dialog"><h3>Checkout</h3><fieldset><legend>Available Payment Accounts</legend></fieldset>'+
+            '<table><thead><tr><th>Select</th><th>Card Nickname</th></tr></thead><tbody><tr ng-click="selectAccount(account)">'+
+            '<td><input type="checkbox" ng-model="account.selected" ng-value="account.id" value="12345678-1234-1234-1234-123456789abc" checked></td>'+
+            '<td>PRIVATE OWNER 4111111111111111</td></tr></tbody></table><input type="password" value="private-secret"></div>');
+        const result=await readPaymentDiagnostics(page),json=JSON.stringify(result);
+        const choice=result.controls.find(control=>control.type==='checkbox')!;
+        assert.equal(choice.valueShape,'uuid');assert.equal(choice.checked,true);assert.equal(choice.inPaymentGroup,false);
+        assert.ok(!/PRIVATE|4111111111111111|12345678-1234|private-secret/.test(json));
+    }finally{await page.close();}
+});
+
+const angularCards=[
+    {id:'12345678-1234-1234-1234-123456789abc',nickName:'Office',cardHolderName:'Private Owner',accountType:'VISA',
+        maskedAccountNumber:'****1234',expirationDate:'12/2030',defaultAccount:true},
+    {id:'87654321-4321-4321-4321-cba987654321',nickName:'Travel',cardHolderName:'Private Owner',accountType:'MC',
+        maskedAccountNumber:'****5678',expirationDate:'11/2030',defaultAccount:false},
+];
+
+test('live MiFILE presentation table and Angular object radios bind to observed stable IDs without paying',async()=>{
+    const page=await browser.newPage(),job=prepared();let submits=0;
+    try {
+        const records=parseObservedPaymentAccounts(angularCards);
+        const html='<button onclick="fetch(\'/api/payment/getcourt?courtId=11111111-1111-1111-1111-111111111111\')">Load accounts</button>'+
+            '<div role="dialog"><h3>Checkout</h3><form id="paymentInfoForm"><div role="group" aria-labelledby="payment-heading">'+
+            '<div id="payment-heading">Available Payment Accounts</div><button type="button">Add Payment Account</button></div>'+
+            '<table role="presentation"><thead aria-hidden="true"><tr>'+['Select','Type','Card Nickname','Number','Expiration Date'].map(label=>'<th>'+label+'</th>').join('')+
+            '</tr></thead><tbody>'+records.map((record,i)=>'<tr><td><input type="radio" name="selectedPaymentAccount" ng-model="modal.selectedPaymentAccount" ng-value="item" value="object:'+(20+i)+'" '+
+                'aria-label="'+record.label+'" '+(!i?'checked':'')+'></td><td aria-hidden="true">Card</td><td aria-hidden="true">Private Owner</td>'+
+                '<td aria-hidden="true">****'+(i?'5678':'1234')+'</td><td aria-hidden="true">12/2030</td></tr>').join('')+'</tbody></table></form><button onclick="window.paid=true">Submit</button></div>';
+        await page.route('**/*',route=>{
+            const url=new URL(route.request().url());
+            if(url.pathname==='/api/payment/getcourt')return route.fulfill({contentType:'application/json',body:JSON.stringify(angularCards)});
+            if(url.pathname.startsWith('/filing/create/'))return route.fulfill({contentType:'text/html',body:html});
+            if(route.request().method()!=='GET')submits++;return route.abort();
+        });
+        await page.goto(String(job.result!.url));
+        await assert.rejects(readPaymentMethods(page),/matching current account evidence/);
+        const stop=observePaymentAccounts(page,job.externalBundleId!);
+        try {
+            await page.getByRole('button',{name:'Load accounts',exact:true}).click();
+            for(let i=0;i<100 && !observedPaymentAccounts(page);i++)await page.waitForTimeout(10);
+            let result=await readPaymentMethods(page);
+            assert.equal(result.state,'selected');assert.equal(result.fingerprint,digest(angularCards[0].id));
+            assert.deepEqual(result.available.map(item=>item.label),['Card ending 1234','Card ending 5678']);
+            assert.ok(!/Private Owner|Office|Travel|12345678-1234|object:/.test(JSON.stringify(result)));
+            await selectPaymentMethodForQuote(page,digest(angularCards[1].id));
+            result=await readPaymentMethods(page);
+            assert.equal(result.fingerprint,digest(angularCards[1].id));
+            assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);assert.equal(submits,0);
+            const diagnostics=await readPaymentDiagnostics(page);
+            assert.equal(diagnostics.groupPresent,true);
+            assert.equal(diagnostics.accountResponse.state,'verified');assert.equal(diagnostics.accountResponse.recordCount,2);
+            await page.goto('https://mifile.courts.michigan.gov/filing/create/fd2c1ad4-633d-429a-0166-08df32c555df');
+            assert.equal(observedPaymentAccounts(page),null);
+            await assert.rejects(readPaymentMethods(page),/matching current account evidence/);
+        }finally{stop();}
+        await assert.rejects(readPaymentMethods(page),/matching current account evidence/);
+    }finally{await page.close();}
+});
+
+test('observed payment metadata rejects duplicate IDs, indistinguishable cards and unmasked card numbers',()=>{
+    for(const cards of [null,{},[...angularCards,angularCards[0]],[angularCards[0],{...angularCards[0],id:angularCards[1].id}],
+        [{...angularCards[0],maskedAccountNumber:'4111111111111111'}],[{...angularCards[0],id:'object:42'}]]) {
+        assert.throws(()=>parseObservedPaymentAccounts(cards));
+    }
+    assert.equal(parseObservedPaymentAccounts([{...angularCards[0],nickName:'Visa ending 9999'}])[0].publicLabel,'Card ending 1234');
 });
 
 test('submission waits for pending checkout to finish and never accepts an unexpected follow-up confirmation',async()=>{

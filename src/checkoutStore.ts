@@ -434,6 +434,7 @@ export class CheckoutStore {
             paymentMethodChoice:choice,
             selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
             submitControl:quoteInspection?.result?.kind === 'quote' ? quoteInspection.result.submitControl || null : null,
+            paymentDiagnostics:quoteInspection?.result?.kind === 'quote' ? quoteInspection.result.paymentDiagnostics || null : null,
             automaticReadiness:readiness || null,
             executionHold:executionHold || null,
             priorBundleActivity:priorActivity ? {status:priorActivity.status,observedAt:bundleActivity!.observed_at,
