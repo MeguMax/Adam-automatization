@@ -53,9 +53,10 @@ import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { draftNotificationConfig } from './draftNotifications';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
+import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-04-batch-intake-v98';
+const ADMIN_BUILD_ID = '2026-11-04-payment-lifecycle-v99';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4753,10 +4754,16 @@ const html = String.raw`<!doctype html>
         (checks.length?'<h3 style="margin-top:16px">Before payment and submission</h3><ul class="checkout-preflight">'+checks.map(check=>
           '<li>'+icon(check.passed?'circle-check':'circle')+'<span>'+escapeHtml(check.label)+'</span></li>').join('')+'</ul>':'')+
         (errors.length?'<ul class="draft-payment-issues" style="margin-top:14px">'+[...new Set(errors)].map(error=>'<li>'+escapeHtml(error)+'</li>').join('')+'</ul>':'')+
-        '<p style="margin-top:14px">A completed checklist is not payment authorization. The final payment adapter and a controlled live test are still required.</p>';
+        (checkout?.submitControl ? '<p style="margin-top:14px">Checkout control: '+escapeHtml(checkout.submitControl.ready ?
+          'Submit control verified. Live execution remains disabled.' : checkout.submitControl.issue || 'Human review required.')+'</p>' : '')+
+        '<p style="margin-top:14px">A completed checklist is not payment authorization. Live execution remains disabled pending a controlled filing with the exact case and amount approved.</p>';
       document.getElementById('draftPaymentInspect').disabled=Boolean(state.draftMutationBusy || !checkout?.canInspect || checkout.active);
       document.getElementById('draftPaymentDetails').disabled=job?.status!=='prepared';
-      document.getElementById('draftPaymentCommit').disabled=true;
+      const commit=document.getElementById('draftPaymentCommit');
+      commit.disabled=Boolean(!checkout?.submission?.executionEnabled || !checkout.submission.canRehearse ||
+        !checkout?.preflight?.complete || errors.length || state.draftMutationBusy);
+      commit.innerHTML=icon(checkout?.submission?.executionEnabled?'send':'lock-keyhole')+
+        (checkout?.submission?.executionEnabled?'Pay &amp; submit':'Pay &amp; submit unavailable');
       renderIcons();
     }
 
@@ -4936,8 +4943,10 @@ const html = String.raw`<!doctype html>
           '<li>' + icon(check.passed ? 'circle-check' : 'circle') + '<span>' + escapeHtml(check.label) + '</span></li>').join('') + '</ul>' +
           (checkout.preflight.complete ? '<span>Preflight complete. Live submission remains disabled.</span>' : '') +
           (checkout.preflight.recordedAt ? '<span>Preflight recorded: ' + escapeHtml(fmtDate(checkout.preflight.recordedAt)) + '</span>' : '') : '') +
-        (checkout.submission?.status ? '<span>Submission rehearsal: ' + escapeHtml(checkout.submission.status.replaceAll('_',' ')) +
+        (checkout.submission?.status ? '<span>'+(checkout.submission.attempts?'Submission record: ':'Submission rehearsal: ') + escapeHtml(checkout.submission.status.replaceAll('_',' ')) +
           ' · ' + escapeHtml(fmtDate(checkout.submission.updatedAt)) + '</span>' : '') +
+        (checkout.submission?.result ? '<span>Payment: '+escapeHtml(checkout.submission.result.paymentState.replaceAll('_',' '))+
+          '. Court filing is verified separately. No automatic payment retry.</span>' : '')+
         (checkout.submission?.status && checkout.submission.issue ? '<span>' + escapeHtml(checkout.submission.issue) + '</span>' : '') +
         '</div><div class="draft-filing-job-actions"><button type="button" data-checkout-action="inspect"' + (checkout.active || !checkout.canInspect ? ' disabled' : '') + '>' +
         icon('refresh-cw') + 'Check checkout</button>' +
@@ -4951,7 +4960,21 @@ const html = String.raw`<!doctype html>
 
     async function checkoutAction(job, action) {
       let payload = {};
-      if (action === 'confirm') {
+      if(action === 'authorize') {
+        const quote=job.checkout?.quote;
+        if(!job.checkout?.submission?.executionEnabled || !job.checkout.preflight?.complete || !quote || state.draftDirty) {
+          throw new Error('Payment is disabled or this exact package needs a fresh checkout review.');
+        }
+        const amount=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(quote.totalCents/100);
+        if(!await confirmDraftAction('Authorize payment and court submission?',[
+          'Case: '+(state.draftDetail?.caseDraft?.editableData?.caseTitle || job.temporaryCaseNumber),
+          'Court: '+job.payload.courtName,'Bundle: '+job.temporaryCaseNumber,'MiFILE account: '+quote.accountEmail,
+          'Payment account: '+(job.checkout.selectedPaymentMethodLabel || 'Not required for a zero total'),
+          'Exact total including fees: '+amount+' USD',
+          'This authorizes one real payment and submission to court. It is not an Unsubmitted test.'
+        ].join('\n'),'Pay '+amount+' & submit'))return;
+        payload={quoteId:quote.id,quoteDigest:quote.quoteDigest,totalCents:quote.totalCents,paymentAndSubmissionApproved:true};
+      } else if (action === 'confirm') {
         const quote = job.checkout.quote;
         if (!quote || !job.checkout.canConfirm) throw new Error('Refresh checkout before confirming the amount.');
         const amount = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(quote.totalCents / 100);
@@ -7554,6 +7577,13 @@ const html = String.raw`<!doctype html>
     });
     document.getElementById('draftPaymentBtn').addEventListener('click',openDraftPaymentReview);
     document.getElementById('draftPaymentClose').addEventListener('click',()=>document.getElementById('draftPaymentDialog').close());
+    document.getElementById('draftPaymentCommit').addEventListener('click',async()=>{
+      if(state.draftMutationBusy)return;
+      const job=state.draftFilingJobs[0];if(!job)return;
+      try {state.draftMutationBusy=true;renderDraftPaymentReview();await checkoutAction(job,'authorize');}
+      catch(error){document.getElementById('draftPaymentError').textContent=error.message;}
+      finally{state.draftMutationBusy=false;renderDraftPaymentReview();}
+    });
     document.getElementById('draftPaymentDetails').addEventListener('click',()=>{
       document.getElementById('draftPaymentDialog').close();setDraftSection('activity',true);
       const details=document.querySelector('[data-checkout-review]');if(details){details.open=true;details.scrollIntoView({block:'nearest'});}
@@ -7825,6 +7855,8 @@ export function createAdminServer(
                         preparationMode: mifileConfig.preparationMode,
                         ready: mifileConfig.ready,
                         automaticStatusRefreshEnabled: automaticStatusRefreshAvailable(),
+                        paymentExecutionEnabled: FINAL_MIFILE_ACTIONS_ENABLED,
+                        courtSubmissionEnabled: FINAL_MIFILE_ACTIONS_ENABLED,
                     },
                 });
                 return;
@@ -8209,14 +8241,16 @@ export function createAdminServer(
             const checkoutMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/checkout\/([^/]+)$/);
             if (req.method === 'POST' && checkoutMatch) {
                 const action = checkoutMatch[2];
-                if (!['inspect','confirm','receipts','payment-method','clear-method','refresh-status','rehearse'].includes(action)) {
+                if (!['inspect','confirm','receipts','payment-method','clear-method','refresh-status','rehearse'].includes(action) &&
+                    !(action==='authorize' && FINAL_MIFILE_ACTIONS_ENABLED)) {
                     sendJson(res, 403, {error:'Payment and final court submission are disabled in this release.'});
                     return;
                 }
                 try {
                     const body = await readRequestBody(req);
                     const input = body ? JSON.parse(body) : {};
-                    const allowed = action === 'rehearse' ? ['quoteId','quoteDigest','totalCents','noPaymentAcknowledged'] : action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] :
+                    const allowed = action === 'authorize' ? ['quoteId','quoteDigest','totalCents','paymentAndSubmissionApproved'] :
+                        action === 'rehearse' ? ['quoteId','quoteDigest','totalCents','noPaymentAcknowledged'] : action === 'confirm' ? ['quoteId','quoteDigest','totalCents'] :
                         action === 'payment-method' ? ['quoteId','quoteDigest','paymentMethodFingerprint'] : [];
                     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !allowed.includes(key))) {
                         throw new Error('Only a read-only checkout inspection or amount review is allowed.');
@@ -8228,6 +8262,11 @@ export function createAdminServer(
                         if (automaticStatusRefreshAvailable()) {
                             db.checkout().refreshReceiptsIfDue(id,account);
                         }
+                    } else if(action==='authorize') {
+                        if(input.paymentAndSubmissionApproved!==true)throw new Error('Explicit approval of payment and court submission is required.');
+                        if(['false','0','no','off'].includes((process.env.MIFILE_FILING_WORKER_ENABLED || 'true').toLowerCase()))throw new Error('The MiFILE worker must be enabled.');
+                        const intent=db.submissions().rehearse(id,{...input,noPaymentAcknowledged:true},account,process.env.ADMIN_USERNAME || 'admin');
+                        db.submissions().authorize(intent.id,input,account);
                     } else if (action === 'rehearse') {
                         db.submissions().rehearse(id,input,account,process.env.ADMIN_USERNAME || 'admin');
                     } else if (action === 'confirm') {

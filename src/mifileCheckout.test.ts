@@ -15,6 +15,8 @@ import {mifileOutcome} from './mifileOutcome';
 import {matchesMiFileAccountHeader} from './mifileSession';
 import {bundleExecutionKey,migrateBundleActivity} from './mifileBundleSafety';
 import {SubmissionStore,executeSubmission,type SubmissionTransport} from './mifileSubmission';
+import {submissionOutcome} from './mifileSubmissionOutcome';
+import {inspectCheckoutSubmitControl,waitForCheckoutSubmissionResult} from './mifileCheckoutControl';
 
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'checkout-qa-'));
 const account:CheckoutAccount={username:'qa@example.com',identity:digest('revision-1'),accountEnvironment:'test',productionConfirmed:false};
@@ -1259,4 +1261,240 @@ test('process interruption during either execution phase requires reconciliation
             assert.equal(f.submissions.state(f.job.id,f.primary).canRehearse,false);
         }finally{f.db.close();}
     }
+});
+
+test('Submitted and Accepted can precede settlement; neither is a verified charge or Filed result',async()=>{
+    for(const status of ['Submitted','In Progress','Accepted'] as const) {
+        const f=submissionFixture(true);let calls=0;
+        try {
+            const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+            f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+            await executeSubmission(f.submissions,intent.id,f.primary,{inspect:async()=>({quote:f.q,observations:[receipt()],account:f.primary}),
+                submitOnce:async()=>{calls++;},receipts:async()=>[receipt(status)],close:async()=>{}});
+            const state=f.submissions.state(f.job.id,f.primary);
+            assert.equal(state.status,'submitted');assert.equal(state.result?.paymentState,'pending');
+            assert.deepEqual(state.result?.filedDocumentIds,[]);assert.equal(state.canRehearse,false);
+            await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,{inspect:async()=>{throw Error('must not inspect');},
+                submitOnce:async()=>{calls++;},receipts:async()=>[],close:async()=>{}}));
+            assert.equal(calls,1);
+        }finally{f.db.close();}
+    }
+});
+
+test('an uncertain result reconciles later from existing history without another submission attempt',async()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        f.submissions.begin(intent.id,f.primary);f.submissions.commitStarted(intent.id,f.primary);
+        f.submissions.failed(intent.id,'Connection lost after Submit');
+        const record=(items:MiFileReceiptObservation[])=>{
+            const work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+            f.store.complete(work.id,{kind:'receipts',observations:items,state:'found',checkedAt:new Date().toISOString(),issue:null},f.primary);
+            f.submissions.reconcile(f.job.id,f.primary);
+        };
+        record([receipt('Submitted')]);
+        assert.equal(f.submissions.state(f.job.id,f.primary).result?.paymentState,'pending');
+        record([{...receipt('Paid'),kind:'payment',totalCents:f.q.totalCents,currency:'USD'}]);
+        let state=f.submissions.state(f.job.id,f.primary);
+        assert.equal(state.status,'submitted');assert.equal(state.result?.paymentState,'verified');
+        assert.equal(state.attempts,1);assert.deepEqual(state.result?.filedDocumentIds,[]);
+        record([{...receipt('Filed'),kind:'filing_status',documentId:'doc-1'}]);
+        state=f.submissions.state(f.job.id,f.primary);
+        assert.deepEqual(state.result?.filedDocumentIds,['doc-1']);
+        assert.equal(f.submissions.queueReceiptFollowups(f.primary,Date.now()+6*60_000),0);
+        assert.equal(f.store.state(f.job.id,f.primary).canInspect,false);
+    }finally{f.db.close();}
+});
+
+test('mismatched and duplicate transaction receipts, rejection and refund retain a no-retry hold',()=>{
+    const payment={...receipt('Paid'),kind:'payment' as const,totalCents:12669,currency:'USD' as const};
+    for(const observations of [
+        [receipt('Submitted'),{...payment,totalCents:12670}],
+        [receipt('Submitted'),payment,{...payment,externalReference:'another-transaction'}],
+        [receipt('Submitted'),receipt('Payment Rejected')],
+        [receipt('Submitted'),{...payment,status:'Refunded' as const,kind:'refund' as const}],
+        [receipt('Submitted'),receipt('Rejected')],
+    ]) {
+        const result=submissionOutcome(observations,12669);
+        assert.equal(result.reviewRequired,true);assert.equal(result.retryAllowed,false);
+    }
+    assert.equal(submissionOutcome([receipt('Submitted'),payment,{...payment,observedAt:new Date().toISOString()}],12669).reviewRequired,false);
+    assert.equal(submissionOutcome([receipt('Submitted')],0).paymentState,'not_required');
+    assert.equal(submissionOutcome([receipt('Paid')],12669).paymentState,'receipt_pending');
+});
+
+test('receipt follow-up is read-only, bounded, account-scoped and survives an uncertain commit',()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        f.submissions.begin(intent.id,f.primary);f.submissions.commitStarted(intent.id,f.primary);f.submissions.recover();
+        const later=Date.now()+6*60_000;
+        assert.equal(f.submissions.queueReceiptFollowups({...f.primary,username:'other@example.com'},later),0);
+        assert.equal(f.submissions.queueReceiptFollowups(f.primary,later),1);
+        assert.equal(f.submissions.queueReceiptFollowups(f.primary,later),0);
+        const work=f.store.claim()!;assert.equal(work.kind,'receipts');f.store.fail(work.id,'Temporary outage');
+        assert.equal(f.submissions.queueReceiptFollowups(f.primary,later+8*24*60*60_000),0);
+        assert.equal(f.submissions.get(intent.id)!.attempts,1);
+    }finally{f.db.close();}
+});
+
+test('authorization queue never revives a changed or expired approval and defaults to disabled',()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        assert.equal(f.submissions.nextAuthorized(f.primary)?.id,intent.id);
+        assert.equal(new SubmissionStore(f.sql,f.store,id=>f.jobs.get(id)||null,()=>{}).nextAuthorized(f.primary),null);
+        f.job.payload!.courtName='Changed court';assert.equal(f.submissions.nextAuthorized(f.primary),null);
+        assert.equal(f.submissions.get(intent.id)?.status,'blocked');assert.equal(f.submissions.get(intent.id)?.attempts,0);
+    }finally{f.db.close();}
+});
+
+test('an authorized action waits for other MiFILE work and a pre-start failure cannot spin the worker',()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        const work=f.store.queue(f.job.id,'receipts',f.primary);f.store.claim();
+        assert.equal(f.submissions.nextAuthorized(f.primary),null);
+        assert.equal(f.submissions.get(intent.id)?.status,'authorized');
+        f.store.fail(work.id,'Read-only check stopped');
+        f.submissions.failed(intent.id,'The browser could not start. Review again.');
+        assert.equal(f.submissions.nextAuthorized(f.primary),null);
+        assert.equal(f.submissions.get(intent.id)?.status,'blocked');assert.equal(f.submissions.get(intent.id)?.attempts,0);
+    }finally{f.db.close();}
+});
+
+test('resending an identical Complaint in another bundle cannot bypass the consumed payment attempt',()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        f.submissions.begin(intent.id,f.primary);f.submissions.commitStarted(intent.id,f.primary);f.submissions.finish(intent.id,f.primary,[receipt('Submitted')]);
+        const copy=structuredClone(f.job);copy.id='resent-job';copy.externalBundleId='fd2c1ad4-633d-429a-0166-08df32c555df';
+        copy.temporaryCaseNumber='TEMP-RESENT';copy.payload!.subject='NEW LT FILING - Resent package';copy.payload!.documents[0].id='doc-resent';
+        copy.result!.url='https://mifile.courts.michigan.gov/filing/create/'+copy.externalBundleId;
+        (copy.result!.documentManifest as any[])[0].documentId='doc-resent';
+        const evidence=copy.result!.savedBundleEvidence as any;
+        Object.assign(evidence,{externalBundleId:copy.externalBundleId,temporaryCaseNumber:copy.temporaryCaseNumber});
+        evidence.sources[0].documentId='doc-resent';evidence.packageDigest=preparationDigest(copy.payload!,evidence.sources);
+        f.jobs.set(copy.id,copy);
+        f.sql.prepare(`INSERT INTO filing_jobs(id,case_draft_id,attempt_number,mode,status,created_at,updated_at)
+            VALUES(?,?,2,'prepare','prepared',?,?)`).run(copy.id,copy.caseDraftId,new Date().toISOString(),new Date().toISOString());
+        const q=completeQuote({...f,job:copy},'selected',Date.now(),f.primary);
+        f.store.confirm(copy.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents},f.primary,'qa');
+        const check=f.store.queue(copy.id,'receipts',f.primary);f.store.claim();
+        f.store.complete(check.id,{kind:'receipts',observations:[{...receipt(),bundleId:copy.externalBundleId!}],state:'unsubmitted',
+            checkedAt:new Date().toISOString(),issue:null},f.primary);
+        const state=f.submissions.state(copy.id,f.primary);
+        assert.equal(state.canRehearse,false);assert.match(state.issue!,/same Complaint/);
+        assert.throws(()=>f.submissions.rehearse(copy.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents,noPaymentAcknowledged:true},f.primary,'qa'),/same Complaint/);
+    }finally{f.db.close();}
+});
+
+test('final browser checkout comparison binds fee components, method, source, bundle and primary account',()=>{
+    const {sameSubmissionCheckout}=require('./mifileSubmissionRunner') as typeof import('./mifileSubmissionRunner');
+    const f=submissionFixture();
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa'),snapshot=intent.snapshot;
+        assert.equal(sameSubmissionCheckout(snapshot,f.q,f.primary),true);
+        for(const changes of [{totalCents:f.q.totalCents+1},{packageDigest:digest('new bytes')},
+            {paymentMethodFingerprint:digest('other card')},{bundleId:'different'},
+            {lines:f.q.lines.map((line,i)=>({...line,cents:line.cents+(i===0?1:i===1?-1:0)}))}]) {
+            const changed={...f.q,...changes};changed.quoteDigest=quoteDigest(changed);
+            assert.equal(sameSubmissionCheckout(snapshot,changed,f.primary),false);
+        }
+        assert.equal(sameSubmissionCheckout(snapshot,f.q,account),false);
+        assert.equal(sameSubmissionCheckout(snapshot,f.q,f.primary,Date.now()+900001),false);
+    }finally{f.db.close();}
+});
+
+test('concrete Playwright transport cannot launch, submit, or read execution results while release is disabled',async()=>{
+    const {MiFileSubmissionTransport}=require('./mifileSubmissionRunner') as typeof import('./mifileSubmissionRunner');
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        const transport=new MiFileSubmissionTransport(f.submissions,intent.id,f.job,f.primary);
+        await assert.rejects(transport.inspect(intent.snapshot),/authorization/);
+        await assert.rejects(transport.submitOnce(),/authorization/);
+        await assert.rejects(transport.receipts(),/No submission/);
+        await transport.close();assert.equal(f.submissions.get(intent.id)?.attempts,0);
+    }finally{f.db.close();}
+});
+
+test('checkout Submit inspection is non-mutating and stops for unknown controls or unchecked acknowledgments',async()=>{
+    const page=await browser.newPage();
+    try {
+        for(const [body,ready] of [
+            ['<button onclick="window.paid=true">Submit</button><button>Cancel</button>',true],
+            ['<button hidden>Submit</button><button>Submit</button><button>Request Fee Waiver</button><button>Cancel</button>',true],
+            ['<button disabled>Submit</button><button>Cancel</button>',false],
+            ['<button>Submit</button><button>Submit</button>',false],
+            ['<button>Submit</button><label><input type="checkbox">Accept terms</label>',false],
+            ['<button>Submit</button><input type="text" value="credit card">',false],
+            ['<button>Submit</button><button>Pay with new provider</button>',false],
+            ['<button>Submit</button><input type="button" value="Pay with new provider">',false],
+        ] as const) {
+            await page.setContent('<div role="dialog"><div role="dialog"><h3>Checkout</h3>'+body+'</div></div>');
+            assert.equal((await inspectCheckoutSubmitControl(page)).ready,ready);
+            assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);
+        }
+    }finally{await page.close();}
+});
+
+test('the live card table outside Available Payment Accounts is read without confusing the Add button with a missing card',async()=>{
+    const page=await browser.newPage();
+    const token='12345678-1234-1234-1234-123456789abc';
+    try {
+        const table='<table><thead><tr>'+['Select','Type','Card Nickname','Number','Expiration Date'].map(label=>'<th>'+label+'</th>').join('')+
+            '</tr></thead><tbody><tr><td><input type="radio" name="card" value="'+token+'" checked></td><td>Visa</td><td>Office</td><td>xxxx 1234</td><td>12/2030</td></tr></tbody></table>';
+        const group='<fieldset><legend>Available Payment Accounts</legend><button>Add Payment Account</button></fieldset>';
+        for(const content of [group+table,group.replace('</fieldset>',table+'</fieldset>')]) {
+            await page.setContent('<div role="dialog"><h3>Checkout</h3>'+content+'<button onclick="window.paid=true">Submit</button></div>');
+            const result=await readPaymentMethods(page);
+            assert.equal(result.state,'selected');assert.equal(result.fingerprint,digest(token));assert.equal(result.available.length,1);
+            assert.equal(result.available[0].label,'Card ending 1234');
+            assert.ok(!JSON.stringify(result).includes(token));
+            await selectPaymentMethodForQuote(page,digest(token));
+            assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);
+        }
+    }finally{await page.close();}
+});
+
+test('an unfamiliar sibling payment table cannot silently become an authorized account source',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent('<div role="dialog"><h3>Checkout</h3><fieldset><legend>Available Payment Accounts</legend><button>Add Payment Account</button></fieldset>'+
+            '<table><thead><tr><th>Card Nickname</th><th>Unknown choice</th></tr></thead><tbody><tr><td><input type="radio" value="12345678123412341234123456789abc" checked></td></tr></tbody></table></div>');
+        await assert.rejects(readPaymentMethods(page),/unfamiliar layout/);
+    }finally{await page.close();}
+});
+
+test('submission waits for pending checkout to finish and never accepts an unexpected follow-up confirmation',async()=>{
+    const page=await browser.newPage();
+    try {
+        await page.setContent('<div role="dialog" id="checkout"><h3>Checkout</h3></div>'+
+            '<script>setTimeout(()=>document.getElementById("checkout").hidden=true,100)</script>');
+        await waitForCheckoutSubmissionResult(page,1000);
+        await page.setContent('<div role="dialog" hidden><h3>Checkout</h3></div><div role="dialog"><h3>Confirm payment again</h3><button>Confirm</button></div>');
+        await assert.rejects(waitForCheckoutSubmissionResult(page,1000),/another confirmation/);
+        await page.setContent('<div role="dialog"><h3>Checkout</h3></div>');
+        await assert.rejects(waitForCheckoutSubmissionResult(page,150),/Timeout/);
+    }finally{await page.close();}
+});
+
+test('submission diagnostics never persist Playwright credential or payment-control call logs',async()=>{
+    const f=submissionFixture(true);
+    try {
+        const intent=f.submissions.rehearse(f.job.id,{...f.input,noPaymentAcknowledged:true},f.primary,'qa');
+        f.submissions.authorize(intent.id,{...f.input,paymentAndSubmissionApproved:true},f.primary);
+        await assert.rejects(executeSubmission(f.submissions,intent.id,f.primary,{
+            inspect:async()=>{throw new Error('locator.fill failed: Call log: fill("sensitive-fixture-only")');},
+            submitOnce:async()=>{throw new Error('must not submit');},receipts:async()=>[],close:async()=>{},
+        }),/browser operation did not complete/);
+        assert.ok(!f.submissions.get(intent.id)?.error?.includes('sensitive-fixture-only'));
+        assert.equal(f.submissions.get(intent.id)?.attempts,0);
+    }finally{f.db.close();}
 });

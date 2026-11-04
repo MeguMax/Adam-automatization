@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { FilingJobView } from './database';
 import { filingReleaseChecks, preparationDigest, usdCents, type MiFileSavedBundleEvidence } from './mifilePreparationEvidence';
+import type {CheckoutSubmitControl} from './mifileCheckoutControl';
 
 export const CHECKOUT_REVIEW_LIFETIME_MS = 15 * 60_000;
 export const FINAL_MIFILE_ACTIONS_ENABLED = false;
@@ -81,7 +82,7 @@ export interface CheckoutInspection {
     result: CheckoutInspectionResult | null;
 }
 
-export type CheckoutInspectionResult = { kind: 'quote'; quote: CheckoutQuote } | {
+export type CheckoutInspectionResult = { kind: 'quote'; quote: CheckoutQuote; submitControl?:CheckoutSubmitControl } | {
     kind: 'receipts'; observations: MiFileReceiptObservation[];
     state: 'unsubmitted' | 'found' | 'inconclusive'; checkedAt: string; issue: string | null;
 };

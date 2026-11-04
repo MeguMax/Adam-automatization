@@ -4,7 +4,7 @@ import type { FilingJobView } from './database';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { mifileOutcome } from './mifileOutcome';
 import { bundleExecutionKey, rememberBundleActivity } from './mifileBundleSafety';
-import { checkoutReviewIssues, receiptEventKey, receiptSummary, validateReceipt,
+import { checkoutReviewIssues, receiptEventKey, receiptSummary, validateReceipt, FINAL_MIFILE_ACTIONS_ENABLED,
     type CheckoutAccount, type CheckoutInspection, type CheckoutInspectionResult, type CheckoutQuote,
     type MiFileReceiptObservation } from './mifileCheckout';
 
@@ -351,7 +351,9 @@ export class CheckoutStore {
                 WHERE execution_key = ? AND (attempt_count > 0 OR status = 'reconciliation_required')`)
                 .get(bundleExecutionKey(account.username,job.externalBundleId)) as typeof executionHold;
         }catch {receiptEvidenceInvalid=true;}
-        if (executionHold) issues.push('An execution attempt requires reconciliation. Check MiFILE; do not repeat payment or submission.');
+        if (executionHold) issues.push(executionHold.status === 'submitted'
+            ? 'This bundle was already submitted. Follow its payment and court status; do not submit or pay again.'
+            : 'An execution attempt requires reconciliation. Check MiFILE; do not repeat payment or submission.');
         let priorActivity: MiFileReceiptObservation|null = null;
         if (bundleActivity && job) {
             try {
@@ -431,19 +433,20 @@ export class CheckoutStore {
                 issues.every(issue => /^(Add a payment method|Select the intended payment method|Verify the payment account)/.test(issue))),
             paymentMethodChoice:choice,
             selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
+            submitControl:quoteInspection?.result?.kind === 'quote' ? quoteInspection.result.submitControl || null : null,
             automaticReadiness:readiness || null,
             executionHold:executionHold || null,
             priorBundleActivity:priorActivity ? {status:priorActivity.status,observedAt:bundleActivity!.observed_at,
                 fromAnotherRecord:bundleActivity!.source_filing_job_id !== filingJobId} : null,
             preflight:{checks:preflightChecks,complete:preflightChecks.every(check=>check.passed),
                 recordedAt:preflightChecks.every(check=>check.passed) ? preflight?.created_at || null : null,
-                executionEnabled:false as const},
+                executionEnabled:FINAL_MIFILE_ACTIONS_ENABLED},
             outcome:{...outcome,submissionObserved:summary.submissionObserved,
                 message:activityWithoutLocalReceipts ? 'Earlier submission or payment activity is recorded for this bundle. Check MiFILE; do not repeat payment or filing.' : outcome.message},
             receipts, receiptSummary:summary, receiptCheckState: receiptResult?.state || null,
             receiptCheckIssue: quote && receipts.some(receipt => receipt.kind === 'payment' && receipt.status === 'Paid' && receipt.totalCents !== quote.totalCents)
                 ? 'The payment receipt amount differs from the reviewed checkout quote. Check MiFILE; do not retry payment.' : receiptResult?.issue || null,
-            confirmationPurpose: 'review_only', paymentExecutionEnabled: false, courtSubmissionEnabled: false,
+            confirmationPurpose: 'review_only', paymentExecutionEnabled: FINAL_MIFILE_ACTIONS_ENABLED, courtSubmissionEnabled: FINAL_MIFILE_ACTIONS_ENABLED,
         };
     }
 

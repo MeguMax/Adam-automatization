@@ -3,6 +3,8 @@ import { MiFileFilingError, MiFileFilingRunner } from './mifileFilingRunner';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { MiFileCheckoutRunner, getCheckoutAccount } from './mifileCheckoutRunner';
 import { workerHealth } from './workerHealth';
+import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
+import {runAuthorizedSubmission} from './mifileSubmissionRunner';
 
 function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) return Promise.resolve();
@@ -37,12 +39,33 @@ export async function runFilingWorker(options: {
     try {
     while (!options.signal?.aborted) {
         workerHealth.work('mifile', 'checking');
+        if(FINAL_MIFILE_ACTIONS_ENABLED && getMiFileRuntimeConfig().ready) {
+            const intent=db.submissions().nextAuthorized(getCheckoutAccount());
+            if(intent) {
+                try {
+                    const job=db.getFilingJob(intent.snapshot.filingJobId);
+                    if(!job)throw new Error('The authorized filing package is unavailable.');
+                    await runAuthorizedSubmission(db.submissions(),intent.id,job,()=>workerHealth.work('mifile','checking_bundle',300_000));
+                    db.checkout().refreshReceiptsIfDue(job.id,getCheckoutAccount());
+                    workerHealth.finish('mifile');
+                }catch(error) {
+                    db.submissions().failed(intent.id,'The submission result needs checking in MiFILE. Do not repeat payment.');
+                    workerHealth.finish('mifile',false);
+                    console.error('Authorized MiFILE execution stopped; no automatic retry is permitted.');
+                }
+                continue;
+            }
+        }
         if (process.env.MIFILE_AUTO_PREPARE_ENABLED !== 'false' && getMiFileRuntimeConfig().ready) {
             try { db.queueValidatedIntakes(); }
             catch (error) { console.error('Automatic Unsubmitted preparation could not be queued:', error); }
         }
         const autoStatus = !['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase());
         const autoCheckout = !['false','0','no','off'].includes((process.env.MIFILE_AUTO_CHECKOUT_ENABLED || 'true').toLowerCase());
+        if(autoStatus && getMiFileRuntimeConfig().ready) {
+            try {db.submissions().queueReceiptFollowups(getCheckoutAccount());}
+            catch {console.warn('Submission receipt follow-up needs attention. No payment retry was queued.');}
+        }
         if (autoStatus && autoCheckout && getMiFileRuntimeConfig().ready) {
             try { db.checkout().advanceAutomaticReadiness(getCheckoutAccount()); }
             catch (error) { console.error('Automatic read-only checkout checks could not be queued:',error); }
@@ -63,6 +86,7 @@ export async function runFilingWorker(options: {
                 const choice = db.checkout().paymentMethodChoice(job.id,getCheckoutAccount());
                 const {result,account} = await runner.inspect(inspection,job,choice);
                 db.checkout().complete(inspection.id,result,account);
+                if(result.kind==='receipts')db.submissions().reconcile(job.id,account);
                 workerHealth.finish('mifile');
             } catch (error) {
                 workerHealth.finish('mifile', false);

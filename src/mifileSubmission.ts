@@ -3,16 +3,18 @@ import type {DatabaseSync} from 'node:sqlite';
 import type {FilingJobView} from './database';
 import type {CheckoutStore} from './checkoutStore';
 import {bundleExecutionKey,rememberBundleActivity} from './mifileBundleSafety';
+import {submissionOutcome} from './mifileSubmissionOutcome';
+import type {MiFileSavedBundleEvidence} from './mifilePreparationEvidence';
 import {checkoutReviewIssues,digest,FINAL_MIFILE_ACTIONS_ENABLED,receiptSummary,validateReceipt,
     type CheckoutAccount,type CheckoutQuote,type MiFileReceiptObservation} from './mifileCheckout';
 
 export interface SubmissionSnapshot {
     version:1;filingJobId:string;bundleId:string;accountEmail:string;accountIdentity:string;executionKey:string;
     quoteId:string;quoteDigest:string;packageDigest:string;totalCents:number;currency:'USD';
-    paymentMethodFingerprint:string|null;expiresAt:string;
+    paymentMethodFingerprint:string|null;expiresAt:string;feeLinesDigest?:string;sourceCaseKey?:string;
 }
 type IntentStatus='rehearsed'|'authorized'|'checking'|'committing'|'blocked'|'reconciliation_required'|'submitted';
-interface SubmissionIntent {id:string;status:IntentStatus;snapshot:SubmissionSnapshot;attempts:number;createdAt:string;updatedAt:string;error:string|null}
+export interface SubmissionIntent {id:string;status:IntentStatus;snapshot:SubmissionSnapshot;attempts:number;createdAt:string;updatedAt:string;error:string|null}
 export class SubmissionStore {
     constructor(private db:DatabaseSync,private checkout:CheckoutStore,private job:(id:string)=>FilingJobView|null,
         private audit:(id:string,action:string,details:Record<string,unknown>)=>void,
@@ -28,7 +30,9 @@ export class SubmissionStore {
         if(snapshot.version!==1 || digest(snapshot)!==row.snapshot_digest ||
             snapshot.executionKey!==row.execution_key || snapshot.executionKey!==bundleExecutionKey(snapshot.accountEmail,snapshot.bundleId) ||
             !Number.isSafeInteger(snapshot.totalCents) || snapshot.totalCents<0 || snapshot.currency!=='USD' ||
-            !Number.isFinite(Date.parse(snapshot.expiresAt)))throw new Error('Submission evidence is invalid. Reconciliation is required.');
+            !Number.isFinite(Date.parse(snapshot.expiresAt)) || snapshot.feeLinesDigest!==undefined &&
+            !/^[a-f0-9]{64}$/.test(snapshot.feeLinesDigest) || snapshot.sourceCaseKey!==undefined &&
+            !/^[a-f0-9]{64}$/.test(snapshot.sourceCaseKey))throw new Error('Submission evidence is invalid. Reconciliation is required.');
         return {id:row.id,status:row.status,snapshot,attempts:row.attempt_count,createdAt:row.created_at,updatedAt:row.updated_at,error:row.error_message};
     }
     private snapshot(filingJobId:string,account:CheckoutAccount,now:number):SubmissionSnapshot {
@@ -39,22 +43,36 @@ export class SubmissionStore {
             AND kind='quote' AND status='completed' ORDER BY created_at DESC,rowid DESC LIMIT 25`).all(filingJobId) as Array<{result_json:string}>;
         const quote=rows.map(row=>JSON.parse(row.result_json)).find(result=>result?.kind==='quote' && result.quote?.id===q.id)?.quote as CheckoutQuote|undefined;
         if(!quote || quote.quoteDigest!==q.quoteDigest || quote.totalCents>0 && !/^[a-f0-9]{64}$/.test(quote.paymentMethodFingerprint || ''))throw new Error('The selected payment account requires a fresh checkout check.');
+        const job=this.job(filingJobId),primary=job?.payload?.documents.filter(document=>document.isPrimary) || [];
+        const sources=(job?.result?.savedBundleEvidence as MiFileSavedBundleEvidence|undefined)?.sources || [];
+        const complaint=primary.length===1?sources.find(source=>source.documentId===primary[0].id):null;
+        if(!complaint || !/^[a-f0-9]{64}$/i.test(complaint.sha256))throw new Error('The primary Complaint source must be verified before authorization.');
+        const sourceCaseKey=digest(['mifile-complaint-v1',account.username.trim().toLowerCase(),job!.payload!.courtName.trim().toLowerCase(),complaint.sha256.toLowerCase()]);
+        const executionKey=bundleExecutionKey(account.username,q.bundleId);
+        if(this.db.prepare(`SELECT 1 FROM mifile_submission_intents WHERE attempt_count=1 AND execution_key<>?
+            AND json_extract(snapshot_json,'$.sourceCaseKey')=?`).get(executionKey,sourceCaseKey)) {
+            throw new Error('The same Complaint already has a submission attempt in another bundle. Check MiFILE; do not pay again.');
+        }
         return {version:1,filingJobId,bundleId:q.bundleId,accountEmail:account.username.trim().toLowerCase(),accountIdentity:account.identity,
-            executionKey:bundleExecutionKey(account.username,q.bundleId),quoteId:q.id,quoteDigest:q.quoteDigest,packageDigest:q.packageDigest,
-            totalCents:q.totalCents,currency:'USD',paymentMethodFingerprint:quote.paymentMethodFingerprint,expiresAt:q.expiresAt};
+            executionKey,sourceCaseKey,quoteId:q.id,quoteDigest:q.quoteDigest,packageDigest:q.packageDigest,
+            totalCents:q.totalCents,currency:'USD',paymentMethodFingerprint:quote.paymentMethodFingerprint,expiresAt:q.expiresAt,
+            feeLinesDigest:digest(quote.lines)};
     }
     state(filingJobId:string,account:CheckoutAccount,now=Date.now()) {
         const job=this.job(filingJobId);let intent:SubmissionIntent|null=null,issue:string|null=null,ready=false;
         try {
             if(job?.externalBundleId){const row=this.db.prepare('SELECT id FROM mifile_submission_intents WHERE execution_key=?')
                 .get(bundleExecutionKey(account.username,job.externalBundleId)) as {id:string}|undefined;if(row)intent=this.get(row.id);}
+            if(intent?.attempts) return {id:intent.id,status:intent.status,attempts:intent.attempts,
+                updatedAt:intent.updatedAt,issue:intent.error,canRehearse:false,executionEnabled:this.enabled(),
+                paymentAuthorized:false,courtSubmissionAuthorized:false,result:this.result(intent.id,account)};
             const current=this.snapshot(filingJobId,account,now);
             ready=!intent || ['rehearsed','blocked'].includes(intent.status) && intent.attempts===0;
             if(intent && digest(current)!==digest(intent.snapshot))issue='The recorded rehearsal no longer matches the current checkout. Rehearse again.';
         }catch(error){issue=(error as Error).message;}
         return {id:intent?.id || null,status:intent?.status || null,attempts:intent?.attempts || 0,
             updatedAt:intent?.updatedAt || null,issue,canRehearse:ready,executionEnabled:this.enabled(),
-            paymentAuthorized:intent?.status==='authorized' && this.enabled(),courtSubmissionAuthorized:intent?.status==='authorized' && this.enabled()};
+            paymentAuthorized:intent?.status==='authorized' && this.enabled(),courtSubmissionAuthorized:intent?.status==='authorized' && this.enabled(),result:null};
     }
     rehearse(filingJobId:string,input:{quoteId:string;quoteDigest:string;totalCents:number;noPaymentAcknowledged:boolean},account:CheckoutAccount,actor:string,now=Date.now()):SubmissionIntent {
         return this.transaction(()=>{
@@ -82,7 +100,30 @@ export class SubmissionStore {
             const current=this.snapshot(intent.snapshot.filingJobId,account,now);
             if(digest(current)!==digest(intent.snapshot) || input.quoteId!==current.quoteId || input.quoteDigest!==current.quoteDigest || input.totalCents!==current.totalCents)throw new Error('The package, account or exact amount changed.');
             this.db.prepare("UPDATE mifile_submission_intents SET status='authorized',updated_at=? WHERE id=?").run(new Date(now).toISOString(),id);
+            this.audit(id,'submission_authorized',{filingJobId:current.filingJobId,totalCents:current.totalCents,
+                quoteId:current.quoteId,paymentAuthorized:true,courtSubmissionAuthorized:true});
         });
+    }
+    nextAuthorized(account:CheckoutAccount):SubmissionIntent|null {
+        if(!this.enabled())return null;
+        if(this.db.prepare("SELECT 1 FROM filing_jobs WHERE status='running'").get() ||
+            this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status='running'").get() ||
+            this.db.prepare("SELECT 1 FROM mifile_submission_intents WHERE status IN ('checking','committing')").get())return null;
+        const rows=this.db.prepare("SELECT id FROM mifile_submission_intents WHERE status='authorized' ORDER BY updated_at LIMIT 20")
+            .all() as Array<{id:string}>;
+        for(const row of rows) {
+            try {
+                const intent=this.get(row.id)!;
+                if(intent.snapshot.accountIdentity!==account.identity || intent.snapshot.accountEmail!==account.username.trim().toLowerCase())throw new Error('Account changed.');
+                if(this.checkout.state(intent.snapshot.filingJobId,account).active)continue;
+                if(digest(this.snapshot(intent.snapshot.filingJobId,account,Date.now()))!==digest(intent.snapshot))throw new Error('Authorization changed.');
+                return intent;
+            }catch {
+                this.db.prepare("UPDATE mifile_submission_intents SET status='blocked',error_message=?,updated_at=? WHERE id=?")
+                    .run('Authorization expired or the package changed. Review a fresh checkout before authorizing again.',new Date().toISOString(),row.id);
+            }
+        }
+        return null;
     }
     begin(id:string,account:CheckoutAccount,now=Date.now()):SubmissionSnapshot {
         if(!this.enabled())throw new Error('Live payment and court submission are disabled.');
@@ -127,7 +168,7 @@ export class SubmissionStore {
             !observations.some(item=>item.kind==='bundle_status' && item.status==='Unsubmitted') ||
             account.identity!==snapshot.accountIdentity || account.username.trim().toLowerCase()!==snapshot.accountEmail ||
             quote.totalCents!==snapshot.totalCents || quote.packageDigest!==snapshot.packageDigest ||
-            quote.paymentMethodFingerprint!==snapshot.paymentMethodFingerprint) {
+            quote.paymentMethodFingerprint!==snapshot.paymentMethodFingerprint || digest(quote.lines)!==snapshot.feeLinesDigest) {
             throw new Error('The live checkout no longer matches the authorized package. No payment attempted.');
         }
     }
@@ -145,22 +186,76 @@ export class SubmissionStore {
                 }catch {malformed=true;}
             }
             if(!Array.isArray(observations) || observations.length>200)malformed=true;
-            const paid=valid.some(receipt=>receipt.kind==='payment' && receipt.status==='Paid' && receipt.totalCents===intent.snapshot.totalCents);
-            const submitted=valid.some(receipt=>receipt.kind==='bundle_status' && ['Submitted','In Progress','Accepted','Filed'].includes(receipt.status));
-            const issue=malformed || !submitted || intent.snapshot.totalCents>0 && !paid ||
-                valid.some(receipt=>['Payment Rejected','Rejected','Refunded'].includes(receipt.status) ||
-                    receipt.kind==='payment' && receipt.totalCents!==intent.snapshot.totalCents)
-                ? 'Exact payment and submission receipts are not both verified. Do not retry.' : null;
+            const outcome=submissionOutcome(valid,intent.snapshot.totalCents);
+            const issue=malformed || !outcome.submissionConfirmed || outcome.reviewRequired
+                ? 'Submission or financial evidence requires reconciliation. Do not retry.' : null;
             this.db.prepare('UPDATE mifile_submission_intents SET status=?,updated_at=?,result_json=?,error_message=? WHERE id=?')
                 .run(issue?'reconciliation_required':'submitted',new Date().toISOString(),JSON.stringify(valid),issue,id);
             this.audit(id,issue?'submission_reconciliation_required':'submission_result_verified',
-                {filingJobId:job.id,verifiedReceiptCount:valid.length,totalCents:intent.snapshot.totalCents});
+                {filingJobId:job.id,verifiedReceiptCount:valid.length,totalCents:intent.snapshot.totalCents,paymentState:outcome.paymentState});
             return issue;
         });
         if(issue)throw new Error(issue);
     }
+    private result(id:string,account:CheckoutAccount) {
+        const intent=this.get(id),job=intent && this.job(intent.snapshot.filingJobId);
+        if(!intent || !job || intent.snapshot.accountEmail!==account.username.trim().toLowerCase())return null;
+        const row=this.db.prepare('SELECT result_json FROM mifile_submission_intents WHERE id=?').get(id) as {result_json:string|null};
+        const observations=JSON.parse(row.result_json || '[]') as MiFileReceiptObservation[];
+        if(!Array.isArray(observations) || observations.length>200)throw new Error('Stored submission receipts require reconciliation.');
+        for(const item of observations)validateReceipt(item,job,account);
+        return submissionOutcome(observations,intent.snapshot.totalCents);
+    }
+    reconcile(filingJobId:string,account:CheckoutAccount):void {
+        this.transaction(()=>{
+            const job=this.job(filingJobId);if(!job?.externalBundleId)return;
+            const row=this.db.prepare(`SELECT id,result_json FROM mifile_submission_intents WHERE execution_key=? AND attempt_count=1
+                AND status IN ('submitted','reconciliation_required')`).get(bundleExecutionKey(account.username,job.externalBundleId)) as
+                {id:string;result_json:string|null}|undefined;
+            if(!row)return;
+            const intent=this.get(row.id)!, state=this.checkout.state(filingJobId,account);
+            if(state.receiptCheckState!=='found' || !state.outcome.fresh || state.outcome.code==='review_required')return;
+            const old=JSON.parse(row.result_json || '[]') as MiFileReceiptObservation[];
+            if(!Array.isArray(old) || old.length>200)throw new Error('Stored submission receipts require reconciliation.');
+            const receipts=new Map<string,MiFileReceiptObservation>();
+            for(const item of [...old,...state.receipts]) {
+                validateReceipt(item,job,account);
+                const key=JSON.stringify([item.kind,item.externalReference,item.documentId,item.status,item.totalCents,item.currency]);
+                const prior=receipts.get(key);
+                if(!prior || Date.parse(item.observedAt)>Date.parse(prior.observedAt))receipts.set(key,item);
+            }
+            const valid=[...receipts.values()];if(valid.length>200)throw new Error('Submission history requires manual reconciliation.');
+            const outcome=submissionOutcome(valid,intent.snapshot.totalCents);
+            if(!outcome.submissionConfirmed)return;
+            const issue=outcome.reviewRequired?'Submission or financial evidence requires reconciliation. Do not retry.':null;
+            const result=JSON.stringify(valid),status=issue?'reconciliation_required':'submitted';
+            if(row.result_json===result && intent.status===status && intent.error===issue)return;
+            this.db.prepare('UPDATE mifile_submission_intents SET status=?,result_json=?,error_message=?,updated_at=? WHERE id=?')
+                .run(status,result,issue,new Date().toISOString(),intent.id);
+            this.audit(intent.id,'submission_receipts_reconciled',{filingJobId,paymentState:outcome.paymentState,
+                submissionConfirmed:outcome.submissionConfirmed,retryAllowed:false});
+        });
+    }
+    queueReceiptFollowups(account:CheckoutAccount,now=Date.now()):number {
+        const rows=this.db.prepare(`SELECT id FROM mifile_submission_intents WHERE attempt_count=1
+            AND status IN ('submitted','reconciliation_required') AND created_at>=? ORDER BY created_at`)
+            .all(new Date(now-7*24*60*60_000).toISOString()) as Array<{id:string}>;
+        let queued=0;
+        for(const row of rows) {
+            try {
+                const intent=this.get(row.id)!,job=this.job(intent.snapshot.filingJobId);
+                if(!job || intent.snapshot.accountEmail!==account.username.trim().toLowerCase())continue;
+                const result=this.result(intent.id,account);
+                if(result?.reviewRequired || result && ['verified','not_required'].includes(result.paymentState) &&
+                    job.payload?.documents.length && result.filedDocumentIds.length===job.payload.documents.length)continue;
+                if(this.checkout.refreshReceiptsIfDue(job.id,account,now))queued++;
+            }catch { /* One damaged record must not stop receipt checks for other packages. */ }
+            if(queued>=5)break;
+        }
+        return queued;
+    }
     failed(id:string,error:string):void {
-        const intent=this.get(id);if(!intent || !['checking','committing'].includes(intent.status))return;
+        const intent=this.get(id);if(!intent || !['authorized','checking','committing'].includes(intent.status))return;
         this.db.prepare('UPDATE mifile_submission_intents SET status=?,error_message=?,updated_at=? WHERE id=?')
             .run(intent.status==='committing'?'reconciliation_required':'blocked',error.slice(0,1200),new Date().toISOString(),id);
     }
@@ -185,6 +280,12 @@ export async function executeSubmission(store:SubmissionStore,id:string,account:
         store.commitStarted(id,account);
         await transport.submitOnce();
         store.finish(id,account,await transport.receipts());
-    }catch(error){if(began)store.failed(id,(error as Error).message);throw error;}
+    }catch(error){
+        const message=error instanceof Error?error.message:'The MiFILE submission operation did not complete.';
+        const safeMessage=/\b(?:locator|page|browser|frame)\.|Call log:|strict mode violation/i.test(message)
+            ? 'The MiFILE browser operation did not complete. Check the existing bundle; do not repeat payment.' : message;
+        if(began)store.failed(id,safeMessage);
+        throw new Error(safeMessage);
+    }
     finally{await transport.close();}
 }

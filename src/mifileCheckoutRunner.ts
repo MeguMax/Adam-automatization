@@ -7,6 +7,7 @@ import { buildCheckoutQuote, digest, type CheckoutAccount, type CheckoutInspecti
     type CheckoutInspectionResult, type CheckoutQuote } from './mifileCheckout';
 import { collectReceiptObservations } from './mifileReceipts';
 import { readPaymentMethods, selectPaymentMethodForQuote } from './mifilePaymentMethods';
+import {inspectCheckoutSubmitControl} from './mifileCheckoutControl';
 
 export function getCheckoutAccount(): CheckoutAccount {
     const credentials = getMiFileCredentials();
@@ -94,10 +95,11 @@ export class MiFileCheckoutRunner {
                     await selectPaymentMethodForQuote(page, paymentMethodFingerprint);
                 }
                 const quote = await readVerifiedCheckoutQuote(page, job, account, source);
+                const submitControl = await inspectCheckoutSubmitControl(page);
                 const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})}).last();
                 await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
                 await dialog.waitFor({state:'hidden'});
-                result = {kind:'quote',quote};
+                result = {kind:'quote',quote,submitControl};
             } else {
                 this.progress('reading_receipts');
                 await runner.verifyAccount(page, account.username);
