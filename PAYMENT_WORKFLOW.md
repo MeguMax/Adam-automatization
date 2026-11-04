@@ -1,6 +1,6 @@
 # MiFILE payment and submission rollout
 
-## Current release: v102
+## Current release: v103
 
 Payment and court submission remain disabled by the compiled
 `FINAL_MIFILE_ACTIONS_ENABLED = false` guard. Neither a Render environment
@@ -120,6 +120,9 @@ It is limited to ten exact cases and sixty calendar days. The CLI emits only
 matched authorization records with hashed references; raw account/card fields,
 authorization codes and credentials are never printed. It does not click
 financial controls, export receipts, or mutate payment accounts or filings.
+The observed endpoint returns its JSON array as `text/plain; charset=utf-8`;
+both that content type and application/json are decoded with strict JSON-array
+validation. HTML, malformed data and oversized responses remain rejected.
 
 An authorization entry is not proof of settlement. An absent entry in the
 requested date range is not proof that a case is unpaid. Negative ledger

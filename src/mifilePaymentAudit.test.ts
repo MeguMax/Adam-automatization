@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {summarizePaymentLedger,validatePaymentAudit} from './mifilePaymentAudit';
+import {summarizePaymentLedger,validatePaymentAudit,parsePaymentLedgerResponse} from './mifilePaymentAudit';
 
 const now=Date.parse('2026-11-04T20:00:00Z'),range={from:'2026-09-29',through:'2026-11-04'};
 const targets=[{caseNumber:'26-01617-LT',courtName:'MI Example County - 29th District Court'}];
@@ -43,4 +43,14 @@ test('case audit bounds targets and valid calendar dates before login or network
         {from:'2026-01-01',through:'2026-11-04'},{from:'2026-11-04',through:'2026-10-01'},
         {from:'2026-11-04',through:'2026-11-07'}])assert.throws(()=>validatePaymentAudit(targets,dates,now));
     validatePaymentAudit(targets,range,now);
+});
+
+test('the observed text/plain JSON ledger is accepted without accepting HTML, malformed or oversized responses',()=>{
+    const body=Buffer.from(JSON.stringify([row]));
+    assert.equal(parsePaymentLedgerResponse('text/plain; charset=utf-8',body).length,1);
+    assert.equal(parsePaymentLedgerResponse('application/json',body).length,1);
+    for(const [type,data] of [['text/html',body],[undefined,body],['text/plain',Buffer.from('<html>Login</html>')],
+        ['text/plain',Buffer.from('{}')],['text/plain',Buffer.alloc(5*1024*1024+1)]]) {
+        assert.throws(()=>parsePaymentLedgerResponse(type as string|undefined,data as Buffer));
+    }
 });

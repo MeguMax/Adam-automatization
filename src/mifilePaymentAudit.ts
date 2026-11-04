@@ -29,6 +29,15 @@ function amountCents(value:unknown):number|null {
     return Number.isSafeInteger(cents)?cents:null;
 }
 
+export function parsePaymentLedgerResponse(contentType:string|undefined,body:Buffer):unknown[] {
+    if(!['application/json','text/plain'].includes(contentType?.split(';')[0].trim().toLowerCase() || '') ||
+        body.length>5*1024*1024)throw new Error('The payment ledger response format is not trusted.');
+    let value:unknown;
+    try {value=JSON.parse(body.toString('utf8'));}catch {throw new Error('The payment ledger response is not valid JSON.');}
+    if(!Array.isArray(value) || value.length>10_000)throw new Error('Unrecognized or oversized MiFILE payment ledger.');
+    return value;
+}
+
 export function summarizePaymentLedger(value:unknown,targets:PaymentAuditTarget[],range:PaymentAuditRange,now=Date.now()) {
     validatePaymentAudit(targets,range,now);
     if(!Array.isArray(value) || value.length>10_000)throw new Error('Unrecognized or oversized MiFILE payment ledger.');
@@ -76,10 +85,11 @@ export async function auditMiFilePayments(targets:PaymentAuditTarget[],range:Pay
         url.searchParams.set('toDate',new Date(Date.parse(range.through)+86_400_000-1).toISOString());
         progress('reading_payment_ledger');
         const response=await page.request.get(url.href,{maxRedirects:0,timeout:45_000});
-        if(!response.ok() || !response.headers()['content-type']?.includes('application/json') ||
+        if(!response.ok() ||
             Number(response.headers()['content-length'] || 0)>5*1024*1024)throw new Error('The primary-account payment ledger could not be read.');
         const body=await response.body();if(body.length>5*1024*1024)throw new Error('The payment ledger exceeds the bounded audit size.');
-        const result=summarizePaymentLedger(JSON.parse(body.toString('utf8')),targets,range);
+        // The observed MiFILE endpoint labels its JSON array text/plain; Angular also parses this response as JSON.
+        const result=summarizePaymentLedger(parsePaymentLedgerResponse(response.headers()['content-type'],body),targets,range);
         await runner.verifyAccount(page,credentials.username);
         if(miFileCredentialIdentity(getMiFileCredentials())!==identity)throw new Error('The primary account changed during the audit.');
         progress('complete');return {...result,accountEmail:credentials.username.trim().toLowerCase()};
