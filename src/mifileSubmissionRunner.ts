@@ -12,6 +12,7 @@ import {digest, quoteDigest, FINAL_MIFILE_ACTIONS_ENABLED, type CheckoutAccount,
 import {executeSubmission, type SubmissionSnapshot, type SubmissionStore, type SubmissionTransport} from './mifileSubmission';
 import {inspectCheckoutSubmitControl,waitForCheckoutSubmissionResult} from './mifileCheckoutControl';
 import {observePaymentAccounts} from './mifilePaymentEvidence';
+import {observeCheckoutTerms} from './mifileCheckoutTerms';
 
 export function sameSubmissionCheckout(snapshot:SubmissionSnapshot,quote:CheckoutQuote,account:CheckoutAccount,now=Date.now()):boolean {
     return account.accountEnvironment==='production' && account.productionConfirmed &&
@@ -31,6 +32,7 @@ export class MiFileSubmissionTransport implements SubmissionTransport {
     private source:{packageDigest:string;sourceFeeSubtotalCents:number}|null=null;
     private clicked=false;
     private stopPaymentObservation:(()=>void)|null=null;
+    private stopTermsObservation:(()=>void)|null=null;
     private runner=new MiFileFilingRunner(()=>{});
     constructor(private store:SubmissionStore,private intentId:string,private job:FilingJobView,
         private account:CheckoutAccount,private progress:(stage:string)=>void=()=>{}) {}
@@ -68,10 +70,11 @@ export class MiFileSubmissionTransport implements SubmissionTransport {
             kind:'bundle_status',externalReference:snapshot.bundleId,documentId:null,status:'Unsubmitted',
             occurredAt:null,observedAt:new Date().toISOString(),totalCents:null,currency:null,receiptUrl:null,source:'mifile_history'};
         this.stopPaymentObservation=observePaymentAccounts(this.page,snapshot.bundleId);
+        this.stopTermsObservation=observeCheckoutTerms(this.page,snapshot.bundleId);
         await openCheckoutForInspection(this.page);
         if(snapshot.paymentMethodFingerprint)await selectPaymentMethodForQuote(this.page,snapshot.paymentMethodFingerprint);
         const quote=await readVerifiedCheckoutQuote(this.page,this.job,this.account,this.source);
-        const control=await inspectCheckoutSubmitControl(this.page);
+        const control=await inspectCheckoutSubmitControl(this.page,quote.totalCents);
         if(!control.ready || !sameSubmissionCheckout(snapshot,quote,getCheckoutAccount())) {
             throw new Error(control.issue || 'The exact total, payment account or package changed. No payment attempted.');
         }
@@ -83,7 +86,7 @@ export class MiFileSubmissionTransport implements SubmissionTransport {
         if(miFileBundleId(this.page.url())!==snapshot.bundleId)throw new Error('Checkout left the authorized MiFILE bundle. Do not retry payment.');
         await this.runner.verifyAccount(this.page,this.account.username);
         const quote=await readVerifiedCheckoutQuote(this.page,this.job,this.account,this.source);
-        const control=await inspectCheckoutSubmitControl(this.page);
+        const control=await inspectCheckoutSubmitControl(this.page,quote.totalCents);
         this.assertIntent('committing');
         if(!control.ready || !sameSubmissionCheckout(snapshot,quote,getCheckoutAccount()))throw new Error(
             control.issue || 'Checkout changed immediately before submission. Check MiFILE before any further action.');
@@ -101,7 +104,7 @@ export class MiFileSubmissionTransport implements SubmissionTransport {
         if(result.kind!=='receipts')throw new Error('The submission receipts could not be read. Do not retry.');
         return result.observations;
     }
-    async close():Promise<void> {try{this.stopPaymentObservation?.();await this.browser?.close();}finally{this.browser=null;this.page=null;}}
+    async close():Promise<void> {try{this.stopPaymentObservation?.();this.stopTermsObservation?.();await this.browser?.close();}finally{this.browser=null;this.page=null;}}
 }
 
 export async function runAuthorizedSubmission(store:SubmissionStore,id:string,job:FilingJobView,

@@ -1,6 +1,6 @@
 # MiFILE payment and submission rollout
 
-## Current release: v99
+## Current release: v101
 
 Payment and court submission remain disabled by the compiled
 `FINAL_MIFILE_ACTIONS_ENABLED = false` guard. Neither a Render environment
@@ -93,3 +93,20 @@ block verification. Only masked suffixes and opaque fingerprints reach the
 quote; full account metadata stays in memory. Structural diagnostics contain
 no field values, account IDs, cardholder names or card numbers. No payment
 account is added, changed or made default by this discovery.
+
+## Final checkout readiness (v101)
+
+An enabled Submit button alone does not prove the account can proceed without
+another legal confirmation. MiFILE reads `CheckoutTCAccepted` when opening
+checkout and can open a terms modal only after Submit is clicked. The runner
+now passively observes that existing read-only property request. It never
+accepts or saves terms. Missing, stale, malformed or conflicting observations
+require human review; the account owner must handle any unaccepted terms in
+MiFILE. Zero-total checkout does not require this payment-terms property.
+
+Final-control readiness is now part of preflight, separate from exact fee
+review. A fee quote can be retained and reviewed without implying the final
+checkout is actionable. Version 3 preflight snapshots also pin the observed
+checkout-control evidence; earlier readiness records require a fresh check.
+The guarded executor repeats the same terms/control verification immediately
+before its single dispatch. Live payment and court submission remain disabled.

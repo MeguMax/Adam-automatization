@@ -10,6 +10,7 @@ import { readPaymentMethods, selectPaymentMethodForQuote } from './mifilePayment
 import {inspectCheckoutSubmitControl} from './mifileCheckoutControl';
 import {readPaymentDiagnostics} from './mifilePaymentDiagnostics';
 import {observePaymentAccounts} from './mifilePaymentEvidence';
+import {observeCheckoutTerms} from './mifileCheckoutTerms';
 
 export function getCheckoutAccount(): CheckoutAccount {
     const credentials = getMiFileCredentials();
@@ -80,6 +81,7 @@ export class MiFileCheckoutRunner {
             process.env.MIFILE_FILING_HEADLESS ?? process.env.TRUECERTIFY_HEADLESS ?? 'true'),
             args:['--no-sandbox','--disable-dev-shm-usage']});
         let stopPaymentObservation:(()=>void)|undefined;
+        let stopTermsObservation:(()=>void)|undefined;
         try {
             const page = await browser.newPage({viewport:{width:1440,height:1000}});
             page.setDefaultTimeout(45_000);
@@ -93,13 +95,14 @@ export class MiFileCheckoutRunner {
                 const source = await runner.inspectSavedForCheckout(page, job, account);
                 this.progress('reading_checkout');
                 stopPaymentObservation=observePaymentAccounts(page,job.externalBundleId!);
+                stopTermsObservation=observeCheckoutTerms(page,job.externalBundleId!);
                 await openCheckoutForInspection(page);
                 if (paymentMethodFingerprint) {
                     this.progress('selecting_reviewed_account_for_quote');
                     await selectPaymentMethodForQuote(page, paymentMethodFingerprint);
                 }
                 const quote = await readVerifiedCheckoutQuote(page, job, account, source);
-                const submitControl = await inspectCheckoutSubmitControl(page);
+                const submitControl = await inspectCheckoutSubmitControl(page,quote.totalCents);
                 const paymentDiagnostics = await readPaymentDiagnostics(page);
                 const dialog = page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})}).last();
                 await dialog.getByRole('button',{name:'Cancel',exact:true}).click();
@@ -112,6 +115,6 @@ export class MiFileCheckoutRunner {
             }
             if (getCheckoutAccount().identity !== account.identity) throw new Error('MiFILE account changed during inspection.');
             return {result,account};
-        } finally {stopPaymentObservation?.();await browser.close();}
+        } finally {stopPaymentObservation?.();stopTermsObservation?.();await browser.close();}
     }
 }

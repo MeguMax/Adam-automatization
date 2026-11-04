@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-04-payment-detection-v100';
+const ADMIN_BUILD_ID = '2026-11-04-checkout-readiness-v101';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4890,6 +4890,7 @@ const html = String.raw`<!doctype html>
     function checkoutReadinessLabel(checkout) {
       if (checkout.executionHold || checkout.priorBundleActivity || checkout.issues.some(issue => issue.startsWith('Stored receipt evidence'))) return 'Check MiFILE before continuing';
       if (checkout.active || checkout.automaticReadiness?.status === 'active') return 'Checking package and fees';
+      if (checkout.canConfirm && !checkout.submitControl?.ready) return 'Exact fees verified; final checkout needs review';
       if (checkout.confirmedAt) return 'Exact amount reviewed';
       if (checkout.canConfirm) return 'Exact amount ready for review';
       return checkout.quote && checkout.checkoutVerified ? 'Choose or verify payment account' : 'Checkout needs review';
@@ -4929,6 +4930,8 @@ const html = String.raw`<!doctype html>
           (checkout.active || checkout.receiptSummary.submissionObserved ? ' disabled' : '') + '>' + icon('x') + 'Clear account choice</button></div>' : '') +
         (checkout.confirmedAt ? '<span>Amount reviewed: ' + escapeHtml(fmtDate(checkout.confirmedAt)) + ' (review only)</span>' : '') +
         checkout.issues.map(issue => '<span class="draft-filing-job-error">' + escapeHtml(issue) + '</span>').join('') +
+        (quote && !checkout.submitControl?.ready ? '<span class="draft-filing-job-error">' +
+          escapeHtml(checkout.submitControl?.issue || 'Refresh checkout to verify the final control and account terms. No payment was attempted.') + '</span>' : '') +
         (checkout.inspection?.error ? '<span class="draft-filing-job-error">' + escapeHtml(checkout.inspection.error) + '</span>' : '') +
         '<span>Receipt check: ' + escapeHtml(checkout.receiptCheckState || 'Not checked') + '</span>' +
         (checkout.receiptCheckIssue ? '<span>' + escapeHtml(checkout.receiptCheckIssue) + '</span>' : '') +

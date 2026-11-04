@@ -728,11 +728,13 @@ async function main() {
         const quoteJob=db.getFilingJob(job.id)!;
         const paymentMethods=[{fingerprint:digest('fixture-token'),label:'Card ending 1234'},
             {fingerprint:digest('fixture-token-2'),label:'Bank account ending 5678'}];
+        const verifiedControl=(checkedAt:string)=>({ready:true,issue:null,label:'Submit' as const,
+            contract:'mifile-checkout-v2' as const,termsState:'accepted' as const,checkedAt});
         const quoted=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
             ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
             {state:'selected',fingerprint:digest('fixture-token'),available:paymentMethods},packageDigest,10300);
         const inspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
-        db.checkout().complete(inspection.id,{kind:'quote',quote:quoted},checkoutAccount);
+        db.checkout().complete(inspection.id,{kind:'quote',quote:quoted,submitControl:verifiedControl(quoted.quotedAt)},checkoutAccount);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         await page.locator('[data-checkout-review] summary').click();
         assert.match(await page.locator('[data-checkout-review]').innerText(),/Checkout total:\s+\$126.69 USD/);
@@ -798,7 +800,7 @@ async function main() {
         const switchedQuote=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
             ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
             {state:'selected',fingerprint:paymentMethods[1].fingerprint,available:paymentMethods},packageDigest,10300);
-        db.checkout().complete(nextInspection.id,{kind:'quote',quote:switchedQuote},checkoutAccount);
+        db.checkout().complete(nextInspection.id,{kind:'quote',quote:switchedQuote,submitControl:verifiedControl(switchedQuote.quotedAt)},checkoutAccount);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         assert.match(await page.locator('[data-checkout-review]').innerText(),/Payment account: Bank account ending 5678/);
         assert.equal(await page.locator('[data-checkout-action="confirm"]').isEnabled(),true);
@@ -814,7 +816,7 @@ async function main() {
         const emptyQuote=buildCheckoutQuote(quoteJob,checkoutAccount,[['Filing Fee','$90.00'],['eFiling System Fee','$20.00'],
             ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
             {state:'unverified',fingerprint:null,available:[]},packageDigest,10300);
-        db.checkout().complete(emptyInspection.id,{kind:'quote',quote:emptyQuote},checkoutAccount);
+        db.checkout().complete(emptyInspection.id,{kind:'quote',quote:emptyQuote,submitControl:verifiedControl(emptyQuote.quotedAt)},checkoutAccount);
         await page.evaluate(()=>(window as any).refreshDraftFilingState());
         assert.match(await page.locator('[data-checkout-review]').innerText(),/Linked account not independently verified/);
         assert.match(await page.locator('[data-checkout-review]').innerText(),/Add Payment Account button alone does not mean a linked card is missing/);
@@ -893,7 +895,7 @@ async function main() {
             ['Processing Service Fee *','$3.69'],['Additional Payment','$13.00'],['Total','$126.69']],
             {state:'selected',fingerprint:paymentMethods[0].fingerprint,available:paymentMethods},packageDigest,10300);
         const rehearsalInspection=db.checkout().queue(job.id,'quote',checkoutAccount);db.checkout().claim();
-        db.checkout().complete(rehearsalInspection.id,{kind:'quote',quote:rehearsalQuote},checkoutAccount);
+        db.checkout().complete(rehearsalInspection.id,{kind:'quote',quote:rehearsalQuote,submitControl:verifiedControl(rehearsalQuote.quotedAt)},checkoutAccount);
         const reviewInput={quoteId:rehearsalQuote.id,quoteDigest:rehearsalQuote.quoteDigest,totalCents:rehearsalQuote.totalCents};
         db.checkout().confirm(job.id,reviewInput,checkoutAccount,'qa');
         for(const data of [{...reviewInput,noPaymentAcknowledged:false},{...reviewInput,noPaymentAcknowledged:true,paymentAuthorized:true}]) {

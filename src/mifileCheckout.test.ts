@@ -16,7 +16,8 @@ import {matchesMiFileAccountHeader} from './mifileSession';
 import {bundleExecutionKey,migrateBundleActivity} from './mifileBundleSafety';
 import {SubmissionStore,executeSubmission,type SubmissionTransport} from './mifileSubmission';
 import {submissionOutcome} from './mifileSubmissionOutcome';
-import {inspectCheckoutSubmitControl,waitForCheckoutSubmissionResult} from './mifileCheckoutControl';
+import {inspectCheckoutSubmitControl,waitForCheckoutSubmissionResult,validCheckoutSubmitControl,type CheckoutSubmitControl} from './mifileCheckoutControl';
+import {observeCheckoutTerms,readCheckoutTerms,parseCheckoutTermsAcceptance} from './mifileCheckoutTerms';
 import {readPaymentDiagnostics} from './mifilePaymentDiagnostics';
 import {observePaymentAccounts,observedPaymentAccounts,parseObservedPaymentAccounts} from './mifilePaymentEvidence';
 
@@ -357,8 +358,12 @@ function completeQuote(fixture:ReturnType<typeof storeFixture>,methodState:'sele
         fingerprint:methodState==='selected'?available[0].fingerprint:null,available},
         (fixture.job.result!.savedBundleEvidence as any).packageDigest,10300,now);
     const work=fixture.store.queue(fixture.job.id,'quote',currentAccount);fixture.store.claim();
-    fixture.store.complete(work.id,{kind:'quote',quote:q},currentAccount);
+    fixture.store.complete(work.id,{kind:'quote',quote:q,submitControl:verifiedControl(q.quotedAt)},currentAccount);
     return q;
+}
+
+function verifiedControl(checkedAt=new Date().toISOString()):CheckoutSubmitControl {
+    return {ready:true,issue:null,label:'Submit',contract:'mifile-checkout-v2',termsState:'accepted',checkedAt};
 }
 
 function completeUnsubmitted(fixture:ReturnType<typeof storeFixture>,currentAccount=account) {
@@ -438,7 +443,8 @@ test('preflight records a primary-account real package only after fresh quote, e
         const snapshot=JSON.parse(f.sql.prepare('SELECT snapshot_json FROM mifile_submission_preflights').get().snapshot_json);
         assert.equal(snapshot.paymentMethodFingerprint,available[0].fingerprint);
         assert.equal(snapshot.paymentAuthorized,false);assert.equal(snapshot.courtSubmissionAuthorized,false);
-        assert.equal(snapshot.version,2);
+        assert.equal(snapshot.version,3);
+        assert.equal(snapshot.checkoutControlDigest,digest(f.store.state(f.job.id,primary).submitControl));
         assert.equal(snapshot.executionKey,bundleExecutionKey(primary.username,f.job.externalBundleId!));
         assert.equal(f.store.state(f.job.id,primary,Date.now()+900001).preflight.complete,false);
         assert.equal(f.store.state(f.job.id,account).preflight.complete,false);
@@ -1440,7 +1446,7 @@ test('checkout Submit inspection is non-mutating and stops for unknown controls 
             ['<button>Submit</button><input type="button" value="Pay with new provider">',false],
         ] as const) {
             await page.setContent('<div role="dialog"><div role="dialog"><h3>Checkout</h3>'+body+'</div></div>');
-            assert.equal((await inspectCheckoutSubmitControl(page)).ready,ready);
+            assert.equal((await inspectCheckoutSubmitControl(page,0)).ready,ready);
             assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);
         }
     }finally{await page.close();}
@@ -1569,5 +1575,110 @@ test('submission diagnostics never persist Playwright credential or payment-cont
         }),/browser operation did not complete/);
         assert.ok(!f.submissions.get(intent.id)?.error?.includes('sensitive-fixture-only'));
         assert.equal(f.submissions.get(intent.id)?.attempts,0);
+    }finally{f.db.close();}
+});
+
+test('checkout terms acceptance uses explicit values, never object or truthy-string coercion',()=>{
+    for(const value of [true,'True','TRUE','true'])assert.equal(parseCheckoutTermsAcceptance(value),true);
+    for(const value of [false,'False','false',null,''])assert.equal(parseCheckoutTermsAcceptance(value),false);
+    for(const value of [undefined,{},[],1,'1','yes',' true ','<html>True</html>'])assert.throws(()=>parseCheckoutTermsAcceptance(value));
+});
+
+test('final checkout observes existing terms GET and never accepts or writes legal terms',async()=>{
+    for(const accepted of [true,false] as const) {
+        const page=await browser.newPage(),job=prepared();let writes=0;
+        try {
+            await page.route('**/*',route=>{
+                const url=new URL(route.request().url());
+                if(route.request().method()!=='GET'){writes++;return route.abort();}
+                if(url.pathname==='/User/GetUserPropertyForCurrentUser')return route.fulfill({contentType:'application/json',body:JSON.stringify(accepted?'True':null)});
+                return route.fulfill({contentType:'text/html',body:'<div role="dialog"><h3>Checkout</h3><button onclick="window.paid=true">Submit</button><button>Cancel</button></div>'+
+                    '<button onclick="fetch(\'/User/GetUserPropertyForCurrentUser?propertyName=CheckoutTCAccepted\')">Load terms</button>'});
+            });
+            await page.goto(String(job.result!.url));
+            assert.equal((await inspectCheckoutSubmitControl(page,12669)).ready,false,'An enabled Submit alone is insufficient');
+            const stop=observeCheckoutTerms(page,job.externalBundleId!);
+            try {
+                await page.getByRole('button',{name:'Load terms',exact:true}).click();
+                const control=await inspectCheckoutSubmitControl(page,12669);
+                assert.equal(control.ready,accepted);assert.equal(control.termsState,accepted?'accepted':'required');
+                assert.equal(validCheckoutSubmitControl(control,12669,new Date().toISOString()),true);
+                assert.equal(await page.evaluate(()=>Boolean((window as any).paid)),false);assert.equal(writes,0);
+                await page.goto('https://mifile.courts.michigan.gov/filing/create/fd2c1ad4-633d-429a-0166-08df32c555df');
+                assert.equal(await readCheckoutTerms(page),'unverified','Evidence cannot move to a different bundle');
+            }finally{stop();}
+            assert.equal(await readCheckoutTerms(page),'unverified');
+            const zero=await inspectCheckoutSubmitControl(page,0);
+            assert.equal(zero.ready,true);assert.equal(zero.termsState,'not_required');
+        }finally{await page.close();}
+    }
+});
+
+test('unreadable or conflicting terms observations cannot make final checkout actionable',async()=>{
+    for(const variant of ['html','malformed','duplicate','oversized','failed','plain'] as const) {
+        const page=await browser.newPage(),job=prepared();
+        try {
+            await page.route('**/*',route=>{
+                if(route.request().url().includes('/User/GetUserPropertyForCurrentUser'))return route.fulfill({
+                    status:variant==='failed'?503:200,contentType:variant==='html'?'text/html':variant==='plain'?'text/plain':'application/json',
+                    body:variant==='oversized'?'x'.repeat(1025):variant==='malformed'?'{}':variant==='plain'?'True':'true'});
+                return route.fulfill({contentType:'text/html',body:'<button onclick="fetch(\'/User/GetUserPropertyForCurrentUser?propertyName=CheckoutTCAccepted\')">Load terms</button>'});
+            });
+            await page.goto(String(job.result!.url));const stop=observeCheckoutTerms(page,job.externalBundleId!);
+            try {
+                await page.getByRole('button',{name:'Load terms',exact:true}).click();
+                assert.equal(await readCheckoutTerms(page),['plain','duplicate'].includes(variant)?'accepted':'unverified');
+                if(variant==='duplicate') {
+                    const response=page.waitForResponse(url=>url.url().includes('/User/GetUserPropertyForCurrentUser'));
+                    await page.getByRole('button',{name:'Load terms',exact:true}).click();await response;
+                    assert.equal(await readCheckoutTerms(page),'unverified');
+                }
+            }finally{stop();}
+        }finally{await page.close();}
+    }
+});
+
+test('unverified or unavailable final controls preserve exact fee review but block preflight and rehearsal',()=>{
+    for(const mode of ['missing','required','unverified','disabled'] as const) {
+        const f=makePrimaryFixture();
+        try {
+            const q=completeQuote(f,'selected',Date.now(),f.primary);completeUnsubmitted(f,f.primary);
+            const row=f.sql.prepare("SELECT id,result_json FROM mifile_checkout_inspections WHERE kind='quote'").get();
+            const result=JSON.parse(row.result_json);
+            if(mode==='missing')delete result.submitControl;
+            else result.submitControl={...verifiedControl(q.quotedAt),ready:false,
+                termsState:mode==='disabled'?'accepted':mode,issue:'The final checkout requires human review.'};
+            f.sql.prepare('UPDATE mifile_checkout_inspections SET result_json=? WHERE id=?').run(JSON.stringify(result),row.id);
+            const input={quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents};
+            assert.equal(f.store.state(f.job.id,f.primary).canConfirm,true);
+            f.store.confirm(f.job.id,input,f.primary,'qa');
+            const state=f.store.state(f.job.id,f.primary);
+            assert.equal(state.confirmedAt!==null,true);assert.equal(state.preflight.complete,false);
+            assert.equal(state.preflight.checks.find(check=>check.id==='checkout_control')?.passed,false);
+            assert.equal(f.sql.prepare('SELECT count(*) AS n FROM mifile_submission_preflights').get().n,0);
+            const submissions=new SubmissionStore(f.sql,f.store,id=>f.jobs.get(id)||null,()=>{});
+            assert.throws(()=>submissions.rehearse(f.job.id,{...input,noPaymentAcknowledged:true},f.primary,'qa'),/fresh exact-amount review/);
+        }finally{f.db.close();}
+    }
+});
+
+test('final-control contract rejects stale, forged or mismatched readiness and pins preflight evidence',()=>{
+    const now=Date.now(),date=new Date(now).toISOString(),control=verifiedControl(date);
+    assert.equal(validCheckoutSubmitControl(control,12669,date,now),true);
+    for(const invalid of [{...control,contract:'mifile-checkout-v1'},{...control,termsState:'required'},
+        {...control,termsState:'not_required'},{...control,checkedAt:new Date(now-900001).toISOString()},
+        {...control,checkedAt:new Date(now+60001).toISOString()},{...control,issue:'unverified'},
+        {...control,ready:false}])assert.equal(validCheckoutSubmitControl(invalid,12669,date,now),false);
+    const f=makePrimaryFixture();
+    try {
+        const q=completeQuote(f,'selected',Date.now(),f.primary);completeUnsubmitted(f,f.primary);
+        f.store.confirm(f.job.id,{quoteId:q.id,quoteDigest:q.quoteDigest,totalCents:q.totalCents},f.primary,'qa');
+        assert.equal(f.store.state(f.job.id,f.primary).preflight.complete,true);
+        const row=f.sql.prepare("SELECT id,result_json FROM mifile_checkout_inspections WHERE kind='quote'").get();
+        const result=JSON.parse(row.result_json);result.submitControl.checkedAt=new Date(Date.parse(q.quotedAt)+1).toISOString();
+        f.sql.prepare('UPDATE mifile_checkout_inspections SET result_json=? WHERE id=?').run(JSON.stringify(result),row.id);
+        assert.equal(f.store.state(f.job.id,f.primary).preflight.complete,false);
+        assert.equal(f.store.state(f.job.id,f.primary).preflight.recordedAt,null);
+        assert.equal(FINAL_MIFILE_ACTIONS_ENABLED,false);
     }finally{f.db.close();}
 });

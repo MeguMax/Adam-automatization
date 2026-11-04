@@ -4,7 +4,8 @@ import type { FilingJobView } from './database';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { mifileOutcome } from './mifileOutcome';
 import { bundleExecutionKey, rememberBundleActivity } from './mifileBundleSafety';
-import { checkoutReviewIssues, receiptEventKey, receiptSummary, validateReceipt, FINAL_MIFILE_ACTIONS_ENABLED,
+import {validCheckoutSubmitControl} from './mifileCheckoutControl';
+import { checkoutReviewIssues, digest, receiptEventKey, receiptSummary, validateReceipt, FINAL_MIFILE_ACTIONS_ENABLED,
     type CheckoutAccount, type CheckoutInspection, type CheckoutInspectionResult, type CheckoutQuote,
     type MiFileReceiptObservation } from './mifileCheckout';
 
@@ -237,6 +238,9 @@ export class CheckoutStore {
                     throw new Error('Reported bundle activity requires reconciliation. Do not retry payment.');
                 }
                 const issues = checkoutReviewIssues(result.quote, job, account);
+                if(result.submitControl!==undefined && !validCheckoutSubmitControl(result.submitControl,result.quote.totalCents,result.quote.quotedAt)) {
+                    throw new Error('The final checkout control evidence is invalid. Refresh checkout; no payment is authorized.');
+                }
                 const choice = this.paymentMethodChoice(job.id,account);
                 if (choice && result.quote.totalCents > 0 && result.quote.paymentMethodFingerprint !== choice) {
                     throw new Error('MiFILE did not retain the chosen payment account. Clear the choice and refresh checkout.');
@@ -319,6 +323,8 @@ export class CheckoutStore {
         const latestQuote = inspections.find(item => item.kind === 'quote');
         const quoteInspection = inspections.find(item => item.kind === 'quote' && item.status === 'completed' && item.result?.kind === 'quote');
         const quote = quoteInspection?.result?.kind === 'quote' ? quoteInspection.result.quote : null;
+        const control=quoteInspection?.result?.kind==='quote'?quoteInspection.result.submitControl:null;
+        const submitControl=quote && validCheckoutSubmitControl(control,quote.totalCents,quote.quotedAt,now)?control:null;
         const issues = quote && job ? checkoutReviewIssues(quote, job, account, now) : [];
         if (quote && latestQuote?.id !== quoteInspection?.id) issues.push('The latest checkout check has not succeeded. Refresh checkout before confirming.');
         if (active) issues.push('Wait for the current MiFILE inspection to finish.');
@@ -384,7 +390,8 @@ export class CheckoutStore {
         if (preflight) {
             try {
                 const snapshot = JSON.parse(preflight.snapshot_json);
-                if (snapshot.version !== 2 || snapshot.filingJobId !== filingJobId || snapshot.bundleId !== quote!.bundleId ||
+                if (snapshot.version !== 3 || snapshot.checkoutControlDigest!==digest(submitControl) ||
+                    snapshot.filingJobId !== filingJobId || snapshot.bundleId !== quote!.bundleId ||
                     snapshot.quoteId !== quote!.id || snapshot.quoteDigest !== quote!.quoteDigest ||
                     snapshot.packageDigest !== quote!.packageDigest || snapshot.totalCents !== quote!.totalCents ||
                     snapshot.currency !== 'USD' || snapshot.accountIdentity !== account.identity ||
@@ -412,6 +419,7 @@ export class CheckoutStore {
             {id:'primary',label:'Primary account confirmed',passed:Boolean(checks?.primaryAccountConfirmed)},
             {id:'real_case',label:'Not a QA test package',passed:Boolean(checks && !checks.testOnly)},
             {id:'quote',label:'Fresh exact quote and payment account verified',passed:Boolean(quote && !issues.length)},
+            {id:'checkout_control',label:'Final checkout control and account terms verified',passed:Boolean(submitControl?.ready)},
             {id:'review',label:'Exact amount reviewed for this package',passed:Boolean(reviewedAt)},
             {id:'receipt',label:'Recent Unsubmitted status checked; no prior payment reported',
                 passed:Boolean(recentUnsubmitted && !summary.submissionObserved && !receiptEvidenceInvalid && !executionHold)},
@@ -433,7 +441,7 @@ export class CheckoutStore {
                 issues.every(issue => /^(Add a payment method|Select the intended payment method|Verify the payment account)/.test(issue))),
             paymentMethodChoice:choice,
             selectedPaymentMethodLabel:publicQuote?.availablePaymentMethods?.find(method => method.fingerprint === quote?.paymentMethodFingerprint)?.label || null,
-            submitControl:quoteInspection?.result?.kind === 'quote' ? quoteInspection.result.submitControl || null : null,
+            submitControl,
             paymentDiagnostics:quoteInspection?.result?.kind === 'quote' ? quoteInspection.result.paymentDiagnostics || null : null,
             automaticReadiness:readiness || null,
             executionHold:executionHold || null,
@@ -481,7 +489,7 @@ export class CheckoutStore {
                 if (!privateQuote || privateQuote.totalCents > 0 && !/^[a-f0-9]{64}$/.test(privateQuote.paymentMethodFingerprint || '')) {
                     throw new Error('The reviewed payment account could not be verified. Refresh checkout.');
                 }
-                const snapshot = {version:2,filingJobId,bundleId:quote.bundleId,quoteId:quote.id,
+                const snapshot = {version:3,checkoutControlDigest:digest(ready.submitControl),filingJobId,bundleId:quote.bundleId,quoteId:quote.id,
                     quoteDigest:quote.quoteDigest,packageDigest:quote.packageDigest,totalCents:quote.totalCents,
                     currency:quote.currency,accountIdentity:account.identity,accountEmail:account.username.trim().toLowerCase(),
                     paymentMethodFingerprint:privateQuote.paymentMethodFingerprint,

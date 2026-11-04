@@ -1,10 +1,28 @@
 import type {Page} from 'playwright';
+import {readCheckoutTerms} from './mifileCheckoutTerms';
 
-export interface CheckoutSubmitControl {ready:boolean;issue:string|null;label:'Submit';contract:'mifile-checkout-v1'}
+export interface CheckoutSubmitControl {
+    ready:boolean;issue:string|null;label:'Submit';contract:'mifile-checkout-v2';
+    termsState:'accepted'|'required'|'unverified'|'not_required';checkedAt:string;
+}
+
+export function validCheckoutSubmitControl(value:unknown,totalCents:number,quotedAt:string,now=Date.now()):value is CheckoutSubmitControl {
+    const control=value as CheckoutSubmitControl|null;
+    if(!control || control.contract!=='mifile-checkout-v2' || control.label!=='Submit' || typeof control.ready!=='boolean' ||
+        !['accepted','required','unverified','not_required'].includes(control.termsState) ||
+        typeof control.checkedAt!=='string' || control.issue!==null && (typeof control.issue!=='string' || !control.issue || control.issue.length>500) ||
+        control.ready && (control.issue!==null || control.termsState!==(totalCents===0?'not_required':'accepted')) ||
+        !control.ready && !control.issue || totalCents>0 && control.termsState==='not_required')return false;
+    const checked=Date.parse(control.checkedAt),quoted=Date.parse(quotedAt);
+    return Number.isFinite(checked) && Number.isFinite(quoted) && checked>=quoted-5000 && checked<=quoted+60_000 &&
+        checked<=now+5000 && now-checked<15*60_000;
+}
 
 /** Inspect only: never accept terms, add cards, or click a financial control. */
-export async function inspectCheckoutSubmitControl(page:Page):Promise<CheckoutSubmitControl> {
-    const result={label:'Submit' as const,contract:'mifile-checkout-v1' as const};
+export async function inspectCheckoutSubmitControl(page:Page,totalCents:number):Promise<CheckoutSubmitControl> {
+    if(!Number.isSafeInteger(totalCents) || totalCents<0)throw new Error('Checkout requires its exact verified amount.');
+    const termsState=totalCents===0?'not_required' as const:await readCheckoutTerms(page);
+    const result={label:'Submit' as const,contract:'mifile-checkout-v2' as const,termsState,checkedAt:new Date().toISOString()};
     const dialog=page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'Checkout',exact:true})}).last();
     if(!await dialog.isVisible())return {...result,ready:false,issue:'The Checkout dialog is not visible.'};
     const submit=dialog.getByRole('button',{name:'Submit',exact:true}).filter({visible:true});
@@ -28,6 +46,10 @@ export async function inspectCheckoutSubmitControl(page:Page):Promise<CheckoutSu
         controls.some(control=>control.tag==='textarea' || control.tag==='input' && !['radio','checkbox','hidden','button','submit'].includes(control.type))) {
         return {...result,ready:false,issue:'Checkout has unfamiliar controls. Review MiFILE before submission.'};
     }
+    if(termsState==='required')return {...result,ready:false,
+        issue:'The MiFILE account has not accepted its checkout terms. The account owner must review them in MiFILE; this app does not accept terms or attempt payment.'};
+    if(termsState==='unverified')return {...result,ready:false,
+        issue:'MiFILE checkout terms could not be verified. Refresh checkout or ask the account owner to review MiFILE before payment.'};
     return {...result,ready:true,issue:null};
 }
 
