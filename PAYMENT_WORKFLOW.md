@@ -1,6 +1,6 @@
 # MiFILE payment and submission rollout
 
-## Current release: v101
+## Current release: v102
 
 Payment and court submission remain disabled by the compiled
 `FINAL_MIFILE_ACTIONS_ENABLED = false` guard. Neither a Render environment
@@ -110,3 +110,19 @@ checkout is actionable. Version 3 preflight snapshots also pin the observed
 checkout-control evidence; earlier readiness records require a fresh check.
 The guarded executor repeats the same terms/control verification immediately
 before its single dispatch. Live payment and court submission remain disabled.
+
+## Read-only historical payment audit
+
+`npm run mifile:payment-audit -- --targets '<JSON array of exact caseNumber/courtName pairs>' --from YYYY-MM-DD --through YYYY-MM-DD`
+uses the configured, confirmed primary account. It reads only MiFILE's existing
+GET `/api/payment/transactionsView`, used by the Payment Transactions screen.
+It is limited to ten exact cases and sixty calendar days. The CLI emits only
+matched authorization records with hashed references; raw account/card fields,
+authorization codes and credentials are never printed. It does not click
+financial controls, export receipts, or mutate payment accounts or filings.
+
+An authorization entry is not proof of settlement. An absent entry in the
+requested date range is not proof that a case is unpaid. Negative ledger
+entries are retained separately, not silently netted into an assumed payment
+balance. Court rejection/refund notifications and official transaction receipts
+must be reconciled before deciding whether another payment is appropriate.

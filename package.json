@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "npm run build && node --test --test-concurrency=2 dist/pdfValidation.test.js dist/pdfPreview.test.js dist/complaintExtractor.test.js dist/database.test.js dist/draftDocuments.test.js dist/emailProcessor.test.js dist/graphRetry.test.js dist/mifileRuntimeConfig.test.js dist/filingIntake.test.js dist/batchIntake.test.js dist/draftNotifications.test.js dist/mifileAccountSettings.test.js dist/adminAuth.test.js dist/formLibrary.test.js dist/scanIntake.test.js dist/mifileFilingRunner.test.js dist/filingProgress.test.js dist/mifileCheckout.test.js dist/excelPdf.test.js dist/microsoftAccess.test.js dist/packageCompleteness.test.js dist/documentRecognition.test.js dist/workerHealth.test.js tools/verify-intake-suite.test.cjs tools/verify-recognition-corpus.test.cjs",
+    "test": "npm run build && node --test --test-concurrency=2 dist/pdfValidation.test.js dist/pdfPreview.test.js dist/complaintExtractor.test.js dist/database.test.js dist/draftDocuments.test.js dist/emailProcessor.test.js dist/graphRetry.test.js dist/mifileRuntimeConfig.test.js dist/filingIntake.test.js dist/batchIntake.test.js dist/draftNotifications.test.js dist/mifileAccountSettings.test.js dist/adminAuth.test.js dist/formLibrary.test.js dist/scanIntake.test.js dist/mifileFilingRunner.test.js dist/filingProgress.test.js dist/mifileCheckout.test.js dist/mifilePaymentAudit.test.js dist/excelPdf.test.js dist/microsoftAccess.test.js dist/packageCompleteness.test.js dist/documentRecognition.test.js dist/workerHealth.test.js tools/verify-intake-suite.test.cjs tools/verify-recognition-corpus.test.cjs",
     "test:intake-examples": "npm run build && node tools/verify-intake-suite.cjs",
     "test:recognition-corpus": "npm run build && node tools/verify-recognition-corpus.cjs",
     "build": "tsc",
@@ -13,6 +13,7 @@
     "start:once": "npm run build && node dist/index.js --once",
     "production": "node dist/productionServer.js",
     "microsoft:check": "npm run build && node dist/microsoftAccess.js",
+    "mifile:payment-audit": "npm run build && node dist/mifilePaymentAudit.js",
     "plaintiffs:export": "npm run build && node dist/plaintiffMappingsCli.js export",
     "plaintiffs:import": "npm run build && node dist/plaintiffMappingsCli.js import",
     "dev": "ts-node src/index.ts",
