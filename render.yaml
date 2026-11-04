@@ -17,6 +17,8 @@ services:
         value: review_before_submission
       - key: WORKER_ENABLED
         value: "true"
+      - key: DRAFT_READY_NOTIFICATIONS_ENABLED
+        value: "true"
       - key: WORKER_POLL_INTERVAL_MS
         value: "10000"
       - key: WORKER_EMAIL_LIMIT

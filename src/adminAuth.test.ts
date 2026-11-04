@@ -36,6 +36,16 @@ async function login(base: string, password = 'test-password', origin = base) {
         body: JSON.stringify({ username: 'admin', password }) });
 }
 
+test('ready-package links preserve only a local Draft identity through login', async () => fixture(async base => {
+    const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
+    const redirect = await fetch(base + '/?draft=' + id, { redirect: 'manual' });
+    assert.equal(redirect.headers.get('location'), '/login?draft=' + id);
+    const page = await fetch(base + '/login?draft=' + id);
+    assert.ok((await page.text()).includes("'/?draft='"));
+    const bad = await fetch(base + '/?draft=https://example.com', { redirect: 'manual' });
+    assert.equal(bad.headers.get('location'), '/login');
+}));
+
 test('unauthenticated browsers get a login page, not a native Basic Auth challenge', async () => fixture(async base => {
     const root = await fetch(base, { redirect: 'manual' });
     assert.equal(root.status, 303);

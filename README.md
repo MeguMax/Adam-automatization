@@ -28,6 +28,8 @@ flowchart LR
 
 - Receives and classifies relevant emails, discovers PDF attachments and maintains a persistent processing queue.
 - Stores documents in OneDrive and creates structured case drafts with validation and review states.
+- Separates several named case packages from one authorized email, with case-scoped documents, forms, retries and filing jobs.
+- Emails the configured recipient after verified Unsubmitted preparation, using a persistent notification outbox independent of payment and court submission.
 - Extracts typed PDF form values, positioned text and scanned content; keeps extraction warnings and source identity visible.
 - Provides a custom admin interface for queue search, draft editing, PDF previews, document replacement, review, retry and activity history.
 - Maintains court-specific form and filing-rule versions without silently replacing the version already selected by a draft.

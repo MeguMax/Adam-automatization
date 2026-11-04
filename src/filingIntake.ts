@@ -10,6 +10,34 @@ export interface FilingIntakeInfo {
     packageMode?: 'standard_lt' | 'custom';
     storageKey: string;
     issues: string[];
+    packageKey?: string;
+    packageLabel?: string;
+    batchSize?: number;
+    groups?: Array<{ key: string; label: string; sources: string[]; issues: string[] }>;
+}
+
+export function intakeCasePrefix(filename: string): { key: string; label: string } | null {
+    const match = filename.normalize('NFKC').trim().match(
+        /^(.+?)\s+([a-z])\s+(?:complaint|summons|request|demand|other|connected|notice|lease|deed|advice|local|affidavit)\b.*\.pdf$/i,
+    );
+    if (!match || !/[a-z\p{L}]/iu.test(match[1])) return null;
+    const surname = match[1].replace(/\s+/g, ' ').trim();
+    return { key: `${surname.toLowerCase()} ${match[2].toLowerCase()}`, label: `${surname} ${match[2].toUpperCase()}` };
+}
+
+export function hasNamedFilingPackage(attachments: CourtEmailAttachment[]): boolean {
+    return attachments.some(file => isPdfAttachment(file) && intakeCasePrefix(file.name) &&
+        /\bcomplaint\b/i.test(file.name));
+}
+
+export function splitFilingIntake(parsed: ParsedEmailInfo): ParsedEmailInfo[] {
+    if (!parsed.intake?.groups?.length) return [parsed];
+    const { groups, ...intake } = parsed.intake;
+    return groups.map(group => ({ ...parsed, intake: {
+        ...intake, packageKey: group.key, packageLabel: group.label, batchSize: groups.length,
+        storageKey: createHash('sha256').update(`${intake.storageKey}\n${group.key}`).digest('hex').slice(0, 24),
+        issues: [...intake.issues.filter(issue => !issue.startsWith('Duplicate attachment filename:')), ...group.issues],
+    }, filedDocuments: parsed.filedDocuments.filter(document => group.sources.includes(document.downloadUrl || '')) }));
 }
 
 export function isFilingIntakeSubject(subject: unknown): boolean {
@@ -61,6 +89,30 @@ export function buildFilingIntake(
         if (names.has(name)) issues.push(`Duplicate attachment filename: ${pdf.name}. Review both documents.`);
         names.add(name);
     }
+    const groups = new Map<string, { key: string; label: string; sources: string[]; issues: string[] }>();
+    const named = pdfs.some(file => intakeCasePrefix(file.name));
+    for (const file of named ? pdfs : []) {
+        const prefix = intakeCasePrefix(file.name);
+        const key = prefix?.key || '__unassigned__';
+        const group = groups.get(key) || { key, label: prefix?.label || 'Unassigned attachments', sources: [], issues: [] };
+        group.sources.push(createEmailAttachmentSource(file.name, file.id));
+        if (!prefix) group.issues.push(`Cannot assign ${file.name} to a case. Use [Last Name] [First Initial] [File Type].pdf or move it to the correct Draft.`);
+        groups.set(key, group);
+    }
+    if (groups.size > 1) for (const group of groups.values()) {
+        const groupFiles = pdfs.filter(file => group.sources.includes(createEmailAttachmentSource(file.name, file.id)));
+        const seen = new Set<string>();
+        for (const file of groupFiles) {
+            const name = file.name.trim().toLowerCase();
+            if (seen.has(name)) group.issues.push(`Duplicate attachment filename: ${file.name}. Review both documents.`);
+            seen.add(name);
+        }
+        if (group.key !== '__unassigned__' && groupFiles.length && groupFiles.every(file =>
+            /\b(?:demand|other|connected|notice|lease|deed|affidavit)\b/i.test(file.name))) {
+            group.issues.push(`Supporting PDFs for ${group.label} have no matching Complaint prefix in this email. Check the filename and move the PDF only after confirming its case.`);
+            group.label = `Unmatched supporting files - ${group.label}`;
+        }
+    }
     return {
         isMiFile: false,
         sourceKind: 'new_filing_intake',
@@ -68,6 +120,7 @@ export function buildFilingIntake(
             storageKey: createHash('sha256').update(String(message.internetMessageId || message.id))
                 .digest('hex').slice(0, 24),
             issues,
+            ...(groups.size > 1 ? { groups: [...groups.values()].sort((a, b) => a.key.localeCompare(b.key)) } : {}),
         },
         courtName: null,
         caseNumber: null,

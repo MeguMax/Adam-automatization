@@ -198,7 +198,7 @@ export async function fetchCourtEmailById(messageId: string): Promise<any> {
         () => graphClient
                 .api(`/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}`)
                 .header('Accept-Encoding', 'identity')
-                .select('id,subject,from,body,receivedDateTime')
+                .select('id,subject,from,body,receivedDateTime,hasAttachments')
                 .get(),
         graphRetryOptions(`Graph message ${messageId}`),
     );

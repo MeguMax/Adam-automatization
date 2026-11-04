@@ -51,7 +51,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-11-03-filing-review-v97';
+const WORKER_BUILD_ID = '2026-11-04-batch-intake-v98';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -376,12 +376,14 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
     console.log(`Processing ${dueRetries.length} due document retry job(s)...`);
     const byEmail = new Map<string, Array<(typeof dueRetries)[number]>>();
     for (const retry of dueRetries) {
-        const grouped = byEmail.get(retry.emailId) ?? [];
+        const key = `${retry.emailId}:${retry.caseDraftId || ''}`;
+        const grouped = byEmail.get(key) ?? [];
         grouped.push(retry);
-        byEmail.set(retry.emailId, grouped);
+        byEmail.set(key, grouped);
     }
 
-    for (const [emailId, retries] of byEmail) {
+    for (const retries of byEmail.values()) {
+        const emailId = retries[0].emailId;
         const caseDraftId = retries[0].caseDraftId;
         const recoveredFiles: NotificationFile[] = [];
         const reportParsed = retryParsedEmail(retries[0]);
@@ -529,7 +531,13 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
         }
 
         if (caseDraftId && reportParsed.sourceKind === 'new_filing_intake') {
-            try { await applyLibraryForms(db, caseDraftId); }
+            try {
+                const detail = db.getDraftDetail(caseDraftId)!;
+                if (!reportParsed.intake?.packageKey || detail.documents.some(document => document.packageRole === 'complaint')) {
+                    await applyLibraryForms(db, caseDraftId);
+                }
+                db.reconcileBatchSupportingDocuments(emailId);
+            }
             catch (error) { console.warn('Standard form synchronization deferred:', error instanceof Error ? error.message : String(error)); }
         }
         db.refreshEmailAfterDocumentRetries(emailId, caseDraftId);
@@ -582,7 +590,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             const email = await recoverOutlookMessage(db, pending);
             emailsById.set(String(email.id), email);
         } catch (error) {
-            if (isFilingIntakeSubject(pending.subject)) {
+            if (isFilingIntakeSubject(pending.subject) || intakeSenderAllowed({ from: { emailAddress: { address: pending.sender } } })) {
                 db.scheduleEmailDiscoveryRetry(pending.emailId, error);
                 continue;
             }
@@ -621,7 +629,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             try {
                 msg = await fetchCourtEmailById(externalMessageId);
             } catch (error) {
-                if (isFilingIntakeSubject(candidate.subject)) db.scheduleEmailDiscoveryRetry(registered.id, error);
+                if (isFilingIntakeSubject(candidate.subject) || intakeSenderAllowed(candidate)) db.scheduleEmailDiscoveryRetry(registered.id, error);
                 console.error(
                     `Unable to fetch message body ${externalMessageId}; ` +
                     'the email remains new and will be retried on the next poll:',
@@ -652,7 +660,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             try {
                 parsed = await parseWorkflowEmail(msg) || undefined;
             } catch (error) {
-                if (isFilingIntakeSubject(msg.subject) && intakeSenderAllowed(msg)) {
+                if (intakeSenderAllowed(msg)) {
                     db.scheduleEmailDiscoveryRetry(emailRecord.id, error);
                     continue;
                 }
@@ -665,26 +673,45 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 continue;
             }
 
-            caseDraftId = db.createCaseDraft(emailRecord.id, parsed);
             if (parsed.sourceKind === 'new_filing_intake') {
-                const stored = db.getDraftDetail(caseDraftId)?.caseDraft?.normalizedDataJson;
-                if (stored) parsed.intake = JSON.parse(stored).intake;
+                const packages = db.createCaseDrafts(emailRecord.id, parsed);
                 const resolver = createEmailAttachmentResolver(async () => msg);
-                const detail = await processFilingIntake(db, emailRecord.id, caseDraftId, parsed, {
-                    download: oneDocument => downloadFiledDocuments(oneDocument, 'downloads', msg.receivedDateTime, {
-                        resolveDocumentBuffer: resolver,
-                    }),
-                    extract: extractComplaintPdf,
-                    progress: phase => workerHealth.work('inbox', phase, 900_000),
-                });
-                console.log('New filing intake completed:', {
-                    draftId: caseDraftId,
-                    documents: detail.documents.length,
-                    uploaded: detail.documents.filter(document => document.oneDriveUrl).length,
-                    status: detail.caseDraft?.status,
-                });
+                const packageErrors: string[] = [];
+                for (const item of packages) {
+                    const initial = db.getDraftDetail(item.draftId)?.caseDraft;
+                    if (!initial || !['not_started', 'failed'].includes(initial.filingStatus) ||
+                        ['rejected', 'archived'].includes(initial.status)) continue;
+                    const stored = initial.normalizedDataJson;
+                    if (stored) item.parsed.intake = JSON.parse(stored).intake;
+                    try {
+                        const detail = await processFilingIntake(db, emailRecord.id, item.draftId, item.parsed, {
+                            download: oneDocument => downloadFiledDocuments(oneDocument, 'downloads', msg.receivedDateTime, {
+                                resolveDocumentBuffer: resolver,
+                            }),
+                            extract: extractComplaintPdf,
+                            deferEmailRefresh: true,
+                            progress: phase => workerHealth.work('inbox', phase, 900_000),
+                        });
+                        console.log('New filing intake completed:', {
+                            draftId: item.draftId,
+                            package: item.parsed.intake?.packageLabel,
+                            documents: detail.documents.length,
+                            uploaded: detail.documents.filter(document => document.oneDriveUrl).length,
+                            status: detail.caseDraft?.status,
+                        });
+                    } catch (error) {
+                        db.recordIntakeProcessingFailure(item.draftId, error);
+                        packageErrors.push(`${item.parsed.intake?.packageLabel || item.draftId}: ${error instanceof Error ? error.message : String(error)}`);
+                        console.error(`Intake package ${item.draftId} requires review:`, error);
+                    }
+                }
+                const matched = db.reconcileBatchSupportingDocuments(emailRecord.id);
+                if (matched) console.log(`Matched ${matched} supporting PDF(s) to their Complaint using exact typed party/address fields.`);
+                db.refreshEmailAfterDocumentRetries(emailRecord.id);
+                if (packageErrors.length) db.markEmailFailed(emailRecord.id, packageErrors.join('\n'), 'partial_failure');
                 continue;
             }
+            caseDraftId = db.createCaseDraft(emailRecord.id, parsed);
             const plaintiffNaming = lookupPlaintiffNaming(db, parsed);
 
             const { downloaded, notificationFiles, failures } = await downloadFiledDocuments(

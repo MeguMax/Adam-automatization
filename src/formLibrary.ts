@@ -68,7 +68,8 @@ export async function uploadLibraryDocument(db: WorkflowDatabase, draftId: strin
         metadata: { driveId: file.driveId, itemId: file.itemId } });
 }
 
-export async function applyLibraryForms(db: WorkflowDatabase, draftId: string, dependencies = productionUpload) {
+export async function applyLibraryForms(db: WorkflowDatabase, draftId: string, dependencies = productionUpload,
+    options: { refreshEmail?: boolean } = {}) {
     const detail = db.assertEditableIntake(draftId);
     const court = JSON.parse(detail.caseDraft!.normalizedDataJson || '{}').courtName || '';
     const available = db.listLibraryForms().filter(form => form.active && (form.role === 'advice' || form.courtKey === courtKey(court)));
@@ -80,6 +81,6 @@ export async function applyLibraryForms(db: WorkflowDatabase, draftId: string, d
             db.completeDocumentRetryFailure({ documentId, reason: error instanceof Error ? error.message : String(error), downloadAttempts: 1 });
         }
     }
-    db.refreshEmailAfterDocumentRetries(detail.email.id, draftId);
+    if (options.refreshEmail !== false) db.refreshEmailAfterDocumentRetries(detail.email.id, draftId);
     return db.applyCourtFilingRule(draftId);
 }

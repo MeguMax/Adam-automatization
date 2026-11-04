@@ -3,6 +3,7 @@ import type { ParsedEmailInfo, FiledDocumentInfo } from './emailProcessor';
 import { INTAKE_MAX_PDF_BYTES, intakeFileName } from './filingIntake';
 import { inspectFilingPdf, validatePdfBuffer } from './pdfValidation';
 import { recognizeDocumentPages, DocumentRecognition } from './documentRecognition';
+import { readSupportingCaseIdentity } from './batchCaseMatching';
 
 export interface IntakeDownloadDependencies {
     download(document: FiledDocumentInfo): Promise<Buffer>;
@@ -42,6 +43,10 @@ export async function downloadIntakeDocuments(
                 if (!inspected) {
                     const pages = await inspectFilingPdf(buffer);
                     recognition = await recognizeDocumentPages(buffer, pages, document.documentName || document.documentType || '');
+                    if (recognition.role === 'ancillary' && recognition.source === 'content' && recognition.supportingKind === 'demand') {
+                        const identity = await readSupportingCaseIdentity(buffer);
+                        if (identity) recognition.caseIdentity = identity;
+                    }
                     inspected = true;
                 }
                 stage = 'upload';

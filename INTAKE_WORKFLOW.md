@@ -2,7 +2,7 @@
 
 ## Current workflow
 
-One authorized email creates one new Draft and one OneDrive folder. The worker processes attached PDFs, extracts fields from the Complaint, and validates the package. Nonpayment, termination, and DC 102c recovery-of-possession Complaints use the same filing workflow; paragraph 10 determines possession-only versus possession and supplemental money judgment.
+One authorized email can create several independent Drafts and OneDrive folders. Batch attachments are grouped by Adam's `[Last Name] [First Initial] [File Type].pdf` convention. Each Complaint independently supplies its case facts and court; different courts may occur in the same email. Nonpayment, termination, and DC 102c recovery-of-possession Complaints use the same filing workflow; paragraph 10 determines possession-only versus possession and supplemental money judgment.
 
 The Draft editor displays the PDF with page navigation and zoom beside the editable fields. On mobile, switch between Document and Fields. Missing data, unreadable files, ambiguous document roles, and incomplete packages require review.
 
@@ -29,6 +29,26 @@ NEW LT FILING - Example Property LLC v Morgan Tenant
 ```
 
 Attach individual PDFs: Complaint, Summons, Request, and applicable Demand/Notice/Lease/Deed or other supporting documents. Include Advice and court-specific Local until the verified forms have been added to Settings > Form library. Keep each PDF within 25 MB. Word files, ZIP archives, and cloud-link-only packages are not supported as intake documents.
+
+### Several cases in one email
+
+Use consistent prefixes, for example `Utsey W Complaint [$].pdf`, `Utsey W Summons.pdf`, `Utsey W Request.pdf`, `Utsey W Demand.pdf`, then the corresponding `Walker W ...` files. Bracketed filename markers do not determine the money claim; paragraph 10 and the amount still come from the Complaint. Multiple supporting PDFs sharing a prefix stay separate uploads in that case.
+
+`NEW LT FILING` remains the recommended subject. An original email from an authorized sender can also use an ordinary subject such as `Five more` when it includes a named Complaint using this convention. Replies, forwards, unrelated attachments and court notification subjects cannot trigger this fallback. Court notifications still require the original TrueFiling sender.
+
+Each group has a stable package key and storage folder. Retrying the same recorded email preserves group IDs, uploaded files and manual corrections. Existing historical one-case records are not silently split or replayed. A complete sibling can proceed to Unsubmitted even when another case has failed downloads. The parent email retains aggregate download counts; the Draft editor and filing jobs use only the selected case's PDFs, fields and activity. Queue record detail links to every case from that email.
+
+Unmatched filenames and supporting-only prefixes remain visible review groups, never silently attached to the closest surname. For example, `Marogi M Demand.pdf` does not automatically belong to `Marogi R Complaint.pdf`. After checking the PDF, use its Documents controls to move a supporting file to another editable case from the same email. The move preserves the original OneDrive file, clears approval, resets its court routing and requires package confirmation. It cannot move core/library PDFs or cross email boundaries. Empty review groups are archived. A prefix that contradicts the extracted Defendant also requires review.
+
+There is one content-based correction path for a supporting-only prefix typo: a verified Demand DC 100a with populated PDF fields can be matched to a single typed Complaint only when its full recipient name/address, Plaintiff and rented-premises address all agree exactly. Conflicting or empty PDF fields, different digits/unit numbers, multiple matching cases, scanned-only evidence and manual edits prevent this automatic reassignment. Each move records its PDF hash and matching method; the original filename and bytes stay unchanged. The empty source review group remains archived so email retries cannot recreate it. Unresolved same-surname or unassigned supporting groups prevent automatic preparation until their grouping is resolved or reviewed.
+
+### Ready package notifications
+
+After a newly completed preparation passes saved-bundle verification, a persistent outbox sends a plain-text email with the case, court, temporary number, source PDF count, Connected count and a direct authenticated Draft link. It explicitly says that no payment or court submission occurred. Opening the link preserves the selected Draft through sign-in. Notifications are not backfilled across historical bundles, not sent for partial/uncertain preparations, and not sent for controlled `NEW LT FILING - QA` fixtures.
+
+The recipient defaults to the existing `NOTIFY_TO_EMAIL`; `DRAFT_READY_NOTIFY_EMAIL` can override it. `DRAFT_READY_NOTIFICATIONS_ENABLED=false` disables these messages. `ADMIN_PUBLIC_URL` supplies the public admin origin outside Render; on Render, its built-in `RENDER_EXTERNAL_URL` is used. `SENDER_USER_ID` must have the existing Microsoft Graph send permission. Settings > Email intake shows the configured recipient, and the Draft Activity view shows sending state and failures.
+
+Each verified job has at most one outbox entry. Successful sends persist across restarts. Microsoft throttling receives bounded delayed retries. The send request disables SDK retries and has a 20-second deadline. A timeout, server error or interrupted send remains uncertain rather than automatically sending again. After checking the recipient and Sent items, an operator can explicitly retry the notification from Activity without repeating MiFILE preparation. A notification failure cannot change the saved package or block another case.
 
 Document types are recognized from known titles in the PDF text layer or offline OCR when the text layer is insufficient. Filenames are a fallback, not the source of case facts. Filename-only recognition, low-confidence OCR, conflicting titles, combined packages, and unknown files require manual Filing Type confirmation. OCR can suggest Complaint parties and addresses, but scan-derived fields and paragraph 2/10 answers require review. Case facts continue to come from the Complaint.
 

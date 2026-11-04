@@ -51,10 +51,11 @@ import { recognizeDocumentPdf } from './documentRecognition';
 import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
 import { changedFieldPaths, mergeExtractedField } from './draftFieldMerge';
 import { filingReleaseChecks } from './mifilePreparationEvidence';
+import { draftNotificationConfig } from './draftNotifications';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-03-filing-review-v97';
+const ADMIN_BUILD_ID = '2026-11-04-batch-intake-v98';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -438,8 +439,7 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
                 continue;
             }
             if (parsed) {
-                db.createCaseDraft(emailRecord.id, parsed);
-                miFileDrafts += 1;
+                miFileDrafts += db.createCaseDrafts(emailRecord.id, parsed).length;
             } else {
                 db.markEmailIgnored(emailRecord.id, 'Not a court notification or authorized NEW LT FILING intake');
             }
@@ -3592,7 +3592,8 @@ const html = String.raw`<!doctype html>
           <div class="field"><span class="field-label">Automation inbox</span><div id="intakeMailbox" class="settings-value"></div></div>
           <div class="field"><span class="field-label">Subject prefix</span><div id="intakeSubject" class="settings-value"></div></div>
           <div class="field"><span class="field-label">Accepted senders</span><div id="intakeSenders" class="settings-value"></div></div>
-          <div class="field"><span class="field-label">Package</span><div class="settings-value">One case per email · PDF attachments · 25 MB per file</div></div>
+          <div class="field"><span class="field-label">Packages</span><div class="settings-value">Multiple cases per email · Last Name + First Initial · PDF attachments · 25 MB per file</div></div>
+          <div class="field"><span class="field-label">Ready package emails</span><div id="draftReadyNotifications" class="settings-value"></div></div>
         </div>
       </section>
       <section class="settings-section">
@@ -3771,6 +3772,7 @@ const html = String.raw`<!doctype html>
       activity: [],
       drafts: [],
       selectedDraftId: null,
+      draftMoveTargets: {},
       draftDetail: null,
       draftFilingJobs: [],
       activeDraftDocumentId: null,
@@ -4127,6 +4129,9 @@ const html = String.raw`<!doctype html>
       document.getElementById('intakeMailbox').textContent = data.intake.mailbox || 'Not configured';
       document.getElementById('intakeSubject').textContent = data.intake.subjectPrefix + ' - [case reference]';
       document.getElementById('intakeSenders').textContent = data.intake.allowedSenders.join(', ');
+      document.getElementById('draftReadyNotifications').textContent = data.notifications.ready
+        ? 'After verified Unsubmitted preparation: ' + data.notifications.recipient
+        : data.notifications.enabled ? 'Not configured: recipient, public admin URL and sender are required' : 'Disabled';
       document.getElementById('miFileAccountEmail').value = data.account.username;
       document.getElementById('miFileAccountPassword').value = '';
       document.getElementById('miFileAccountType').value = data.account.accountEnvironment;
@@ -4281,7 +4286,7 @@ const html = String.raw`<!doctype html>
             (state.selectedIds.has(item.emailId) ? 'checked' : '') + ' aria-label="Select email"></td>' +
           '<td data-label="Received"><span class="cell-secondary">' + escapeHtml(fmtDate(item.receivedAt)) + '</span></td>' +
           '<td data-label="Subject"><span class="subject-main">' + escapeHtml(item.subject || '(no subject)') + '</span><span class="cell-secondary">' + escapeHtml(item.sender || '') + '</span></td>' +
-          '<td data-label="Case"><span class="subject-main">' + escapeHtml(item.caseNumber || '—') + '</span></td>' +
+          '<td data-label="Case"><span class="subject-main">' + escapeHtml(item.draftCount > 1 ? item.draftCount + ' case packages' : item.caseNumber || '—') + '</span></td>' +
           '<td data-label="Plaintiff">' + renderPlaintiffCell(item) + '</td>' +
           '<td data-label="Documents">' + renderDocCount(item) + '</td>' +
           '<td data-label="Status"><div class="status-line">' + statusPill(item.processingStatus) + '</div><span class="cell-secondary">' +
@@ -4414,7 +4419,7 @@ const html = String.raw`<!doctype html>
         '</tr></thead><tbody>' +
         state.drafts.map(item => '<tr data-open-draft="' + escapeHtml(item.draftId) + '">' +
           '<td data-label="Received"><span class="cell-secondary">' + escapeHtml(fmtDate(item.receivedAt)) + '</span></td>' +
-          '<td data-label="Case"><span class="draft-case">' + escapeHtml(item.caseNumber || 'Unassigned') + '</span>' +
+          '<td data-label="Case"><span class="draft-case">' + escapeHtml(item.caseNumber || item.packageLabel || 'Unassigned') + '</span>' +
             '<span class="cell-secondary">' + escapeHtml(item.subject || '(no subject)') + '</span></td>' +
           '<td data-label="Parties"><span class="draft-parties">' + escapeHtml(
             [item.plaintiff, item.defendant].filter(Boolean).join(' v. ') ||
@@ -4546,6 +4551,7 @@ const html = String.raw`<!doctype html>
       const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
       if (!detail.caseDraft) throw new Error('Draft data is not available');
       state.selectedDraftId = draftId;
+      state.draftMoveTargets = {};
       state.draftSection = 'review';
       state.draftDetail = detail;
       state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
@@ -4636,10 +4642,10 @@ const html = String.raw`<!doctype html>
       }
       const data = draft.editableData || {};
       const caseNumber = data.caseNumber || data.newCaseNumber ||
-        data.temporaryCaseNumber || data.caseTitle || 'Unassigned draft';
+        data.temporaryCaseNumber || data.caseTitle || JSON.parse(draft.normalizedDataJson || '{}').intake?.packageLabel || 'Unassigned draft';
       document.getElementById('draftWorkspaceCase').textContent = caseNumber;
       document.getElementById('draftWorkspaceSubject').textContent =
-        detail.email.subject || '(no subject)';
+        [JSON.parse(draft.normalizedDataJson || '{}').intake?.packageLabel, detail.email.subject || '(no subject)'].filter(Boolean).join(' · ');
       document.getElementById('draftWorkspaceStatuses').innerHTML =
         statusPill(draft.status);
       document.getElementById('draftApproveBtn').innerHTML = icon('check-check') +
@@ -5000,7 +5006,12 @@ const html = String.raw`<!doctype html>
           'Automation: Unsubmitted only. This app will not pay or submit to court.' +
         (!config.ready && config.issues && config.issues.length
           ? '<br>' + escapeHtml(config.issues.join(' '))
-          : '') + '</span></div>';
+          : '') + '</span></div>' + (state.draftDetail?.readyNotification ?
+          '<p class="cell-secondary">' + icon('mail') + 'Ready notification: ' +
+          escapeHtml(statusLabel(state.draftDetail.readyNotification.status)) +
+          (state.draftDetail.readyNotification.lastError ? ' · ' + escapeHtml(state.draftDetail.readyNotification.lastError) : '') +
+          (['failed','uncertain'].includes(state.draftDetail.readyNotification.status) ?
+            ' <button type="button" data-retry-ready-email="' + escapeHtml(state.selectedDraftId) + '">' + icon('mail') + 'Retry notification</button>' : '') + '</p>' : '');
       const latest = jobs[0];
       const outcome = latest?.status === 'prepared' ? latest.checkout?.outcome : null;
       const checkout = latest?.status === 'prepared' ? latest.checkout : null;
@@ -5609,6 +5620,10 @@ const html = String.raw`<!doctype html>
       document.querySelectorAll(
         '#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea',
       ).forEach(input => {
+        if (input.hasAttribute('data-move-target')) {
+          input.addEventListener('change', () => { state.draftMoveTargets[input.dataset.moveTarget] = input.value; });
+          return;
+        }
         input.addEventListener('input', () => setDraftDirty(true));
         input.addEventListener('change', () => setDraftDirty(true));
       });
@@ -6002,6 +6017,16 @@ const html = String.raw`<!doctype html>
               .map(option => '<option value="' + option.value + '"' + (supportingKind === option.value ? ' selected' : '') +
                 '>' + option.label + '</option>').join('') +
           '</select></label>' : '') +
+        (supportingDocument && (state.draftDetail?.caseDrafts || []).length > 1 ?
+          '<label class="draft-field"><span class="draft-field-label">Move supporting PDF to case</span>' +
+          '<select data-move-target="' + escapeHtml(document.id) + '"><option value="">Choose case from this email</option>' +
+          state.draftDetail.caseDrafts.filter(item => item.id !== state.selectedDraftId &&
+            !['queued','running','prepared','succeeded','reconciliation_required'].includes(item.filingStatus) &&
+            !['filing_in_progress','filing_reconciliation','filing_prepared','filed_successfully','archived','rejected'].includes(item.status))
+            .map(item => '<option value="' + escapeHtml(item.id) + '"' +
+              (state.draftMoveTargets[document.id] === item.id ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>').join('') +
+          '</select><button type="button" data-move-supporting="' + escapeHtml(document.id) + '">' +
+          icon('arrow-right-left') + 'Move PDF</button></label>' : '') +
       '</div></details>';
     }
 
@@ -6792,6 +6817,12 @@ const html = String.raw`<!doctype html>
           (email.processingError ? '<div class="error-callout">' + icon('triangle-alert') + '<div>' + escapeHtml(email.processingError) + '</div></div>' : '') +
           (email.nextRetryAt ? '<div class="detail-meta">' + icon('clock') + 'Inbox retry: ' + escapeHtml(fmtDate(email.nextRetryAt)) + '</div>' : '') +
         '</div>' +
+        ((detail.caseDrafts || []).length > 1 ? '<div class="detail-section"><div class="detail-section-title">' +
+          icon('folders') + 'Cases in this email</div>' + detail.caseDrafts.map(item =>
+          '<div class="doc"><div class="doc-title"><b>' + escapeHtml(item.label) + '</b>' + statusPill(item.status) + '</div>' +
+          '<span class="cell-secondary">' + escapeHtml(item.documentCount) + ' documents</span>' +
+          '<button type="button" data-open-detail-draft="' + escapeHtml(item.id) + '">' + icon('panel-right-open') + 'Open editor</button></div>'
+          ).join('') + '</div>' : '') +
         (draft ? '<div class="detail-section">' +
           '<div class="detail-section-title"><span>' + icon('file-text') + 'Draft</span></div>' +
           '<div class="draft-status-grid">' +
@@ -7647,7 +7678,45 @@ const html = String.raw`<!doctype html>
     document.getElementById('clearMappingBtn').addEventListener('click', clearMappingForm);
 
     renderIcons();
-    loadData().catch(showQueueError);
+    loadData().then(async () => {
+      const draft = new URLSearchParams(window.location.search).get('draft');
+      if (draft && /^[a-f0-9-]{36}$/i.test(draft)) { setView('drafts'); await openDraft(draft); }
+    }).catch(showQueueError);
+    document.addEventListener('click', async event => {
+      const retryMail = event.target.closest('[data-retry-ready-email]');
+      if (retryMail) {
+        if (!confirm('Check the recipient inbox and Sent items first. Confirm this ready-package email was not delivered before retrying.')) return;
+        retryMail.disabled = true;
+        try {
+          await api('/api/drafts/' + encodeURIComponent(retryMail.dataset.retryReadyEmail) + '/ready-notification/retry', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmNotDelivered: true }),
+          });
+          await refreshDraftFilingState();
+          showToast('Ready notification queued. The MiFILE package is unchanged.', 'success');
+        } catch (error) { showDraftError(error); }
+        finally { retryMail.disabled = false; }
+        return;
+      }
+      const button = event.target.closest('[data-move-supporting]');
+      if (!button || state.draftMutationBusy) return;
+      const id = button.dataset.moveSupporting;
+      const target = document.querySelector('[data-move-target="' + id + '"]')?.value;
+      if (!target) { showToast('Choose the destination case first.', 'error'); return; }
+      try {
+        if (state.draftDirty) await saveDraft(true);
+        const source = state.selectedDraftId;
+        const pdf = state.draftDetail.documents.find(item => item.id === id);
+        if (!pdf || !confirm('Move this supporting PDF to the selected case? Both packages will require review. No OneDrive file is deleted.')) return;
+        state.draftMutationBusy = true;
+        const updated = await api('/api/drafts/' + encodeURIComponent(source) + '/documents/' + encodeURIComponent(id) + '/move', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targetDraftId: target, sourceVersion: pdf.sourceVersion }),
+        });
+        if (state.selectedDraftId === source) state.draftDetail = updated;
+        showToast('PDF moved. Review both packages before preparation.', 'success');
+      } catch (error) { showDraftError(error); }
+      finally { state.draftMutationBusy = false; if (state.selectedDraftId) renderDraftWorkspace(); }
+    });
     document.getElementById('signOutBtn').addEventListener('click', async () => {
       if (state.draftDirty && !confirm('Discard unsaved changes and sign out?')) return;
       try {
@@ -7749,6 +7818,8 @@ export function createAdminServer(
                 sendJson(res, 200, {
                     ok: true,
                     buildId: ADMIN_BUILD_ID,
+                    intake: { multipleCasesPerEmail: true },
+                    draftNotifications: { enabled: draftNotificationConfig().enabled, configured: draftNotificationConfig().ready },
                     mifile: {
                         accountEnvironment: mifileConfig.accountEnvironment,
                         preparationMode: mifileConfig.preparationMode,
@@ -7813,6 +7884,25 @@ export function createAdminServer(
                 return;
             }
 
+            const retryReadyMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/ready-notification\/retry$/);
+            if (req.method === 'POST' && retryReadyMatch) {
+                try {
+                    const input = JSON.parse((await readRequestBuffer(req, 1024)).toString('utf8'));
+                    db.draftNotifications().retry(decodeURIComponent(retryReadyMatch[1]), input.confirmNotDelivered === true);
+                    sendJson(res, 200, { queued: true });
+                } catch (error) { sendJson(res, 409, { error: error instanceof Error ? error.message : 'The notification could not be queued' }); }
+                return;
+            }
+            const moveDocumentMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/documents\/([^/]+)\/move$/);
+            if (req.method === 'POST' && moveDocumentMatch) {
+                try {
+                    const input = JSON.parse((await readRequestBuffer(req, 8192)).toString('utf8'));
+                    if (typeof input.targetDraftId !== 'string' || typeof input.sourceVersion !== 'string') throw new Error('Select a destination and refresh the source PDF.');
+                    sendJson(res, 200, db.moveSupportingDocument(decodeURIComponent(moveDocumentMatch[1]),
+                        decodeURIComponent(moveDocumentMatch[2]), input.targetDraftId, input.sourceVersion));
+                } catch (error) { sendJson(res, 409, { error: error instanceof Error ? error.message : 'The PDF could not be moved' }); }
+                return;
+            }
             if (req.method === 'GET' && url.pathname === '/api/mifile-config') {
                 sendJson(res, 200, getMiFileRuntimeConfig());
                 return;
@@ -7822,6 +7912,7 @@ export function createAdminServer(
                 const account = accountSettingsView();
                 sendJson(res, 200, {
                     intake: getFilingIntakeConfig(),
+                    notifications: { ...draftNotificationConfig(), deliveries: db.draftNotifications().summary() },
                     account: { ...account, editable: account.editable && hasAdminCredentials() },
                     microsoft: microsoftSettings(),
                 });

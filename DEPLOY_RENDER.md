@@ -31,6 +31,8 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
    Required secrets: `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`, `USER_EMAIL`, `NOTIFY_TO_EMAIL`, `SENDER_USER_ID`, `ONEDRIVE_ROOT_SHARE_URL`, `MIFILE_USER`, `MIFILE_PASSWORD`, `TWO_CAPTCHA_API_KEY`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD`. `TRUECERTIFY_HEADLESS=true` and `TRUECERTIFY_DEBUG_DIR=/var/data/captcha_debug` are configured by the Blueprint.
 
+   Prepared-package notifications reuse `NOTIFY_TO_EMAIL` and `SENDER_USER_ID`. Optionally override the recipient with `DRAFT_READY_NOTIFY_EMAIL`; disable with `DRAFT_READY_NOTIFICATIONS_ENABLED=false`. Render's `RENDER_EXTERNAL_URL` supplies the authenticated Draft link. Outside Render set `ADMIN_PUBLIC_URL` to an HTTPS origin. Settings > Email intake and `/healthz` indicate whether sending is configured; no historical notification backfill runs on deployment.
+
    MiFILE preparation is hard-limited to **History -> Unsubmitted**. There is no payment or final court-submission action in the worker.
 
 5. Leave `WORKER_ENABLED=false` for the first deploy. Open `https://<service>.onrender.com/`, authenticate with `ADMIN_USERNAME` and `ADMIN_PASSWORD`, and verify `https://<service>.onrender.com/healthz` returns `{"ok":true}`.

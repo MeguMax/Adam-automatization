@@ -14,6 +14,9 @@ import { filingPreparationProgress, type FilingPreparationProgress } from './fil
 import { CheckoutStore } from './checkoutStore';
 import {SubmissionStore} from './mifileSubmission';
 import { migrateBundleActivity } from './mifileBundleSafety';
+import { splitFilingIntake } from './filingIntake';
+import { DraftNotificationStore } from './draftNotifications';
+import { matchesSupportingCase } from './batchCaseMatching';
 import type { CheckoutAccount } from './mifileCheckout';
 import {
     ComplaintExtractionResult,
@@ -204,6 +207,7 @@ export interface PlaintiffFilenameMappingState {
 export interface QueueItem {
     emailId: string;
     caseDraftId: string | null;
+    draftCount: number;
     sender: string | null;
     subject: string | null;
     receivedAt: string | null;
@@ -264,6 +268,7 @@ export interface DraftListItem {
     draftId: string;
     emailId: string;
     subject: string | null;
+    packageLabel?: string | null;
     sender: string | null;
     receivedAt: string | null;
     caseNumber: string | null;
@@ -564,6 +569,8 @@ export interface FilingJobView {
 }
 
 export interface EmailDetail {
+    readyNotification?: unknown;
+    caseDrafts: Array<{ id: string; label: string; status: string; filingStatus: string; validationStatus: string; documentCount: number }>;
     email: {
         id: string;
         externalMessageId: string;
@@ -2635,11 +2642,29 @@ const migrations: Migration[] = [
             actor TEXT NOT NULL,attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count IN (0,1)),error_message TEXT,result_json TEXT
         );`),
     },
+    {
+        version: 34, name: 'email_case_packages',
+        up: db => db.exec(`ALTER TABLE case_drafts ADD COLUMN intake_package_key TEXT;
+            CREATE UNIQUE INDEX idx_intake_package_key ON case_drafts(email_id, intake_package_key)
+            WHERE intake_package_key IS NOT NULL;`),
+    },
+    {
+        version: 35, name: 'prepared_draft_email_outbox',
+        up: db => db.exec(`CREATE TABLE draft_notifications (
+            id TEXT PRIMARY KEY, case_draft_id TEXT NOT NULL REFERENCES case_drafts(id) ON DELETE CASCADE,
+            filing_job_id TEXT NOT NULL UNIQUE REFERENCES filing_jobs(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','uncertain')),
+            payload_json TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+            last_error TEXT, sent_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        ); CREATE INDEX idx_draft_notifications_due ON draft_notifications(status,next_attempt_at);`),
+    },
 ];
 
 export class WorkflowDatabase {
     private db: DatabaseSync;
     private readonly databasePath: string;
+
+    draftNotifications(): DraftNotificationStore { return new DraftNotificationStore(this.db); }
 
     constructor(dbPath = process.env.WORKFLOW_DB_PATH || DEFAULT_WORKFLOW_DB_PATH) {
         this.databasePath = path.resolve(dbPath);
@@ -2775,7 +2800,7 @@ export class WorkflowDatabase {
               AND COALESCE(json_extract(c.normalized_data_json, '$.intake.manual'), 0) = 0
               AND COALESCE(json_extract(c.normalized_data_json, '$.manualDocumentEdits'), 0) = 0
               AND json_extract(c.normalized_data_json, '$.supportingPolicyVersion') = 2
-              AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status = 'processed')
+              AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status IN ('processed','partial_failure','failed'))
               AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = c.id)
             ORDER BY c.created_at LIMIT ?`).all(CURRENT_COMPLAINT_EXTRACTOR_VERSION, limit) as Array<{id:string}>;
         let queued = 0;
@@ -2999,6 +3024,82 @@ export class WorkflowDatabase {
             throw new Error('Wait for the current document processing to finish before changing this PDF');
         }
         return { detail, document };
+    }
+
+    reconcileBatchSupportingDocuments(emailId: string): number {
+        const siblings = this.getEmailDetail(emailId)?.caseDrafts || [];
+        let matched = 0;
+        for (const group of siblings) {
+            const detail = this.getDraftDetail(group.id)!;
+            if (detail.caseDraft?.filingStatus !== 'not_started' || detail.documents.some(document => document.packageRole === 'complaint')) continue;
+            for (const document of detail.documents) {
+                const candidates = siblings.filter(target => target.id !== group.id && this.canMatchSupportingCase(detail, document,
+                    this.getDraftDetail(target.id)!));
+                if (candidates.length !== 1) continue;
+                try {
+                    this.moveSupportingDocument(group.id, document.id, candidates[0].id, document.sourceVersion!, true);
+                    matched++;
+                } catch (error) { this.recordIntakeProcessingFailure(group.id, error); }
+            }
+        }
+        return matched;
+    }
+
+    private canMatchSupportingCase(source: EmailDetail, document: DocumentRecordView, target: EmailDetail): boolean {
+        const origin = this.safeJson(source.caseDraft?.normalizedDataJson || null);
+        const destination = this.safeJson(target.caseDraft?.normalizedDataJson || null);
+        const extraction = target.caseDraft?.complaintExtraction;
+        const identity = document.recognition?.caseIdentity;
+        return Boolean(source.email.id === target.email.id && source.caseDraft?.filingStatus === 'not_started' &&
+            !['archived','rejected'].includes(source.caseDraft?.status || '') &&
+            target.caseDraft?.filingStatus === 'not_started' && !['archived','rejected'].includes(target.caseDraft?.status || '') &&
+            origin?.intake?.packageKey && destination?.intake?.packageKey &&
+            !origin.manualDocumentEdits && !destination.manualDocumentEdits &&
+            !(origin.manualFilingFields?.length || origin.manualFilingPaths?.length || origin.manualEditableFields?.length ||
+                destination.manualFilingFields?.length || destination.manualFilingPaths?.length || destination.manualEditableFields?.length) &&
+            !source.documents.some(item => item.packageRole === 'complaint') && document.status === 'uploaded' &&
+            document.packageRole === 'ancillary' && !document.formTemplate && identity &&
+            identity.sourceHash === document.recognition?.contentHash && identity.sourceHash === document.supportingEvidence?.contentHash &&
+            extraction?.extractionMethod === 'form_fields' && extraction.fieldConfidence.defendants === 'high' &&
+            extraction.fieldConfidence.plaintiff === 'high' &&
+            !extraction.warnings.some(warning => warning.code === 'source_conflict') && matchesSupportingCase(identity, extraction.data));
+    }
+
+    moveSupportingDocument(draftId: string, documentId: string, targetDraftId: string, sourceVersion: string, automatic = false): EmailDetail {
+        if (draftId === targetDraftId) throw new Error('Select a different case from this email');
+        this.runInTransaction(() => {
+            const context = automatic ? (() => {
+                const detail = this.assertEditableIntake(draftId);
+                return { detail, document: detail.documents.find(item => item.id === documentId)! };
+            })() : this.getDraftDocumentEditContext(documentId);
+            const { detail, document } = context;
+            const target = this.assertEditableIntake(targetDraftId);
+            if (detail.caseDraft!.id !== draftId || detail.email.id !== target.email.id || detail.caseDrafts.length < 2) {
+                throw new Error('A supporting PDF can only move between cases from the same email');
+            }
+            if (!document || document.isPrimary || document.formTemplate || document.packageRole !== 'ancillary' || document.sourceVersion !== sourceVersion) {
+                throw new Error('Only a current supporting PDF can be moved. Refresh the Draft before trying again.');
+            }
+            if (automatic && !this.canMatchSupportingCase(detail, document, target)) throw new Error('Automatic case matching no longer agrees with the source PDFs');
+            const timestamp = nowIso();
+            this.db.prepare(`UPDATE document_records SET case_draft_id=?,filing_type='Other',filing_type_source='suggested',
+                filing_relation='unknown',filing_relation_source='suggested',required_for_filing=1,
+                metadata_json=json_remove(COALESCE(metadata_json,'{}'),'$.courtRule'),updated_at=? WHERE id=? AND case_draft_id=?`)
+                .run(targetDraftId, timestamp, documentId, draftId);
+            for (const id of [draftId, targetDraftId]) {
+                this.db.prepare(`UPDATE case_drafts SET reviewed_at=NULL,status='needs_review',validation_status='unknown',
+                    normalized_data_json=${automatic ? 'normalized_data_json' : "json_set(normalized_data_json,'$.manualDocumentEdits',json('true'))"},updated_at=? WHERE id=?`)
+                    .run(timestamp, id);
+                this.insertAuditLog('case_draft', id, automatic ? 'batch_document_matched_by_pdf_fields' : 'batch_document_moved', { documentId, fromDraftId: draftId, toDraftId: targetDraftId,
+                    matchingEvidence: automatic ? { method: 'exact_dc100a_parties_and_premises', sourceHash: document.recognition!.caseIdentity!.sourceHash } : null,
+                    originalFilename: document.originalFilename, oneDriveFilePreserved: true });
+            }
+            const remaining = this.db.prepare('SELECT COUNT(*) AS count FROM document_records WHERE case_draft_id=? AND is_active=1')
+                .get(draftId) as { count: number };
+            if (!remaining.count) this.db.prepare("UPDATE case_drafts SET status='archived' WHERE id=?").run(draftId);
+        });
+        this.applyCourtFilingRule(targetDraftId);
+        return this.refreshCaseDraftValidation(draftId);
     }
 
     removeDraftDocument(draftId: string, documentId: string): EmailDetail {
@@ -3905,7 +4006,7 @@ export class WorkflowDatabase {
         });
     }
 
-    refreshEmailAfterDocumentRetries(emailId: string, caseDraftId: string | null): void {
+    refreshEmailAfterDocumentRetries(emailId: string, caseDraftId: string | null = null): void {
         const totals = this.db
             .prepare(`
                 SELECT
@@ -3935,7 +4036,8 @@ export class WorkflowDatabase {
                 `${outstanding} document(s) still require download retry`,
                 status,
             );
-            if (caseDraftId) {
+            if (caseDraftId && this.getDraftDetail(caseDraftId)?.documents.some(document =>
+                ['pending', 'failed', 'retry_queued', 'retrying'].includes(document.status))) {
                 this.setCaseDraftStatus(caseDraftId, 'needs_review', 'warnings', 'not_started');
             }
             return;
@@ -4378,16 +4480,16 @@ export class WorkflowDatabase {
         };
     }
 
-    getEmailPlaintiffFilenameMappingState(emailId: string): PlaintiffFilenameMappingState {
+    getEmailPlaintiffFilenameMappingState(emailId: string, caseDraftId?: string): PlaintiffFilenameMappingState {
         const caseDraft = this.db
             .prepare(`
                 SELECT normalized_data_json
                 FROM case_drafts
-                WHERE email_id = ?
+                WHERE email_id = ? AND (? IS NULL OR id = ?)
                 ORDER BY created_at DESC
                 LIMIT 1
             `)
-            .get(emailId) as { normalized_data_json: string | null } | undefined;
+            .get(emailId, caseDraftId || null, caseDraftId || null) as { normalized_data_json: string | null } | undefined;
         const fullName = extractPlaintiffName(this.safeJson(caseDraft?.normalized_data_json));
         const mapping = this.getPlaintiffMappingStatus(fullName);
         const shortName = mapping.status === 'mapped' ? mapping.shortName : null;
@@ -4397,11 +4499,12 @@ export class WorkflowDatabase {
                 SELECT current_filename, one_drive_url
                 FROM document_records
                 WHERE email_id = ?
+                  AND (? IS NULL OR case_draft_id = ?)
                   AND status = 'uploaded'
                   AND current_filename IS NOT NULL
                   AND one_drive_url IS NOT NULL
             `)
-            .all(emailId) as Array<{ current_filename: string; one_drive_url: string }>;
+            .all(emailId, caseDraftId || null, caseDraftId || null) as Array<{ current_filename: string; one_drive_url: string }>;
 
         let appliedDocumentCount = 0;
         let needsApplicationCount = 0;
@@ -4712,7 +4815,7 @@ export class WorkflowDatabase {
                 e.subject LIKE ? COLLATE NOCASE
                 OR e.sender LIKE ? COLLATE NOCASE
                 OR e.processing_error LIKE ? COLLATE NOCASE
-                OR c.normalized_data_json LIKE ? COLLATE NOCASE
+                OR EXISTS (SELECT 1 FROM case_drafts searched WHERE searched.email_id=e.id AND searched.normalized_data_json LIKE ? COLLATE NOCASE)
             )`);
             parameters.push(pattern, pattern, pattern, pattern);
         }
@@ -4732,7 +4835,7 @@ export class WorkflowDatabase {
             .prepare(`
                 SELECT COUNT(DISTINCT e.id) AS total
                 FROM email_records e
-                LEFT JOIN case_drafts c ON c.email_id = e.id
+                LEFT JOIN case_drafts c ON c.id=(SELECT id FROM case_drafts WHERE email_id=e.id ORDER BY created_at,id LIMIT 1)
                 WHERE ${whereSql}
             `)
             .get(...parameters) as { total: number };
@@ -4746,6 +4849,7 @@ export class WorkflowDatabase {
                 SELECT
                     e.id AS email_id,
                     c.id AS case_draft_id,
+                    (SELECT COUNT(*) FROM case_drafts counted WHERE counted.email_id=e.id) AS draft_count,
                     e.sender,
                     e.subject,
                     e.received_at,
@@ -4767,8 +4871,8 @@ export class WorkflowDatabase {
                     SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) AS failed_document_count,
                     SUM(CASE WHEN d.status = 'not_downloadable' THEN 1 ELSE 0 END) AS not_downloadable_document_count
                 FROM email_records e
-                LEFT JOIN case_drafts c ON c.email_id = e.id
-                LEFT JOIN document_records d ON d.email_id = e.id
+                LEFT JOIN case_drafts c ON c.id=(SELECT id FROM case_drafts WHERE email_id=e.id ORDER BY created_at,id LIMIT 1)
+                LEFT JOIN document_records d ON d.email_id = e.id AND d.is_active=1
                 WHERE ${whereSql}
                 GROUP BY e.id, c.id
                 ORDER BY
@@ -4785,12 +4889,13 @@ export class WorkflowDatabase {
             .all(...parameters, pageSize, offset) as any[];
 
         const items = rows.map(row => {
-            const normalized = this.safeJson(row.normalized_data_json);
+            const normalized = Number(row.draft_count) > 1 ? null : this.safeJson(row.normalized_data_json);
             const plaintiffName = extractPlaintiffName(normalized);
             const plaintiffMapping = this.getPlaintiffMappingStatus(plaintiffName);
             return {
                 emailId: row.email_id,
-                caseDraftId: row.case_draft_id,
+                caseDraftId: Number(row.draft_count) > 1 ? null : row.case_draft_id,
+                draftCount: Number(row.draft_count),
                 sender: row.sender,
                 subject: row.subject,
                 receivedAt: row.received_at,
@@ -4810,10 +4915,10 @@ export class WorkflowDatabase {
                     ? plaintiffMapping.shortName
                     : null,
                 plaintiffMappingStatus: plaintiffMapping.status,
-                caseNumber: normalized?.caseNumber ?? null,
-                draftStatus: row.draft_status,
-                validationStatus: row.validation_status,
-                filingStatus: row.filing_status,
+                caseNumber: Number(row.draft_count) > 1 ? null : normalized?.caseNumber ?? null,
+                draftStatus: Number(row.draft_count) > 1 ? null : row.draft_status,
+                validationStatus: Number(row.draft_count) > 1 ? null : row.validation_status,
+                filingStatus: Number(row.draft_count) > 1 ? null : row.filing_status,
                 workflowMode: row.workflow_mode,
                 updatedAt: row.updated_at,
             };
@@ -4927,6 +5032,7 @@ export class WorkflowDatabase {
                     draftId: row.draft_id,
                     emailId: row.email_id,
                     subject: row.subject,
+                    packageLabel: normalized?.intake?.packageLabel || null,
                     sender: row.sender,
                     receivedAt: row.received_at,
                     caseNumber:
@@ -5196,7 +5302,7 @@ export class WorkflowDatabase {
         return totals;
     }
 
-    getEmailDetail(emailId: string): EmailDetail | null {
+    getEmailDetail(emailId: string, caseDraftId?: string): EmailDetail | null {
         const email = this.db
             .prepare(`
                 SELECT
@@ -5221,6 +5327,11 @@ export class WorkflowDatabase {
 
         if (!email) return null;
 
+        const siblings = this.db.prepare(`SELECT c.id, c.status, c.filing_status, c.validation_status, c.normalized_data_json,
+            (SELECT COUNT(*) FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1) AS document_count
+            FROM case_drafts c WHERE c.email_id=? ORDER BY c.created_at,c.id`).all(emailId) as any[];
+        const selectedId = caseDraftId || (siblings.length === 1 ? siblings[0].id : null);
+        if (caseDraftId && !siblings.some(item => item.id === caseDraftId)) return null;
         const caseDraft = this.db
             .prepare(`
                 SELECT
@@ -5237,11 +5348,11 @@ export class WorkflowDatabase {
                     created_at,
                     updated_at
                 FROM case_drafts
-                WHERE email_id = ?
+                WHERE email_id = ? AND id = ?
                 ORDER BY created_at DESC
                 LIMIT 1
             `)
-            .get(emailId) as any | undefined;
+            .get(emailId, selectedId) as any | undefined;
 
         const documents = this.db
             .prepare(`
@@ -5276,9 +5387,10 @@ export class WorkflowDatabase {
                 FROM document_records
                 WHERE email_id = ?
                   AND is_active = 1
+                  AND (? IS NULL OR case_draft_id = ?)
                 ORDER BY created_at ASC
             `)
-            .all(emailId) as any[];
+            .all(emailId, caseDraftId || null, caseDraftId || null) as any[];
 
         const auditLogs = this.db
             .prepare(`
@@ -5295,21 +5407,22 @@ export class WorkflowDatabase {
                 WHERE entity_id IN (
                     SELECT id FROM email_records WHERE id = ?
                     UNION
-                    SELECT id FROM case_drafts WHERE email_id = ?
+                    SELECT id FROM case_drafts WHERE email_id = ? AND (? IS NULL OR id = ?)
                     UNION
-                    SELECT id FROM document_records WHERE email_id = ?
+                    SELECT id FROM document_records WHERE email_id = ? AND (? IS NULL OR case_draft_id = ?)
                 )
                 ORDER BY created_at DESC
                 LIMIT 100
             `)
-            .all(emailId, emailId, emailId) as any[];
+            .all(emailId, emailId, caseDraftId || null, caseDraftId || null,
+                emailId, caseDraftId || null, caseDraftId || null) as any[];
 
         const plaintiffMapping = this.getPlaintiffMappingStatus(
             caseDraft
                 ? extractPlaintiffName(this.safeJson(caseDraft.normalized_data_json))
                 : null,
         );
-        const plaintiffFilenameMapping = this.getEmailPlaintiffFilenameMappingState(emailId);
+        const plaintiffFilenameMapping = this.getEmailPlaintiffFilenameMappingState(emailId, selectedId || undefined);
         const extractedDraftData = caseDraft
             ? this.safeJson(caseDraft.extracted_data_json)
             : null;
@@ -5418,6 +5531,7 @@ export class WorkflowDatabase {
             ? [
                 ...validateDraftData(normalizedDraftData),
                 ...this.intakeValidationIssues(normalizedDraftData, documentViews),
+                ...this.batchAssignmentIssues(emailId, caseDraft.id, normalizedDraftData),
                 ...(manualPackage
                     ? validateManualDraftDocuments(documentViews)
                     : [
@@ -5453,6 +5567,10 @@ export class WorkflowDatabase {
             : [];
 
         return {
+            caseDrafts: siblings.map(item => ({ id: item.id, status: item.status, filingStatus: item.filing_status, validationStatus: item.validation_status,
+                documentCount: Number(item.document_count), label: this.safeJson(item.normalized_data_json)?.intake?.packageLabel ||
+                    this.safeJson(item.normalized_data_json)?.caseTitle || 'Case Draft' })),
+            readyNotification: selectedId ? this.draftNotifications().forDraft(selectedId) : null,
             email: {
                 id: email.id,
                 externalMessageId: email.external_message_id,
@@ -5519,7 +5637,7 @@ export class WorkflowDatabase {
         const row = this.db
             .prepare('SELECT email_id FROM case_drafts WHERE id = ?')
             .get(caseDraftId) as { email_id: string } | undefined;
-        return row ? this.getEmailDetail(row.email_id) : null;
+        return row ? this.getEmailDetail(row.email_id, caseDraftId) : null;
     }
 
     buildFilingPayload(caseDraftId: string): FilingPayload {
@@ -5908,6 +6026,11 @@ export class WorkflowDatabase {
             );
             if (input.status === 'prepared' && input.readinessAccount) {
                 this.checkout().startAutomaticReadiness(input.filingJobId,input.readinessAccount);
+            }
+            if (input.status === 'prepared') {
+                const completed = this.getFilingJob(input.filingJobId)!;
+                const draftData = this.safeJson(this.getDraftDetail(existing.caseDraftId)?.caseDraft?.normalizedDataJson || null);
+                this.draftNotifications().enqueue(completed, draftData?.intake?.packageLabel || null);
             }
             this.insertAuditLog('filing_job', input.filingJobId, `filing_job_${input.status}`, {
                 caseDraftId: existing.caseDraftId,
@@ -6324,7 +6447,7 @@ export class WorkflowDatabase {
             }
         });
 
-        const detailAfterUpdate = this.getEmailDetail(existing.email_id);
+        const detailAfterUpdate = this.getDraftDetail(caseDraftId);
         if (!detailAfterUpdate?.caseDraft) {
             throw new Error('Draft email record not found after update');
         }
@@ -6376,7 +6499,7 @@ export class WorkflowDatabase {
             },
         );
 
-        const detail = this.getEmailDetail(existing.email_id);
+        const detail = this.getDraftDetail(caseDraftId);
         if (!detail) throw new Error('Draft email record not found');
         return detail;
     }
@@ -6724,7 +6847,7 @@ export class WorkflowDatabase {
             warnings: extraction.warnings.map(warning => warning.code),
         });
 
-        const detail = this.getEmailDetail(existing.email_id);
+        const detail = this.getDraftDetail(caseDraftId);
         if (!detail) throw new Error('Draft email record not found after Complaint extraction');
         return detail;
     }
@@ -6782,6 +6905,24 @@ export class WorkflowDatabase {
         return this.getDraftDetail(caseDraftId) ?? detail;
     }
 
+    private batchAssignmentIssues(emailId: string, draftId: string, data: any): DraftValidationIssue[] {
+        const key = data?.intake?.packageKey;
+        if (!key || key === '__unassigned__') return [];
+        const surname = key.slice(0, key.lastIndexOf(' '));
+        const siblings = this.db.prepare(`SELECT c.normalized_data_json FROM case_drafts c WHERE c.email_id=? AND c.id!=?
+            AND c.status NOT IN ('archived','rejected')
+            AND EXISTS (SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1)
+            AND NOT EXISTS (SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1 AND lower(d.document_type) LIKE '%complaint%')`)
+            .all(emailId, draftId) as Array<{ normalized_data_json: string }>;
+        return siblings.flatMap(row => {
+            const intake = this.safeJson(row.normalized_data_json)?.intake;
+            if (!intake?.packageKey || (intake.packageKey !== '__unassigned__' &&
+                intake.packageKey.slice(0, intake.packageKey.lastIndexOf(' ')) !== surname)) return [];
+            return [{ field: 'intake', severity: 'warning' as const,
+                message: `Supporting files in ${intake.packageLabel || intake.packageKey} still need a case assignment. Review grouping before preparing this case.` }];
+        });
+    }
+
     private intakeValidationIssues(data: unknown, documents: DocumentRecordView[]): DraftValidationIssue[] {
         const root = data as Record<string, any> | null;
         const issues: DraftValidationIssue[] = [];
@@ -6797,7 +6938,33 @@ export class WorkflowDatabase {
             field: 'complaintExtraction', severity: 'error',
             message: `Complaint extraction failed: ${root.complaintExtractionError}. Automatic retry is scheduled when available; a corrected PDF can also be uploaded.`,
         });
+        if (root?.intake?.processingError) issues.push({ field: 'intake', severity: 'error',
+            message: `Case package processing could not finish: ${root.intake.processingError}. Reprocess this email after correcting the issue.` });
+        if (root?.intake?.packageKey && root.intake.packageKey !== '__unassigned__' && root.complaintExtraction) {
+            const key = String(root.intake.packageKey);
+            const surname = key.slice(0, key.lastIndexOf(' '));
+            const initial = key.slice(-1);
+            const normalize = (value: unknown) => String(value || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+            const matches = draftFilingData(root).defendants.some(party => normalize(party.lastName) === normalize(surname) &&
+                normalize(party.firstName).startsWith(initial));
+            if (!matches) issues.push({ field: 'filingData.defendants', severity: 'warning',
+                message: `The attachment prefix ${root.intake.packageLabel || key} does not match an extracted Defendant name. Review this case grouping before preparation.` });
+        }
         return issues;
+    }
+
+    recordIntakeProcessingFailure(caseDraftId: string, error: unknown | null): void {
+        if (error === null) {
+            this.db.prepare("UPDATE case_drafts SET normalized_data_json=json_remove(normalized_data_json,'$.intake.processingError') WHERE id=?")
+                .run(caseDraftId);
+            return;
+        }
+        const message = (normalizeError(error) || 'Unknown intake processing error').slice(0, 1200);
+        this.db.prepare(`UPDATE case_drafts SET normalized_data_json=json_set(normalized_data_json,'$.intake.processingError',?),
+            status='needs_review',validation_status='failed',updated_at=? WHERE id=? AND filing_status IN ('not_started','failed')
+            AND status NOT IN ('archived','rejected')`)
+            .run(message, nowIso(), caseDraftId);
+        this.insertAuditLog('case_draft', caseDraftId, 'intake_package_processing_failed', { message });
     }
 
     recordComplaintExtractionFailure(caseDraftId: string, documentId: string, error: unknown): void {
@@ -6812,7 +6979,17 @@ export class WorkflowDatabase {
         if (result.changes) this.insertAuditLog('case_draft', caseDraftId, 'complaint_extraction_failed', { documentId, message });
     }
 
+    createCaseDrafts(emailId: string, parsed: ParsedEmailInfo): Array<{ draftId: string; parsed: ParsedEmailInfo }> {
+        const packages = parsed.sourceKind === 'new_filing_intake' ? splitFilingIntake(parsed) : [parsed];
+        // Historical one-case intakes remain pinned to their original source snapshot.
+        const legacy = this.db.prepare('SELECT id,extracted_data_json FROM case_drafts WHERE email_id=? AND intake_package_key IS NULL LIMIT 1')
+            .get(emailId) as { id: string; extracted_data_json: string } | undefined;
+        if (legacy && packages.length > 1) return [{ draftId: legacy.id, parsed: this.safeJson(legacy.extracted_data_json) || parsed }];
+        return packages.map(item => ({ draftId: this.createCaseDraft(emailId, item), parsed: item }));
+    }
+
     createCaseDraft(emailId: string, parsed: ParsedEmailInfo): string {
+        if (parsed.intake?.groups?.length) throw new Error('Use createCaseDrafts for an email containing multiple case packages');
         const parsedJson = toJson(parsed);
         this.ensurePlaintiffCandidateFromParsed(parsed);
 
@@ -6820,11 +6997,11 @@ export class WorkflowDatabase {
             .prepare(`
                 SELECT id, status, filing_status, extracted_data_json, normalized_data_json
                 FROM case_drafts
-                WHERE email_id = ?
+                WHERE email_id = ? AND intake_package_key IS ?
                 ORDER BY created_at DESC
                 LIMIT 1
             `)
-            .get(emailId) as
+            .get(emailId, parsed.intake?.packageKey || null) as
             | {
                 id: string;
                 status: CaseDraftStatus;
@@ -6835,7 +7012,7 @@ export class WorkflowDatabase {
             | undefined;
 
         if (existing) {
-            if (existing.filing_status === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived']
+            if (existing.filing_status === 'queued' || ['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived', 'rejected']
                 .includes(existing.status)) return existing.id;
             this.ensureExpectedDocuments(emailId, existing.id, parsed);
 
@@ -6931,6 +7108,7 @@ export class WorkflowDatabase {
                 INSERT INTO case_drafts (
                     id,
                     email_id,
+                    intake_package_key,
                     workflow_mode,
                     status,
                     validation_status,
@@ -6940,9 +7118,9 @@ export class WorkflowDatabase {
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, 'parsed', 'unknown', 'not_started', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, 'parsed', 'unknown', 'not_started', ?, ?, ?, ?)
             `)
-            .run(id, emailId, workflowMode, parsedJson, normalizedJson, timestamp, timestamp);
+            .run(id, emailId, parsed.intake?.packageKey || null, workflowMode, parsedJson, normalizedJson, timestamp, timestamp);
 
         this.ensureExpectedDocuments(emailId, id, parsed);
 

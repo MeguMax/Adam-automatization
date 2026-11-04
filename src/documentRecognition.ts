@@ -12,6 +12,7 @@ export type RecognizedRole = keyof typeof DOCUMENT_LABELS;
 export type SupportingDocumentKind = 'demand' | 'notice_to_quit' | 'lease' | 'deed' | 'affidavit' | 'other' | 'unknown';
 export const DOCUMENT_RECOGNITION_VERSION = 2;
 export interface DocumentRecognition {
+    caseIdentity?: import('./batchCaseMatching').SupportingCaseIdentity;
     role: RecognizedRole;
     source: 'content' | 'filename' | 'conflict' | 'unknown' | 'supplied';
     message: string;

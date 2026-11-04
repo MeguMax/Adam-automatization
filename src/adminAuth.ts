@@ -110,7 +110,8 @@ document.getElementById('loginForm').addEventListener('submit', async function(e
             body: JSON.stringify({username:document.getElementById('username').value, password:document.getElementById('password').value}) });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'Sign-in failed. Please try again.');
-        window.location.replace('/');
+        const draft = new URLSearchParams(window.location.search).get('draft');
+        window.location.replace(draft && /^[a-f0-9-]{36}$/i.test(draft) ? '/?draft=' + encodeURIComponent(draft) : '/');
     } catch (failure) { error.textContent = failure.message || 'Connection interrupted. Please try again.'; }
     finally { button.disabled = false; button.textContent = 'Sign in'; }
 });
@@ -202,7 +203,10 @@ export function createAdminAuth(now: () => number = Date.now, sessions: AdminSes
         }
         const devAccess = !hasAdminCredentials() && process.env.NODE_ENV !== 'production';
         if (!validSession && !validBasic && !devAccess) {
-            if (req.method === 'GET' && !pathname.startsWith('/api/') && !pathname.startsWith('/assets/')) redirect(res, '/login');
+            if (req.method === 'GET' && !pathname.startsWith('/api/') && !pathname.startsWith('/assets/')) {
+                const draft = new URL(req.url || '/', 'http://localhost').searchParams.get('draft');
+                redirect(res, draft && /^[a-f0-9-]{36}$/i.test(draft) ? '/login?draft=' + encodeURIComponent(draft) : '/login');
+            }
             else json(res, 401, { error: 'Please sign in again.' });
             return false;
         }

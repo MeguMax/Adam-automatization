@@ -16,6 +16,7 @@ export async function processFilingIntake(
         extract(buffer: Buffer, documentType: string | null): Promise<ComplaintExtractionResult>;
         forms?: FormUploadDependencies;
         progress?: (phase:WorkerPhase)=>void;
+        deferEmailRefresh?: boolean;
     },
 ) {
     const initial = db.getDraftDetail(draftId);
@@ -80,8 +81,15 @@ export async function processFilingIntake(
             });
         }
     }
-    if (parsed.filedDocuments.length) db.refreshEmailAfterDocumentRetries(emailId, draftId);
-    else db.markEmailProcessed(emailId);
+    if (!dependencies.deferEmailRefresh) {
+        if (parsed.filedDocuments.length) db.refreshEmailAfterDocumentRetries(emailId);
+        else db.markEmailProcessed(emailId);
+    }
     dependencies.progress?.('adding_forms');
-    return applyLibraryForms(db, draftId, dependencies.forms);
+    const current = db.getDraftDetail(draftId)!;
+    if (!parsed.intake?.packageKey || current.documents.some(document => document.packageRole === 'complaint')) {
+        await applyLibraryForms(db, draftId, dependencies.forms, { refreshEmail: !dependencies.deferEmailRefresh });
+    }
+    db.recordIntakeProcessingFailure(draftId, null);
+    return db.refreshCaseDraftValidation(draftId);
 }
