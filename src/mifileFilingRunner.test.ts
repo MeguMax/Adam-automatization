@@ -461,6 +461,37 @@ test('long and duplicate source names materialize as distinct PDF filenames with
     } finally { drive.resolveSharedDriveItem = resolve; drive.downloadDriveItemBuffer = download; }
 });
 
+test('a hung OneDrive source cannot hold the filing queue or write a late PDF', async () => {
+    const drive = require('./oneDriveClient'), resolve = drive.resolveSharedDriveItem, download = drive.downloadDriveItemBuffer;
+    let signal: AbortSignal | undefined, release!: (buffer: Buffer) => void;
+    drive.resolveSharedDriveItem = async (_url: string, current: AbortSignal) => {
+        signal = current;
+        return new Promise(resolve => {release = (buffer: Buffer) => resolve({driveId:'qa', itemId:buffer.toString()});});
+    };
+    let downloads = 0;
+    drive.downloadDriveItemBuffer = async () => {downloads++; return testPdfFixture();};
+    const job = {id:'hung-materialization', mode:'prepare', payload:{courtName:'Court',
+        filingData:{relatedCivilAction:'none',moneyJudgmentRequested:false}, documents:[filingDocument(0)]}} as FilingJobView;
+    job.payload!.completeness = evaluatePackageCompleteness('Court',job.payload!.documents,null,
+        {requirement:'none',reason:'Attorney-reviewed custom QA package without a Demand or Notice.',
+            contextHash:completenessContext('Court',job.payload!.documents)});
+    try {
+        const runner = new MiFileFilingRunner(); (runner as any).sourceReadTimeoutMs = 10;
+        await assert.rejects(runner.prepare(job), (error:any) => error.code==='SOURCE_PDF_READ_TIMEOUT' &&
+            error.checkpoint==='materialize_documents');
+        assert.equal(signal?.aborted,true);
+        assert.equal(fs.existsSync(path.join(directory,job.id,'documents')),false);
+        release(Buffer.from('late'));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(fs.existsSync(path.join(directory,job.id,'documents')),false);
+        assert.equal(downloads,0);
+        const target = path.join(directory,'next-source-after-timeout'); fs.mkdirSync(target);
+        drive.resolveSharedDriveItem = async () => ({driveId:'qa',itemId:'next'});
+        assert.equal((await (runner as any).materializeDocuments({documents:[filingDocument(0)]},target)).length,1);
+        assert.equal(downloads,1);
+    } finally {drive.resolveSharedDriveItem=resolve;drive.downloadDriveItemBuffer=download;}
+});
+
 test('old queued snapshots with unknown answers or document relations are stopped before remote access', async () => {
     const runner = new MiFileFilingRunner();
     await assert.rejects(runner.prepare({mode:'submit'} as FilingJobView),
@@ -682,6 +713,67 @@ test('persisted bundle mismatches stop for reconciliation; no missing PDF, warni
             assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
         } finally {await f.page.close();}
     }
+});
+
+test('a transient saved-bundle read retries only the exact GET and never repeats preparation', async () => {
+    const f = await savedBundlePage();
+    try {
+        const url=f.page.url(), requests: string[]=[], logs: any[]=[];
+        await f.page.route(url,route=>{
+            requests.push(route.request().method()+' '+route.request().url());
+            if(requests.length===1)return route.fulfill({status:503,body:'Temporarily unavailable'});
+            return route.fallback();
+        });
+        const runner=new MiFileFilingRunner(entry=>{logs.push(entry);});
+        (runner as any).savedReadRetryDelayMs=0;
+        await (runner as any).reopenSavedBundle(f.page,url,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA');
+        assert.deepEqual(requests,[`GET ${url}`,`GET ${url}`]);
+        assert.equal(logs.filter(entry=>entry.details?.event==='saved_bundle_read_retry').length,1);
+        assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+    } finally {await f.page.close();}
+});
+
+test('an incomplete saved-page read is bounded across three attempts and preserves reconciliation', async () => {
+    const f=await savedBundlePage();
+    try {
+        let reads=0;
+        await f.page.route(f.page.url(),route=>{reads++;return route.fulfill({body:'Still loading'});});
+        const runner=new MiFileFilingRunner();
+        (runner as any).timeoutMs=30;(runner as any).savedReadRetryDelayMs=0;
+        await assert.rejects((runner as any).reopenSavedBundle(f.page,f.page.url(),f.payload,f.receipts,
+            'qa@example.com',f.id,'TEMP-QA'), /Timeout/);
+        assert.equal(reads,3);
+    } finally {await f.page.close();}
+});
+
+test('persisted identity, PDF and connection mismatches do not trigger read retries or corrective writes', async () => {
+    for(const options of [{wrongFiler:true},{wrongAccount:true},{wrongName:true},{extraPdf:true},{wrongParent:true},{warning:true}]) {
+        const f=await savedBundlePage(options);
+        try {
+            let reads=0;
+            await f.page.route(f.page.url(),route=>{reads++;return route.fallback();});
+            const runner=new MiFileFilingRunner();(runner as any).savedReadRetryDelayMs=0;
+            await assert.rejects((runner as any).reopenSavedBundle(f.page,f.page.url(),f.payload,f.receipts,
+                'qa@example.com',f.id,'TEMP-QA'), (error:any)=>error.code==='SAVED_BUNDLE_VERIFICATION_FAILED');
+            assert.equal(reads,1);
+            assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+        } finally {await f.page.close();}
+    }
+});
+
+test('saved-bundle verification rejects a different URL and permanent access errors without another navigation', async () => {
+    const f=await savedBundlePage();
+    try {
+        let reads=0;
+        await f.page.route(f.page.url(),route=>{reads++;return route.fulfill({status:403,body:'Forbidden'});});
+        const runner=new MiFileFilingRunner();(runner as any).savedReadRetryDelayMs=0;
+        await assert.rejects((runner as any).reopenSavedBundle(f.page,'https://example.com/changed',f.payload,f.receipts,
+            'qa@example.com',f.id,'TEMP-QA'), /URL does not match/);
+        assert.equal(reads,0);
+        await assert.rejects((runner as any).reopenSavedBundle(f.page,f.page.url(),f.payload,f.receipts,
+            'qa@example.com',f.id,'TEMP-QA'), /HTTP 403/);
+        assert.equal(reads,1);
+    } finally {await f.page.close();}
 });
 
 test('unfamiliar fee quantities do not produce a guessed subtotal', async () => {

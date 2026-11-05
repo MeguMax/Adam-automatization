@@ -8,6 +8,7 @@ const {parseArgs} = require('node:util');
 const {values, positionals} = parseArgs({allowPositionals:true, options:{
     forms:{type:'string'}, output:{type:'string'}, 'expect-review':{type:'boolean',default:false},
     'expected-extraction':{type:'string'},
+    'curated-single-case':{type:'boolean',default:false},
 }});
 if (!positionals.length || !values.output) throw new Error('Use --output report.json [--forms directory] file.pdf ...');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(),'local-intake-qa-'));
@@ -24,6 +25,7 @@ const {extractComplaintPdf}=require('../dist/complaintExtractor');
 const {ensureDraftComplaintExtraction}=require('../dist/draftExtraction');
 const {saveFormPdf}=require('../dist/formLibrary');
 const {planFormImports}=require('../dist/courtForms');
+const {singleCaseFixture}=require('./verify-intake-suite.cjs');
 
 (async()=>{
     const db=new WorkflowDatabase(process.env.WORKFLOW_DB_PATH);
@@ -43,8 +45,8 @@ const {planFormImports}=require('../dist/courtForms');
         }
         const message={id:'offline-local-package',subject:'NEW LT FILING - offline local verification',
             from:{emailAddress:{address:'qa@example.com'}}};
-        const parsed=buildFilingIntake(message,[...files].map(([name,buffer],index)=>
-            ({id:String(index),name,size:buffer.length,contentType:'application/pdf'})));
+        const parsed=singleCaseFixture(buildFilingIntake(message,[...files].map(([name,buffer],index)=>
+            ({id:String(index),name,size:buffer.length,contentType:'application/pdf'}))),values['curated-single-case']);
         const email=db.registerEmail(message), draftId=db.createCaseDraft(email.id,parsed);
         const uploads=[];
         const upload=async(_key,filename,buffer)=>{
@@ -86,6 +88,7 @@ const {planFormImports}=require('../dist/courtForms');
             compare(detail.caseDraft.complaintExtraction.data,expected,'Complaint');
         }
         const report={sourcePdfs:files.size,pdfCount:detail.documents.length,uploads:uploadCount,
+            caseAssembly:values['curated-single-case']?'curated_single_case':'automatic',
             assertedFields,
             networkAttempts,filingJobs:0,manualOverridePreserved:true,reprocessingIdempotent:true,
             extraction:detail.caseDraft.complaintExtraction,fields:detail.caseDraft.filingData,

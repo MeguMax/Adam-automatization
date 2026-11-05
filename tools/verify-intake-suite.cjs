@@ -38,12 +38,22 @@ function validateManifest(manifest) {
     assert.ok(Array.isArray(manifest.cases) && manifest.cases.length > 0 && manifest.cases.length <= 30);
     const ids = new Set();
     for (const sample of manifest.cases) {
+        assert.ok(sample.mode === undefined || ['automatic', 'curated_single_case'].includes(sample.mode), 'Unknown fixture assembly mode');
         assert.match(sample.id, /^[a-z0-9][a-z0-9-]{0,69}$/);
         assert.ok(!ids.has(sample.id), 'Duplicate sample ID'); ids.add(sample.id);
         assert.ok(Array.isArray(sample.files) && sample.files.length > 0 && sample.files.length <= 30);
         assert.ok(sample.files.every(filename => typeof filename === 'string' && /\.pdf$/i.test(filename)));
         assert.ok(typeof sample.expected?.review === 'boolean', 'Each sample must define whether review is expected');
     }
+}
+
+function singleCaseFixture(parsed, curated = false) {
+    if (!curated) {
+        assert.ok(!parsed.intake?.groups?.length, 'This fixture contains multiple case groups. Use batch verification or explicitly declare curated_single_case for a manually assembled historical example.');
+        return parsed;
+    }
+    const {groups, ...intake} = parsed.intake;
+    return {...parsed, intake: {...intake, manual: true}};
 }
 
 function runSuite(manifestFile, outputDirectory) {
@@ -55,6 +65,7 @@ function runSuite(manifestFile, outputDirectory) {
     for (const sample of manifest.cases) {
         const started = Date.now(), filename = path.join(output, sample.id + '.json');
         const args = [path.join(__dirname, 'verify-local-intake.cjs'), '--output', filename];
+        if (sample.mode === 'curated_single_case') args.push('--curated-single-case');
         if (manifest.forms) args.push('--forms', path.resolve(root, manifest.forms));
         if (sample.expected.review) args.push('--expect-review');
         args.push(...sample.files.map(file => path.resolve(root, file)));
@@ -64,10 +75,11 @@ function runSuite(manifestFile, outputDirectory) {
             assert.equal(child.error, undefined, child.error?.message);
             assert.equal(child.status, 0, 'The isolated intake process failed; see its local log');
             const report = JSON.parse(fs.readFileSync(filename, 'utf8'));
+            assert.equal(report.caseAssembly, sample.mode || 'automatic', 'Fixture assembly mode must be reported accurately');
             const expected = { ...sample.expected };
             if (expected.extractionFile) expected.extraction = JSON.parse(fs.readFileSync(path.resolve(root, expected.extractionFile), 'utf8'));
             const comparedFields = checkResult(report, expected);
-            results.push({ id: sample.id, passed: true, comparedFields, sourcePdfs: report.sourcePdfs, pdfCount: report.pdfCount,
+            results.push({ id: sample.id, passed: true, caseAssembly: report.caseAssembly, comparedFields, sourcePdfs: report.sourcePdfs, pdfCount: report.pdfCount,
                 review: report.issues.length > 0, issueFields: report.issues.map(issue => issue.field), elapsedMs: Date.now() - started });
         } catch (error) {
             results.push({ id: sample.id, passed: false, error: error.message, elapsedMs: Date.now() - started });
@@ -80,7 +92,7 @@ function runSuite(manifestFile, outputDirectory) {
     return summary;
 }
 
-module.exports = { checkResult, validateManifest, runSuite };
+module.exports = { checkResult, validateManifest, singleCaseFixture, runSuite };
 if (require.main === module) {
     const { values } = parseArgs({ options: { manifest: { type: 'string' }, output: { type: 'string' } } });
     if (!values.manifest || !values.output) throw new Error('Use --manifest local-cases.json --output private-report-directory');

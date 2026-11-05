@@ -524,3 +524,30 @@ selection. An unavailable or ambiguous filer at this late stage requires
 reconciliation of the existing bundle, never a fresh automatic preparation.
 Reopening the saved bundle still must confirm the persisted filer and full PDF
 manifest before reporting Prepared (v111).
+
+## Bounded source reads and saved-bundle recovery (v112)
+
+Materializing source PDFs before MiFILE preparation or checkout inspection uses
+the same two-minute cancellable OneDrive read boundary as recognition. A stalled
+source stops that package before browser preparation starts, removes temporary
+PDFs and lets later jobs proceed. Late reads cannot write files after cleanup.
+The failure is reported as a source-read timeout, not an upload failure or a
+promise of an unrelated OCR retry. Current source hashes still must match every
+included PDF before MiFILE is opened.
+
+After Save Progress, transient navigation, HTTP or page-loading failures may
+reopen the exact saved bundle URL up to three times. These attempts perform no
+case creation, PDF upload, filer change, Save Progress, checkout, payment or
+court submission. The existing bundle/account/manifest checks still run after
+each successful load. Persisted identity, document/type/connection mismatches,
+unrecognized notices and permanent access errors stop without corrective writes.
+Exhausted reads retain reconciliation-required status rather than queuing a new
+filing. Read retries are recorded in the existing preparation activity log.
+
+Offline acceptance defaults to automatic email assembly and refuses to collapse
+several intake groups into one Draft. A manifest may explicitly declare
+`mode: "curated_single_case"` for historical examples already assembled by a
+tester (including borrowed supporting PDFs or pre-prefix filenames). These use
+a manual standard-LT fixture and report that mode separately; they are evidence
+of recognition/completeness, not automatic batch grouping. Production grouping
+is unchanged. Use `verify-batch-intake.cjs` for actual multi-case email acceptance.

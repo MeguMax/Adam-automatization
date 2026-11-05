@@ -10,7 +10,7 @@ import {
     FilingJobView,
     FilingPayload,
 } from './database';
-import { downloadDriveItemBuffer, resolveSharedDriveItem } from './oneDriveClient';
+import { downloadDraftPdf } from './draftPdfDownload';
 import { validatePdfBuffer } from './pdfValidation';
 import { validCompletenessSnapshot } from './packageCompleteness';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
@@ -56,18 +56,21 @@ export class MiFileFilingError extends Error {
     readonly code: string;
     readonly checkpoint: string;
     readonly debugArtifactPath: string | null;
+    readonly retryableRead: boolean;
 
     constructor(
         message: string,
         code: string,
         checkpoint: string,
         debugArtifactPath: string | null = null,
+        retryableRead = false,
     ) {
         super(message);
         this.name = 'MiFileFilingError';
         this.code = code;
         this.checkpoint = checkpoint;
         this.debugArtifactPath = debugArtifactPath;
+        this.retryableRead = retryableRead;
     }
 }
 
@@ -148,7 +151,15 @@ async function firstVisible(locator: Locator): Promise<Locator | null> {
     return null;
 }
 
+function transientBundleRead(error: unknown): boolean {
+    if (error instanceof MiFileFilingError) return error.retryableRead;
+    return error instanceof Error && (error.name === 'TimeoutError' ||
+        /\bnet::ERR_(?:CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_REFUSED|TIMED_OUT|NETWORK_CHANGED|EMPTY_RESPONSE)\b/.test(error.message));
+}
+
 export class MiFileFilingRunner {
+    private readonly sourceReadTimeoutMs = 120_000;
+    private readonly savedReadRetryDelayMs = 1_000;
     private readonly timeoutMs = boundedTimeout(
         process.env.MIFILE_FILING_TIMEOUT_MS,
         DEFAULT_TIMEOUT_MS,
@@ -286,10 +297,8 @@ export class MiFileFilingRunner {
                 packageDigest: preparationDigest(job.payload, documents.map(document => document.fingerprint)),
             });
             lastCheckpoint = 'verify_saved_bundle';
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: this.timeoutMs });
-            await page.locator('#documentTable').waitFor({ state: 'visible', timeout: this.timeoutMs });
-            await dismissMifilePreparationNotice(page);
-            await this.verifySavedBundle(page, job.payload, documentManifest, credentials.username, externalBundleId, temporaryCaseNumber);
+            await this.reopenSavedBundle(page, savedUrl, job.payload, documentManifest,
+                credentials.username, externalBundleId, temporaryCaseNumber);
             const sources = documents.map(document => document.fingerprint);
             const savedBundleEvidence: MiFileSavedBundleEvidence = {
                 version: 1, verifiedAt: new Date().toISOString(), externalBundleId, temporaryCaseNumber,
@@ -365,8 +374,14 @@ export class MiFileFilingRunner {
         const materialized: MaterializedDocument[] = [];
         for (let index = 0; index < payload.documents.length; index += 1) {
             const document = payload.documents[index];
-            const sharedItem = await resolveSharedDriveItem(document.oneDriveUrl);
-            const buffer = await downloadDriveItemBuffer(sharedItem.driveId, sharedItem.itemId);
+            const buffer = await downloadDraftPdf(document.oneDriveUrl, {
+                timeoutMs: this.sourceReadTimeoutMs,
+                timeoutMessage: `${document.filename}: Reading a source PDF from OneDrive timed out. No documents were uploaded or submitted by this check.`,
+            }).catch(error => {
+                if (error?.code === 'PDF_READ_TIMEOUT') throw new MiFileFilingError(error.message,
+                    'SOURCE_PDF_READ_TIMEOUT', 'materialize_documents');
+                throw error;
+            });
             const validation = validatePdfBuffer(buffer);
             if (!validation.valid) {
                 throw new MiFileFilingError(
@@ -771,6 +786,31 @@ export class MiFileFilingRunner {
         }
     }
 
+    private async reopenSavedBundle(page: Page, url: string, payload: FilingPayload, receipts: MiFileDocumentReceipt[],
+        username: string, bundleId: string, temporaryCaseNumber: string): Promise<void> {
+        if (miFileBundleId(url) !== bundleId) throw new MiFileFilingError('The saved bundle URL does not match its exact reference.',
+            'SAVED_BUNDLE_VERIFICATION_FAILED', 'verify_saved_bundle');
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                // Only reopen the already-saved URL. Never repeat Save, upload or case creation.
+                const response = await page.goto(url, {waitUntil: 'domcontentloaded', timeout: this.timeoutMs});
+                if (!response?.ok()) throw new MiFileFilingError('MiFILE could not reopen the saved bundle' +
+                    (response ? ` (HTTP ${response.status()}).` : '.'), 'SAVED_BUNDLE_VERIFICATION_FAILED',
+                    'verify_saved_bundle', null, Boolean(response && [408, 429, 500, 502, 503, 504].includes(response.status())));
+                await page.locator('#documentTable').waitFor({state: 'visible', timeout: this.timeoutMs});
+                await dismissMifilePreparationNotice(page);
+                await this.verifySavedBundle(page, payload, receipts, username, bundleId, temporaryCaseNumber);
+                return;
+            } catch (error) {
+                if (attempt === 3 || !transientBundleRead(error)) throw error;
+                await this.log('warning', 'verify_saved_bundle',
+                    'The saved bundle could not be read yet. Reopening the same bundle without repeating preparation.',
+                    {event: 'saved_bundle_read_retry', attempt, maxAttempts: 3, externalBundleId: bundleId});
+                await page.waitForTimeout(this.savedReadRetryDelayMs * attempt);
+            }
+        }
+    }
+
     private async verifySavedBundle(page: Page, payload: FilingPayload, receipts: MiFileDocumentReceipt[],
         username: string, bundleId: string, temporaryCaseNumber: string): Promise<void> {
         try {
@@ -786,6 +826,8 @@ export class MiFileFilingRunner {
                 await page.locator('#isEmergency').isChecked()) {
                 throw new Error('Unexpected service or emergency settings require review.');
             }
+            const actualCount = await page.locator('#documentTable tbody[id^="filing-"], #documentTable tbody[id^="child-"]').count();
+            if (actualCount > receipts.length + 1) throw new Error('The saved bundle contains unexpected additional PDFs.');
             await page.waitForFunction(expected => document.querySelectorAll(
                 '#documentTable tbody[id^="filing-"], #documentTable tbody[id^="child-"]').length === expected,
             receipts.length + 1, { timeout: this.timeoutMs });
@@ -802,7 +844,7 @@ export class MiFileFilingRunner {
             await this.verifyDocumentManifest(page, receipts);
         } catch (error) {
             throw new MiFileFilingError(error instanceof Error ? error.message : 'Saved bundle verification failed.',
-                'SAVED_BUNDLE_VERIFICATION_FAILED', 'verify_saved_bundle');
+                'SAVED_BUNDLE_VERIFICATION_FAILED', 'verify_saved_bundle', null, transientBundleRead(error));
         }
         await this.log('info', 'verify_saved_bundle', 'Reopened bundle matches the expected court, account, filer and complete PDF manifest.',
             { externalBundleId: bundleId, temporaryCaseNumber, sourcePdfCount: receipts.length });
@@ -821,10 +863,7 @@ export class MiFileFilingRunner {
             if (packageDigest !== (job.result?.savedBundleEvidence as MiFileSavedBundleEvidence).packageDigest) {
                 throw new Error('A source PDF changed in OneDrive after preparation. Review the package before checkout.');
             }
-            await page.goto(String(job.result!.url), {waitUntil:'domcontentloaded', timeout:this.timeoutMs});
-            await page.locator('#documentTable').waitFor({state:'visible', timeout:this.timeoutMs});
-            await dismissMifilePreparationNotice(page);
-            await this.verifySavedBundle(page, job.payload, job.result!.documentManifest as MiFileDocumentReceipt[],
+            await this.reopenSavedBundle(page, String(job.result!.url), job.payload, job.result!.documentManifest as MiFileDocumentReceipt[],
                 account.username, job.externalBundleId, job.temporaryCaseNumber);
             const fees = await this.observeFees(page);
             if (fees.displayedSubtotalCents === null) throw new Error('The current bundle fees could not be read unambiguously.');

@@ -24,3 +24,11 @@ test('PDF download preserves ordinary read errors and clears its timeout after s
     await new Promise(resolve=>setTimeout(resolve,15));
     assert.equal(signal!.aborted,false);assert.equal(result.toString(),'PDF');
 });
+
+test('source materialization has a contextual timeout without promising an unrelated recognition retry', async () => {
+    await assert.rejects(downloadDraftPdf('https://onedrive.example/source', {timeoutMs: 5,
+        timeoutMessage: 'Reading a source PDF timed out. This check did not upload documents.',
+        download: async () => new Promise<Buffer>(() => {}),
+    }), (error: any) => error.code === 'PDF_READ_TIMEOUT' && !error.message.includes('recognition') &&
+        error.message.includes('source PDF timed out'));
+});
