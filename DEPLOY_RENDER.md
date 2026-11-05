@@ -110,6 +110,18 @@ If the service restarts while **Save Progress** is completing, the Draft becomes
 
 ## Notes
 
+- PDF page inspection and supporting-form text-field reads use a serialized,
+  isolated Node parser instead of the admin/inbox event loop. Its V8 heap is capped
+  at 256 MB and each read defaults to a 60-second deadline. Optional
+  `PDF_INSPECTION_TIMEOUT_MS` is bounded to 1-120 seconds. A hung or crashed parser
+  is stopped before another read starts; timeout/queue errors remain file-level
+  retry/review issues, never proof of a complete package. The parser reuses its
+  runtime for up to 50 reads, exits after 15 idle seconds, receives no mail/MiFILE
+  credentials and cannot keep a CLI process alive. At most four different reads
+  wait, for up to 30 seconds each. Text results are bounded; documents over 500
+  pages require splitting/review rather than silent partial inspection. These
+  limits concern safe parsing, not a file-size heuristic for PDF validity.
+
 - **Settings > Microsoft connection > Check connection** runs a bounded, read-only check of the server application, inbox metadata and the worker's configured OneDrive folder. It does not grant permissions, redeem sharing links, read message bodies, download files, upload anything or send email. Upload/send rights are labeled **Granted (not tested)** when declared by the token; this is not a write test. Results are cached for 30 seconds and shared by simultaneous checks. The same safe diagnostic is available with `npm.cmd run microsoft:check`; raw tokens, credentials, folder URLs, file names and Microsoft error bodies are omitted.
 - These are server-side application permissions, independent of the OneDrive signed into the local computer. They do not install an Excel add-in or establish a live Excel Online session. Excel PDF delivery remains local downloads unless a separate `EXCEL_PDF_ONEDRIVE_SHARE_URL` is explicitly configured; the worker folder is never reused for that purpose.
 

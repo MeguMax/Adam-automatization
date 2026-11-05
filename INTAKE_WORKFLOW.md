@@ -427,3 +427,14 @@ The attorney confirmed that the previously supplied examples are historical
 actions for testing, not new authorized filings. Do not pay, submit or recreate
 those cases based on their presence in the QA corpus. Unsubmitted cleanup belongs
 to the account owner. Final payment and court submission remain compiled off.
+
+## PDF inspection recovery (v106)
+
+Page verification and supporting PDF text-field reads are isolated from the
+admin/inbox event loop. A hung parser is terminated at its deadline and the
+queue continues with the next file. The affected document retains a specific
+timeout, unreadable-PDF, complexity or busy-queue error for the existing retry
+and correction flow. A parser timeout is not a successful upload or a verified
+filing package. Files are not silently truncated or accepted on filename/size
+alone, and manual Draft corrections remain protected. This isolation does not
+replace the separate OCR review and Complaint-extraction safeguards.

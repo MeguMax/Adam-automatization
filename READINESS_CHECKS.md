@@ -398,3 +398,34 @@ extraction, source replacement, retry recovery and desktop/mobile PDF previews.
 Private source PDFs, hashes and acceptance evidence are under
 `output/ristovski-2026-11-05/`, outside version control. No payment or final court
 submission is enabled by this release.
+
+## Isolated PDF inspection (v106)
+
+PDF page validation and supporting-form text-field reads run in one separate
+Node parser, with a 256-MB V8 heap and a bounded per-read deadline. A CPU-bound
+fixture is killed while the parent event loop remains responsive; crashed and
+malformed workers cannot block the next file. A warm parser is recycled after
+50 reads or 15 idle seconds. It receives only basic operating-system environment
+values, not Graph, MiFILE or admin credentials. Source-mode `ts-node` execution
+and compiled production execution are both covered.
+
+The queue allows four waiting reads with a 30-second wait limit. Identical reads
+share work; cached results are content-hash keyed, bounded and independently
+cloned. Input bytes are copied before queuing so a later caller mutation cannot
+alter their pin or cached result. Failed checks are not cached as success. The
+parser validates every page; the 500-page / bounded text-output limits produce
+an actionable error rather than silently accepting a partial PDF. Structural
+PDF validation still does not depend on a minimum file size.
+
+All 436 project tests passed without failures or skips. The admin desktop/mobile
+smoke passed, including cleanup after fixing a Windows working-directory lock.
+The supplied 22-PDF batch still produced four complete packages and 30 PDFs after
+library enrichment, with unchanged source hashes, idempotent replay and zero
+network calls, filing jobs or notifications. Ristovski retained its 24 expected
+values, two Defendants, 41A-2 Local and only its missing-supporting review gate.
+Six earlier intakes passed 43 comparisons; a separate three-Complaint corpus
+passed 27 comparisons. These are offline checks, not new court submissions.
+
+Private logs and acceptance results are under
+`output/pdf-inspection-2026-11-05/`. Payment and final submission remain compiled
+off; historical examples are not replayed or authorized for filing.
