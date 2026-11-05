@@ -3,6 +3,7 @@ export interface GraphRetryOptions {
     baseDelayMs?: number;
     maxDelayMs?: number;
     label?: string;
+    attemptTimeoutMs?: number;
     onRetry?: (details: {
         attempt: number;
         maxAttempts: number;
@@ -76,18 +77,29 @@ function boundedInteger(
     return Math.min(Math.max(Math.floor(value as number), min), max);
 }
 
+// Read requests only: an uncertain write must be reconciled, never retried here.
 export async function withGraphRetry<T>(
-    operation: () => Promise<T>,
+    operation: (signal: AbortSignal) => Promise<T>,
     options: GraphRetryOptions = {},
 ): Promise<T> {
     const maxAttempts = boundedInteger(options.maxAttempts, 5, 1, 10);
     const baseDelayMs = boundedInteger(options.baseDelayMs, 1_000, 0, 60_000);
     const maxDelayMs = boundedInteger(options.maxDelayMs, 15_000, 0, 120_000);
+    const attemptTimeoutMs = boundedInteger(options.attemptTimeoutMs, 90_000, 1, 300_000);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const controller = new AbortController();
+        let timer: NodeJS.Timeout | undefined;
         try {
-            return await operation();
+            const timeout = new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                    reject(Object.assign(new Error('Microsoft Graph read timed out'), {code: 'ETIMEDOUT'}));
+                    controller.abort();
+                }, attemptTimeoutMs);
+            });
+            return await Promise.race([Promise.resolve().then(() => operation(controller.signal)), timeout]);
         } catch (error) {
+            clearTimeout(timer);
             if (attempt >= maxAttempts || !isRetryableGraphError(error)) {
                 throw error;
             }
@@ -102,6 +114,8 @@ export async function withGraphRetry<T>(
             if (delayMs > 0) {
                 await new Promise(resolve => setTimeout(resolve, delayMs));
             }
+        } finally {
+            clearTimeout(timer);
         }
     }
 

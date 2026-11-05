@@ -499,3 +499,21 @@ OneDrive reads used by Complaint extraction and document recognition have a
 two-minute deadline and cancellation signal. Timed-out reads cannot apply late
 results. With the production extraction worker enabled, opening a Draft returns
 its current state immediately; it does not hold the page open for PDF/OCR work.
+
+## MiFILE party layout and inbox deadlines (v110)
+
+MiFILE allocates person identifiers when it renders an attorney or adds a party;
+the second Defendant is not necessarily person 2. The preparation runner detects
+the newly added Defendant's actual identifier and locates the attorney by its
+Bar Number field. It rejects unexpected or ambiguous layouts instead of writing
+into another party's section. Before saving, it reads back each party's name,
+organization/person selection, country and address. Regression fixtures cover
+both the deferred-attorney layout and an interleaved attorney with three named
+Defendants, including an organization.
+
+Inbox metadata, message bodies, attachment lists and attachment downloads also
+have a 90-second per-attempt read deadline, with cancellation and the existing
+bounded retry budget. A late failed read cannot replace a successful retry.
+Exhaustion flows through the existing per-document/per-package error handling;
+no uncertain cloud write or MiFILE operation is retried by this helper. Payment
+and final court submission remain compiled off.

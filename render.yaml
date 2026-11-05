@@ -27,6 +27,8 @@ services:
         value: "10"
       - key: GRAPH_REQUEST_MAX_ATTEMPTS
         value: "5"
+      - key: GRAPH_REQUEST_TIMEOUT_MS
+        value: "90000"
       - key: GRAPH_BODY_FETCH_CONCURRENCY
         value: "4"
       - key: EMAIL_RETRY_BATCH_SIZE

@@ -555,12 +555,28 @@ export class MiFileFilingRunner {
 
     private async completeCaseForm(page: Page, payload: FilingPayload): Promise<void> {
         const frame = await this.waitForCaseForm(page);
+        const initialParties = await this.casePartyIndexes(frame);
+        if (initialParties.length !== 2 || !initialParties.includes(0) || !initialParties.includes(1)) {
+            throw new MiFileFilingError('MiFILE opened an unexpected party layout. No party fields were entered.',
+                'CASE_PARTY_LAYOUT_UNCONFIRMED', 'case_form');
+        }
         await this.fillParty(frame, 0, payload.filingData.plaintiff, true);
+        const defendantIndexes: number[] = [];
         for (let index = 0; index < payload.filingData.defendants.length; index += 1) {
+            let partyIndex = 1;
             if (index > 0) {
+                const before = await this.casePartyIndexes(frame);
                 await frame.getByRole('button', { name: 'Add Defendant', exact: true }).click();
+                await frame.waitForFunction(previous => Array.from(document.querySelectorAll('input[id^="psn"][id$="IsPerson_0"]'))
+                    .some(input => !previous.includes(Number(input.id.match(/^psn(\d+)IsPerson_0$/)?.[1]))),
+                before, {timeout: this.timeoutMs});
+                const added = (await this.casePartyIndexes(frame)).filter(value => !before.includes(value));
+                if (added.length !== 1) throw new MiFileFilingError('MiFILE did not add exactly one new Defendant.',
+                    'CASE_PARTY_LAYOUT_UNCONFIRMED', 'case_form');
+                partyIndex = added[0];
             }
-            await this.fillParty(frame, index + 1, payload.filingData.defendants[index], false);
+            defendantIndexes.push(partyIndex);
+            await this.fillParty(frame, partyIndex, payload.filingData.defendants[index], false);
         }
 
         if (payload.filingData.relatedCivilAction === 'none') {
@@ -620,20 +636,28 @@ export class MiFileFilingRunner {
                 'case_form',
             );
         }
-        const attorneyIndex = payload.filingData.defendants.length + 1;
-        const attorneyFirstName = frame.locator(`#psn${attorneyIndex}FirstName`);
-        if (!(await attorneyFirstName.count())) {
-            // MiFILE renders the represented-party attorney section only after
-            // the base form is saved once. That first save intentionally leaves
-            // the form open so the attorney fields can be completed.
+        const attorneyFields = frame.locator('input[id^="aty"][id$="BarNumber"]');
+        if (!(await attorneyFields.count())) {
+            // Some MiFILE layouts defer the attorney section until the first
+            // validation save, which leaves the form open for completion.
             await saveForm.click();
-            await attorneyFirstName.waitFor({ state: 'attached', timeout: this.timeoutMs });
+            await attorneyFields.first().waitFor({ state: 'attached', timeout: this.timeoutMs });
+        }
+        const attorneyIds = await attorneyFields.evaluateAll(elements => elements.map(element => element.id));
+        const attorneyIndex = attorneyIds.length === 1 ? Number(attorneyIds[0].match(/^aty(\d+)BarNumber$/)?.[1]) : NaN;
+        if (!Number.isInteger(attorneyIndex) || [0, ...defendantIndexes].includes(attorneyIndex)) {
+            throw new MiFileFilingError('The filing attorney section could not be identified separately from the parties.',
+                'ATTORNEY_LAYOUT_UNCONFIRMED', 'case_form');
         }
         await this.fillAttorney(
             frame,
             attorneyIndex,
             payload.filingData.attorney,
         );
+        await this.verifyPartyFields(frame, 0, payload.filingData.plaintiff);
+        for (let index = 0; index < defendantIndexes.length; index++) {
+            await this.verifyPartyFields(frame, defendantIndexes[index], payload.filingData.defendants[index]);
+        }
         await this.verifyCaseAnswers(frame, payload);
         await saveForm.click();
         await page.locator('#fileUpload').waitFor({
@@ -648,6 +672,33 @@ export class MiFileFilingRunner {
             );
         });
         await this.log('info', 'case_form', 'MiFILE accepted the case-initiation fields.');
+    }
+
+    private async casePartyIndexes(frame: Frame): Promise<number[]> {
+        return frame.locator('input[id^="psn"][id$="IsPerson_0"]').evaluateAll(elements => elements
+            .map(element => Number(element.id.match(/^psn(\d+)IsPerson_0$/)?.[1]))
+            .filter(index => Number.isInteger(index) && !document.getElementById(`aty${index}BarNumber`)));
+    }
+
+    private async verifyPartyFields(frame: Frame, index: number, party: DraftParty): Promise<void> {
+        const prefix = `#psn${index}`;
+        const entity = party.partyType === 'entity';
+        const names = entity ? null : partyPersonNames(party);
+        const expected: Array<[string, string]> = [
+            ['Address', party.address1 || ''], ['Address2', party.address2 || ''],
+            ['City', party.city || ''], ['Zip', party.postalCode || ''],
+            ...(entity ? [['EntityName', party.entityName || party.displayName || '']] : [
+                ['FirstName', names!.firstName], ['MiddleName', party.middleName || ''],
+                ['FamilyName', names!.lastName], ['Suffix', party.suffix || ''],
+            ]) as Array<[string, string]>,
+        ];
+        let matches = await frame.locator(`${prefix}IsPerson_${entity ? 1 : 0}`).isChecked();
+        for (const [field, value] of expected) matches = matches &&
+            (await frame.locator(`${prefix}${field}`).inputValue()).trim() === value.trim();
+        matches = matches && await frame.locator(`${prefix}Country`).inputValue() === 'US' &&
+            (await frame.locator(`${prefix}State option:checked`).innerText()).trim() === stateLabel(party.state);
+        if (!matches) throw new MiFileFilingError('MiFILE did not retain the expected party name or address. Review the case form.',
+            'CASE_PARTY_VALUES_MISMATCH', 'case_form');
     }
 
     private async fillAttorney(

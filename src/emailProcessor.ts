@@ -110,6 +110,7 @@ function graphRetryOptions(label: string) {
     return {
         label,
         maxAttempts: GRAPH_REQUEST_MAX_ATTEMPTS,
+        attemptTimeoutMs: boundedEnvironmentInteger(process.env.GRAPH_REQUEST_TIMEOUT_MS, 90_000, 1_000, 300_000),
         onRetry: (details: {
             attempt: number;
             maxAttempts: number;
@@ -131,8 +132,9 @@ export async function fetchRecentCourtEmailHeaders(top: number): Promise<any[]> 
         `/users/${encodeURIComponent(userEmail)}/mailFolders/Inbox/messages`;
 
     const firstPage = await withGraphRetry(
-        () => graphClient
+        signal => graphClient
             .api(firstPath)
+            .options({signal})
             .header('Accept-Encoding', 'identity')
             .top(pageSize)
             .orderby('receivedDateTime DESC')
@@ -148,8 +150,9 @@ export async function fetchRecentCourtEmailHeaders(top: number): Promise<any[]> 
     while (nextLink && messages.length < limit) {
         try {
             const page = await withGraphRetry(
-                () => graphClient
+                signal => graphClient
                     .api(nextLink!)
+                    .options({signal})
                     .header('Accept-Encoding', 'identity')
                     .get(),
                 graphRetryOptions(`Graph Inbox metadata page ${pageNumber}`),
@@ -195,8 +198,9 @@ export async function fetchRecentCourtEmails(top: number): Promise<any[]> {
 
 export async function fetchCourtEmailById(messageId: string): Promise<any> {
     return withGraphRetry(
-        () => graphClient
+        signal => graphClient
                 .api(`/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}`)
+                .options({signal})
                 .header('Accept-Encoding', 'identity')
                 .select('id,subject,from,body,receivedDateTime,hasAttachments')
                 .get(),
@@ -224,8 +228,9 @@ export async function findCourtEmailByMetadata(lookup: CourtEmailLookup): Promis
     let messages: any[] = [];
     try {
         const searchResult = await withGraphRetry(
-            () => graphClient
+            signal => graphClient
                 .api(path)
+                .options({signal})
                 .header('Accept-Encoding', 'identity')
                 .header('ConsistencyLevel', 'eventual')
                 .search(`"subject:${searchSubject}"`)
@@ -244,8 +249,9 @@ export async function findCourtEmailByMetadata(lookup: CourtEmailLookup): Promis
         const from = new Date(receivedAt.getTime() - windowMs).toISOString();
         const to = new Date(receivedAt.getTime() + windowMs).toISOString();
         const dateResult = await withGraphRetry(
-            () => graphClient
+            signal => graphClient
                 .api(path)
+                .options({signal})
                 .header('Accept-Encoding', 'identity')
                 .filter(`receivedDateTime ge ${from} and receivedDateTime le ${to}`)
                 .top(100)
@@ -295,8 +301,9 @@ export async function fetchCourtEmailAttachments(
         visited.add(next);
         const requestUrl: string = next;
         const result: any = await withGraphRetry(
-            () => graphClient
+            signal => graphClient
                 .api(requestUrl)
+                .options({signal})
                 .header('Accept-Encoding', 'identity')
                 .query(visited.size === 1 ? { $top: 100, $select: 'id,name,contentType,size,isInline' } : {})
                 .get(),
@@ -325,11 +332,12 @@ export async function downloadCourtEmailAttachment(
     attachmentId: string,
 ): Promise<Buffer> {
     const value = await withGraphRetry(
-        () => graphClient
+        signal => graphClient
             .api(
                 `/users/${encodeURIComponent(userEmail)}/messages/${encodeURIComponent(messageId)}` +
                 `/attachments/${encodeURIComponent(attachmentId)}/$value`,
             )
+            .options({signal})
             .header('Accept-Encoding', 'identity')
             .responseType(ResponseType.ARRAYBUFFER)
             .get(),

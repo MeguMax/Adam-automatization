@@ -43,6 +43,13 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
    MiFILE preparation is hard-limited to **History -> Unsubmitted**. There is no payment or final court-submission action in the worker.
 
+   Inbox metadata, message bodies, attachment lists and attachment downloads use
+   bounded read attempts. `GRAPH_REQUEST_TIMEOUT_MS` defaults to 90000 (allowed
+   1000-300000); each timed-out attempt aborts its request and uses the existing
+   Graph retry budget. Exhaustion remains an explicit processing failure so the
+   next attachment/package can proceed. This deadline does not retry cloud
+   uploads, outgoing mail, payment or court-submission writes.
+
 5. Leave `WORKER_ENABLED=false` for the first deploy. Open `https://<service>.onrender.com/`, authenticate with `ADMIN_USERNAME` and `ADMIN_PASSWORD`, and verify `https://<service>.onrender.com/healthz` returns `{"ok":true}`.
 
 6. While the worker is disabled, the admin synchronizes 100 recent inbox messages per background pass. Use **Sync 1000** once when a larger metadata backfill is needed; this does not download historical court files again.

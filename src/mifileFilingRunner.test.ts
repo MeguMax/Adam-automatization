@@ -170,6 +170,56 @@ test('the case form adds the second Defendant before the deferred attorney secti
     }finally{await page.close();}
 });
 
+test('live-style interleaved attorney IDs do not overwrite the second or third Defendant', async () => {
+    const page = await browser.newPage();
+    try {
+        const person = (index: number, attorney = false) => {
+            const p = `psn${index}`;
+            return (attorney ? '' : `<input type="radio" id="${p}IsPerson_0" name="${p}type"><input type="radio" id="${p}IsPerson_1" name="${p}type">`) +
+                ['EntityName','FirstName','MiddleName','FamilyName','Suffix','Address','Address2','City','Zip','Phone','Email']
+                    .map(name => `<input id="${p}${name}">`).join('') +
+                `<select id="${p}Country"><option value="US">US</option></select><select id="${p}State"><option value="MI">Michigan</option></select>`;
+        };
+        const attorney = person(2, true) + '<input id="aty2BarNumber"><select id="aty2Jurisdiction"><option value="MI">Michigan</option></select>';
+        const form = person(0) + '<div id="attorney"></div><div id="defendants">' + person(1) + '</div>' +
+            `<input type="radio" id="pty0SelfRepresented_0" onclick='if(!document.getElementById("aty2BarNumber"))document.getElementById("attorney").innerHTML=${JSON.stringify(attorney)}'>` +
+            '<input id="attorneyEmail" value="primary@example.com">' +
+            '<input type="radio" id="relatedCivilActions_0" name="related"><input type="radio" id="relatedCivilActions_1" name="related">' +
+            '<input id="claimAmount"><input type="checkbox" id="requestSecondMail">' +
+            `<button onclick='window.adds=(window.adds||0)+1;document.getElementById("defendants").insertAdjacentHTML("beforeend",window.adds===1?${JSON.stringify(person(3))}:${JSON.stringify(person(4))})'>Add Defendant</button>` +
+            '<button onclick="window.saves=(window.saves||0)+1;parent.document.body.insertAdjacentHTML(\'beforeend\',\'<input id=fileUpload type=file>\')">Save Case Initiation Form</button>';
+        await page.route('**/*', route => {
+            if (route.request().url().endsWith('/form/getform')) return route.fulfill({contentType:'text/html',body:form});
+            if (route.request().url().endsWith('/qa-form')) return route.fulfill({contentType:'text/html',
+                body:'<iframe id="formFrame" src="/form/getform"></iframe><button onclick="window.submitted=true">Submit</button>'});
+            return route.abort();
+        });
+        await page.goto('https://mifile.courts.michigan.gov/qa-form');
+        const address = {address1:'102 QA Rental Street',address2:null,city:'Lincoln Park',state:'MI',postalCode:'48146',phone:null,email:null};
+        const payload = {filingData:{plaintiff:{...address,id:'owner',partyType:'entity',displayName:'Example Owner LLC',entityName:'Example Owner LLC'},
+            defendants:[{...address,id:'first',partyType:'person',displayName:'Blair Tenant',firstName:'Blair',lastName:'Tenant'},
+                {...address,id:'second',partyType:'person',displayName:'Casey Resident',firstName:'Casey',lastName:'Resident'},
+                {...address,id:'third',partyType:'entity',displayName:'Example Occupant LLC',entityName:'Example Occupant LLC'}],
+            attorney:{name:'Adam Devlin',barNumber:'P72877',address1:'30850 Telegraph Rd',address2:'Ste 250',city:'Bingham Farms',state:'MI',postalCode:'48025',email:'primary@example.com'},
+            relatedCivilAction:'none',moneyJudgmentRequested:false,claimAmount:'0.00',mailingRequested:true}};
+        await (new MiFileFilingRunner() as any).completeCaseForm(page,payload);
+        const frame = page.frames().find(item => item.url().endsWith('/form/getform'))!;
+        assert.equal(await frame.locator('#psn1FirstName').inputValue(),'Blair');
+        assert.equal(await frame.locator('#psn3FirstName').inputValue(),'Casey');
+        assert.equal(await frame.locator('#psn4EntityName').inputValue(),'Example Occupant LLC');
+        assert.equal(await frame.locator('#psn2FamilyName').inputValue(),'Devlin');
+        assert.equal(await frame.locator('#aty2BarNumber').inputValue(),'P72877');
+        assert.equal(await frame.locator('#psn3Address').inputValue(),address.address1);
+        assert.equal(await frame.locator('#psn2City').inputValue(),'Bingham Farms');
+        assert.equal(await frame.evaluate(() => (window as any).adds),2);
+        assert.equal(await frame.evaluate(() => (window as any).saves),1);
+        assert.equal(await page.evaluate(() => Boolean((window as any).submitted)),false);
+        await frame.locator('#psn3FamilyName').fill('Wrong Person');
+        await assert.rejects((new MiFileFilingRunner() as any).verifyPartyFields(frame,3,payload.filingData.defendants[1]),
+            /expected party name or address/);
+    } finally {await page.close();}
+});
+
 async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean; feeLabels?: boolean; noOther?: boolean;
     noConnectEffect?: boolean; insertFirst?: boolean; failedFile?: string; warningFile?: string; merged?: boolean; systemParent?: boolean } = {}): Promise<Page> {
     const page = await browser.newPage();
