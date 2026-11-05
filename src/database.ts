@@ -17,6 +17,7 @@ import { migrateBundleActivity } from './mifileBundleSafety';
 import { splitFilingIntake } from './filingIntake';
 import { DraftNotificationStore } from './draftNotifications';
 import { matchesSupportingCase } from './batchCaseMatching';
+import { complaintReadingView, COMPLAINT_READING_ATTEMPTS, type ComplaintReadingView } from './complaintReading';
 import type { CheckoutAccount } from './mifileCheckout';
 import {
     ComplaintExtractionResult,
@@ -607,6 +608,7 @@ export interface EmailDetail {
             extractedAt: string;
             appliedFields: string[];
         }) | null;
+        complaintReading: ComplaintReadingView;
         manualPackage: boolean;
         packageCompleteness: PackageCompleteness;
         validationIssues: DraftValidationIssue[];
@@ -2744,6 +2746,40 @@ export class WorkflowDatabase {
             .run(toJson(state), nowIso(), draftId);
     }
 
+    queueComplaintExtraction(draftId: string): EmailDetail {
+        return this.runInTransaction(() => {
+            const detail = this.assertEditableIntake(draftId);
+            const draft = detail.caseDraft!;
+            const source = detail.documents.find(document => document.id === draft.primaryDocumentId &&
+                document.packageRole === 'complaint' && document.recognition?.source !== 'conflict' &&
+                document.oneDriveUrl && ['uploaded', 'downloaded', 'replaced'].includes(document.status));
+            if (!source) throw new Error('Select an available primary Complaint before reading it again.');
+            this.getDraftDocumentEditContext(source.id);
+            const version = this.getComplaintSourceVersion(source.id);
+            const root = this.safeJson(draft.normalizedDataJson);
+            const previous = root.complaintAutoExtraction;
+            if (previous?.documentId === source.id && previous.sourceVersion === version &&
+                ['queued', 'running'].includes(previous.status)) {
+                if (root.manualDocumentEdits !== true) {
+                    this.db.prepare(`UPDATE case_drafts SET normalized_data_json=json_set(normalized_data_json,
+                        '$.manualDocumentEdits',json('true')),reviewed_at=NULL,updated_at=? WHERE id=?`).run(nowIso(),draftId);
+                    this.insertAuditLog('case_draft',draftId,'complaint_reading_requested',{documentId:source.id,coalesced:true});
+                }
+                return this.getDraftDetail(draftId)!;
+            }
+            const timestamp = nowIso();
+            const request = { documentId: source.id, sourceVersion: version, contentHash: source.recognition?.contentHash,
+                expectedContentHash: source.recognition?.contentHash, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+                requestId: randomUUID(), requestedAt: timestamp, status: 'queued', attempts: 0 };
+            this.db.prepare(`UPDATE case_drafts SET normalized_data_json=json_set(normalized_data_json,
+                '$.complaintAutoExtraction',json(?),'$.manualDocumentEdits',json('true')),
+                reviewed_at=NULL,status='needs_review',validation_status='failed',updated_at=? WHERE id=?`)
+                .run(toJson(request), timestamp, draftId);
+            this.insertAuditLog('case_draft', draftId, 'complaint_reading_requested', { documentId: source.id, requestId: request.requestId });
+            return this.getDraftDetail(draftId)!;
+        });
+    }
+
     clearStaleComplaintExtractionState(draftId: string, sourceVersion: string | null): void {
         this.db.prepare(`UPDATE case_drafts SET normalized_data_json = json_remove(normalized_data_json, '$.complaintAutoExtraction'), updated_at = ?
             WHERE id = ? AND json_extract(normalized_data_json, '$.complaintAutoExtraction.sourceVersion') = ?
@@ -2759,7 +2795,7 @@ export class WorkflowDatabase {
         for (const row of rows) {
             const state = this.safeJson(row.normalized_data_json).complaintAutoExtraction;
             this.recordComplaintExtractionFailure(row.id,state.documentId,new Error('Automatic Complaint reading was interrupted by a restart.'));
-            this.setComplaintAutoExtractionState(row.id,{...state,status:'failed',nextRetryAt:state.attempts<3?nowIso():null});
+            this.setComplaintAutoExtractionState(row.id,{...state,status:'failed',nextRetryAt:state.attempts<COMPLAINT_READING_ATTEMPTS?nowIso():null});
         }
         return rows.length;
     }
@@ -2770,9 +2806,10 @@ export class WorkflowDatabase {
               AND c.filing_status IN ('not_started','failed') AND c.status IN ('parsed', 'needs_review', 'validation_failed', 'ready_to_file','filing_failed')
               AND e.processing_status != 'processing'
               AND (COALESCE(json_extract(c.normalized_data_json, '$.complaintExtraction.extractorVersion'), 0) < ?
-                OR json_extract(c.normalized_data_json, '$.complaintExtractionError') IS NOT NULL)
+                OR json_extract(c.normalized_data_json, '$.complaintExtractionError') IS NOT NULL
+                OR json_extract(c.normalized_data_json, '$.complaintAutoExtraction.status') = 'queued')
               AND (COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.extractorVersion'), 0) != ?
-                OR (COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.attempts'), 0) < 3
+                OR (COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.attempts'), 0) < ${COMPLAINT_READING_ATTEMPTS}
                   AND COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.nextRetryAt'), '') <= ?))
               AND EXISTS (SELECT 1 FROM document_records d WHERE d.case_draft_id = c.id AND d.is_active = 1
                 AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','replaced','downloaded')
@@ -2796,7 +2833,7 @@ export class WorkflowDatabase {
             WHERE json_extract(c.normalized_data_json, '$.sourceKind') = 'new_filing_intake'
               AND c.status = 'ready_to_file' AND c.validation_status = 'passed' AND c.filing_status = 'not_started'
               AND COALESCE(json_extract(c.normalized_data_json, '$.complaintExtraction.extractorVersion'), 0) >= ?
-              AND COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.status'), '') != 'running'
+              AND COALESCE(json_extract(c.normalized_data_json, '$.complaintAutoExtraction.status'), '') NOT IN ('queued','running')
               AND COALESCE(json_extract(c.normalized_data_json, '$.intake.manual'), 0) = 0
               AND COALESCE(json_extract(c.normalized_data_json, '$.manualDocumentEdits'), 0) = 0
               AND json_extract(c.normalized_data_json, '$.supportingPolicyVersion') = 2
@@ -5607,6 +5644,13 @@ export class WorkflowDatabase {
                         normalizedDraftData,
                     ),
                     complaintExtraction,
+                    complaintReading: complaintReadingView(normalizedDraftData,
+                        documentViews.some(document => document.id === caseDraft.primary_document_id && document.packageRole === 'complaint' &&
+                            document.recognition?.source !== 'conflict' &&
+                            document.oneDriveUrl && ['uploaded','downloaded','replaced'].includes(document.status)),
+                        filingEligibilityIssues.length === 0 && email.processing_status !== 'processing' &&
+                            ['not_started','failed'].includes(caseDraft.filing_status) &&
+                            ['parsed','needs_review','validation_failed','ready_to_file','filing_failed'].includes(caseDraft.status)),
                     manualPackage,
                     packageCompleteness,
                     validationIssues,
@@ -5726,17 +5770,20 @@ export class WorkflowDatabase {
             if (expectedUpdatedAt && this.getDraftDetail(caseDraftId)?.caseDraft?.updatedAt !== expectedUpdatedAt) {
                 throw new Error('The Draft changed. Review the latest package before confirming.');
             }
-            if (confirmPackage) this.reviewCaseDraft(caseDraftId, 'approve');
-            const detail = this.getDraftDetail(caseDraftId);
+            let detail = this.getDraftDetail(caseDraftId);
             if (!detail?.caseDraft) throw new Error('Case draft not found');
-            if (this.safeJson(detail.caseDraft.normalizedDataJson)?.complaintAutoExtraction?.status === 'running') {
-                throw new Error('Filing is blocked: Complaint extraction is still running.');
+            if (['queued','running'].includes(this.safeJson(detail.caseDraft.normalizedDataJson)?.complaintAutoExtraction?.status)) {
+                throw new Error('Filing is blocked: Complaint extraction is queued or still running.');
+            }
+            if (confirmPackage) {
+                this.reviewCaseDraft(caseDraftId, 'approve');
+                detail = this.getDraftDetail(caseDraftId)!;
             }
             const allowedStatuses = new Set(['ready_to_file', 'filing_failed']);
-            if (!allowedStatuses.has(detail.caseDraft.status)) {
+            if (!allowedStatuses.has(detail.caseDraft!.status)) {
                 throw new Error('Approve the Draft before preparing it in MiFILE');
             }
-            if (this.safeJson(detail.caseDraft.normalizedDataJson)?.manualDocumentEdits && !detail.caseDraft.reviewedAt) {
+            if (this.safeJson(detail.caseDraft!.normalizedDataJson)?.manualDocumentEdits && !detail.caseDraft!.reviewedAt) {
                 throw new Error('Approve the Draft after reviewing the changed documents before preparing it in MiFILE');
             }
             const active = this.db
@@ -6936,9 +6983,15 @@ export class WorkflowDatabase {
                 issues.push({ field: 'intake', severity: 'warning', message: String(message) });
             }
         }
-        if (root?.complaintExtractionError) issues.push({
+        const reading = complaintReadingView(root, true, true);
+        const readingBusy = ['queued','reading'].includes(reading.status);
+        if (root?.complaintExtractionError || readingBusy) issues.push({
             field: 'complaintExtraction', severity: 'error',
-            message: `Complaint extraction failed: ${root.complaintExtractionError}. Automatic retry is scheduled when available; a corrected PDF can also be uploaded.`,
+            message: readingBusy
+                ? `Complaint reading is ${reading.status === 'reading' ? 'running' : 'queued'}. Wait for it to finish before preparation.`
+                : `Complaint extraction failed: ${reading.lastError}. ` + (reading.nextRetryAt
+                    ? `Automatic retry is scheduled for ${reading.nextRetryAt}.`
+                    : 'Automatic reading has stopped. Re-read the Complaint or upload a corrected PDF.'),
         });
         if (root?.intake?.processingError) issues.push({ field: 'intake', severity: 'error',
             message: `Case package processing could not finish: ${root.intake.processingError}. Reprocess this email after correcting the issue.` });
@@ -7238,6 +7291,7 @@ export class WorkflowDatabase {
                     filing_status = ?,
                     reviewer_notes = ?,
                     reviewed_at = COALESCE(?, reviewed_at),
+                    normalized_data_json = CASE WHEN ? THEN json_remove(normalized_data_json, '$.complaintAutoExtraction') ELSE normalized_data_json END,
                     updated_at = ?
                 WHERE id = ?
             `)
@@ -7247,6 +7301,7 @@ export class WorkflowDatabase {
                 next.filingStatus,
                 next.reviewerNotes,
                 next.reviewedAt,
+                action === 'reject' ? 1 : 0,
                 timestamp,
                 caseDraftId,
             );

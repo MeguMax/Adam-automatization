@@ -438,3 +438,26 @@ and correction flow. A parser timeout is not a successful upload or a verified
 filing package. Files are not silently truncated or accepted on filename/size
 alone, and manual Draft corrections remain protected. This isolation does not
 replace the separate OCR review and Complaint-extraction safeguards.
+
+## Complaint reading status and recovery (v107)
+
+Review shows when Complaint reading is queued, running, waiting for an automatic
+retry or stopped. The attempt count and next retry time are distinct from PDF
+download attempts. After the three automatic reading attempts are exhausted,
+the interface no longer promises another scheduled attempt. The retry-arrow
+action and Document tools > Re-read Complaint start a fresh bounded reading
+request. A corrected PDF can still be uploaded instead. Short error summaries
+are shown in Review; the full stored diagnostic remains available in activity.
+
+With the production extraction worker enabled, a manual reading request is
+persisted and returns immediately. The worker continues after the page closes
+and recovers queued/interrupted work after restart. Repeated clicks while the
+same source is queued or running do not create another read. Manual fields and
+unsaved browser edits remain protected. The PDF is not downloaded from email or
+uploaded to OneDrive again just to re-read it.
+
+Preparation is blocked while reading is queued/running. Explicitly requesting a
+re-read clears approval and requires package confirmation afterwards; it cannot
+automatically prepare an old historical package. Rejecting the package cancels
+the pending request. Existing automatic reading/preparation of complete new
+email packages remains unchanged. Payment and final court submission stay off.

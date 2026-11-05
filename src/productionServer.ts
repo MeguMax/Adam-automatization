@@ -48,13 +48,14 @@ async function main(): Promise<void> {
 
     const port = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
     const filingWorkerEnabled = isFilingWorkerEnabled();
+    const workerEnabled = isWorkerEnabled();
     const server = createAdminServer(port, {
         handleSignals: false,
         closeDatabaseOnShutdown: false,
         filingWorkerAvailable: () => filingWorkerEnabled,
+        extractionWorkerAvailable: () => workerEnabled,
     });
     const controller = new AbortController();
-    const workerEnabled = isWorkerEnabled();
     if (!workerEnabled) { workerHealth.disable('inbox'); workerHealth.disable('extraction'); }
     if (!filingWorkerEnabled) workerHealth.disable('mifile');
     const stopHealthWatch = watchWorkerHealth();

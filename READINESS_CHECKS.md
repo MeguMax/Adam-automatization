@@ -429,3 +429,36 @@ passed 27 comparisons. These are offline checks, not new court submissions.
 Private logs and acceptance results are under
 `output/pdf-inspection-2026-11-05/`. Payment and final submission remain compiled
 off; historical examples are not replayed or authorized for filing.
+
+## Persistent Complaint re-reading (v107)
+
+Manual re-reading is a persisted request with a fresh three-attempt budget,
+source/version identity and audit entry. Queued/running requests are idempotent;
+they block MiFILE preparation and require later package confirmation. An
+explicit request coalesced into an existing automatic read still clears approval.
+Rejected cases cancel their queued progress rather than appearing to read forever.
+
+Retry identity now retains the expected source pin separately from bytes observed
+in a failed read. Differing downloaded bytes can no longer restart the attempt
+counter indefinitely. Downloaded/uploaded PDF status is not changed by a reading
+failure. Review distinguishes scheduled retries from exhausted attempts and shows
+a short error; full diagnostics remain in the stored record and audit.
+
+The production route returns 202 without waiting for OCR; standalone mode retains
+its existing synchronous fallback. The browser refreshes reading progress even
+when an older filing job has not changed, preserves edits made during the read
+and provides a direct retry arrow. Mobile action buttons now stay inside their
+panel instead of wrapping into an invisible second flex column.
+
+Regression coverage includes durable restart/read recovery, duplicate requests,
+cached-result bypass, changed-byte retry exhaustion, cancellation, approval gates
+and manual field preservation. The authenticated desktop/mobile smoke checks the
+202 response, visible stopped/queued/running states, clipped-button bounds and an
+unsaved correction surviving completion. Private evidence is under
+`output/complaint-reading-2026-11-05/`. No MiFILE package, charge or court submission
+is created by these tests.
+
+The complete project regression passed all 442 tests with no failures or skips,
+including Excel PDF generation. The six earlier package expectations retained
+their 43 explicit value comparisons; Ristovski retained all 24 checked values,
+both Defendants and its missing-supporting review requirement.

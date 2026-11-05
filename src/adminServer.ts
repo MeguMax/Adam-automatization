@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-05-isolated-pdf-inspection-v106';
+const ADMIN_BUILD_ID = '2026-11-05-complaint-reading-recovery-v107';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3148,6 +3148,10 @@ const html = String.raw`<!doctype html>
     .draft-document-select { flex: 1 1 100%; }
     .draft-fields-panel { overflow: hidden; }
     .draft-fields-heading { min-height: 44px; padding: 10px 16px; background: #fff; }
+    .draft-reading-status { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 10px; padding: 0 0 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+    .draft-reading-status strong, .draft-reading-status span { display: block; overflow-wrap: anywhere; }
+    .draft-reading-status strong { font-size: 12px; }
+    .draft-reading-status span { color: var(--muted); font-size: 11px; margin-top: 4px; }
     .draft-section-tabs { display: flex; gap: 0; padding: 0 12px; border-bottom: 1px solid var(--line); flex: 0 0 auto; }
     .draft-section-tabs button { flex: 1; padding: 11px 6px; min-width: 0; min-height: 42px; border: 0; border-radius: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .draft-section-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 700; }
@@ -3224,8 +3228,8 @@ const html = String.raw`<!doctype html>
       .draft-document-links { width: auto; margin-left: auto; }
       .draft-source-actions { display: grid; grid-template-columns: 1fr; width: 230px; }
       #draftFieldsForm { padding: 12px; }
-      .draft-next-action { flex-wrap: wrap; padding: 10px 12px; gap: 8px; }
-      .draft-next-action > div { flex: 1 1 100%; }
+      .draft-next-action { flex-wrap: nowrap; padding: 10px 12px; gap: 8px; }
+      .draft-next-action > div { flex: 0 0 auto; width: 100%; }
       #draftPrepareBtn { width: 100%; }
       .draft-workspace-shell { height: calc(100dvh - 116px); }
     }
@@ -3541,6 +3545,7 @@ const html = String.raw`<!doctype html>
             </nav>
             <form id="draftFieldsForm">
               <div id="draftReviewPane" data-draft-pane="review" role="tabpanel" aria-labelledby="draftReviewTab">
+                <div id="draftReadingStatus" class="draft-reading-status hidden" role="status" aria-live="polite"></div>
                 <div id="draftPreparationStatus"></div>
               <div id="draftValidationSummary"></div>
                 <div id="draftReviewOverview"></div>
@@ -4655,6 +4660,7 @@ const html = String.raw`<!doctype html>
       manualCopyButton.classList.add('hidden');
       document.getElementById('draftReviewerNotes').value = draft.reviewerNotes || '';
       renderDraftFields(draft);
+      renderComplaintReading(draft);
       renderDraftFilingJobs();
       renderDraftDocuments(detail.documents || []);
       setDraftDirty(false);
@@ -4691,13 +4697,14 @@ const html = String.raw`<!doctype html>
       const unavailable = draft.filingEligible === false || draft.status === 'rejected';
       const reconcile = draft.status === 'filing_reconciliation';
       const running = draft.filingStatus === 'queued' || draft.status === 'filing_in_progress';
+      const reading = ['queued','reading'].includes(draft.complaintReading?.status);
       const ready = state.mifileConfig && state.mifileConfig.ready;
       const progress = state.draftFilingJobs[0]?.progress;
       const outcome = state.draftFilingJobs[0]?.checkout?.outcome;
       const title = unavailable ? (draft.status === 'rejected' ? 'Package rejected' : 'Court notification') :
         filed ? 'Filed in MiFILE' : prepared ? outcome?.title || 'Saved in MiFILE' : reconcile ? 'Check MiFILE before retrying' :
         running ? (progress ? progress.stage + (progress.uploaded !== null && progress.total ? ' (' + progress.uploaded + ' / ' + progress.total + ')' : '') : 'Preparation in progress') : state.draftDirty ? 'Changes not saved' :
-        errors ? errors + (errors === 1 ? ' correction needed' : ' corrections needed') :
+        reading ? 'Reading Complaint' : errors ? errors + (errors === 1 ? ' correction needed' : ' corrections needed') :
         !ready ? 'MiFILE account needs attention' : 'Ready for your confirmation';
       document.getElementById('draftNextActionTitle').textContent = title;
       document.getElementById('draftNextActionNote').textContent = prepared
@@ -4710,11 +4717,25 @@ const html = String.raw`<!doctype html>
         draft.status === 'filing_failed' ? 'Retry in Unsubmitted' : 'Save to Unsubmitted';
       button.innerHTML = icon(prepared ? 'external-link' : reconcile ? 'search' : running ? 'activity' :
         state.draftDirty ? 'save' : errors ? 'arrow-right' : !ready ? 'settings' : 'check-check') + escapeHtml(label);
-      button.disabled = state.draftMutationBusy || draft.filingEligible === false || draft.status === 'rejected';
+      button.disabled = state.draftMutationBusy || reading || draft.filingEligible === false || draft.status === 'rejected';
       const paymentButton=document.getElementById('draftPaymentBtn');
       paymentButton.innerHTML=icon('credit-card')+escapeHtml(filed || state.draftFilingJobs[0]?.checkout?.receiptSummary.submissionObserved ? 'Payment & receipts' : 'Pay & submit');
-      paymentButton.disabled = Boolean(state.draftMutationBusy || unavailable || running || reconcile);
+      paymentButton.disabled = Boolean(state.draftMutationBusy || unavailable || running || reconcile || reading);
       if (document.getElementById('draftPaymentDialog').open) renderDraftPaymentReview();
+    }
+
+    function renderComplaintReading(draft) {
+      const reading = draft.complaintReading;
+      const root = document.getElementById('draftReadingStatus');
+      root.classList.toggle('hidden', !reading || ['complete','unavailable','not_started'].includes(reading.status));
+      if (!reading) { root.innerHTML = ''; return; }
+      const label = {queued:'Complaint reading queued',reading:'Reading Complaint',retry_scheduled:'Complaint reading will retry',stopped:'Complaint reading stopped'}[reading.status] || '';
+      root.innerHTML = '<div><strong>' + escapeHtml(label) + '</strong><span>' +
+        escapeHtml('Attempts: ' + reading.attempts + ' / ' + reading.maxAttempts +
+          (reading.nextRetryAt ? ' · Next retry: ' + fmtDate(reading.nextRetryAt) : '')) + '</span></div>' +
+        (reading.canRetry ? '<button type="button" class="icon-button" data-retry-complaint title="Re-read Complaint" aria-label="Re-read Complaint">' + icon('rotate-cw') + '</button>' : '');
+      const retry = root.querySelector('[data-retry-complaint]');
+      if (retry) retry.onclick = () => extractPrimaryComplaint().catch(showDraftError);
     }
 
     function renderDraftPaymentReview() {
@@ -5202,7 +5223,8 @@ const html = String.raw`<!doctype html>
       const previous = state.draftFilingJobs[0];
       const latest = jobs[0];
       state.draftFilingJobs = jobs;
-      if (!previous || !latest || previous.updatedAt !== latest.updatedAt) {
+      if (!previous || !latest || previous.updatedAt !== latest.updatedAt ||
+          ['queued','reading','retry_scheduled'].includes(state.draftDetail.caseDraft?.complaintReading?.status)) {
         const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
         if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open || state.draftEditRevision !== revision) return;
         state.draftDetail = detail;
@@ -6150,6 +6172,7 @@ const html = String.raw`<!doctype html>
         : 'Only Complaint documents can be primary';
       const canExtract = Boolean(
         canModifyDocuments &&
+        draft?.complaintReading?.canRetry !== false &&
         activeDocument &&
         activeDocument.isPrimary &&
         activeDocument.documentRole === 'primary_source' &&
@@ -6398,21 +6421,26 @@ const html = String.raw`<!doctype html>
       const detail = state.draftDetail;
       if (!detail || !detail.caseDraft) return;
       if (state.draftDirty) await saveDraft(true);
+      const revision = state.draftEditRevision;
       const button = document.getElementById('draftExtractBtn');
       setButtonBusy(button, true, 'Extracting');
       try {
-        state.draftDetail = await api('/api/drafts/' +
+        const updated = await api('/api/drafts/' +
           encodeURIComponent(detail.caseDraft.id) + '/extract-complaint', {
           method: 'POST',
         });
-        state.draftDirty = false;
-        const primary = (state.draftDetail.documents || []).find(document => document.isPrimary);
-        state.activeDraftDocumentId = primary ? primary.id : state.activeDraftDocumentId;
-        renderDraftWorkspace();
+        if (state.selectedDraftId === detail.caseDraft.id && !state.draftDirty && state.draftEditRevision === revision) {
+          state.draftDetail = updated;
+          const primary = (updated.documents || []).find(document => document.isPrimary);
+          state.activeDraftDocumentId = primary ? primary.id : state.activeDraftDocumentId;
+          renderDraftWorkspace();
+        }
         await loadDrafts(true);
-        showToast('Complaint fields extracted. Review the highlighted warnings.');
+        showToast(['queued','reading'].includes(updated.caseDraft?.complaintReading?.status)
+          ? 'Complaint reading queued. Updates will appear automatically.' : 'Complaint fields extracted. Review the highlighted warnings.');
       } finally {
         setButtonBusy(button, false);
+        if (state.selectedDraftId === detail.caseDraft.id) renderActiveDraftDocument(state.draftDetail.documents || []);
       }
     }
 
@@ -7796,6 +7824,7 @@ export interface CreateAdminServerOptions {
     handleSignals?: boolean;
     closeDatabaseOnShutdown?: boolean;
     filingWorkerAvailable?: () => boolean;
+    extractionWorkerAvailable?: () => boolean;
 }
 
 export function createAdminServer(
@@ -8788,7 +8817,14 @@ export function createAdminServer(
 
                 try { db.getDraftDocumentEditContext(primary.id); }
                 catch (error) { sendJson(res, 409, {error:(error as Error).message}); return; }
-                const latest = await ensureDraftComplaintExtraction(db, caseDraftId, {force:true});
+                let queued;
+                try { queued = db.queueComplaintExtraction(caseDraftId); }
+                catch (error) { sendJson(res, 409, {error:(error as Error).message}); return; }
+                if (options.extractionWorkerAvailable?.() === true || queued.caseDraft?.complaintReading.status === 'reading') {
+                    sendJson(res, 202, queued);
+                    return;
+                }
+                const latest = await ensureDraftComplaintExtraction(db, caseDraftId);
                 if (JSON.parse(latest.caseDraft?.normalizedDataJson || '{}').complaintExtractionError) {
                     sendJson(res, 422, { error: 'Complaint extraction failed. Check the Draft validation details.' });
                     return;

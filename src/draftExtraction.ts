@@ -5,6 +5,7 @@ import { recognizeDocumentPdf } from './documentRecognition';
 import type { DocumentRecognition } from './documentRecognition';
 import { createHash } from 'node:crypto';
 import { workerHealth, type WorkerPhase } from './workerHealth';
+import { COMPLAINT_READING_ATTEMPTS } from './complaintReading';
 
 const running = new WeakMap<WorkflowDatabase, Map<string, Promise<EmailDetail>>>();
 const recognizing = new WeakMap<WorkflowDatabase, Map<string, Promise<EmailDetail>>>();
@@ -100,16 +101,19 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
         const root = JSON.parse(draft.normalizedDataJson || '{}');
         if (root.sourceKind !== 'new_filing_intake') return initial;
         const previous = root.complaintAutoExtraction;
+        // Failed downloads may contain different bytes; retry identity stays tied to the expected source pin.
         const same = previous?.sourceVersion === sourceVersion && previous?.extractorVersion === CURRENT_COMPLAINT_EXTRACTOR_VERSION &&
-            (!expectedHash || previous?.contentHash === expectedHash);
+            (!expectedHash || (previous?.expectedContentHash ?? previous?.contentHash) === expectedHash);
+        const requested = same && previous?.status === 'queued';
         if (!options.force) {
             if (draft.complaintExtraction?.documentId === source.id && draft.complaintExtraction.extractorVersion === CURRENT_COMPLAINT_EXTRACTOR_VERSION &&
                 draft.complaintExtraction.contentHash && (!expectedHash || draft.complaintExtraction.contentHash === expectedHash) &&
-                !root.complaintExtractionError && (!previous || same)) return initial;
-            if (same && (previous.attempts >= 3 || Date.parse(previous.nextRetryAt || '') > Date.now())) return initial;
+                !root.complaintExtractionError && !requested && (!previous || same)) return initial;
+            if (same && (previous.attempts >= COMPLAINT_READING_ATTEMPTS || Date.parse(previous.nextRetryAt || '') > Date.now())) return initial;
         }
-        const attempts = same ? Number(previous.attempts || 0) + 1 : 1;
-        const state = { documentId: source.id, sourceVersion, contentHash:expectedHash, extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+        const attempts = !options.force && same ? Number(previous.attempts || 0) + 1 : 1;
+        const state = { documentId: source.id, sourceVersion, contentHash:expectedHash, expectedContentHash:expectedHash,
+            ...(same && previous?.requestId ? {requestId:previous.requestId,requestedAt:previous.requestedAt} : {}), extractorVersion: CURRENT_COMPLAINT_EXTRACTOR_VERSION,
             attempts, startedAt: new Date().toISOString() };
         db.setComplaintAutoExtractionState(draftId, { ...state, status: 'running' });
         try {
@@ -150,7 +154,7 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
                 (!latest.caseDraft?.primaryDocumentId || latest.caseDraft.primaryDocumentId===source.id)) {
                 db.recordComplaintExtractionFailure(draftId, source.id, error);
                 db.setComplaintAutoExtractionState(draftId, { ...state, status: 'failed',
-                    nextRetryAt: attempts < 3 ? new Date(Date.now() + attempts * 5 * 60_000).toISOString() : null });
+                    nextRetryAt: attempts < COMPLAINT_READING_ATTEMPTS ? new Date(Date.now() + attempts * 5 * 60_000).toISOString() : null });
             } else db.clearStaleComplaintExtractionState(draftId,sourceVersion);
             return db.getDraftDetail(draftId) || initial;
         }

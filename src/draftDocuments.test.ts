@@ -14,6 +14,7 @@ import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, finalizeScanVerification, applyVis
 import { ensureDraftComplaintExtraction, ensureDraftDocumentRecognitions } from './draftExtraction';
 import { testPdfFixture, testComplaintFormFixture } from './testPdfFixture';
 import { validCompletenessSnapshot } from './packageCompleteness';
+import { complaintReadingView, COMPLAINT_READING_ATTEMPTS } from './complaintReading';
 
 const court = 'MI Example County - 25th District Court';
 const otherCourt = 'MI Example County - 29th District Court';
@@ -833,6 +834,132 @@ test('automatic failures back off persistently without changing successful PDF d
         assert.equal(f.db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION).length,0);
         assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.complaint)!.status,'uploaded');
         assert.match(f.db.getDraftDetail(f.draftId)!.caseDraft!.normalizedDataJson!,/nextRetryAt/);
+    }finally{f.close();}
+});
+
+test('Complaint reading status distinguishes waiting, active, exhausted and completed work',()=>{
+    const failure={complaintExtractionError:'Parser timed out',complaintAutoExtraction:{status:'failed',attempts:3,nextRetryAt:'2099-01-01T00:00:00Z'}};
+    assert.equal(complaintReadingView(failure,true,true).status,'stopped');
+    assert.equal(complaintReadingView(failure,true,true).nextRetryAt,null);
+    assert.equal(complaintReadingView(failure,true,true).canRetry,true);
+    assert.equal(complaintReadingView({...failure,complaintAutoExtraction:{...failure.complaintAutoExtraction,attempts:1}},true,true).status,'retry_scheduled');
+    assert.equal(complaintReadingView({...failure,complaintAutoExtraction:{status:'running',attempts:2}},true,true).status,'reading');
+    assert.equal(complaintReadingView({...failure,complaintAutoExtraction:{status:'queued',attempts:0}},true,true).canRetry,false);
+    assert.equal(complaintReadingView({complaintExtraction:{}},true,true).status,'complete');
+    assert.equal(complaintReadingView({},false,true).status,'unavailable');
+    assert.equal(complaintReadingView(failure,true,false).canRetry,false);
+    const diagnostic={complaintExtractionError:'Error: Parser timed out\n    at internalFunction (private-server-path:1:1)'};
+    assert.equal(complaintReadingView(diagnostic,true,true).lastError,'Parser timed out');
+    assert.ok(diagnostic.complaintExtractionError.includes('private-server-path'),'The diagnostic record itself is retained');
+});
+
+test('an exhausted read can be queued once, survives restart, preserves manual fields and never auto-prepares the case',async()=>{
+    const f=fixture();
+    try {
+        const manual=structuredClone(f.db.getDraftDetail(f.draftId)!.caseDraft!.filingData);
+        manual.defendants[0].address1='210 Reviewed Avenue';
+        f.db.updateCaseDraft(f.draftId,{},undefined,manual);
+        f.db.recordComplaintExtractionFailure(f.draftId,f.complaint,new Error('Timeout after three attempts'));
+        f.db.setComplaintAutoExtractionState(f.draftId,{status:'failed',attempts:3,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,
+            sourceVersion:f.db.getComplaintSourceVersion(f.complaint),documentId:f.complaint});
+        const stopped=f.db.getDraftDetail(f.draftId)!.caseDraft!;
+        assert.equal(stopped.complaintReading.status,'stopped');
+        assert.ok(stopped.validationIssues.some(issue=>issue.field==='complaintExtraction' && issue.message.includes('Automatic reading has stopped')));
+        assert.deepEqual(f.db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION),[]);
+        const first=f.db.queueComplaintExtraction(f.draftId), second=f.db.queueComplaintExtraction(f.draftId);
+        assert.equal(first.caseDraft!.complaintReading.status,'queued');
+        assert.equal(second.caseDraft!.normalizedDataJson,first.caseDraft!.normalizedDataJson);
+        assert.equal(second.auditLogs.filter(log=>log.action==='complaint_reading_requested').length,1);
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/queued or still running/);
+        assert.equal(f.db.recoverInterruptedComplaintExtractions(),0,'A queued request is not an interrupted read');
+        const reopened=new WorkflowDatabase(f.db.getPath());
+        try {
+            assert.deepEqual(reopened.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION),[f.draftId]);
+            let calls=0;
+            const result=await ensureDraftComplaintExtraction(reopened,f.draftId,{extract:async()=>{calls++;return {...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};},
+                download:async()=>syntheticDocument(coreTitles.Complaint,'Complaint.pdf').pdf});
+            assert.equal(calls,1);assert.equal(result.caseDraft!.complaintReading.status,'complete');
+            assert.equal(result.caseDraft!.filingData.defendants[0].address1,'210 Reviewed Avenue');
+            assert.equal(result.documents.find(doc=>doc.id===f.complaint)!.status,'uploaded');
+            assert.equal(reopened.queueValidatedIntakes(),0);
+            assert.equal(reopened.listFilingJobs().length,0);
+        }finally{reopened.close();}
+    }finally{f.close();}
+});
+
+test('a manual reread bypasses a current cached result without changing the source PDF or reuploading it',async()=>{
+    const f=fixture();
+    try {
+        f.db.saveCourtFilingRule({courtName:court,relation:'separate',confirmed:true});
+        f.db.applyCourtFilingRule(f.draftId);
+        const pdf=syntheticDocument(coreTitles.Complaint,'Complaint.pdf').pdf;
+        await ensureDraftComplaintExtraction(f.db,f.draftId,{content:pdf,extract:async()=>({...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION})});
+        f.db.queueComplaintExtraction(f.draftId);
+        let calls=0;
+        const result=await ensureDraftComplaintExtraction(f.db,f.draftId,{download:async()=>pdf,extract:async()=>{calls++;return {...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};}});
+        assert.equal(calls,1);assert.equal(result.caseDraft!.complaintReading.status,'complete');
+        assert.deepEqual(result.caseDraft!.validationIssues,[]);
+        assert.equal(JSON.parse(result.caseDraft!.normalizedDataJson!).manualDocumentEdits,true);
+        assert.equal(f.db.queueValidatedIntakes(),0,'An explicit reread cannot automatically prepare a historical package');
+        assert.equal(f.db.listFilingJobs().length,0);
+        assert.equal(result.documents.length,6);
+    }finally{f.close();}
+});
+
+test('downloaded bytes differing from the prior pin cannot reset a failed extraction retry budget forever',async()=>{
+    const f=fixture();
+    try {
+        let calls=0;
+        const options={download:async()=>Buffer.from('changed OneDrive bytes'),extract:async()=>{calls++;throw new Error('Unreadable changed PDF');}};
+        for(let attempt=1;attempt<=COMPLAINT_READING_ATTEMPTS;attempt++) {
+            await ensureDraftComplaintExtraction(f.db,f.draftId,options);
+            const current=f.db.getDraftDetail(f.draftId)!;
+            assert.equal(current.caseDraft!.complaintReading.attempts,attempt);
+            const state=JSON.parse(current.caseDraft!.normalizedDataJson!).complaintAutoExtraction;
+            assert.notEqual(state.expectedContentHash,state.contentHash);
+            f.db.setComplaintAutoExtractionState(f.draftId,{...state,nextRetryAt:'2000-01-01T00:00:00Z'});
+        }
+        await ensureDraftComplaintExtraction(f.db,f.draftId,options);
+        assert.equal(calls,COMPLAINT_READING_ATTEMPTS);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.complaintReading.status,'stopped');
+        assert.deepEqual(f.db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION),[]);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.complaint)!.status,'uploaded');
+    }finally{f.close();}
+});
+
+test('requesting a reread during automatic reading coalesces work but still requires package confirmation',async()=>{
+    const f=fixture();
+    let release!:()=>void;
+    let pending:ReturnType<typeof ensureDraftComplaintExtraction>|undefined;
+    try {
+        const gate=new Promise<void>(resolve=>{release=resolve;});
+        pending=ensureDraftComplaintExtraction(f.db,f.draftId,{content:Buffer.from('mock'),
+            extract:async()=>{await gate;return {...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION};}});
+        const requested=f.db.queueComplaintExtraction(f.draftId);
+        assert.equal(requested.caseDraft!.complaintReading.status,'reading');
+        assert.equal(requested.caseDraft!.complaintReading.attempts,1);
+        assert.equal(JSON.parse(requested.caseDraft!.normalizedDataJson!).manualDocumentEdits,true);
+        f.db.queueComplaintExtraction(f.draftId);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.auditLogs.filter(log=>log.action==='complaint_reading_requested').length,1);
+        release();await pending;
+        assert.equal(f.db.getDraftDetail(f.draftId)!.caseDraft!.complaintReading.status,'complete');
+        assert.equal(f.db.queueValidatedIntakes(),0);
+    }finally{release?.();await pending;f.close();}
+});
+
+test('rejecting a package cancels its queued reading request without leaving false progress',()=>{
+    const f=fixture();
+    try {
+        f.db.queueComplaintExtraction(f.draftId);
+        f.db.reviewCaseDraft(f.draftId,'reject');
+        const rejected=f.db.getDraftDetail(f.draftId)!.caseDraft!;
+        assert.equal(rejected.status,'rejected');
+        assert.equal(JSON.parse(rejected.normalizedDataJson!).complaintAutoExtraction,undefined);
+        assert.equal(rejected.complaintReading.canRetry,false);
+        assert.notEqual(rejected.complaintReading.status,'queued');
+        assert.deepEqual(f.db.listPendingComplaintExtractions(CURRENT_COMPLAINT_EXTRACTOR_VERSION),[]);
+        assert.throws(()=>f.db.queueComplaintExtraction(f.draftId),/locked/);
+        assert.equal(f.db.listFilingJobs().length,0);
     }finally{f.close();}
 });
 

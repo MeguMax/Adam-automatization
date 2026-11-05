@@ -110,6 +110,15 @@ If the service restarts while **Save Progress** is completing, the Draft becomes
 
 ## Notes
 
+- Production uses the existing extraction worker for persisted manual Complaint
+  re-reading requests. `POST /api/drafts/:id/extract-complaint` returns 202 with
+  the current Draft rather than holding the HTTP request open through OCR. The
+  Draft's `complaintReading` view reports state, attempts, next retry and whether
+  a manual retry is available. No new environment variable or schema migration
+  is required. Standalone admin mode retains synchronous reading when no
+  extraction worker is supplied. Keep `WORKER_ENABLED=true` for background
+  processing. Existing complete/historical packages are not bulk requeued.
+
 - PDF page inspection and supporting-form text-field reads use a serialized,
   isolated Node parser instead of the admin/inbox event loop. Its V8 heap is capped
   at 256 MB and each read defaults to a 60-second deadline. Optional

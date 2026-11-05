@@ -105,7 +105,9 @@ async function main() {
     const { createAdminServer } = require('./adminServer') as typeof import('./adminServer');
     const {workerHealth}=require('./workerHealth') as typeof import('./workerHealth');
     workerHealth.start('inbox',10_000); workerHealth.finish('inbox'); workerHealth.disable('mifile');
-    const server = createAdminServer(0, { handleSignals: false, closeDatabaseOnShutdown: false, filingWorkerAvailable:()=>true });
+    let extractionWorkerAvailable = false;
+    const server = createAdminServer(0, { handleSignals: false, closeDatabaseOnShutdown: false,
+        filingWorkerAvailable:()=>true, extractionWorkerAvailable:()=>extractionWorkerAvailable });
     await once(server, 'listening');
     const port = (server.address() as { port: number }).port;
     const url = `http://127.0.0.1:${port}`;
@@ -1088,6 +1090,83 @@ async function main() {
         assert.equal(db.getDraftDetail(manual.caseDraft.id)!.documents.find(doc=>doc.originalFilename==='New Other.pdf')!.status,'failed');
         rejectUpload=false;
         await page.screenshot({path:path.join(screenshots,'draft-upload-recovery.png'),fullPage:true});
+        await page.locator('#closeDraftBtn').click();
+
+        const readingMessage={id:'qa-complaint-reading',subject:'NEW LT FILING - QA Complaint reading',
+            from:{emailAddress:{address:'qa@example.com'}}};
+        const readingParsed=buildFilingIntake(readingMessage,[]);
+        readingParsed.intake!.manual=true;
+        readingParsed.courtName='MI Example County - 25th District Court';
+        const readingEmail=db.registerEmail(readingMessage),readingDraft=db.createCaseDraft(readingEmail.id,readingParsed);
+        const readingPdf=testComplaintFormFixture({6:'Adam J Devlin P72877\r30850 Telegraph Rd Ste 250\rBingham Farms, MI 48025\r248 703 6201'});
+        const recognition=await (require('./documentRecognition') as typeof import('./documentRecognition')).recognizeDocumentPdf(readingPdf,'Complaint.pdf');
+        storedFiles.set('Reading Complaint.pdf',readingPdf);
+        const readingDocument=db.addDocument({emailId:readingEmail.id,caseDraftId:readingDraft,documentType:'Complaint',
+            originalFilename:'Complaint.pdf',currentFilename:'Reading Complaint.pdf',status:'uploaded',uploadSource:'test',
+            oneDriveUrl:'https://onedrive.example/Reading%20Complaint.pdf',fileSize:readingPdf.length,metadata:{recognition}});
+        db.applyComplaintExtraction(readingDraft,readingDocument,originalExtraction);
+        db.markEmailProcessed(readingEmail.id);
+        db.recordComplaintExtractionFailure(readingDraft,readingDocument,new Error('Synthetic parser timeout'));
+        db.setComplaintAutoExtractionState(readingDraft,{documentId:readingDocument,sourceVersion:db.getComplaintSourceVersion(readingDocument),
+            extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,contentHash:recognition.contentHash,
+            expectedContentHash:recognition.contentHash,status:'failed',attempts:3});
+        await page.evaluate(id=>(window as any).openDraft(id),readingDraft);
+        await page.locator('#draftExtractionProgress').waitFor({state:'hidden'});
+        await page.locator('#draftReviewTab').click();
+        assert.match(await page.locator('#draftReadingStatus').innerText(),/Complaint reading stopped/);
+        assert.match(await page.locator('#draftReadingStatus').innerText(),/3 \/ 3/);
+        await page.locator('#draftPdfViewer canvas').waitFor({state:'visible'});
+        await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
+        while(await page.getByRole('button',{name:'Dismiss notification',exact:true}).count()) {
+            await page.getByRole('button',{name:'Dismiss notification',exact:true}).first().click();
+        }
+        await page.screenshot({path:path.join(screenshots,'draft-reading-stopped-desktop.png'),fullPage:true});
+        extractionWorkerAvailable=true;
+        const rereadResponse=page.waitForResponse(response=>response.url().endsWith('/extract-complaint'));
+        await page.locator('[data-retry-complaint]').click();
+        assert.equal((await rereadResponse).status(),202);
+        await page.waitForFunction(()=>document.getElementById('draftReadingStatus')?.textContent?.includes('Complaint reading queued'));
+        assert.equal(await page.locator('#draftPrepareBtn').isDisabled(),true);
+        const repeated=await context.request.post(`${url}/api/drafts/${readingDraft}/extract-complaint`,{headers:{Origin:url}});
+        assert.equal(repeated.status(),202);
+        assert.equal(db.getDraftDetail(readingDraft)!.auditLogs.filter(log=>log.action==='complaint_reading_requested').length,1);
+        await page.setViewportSize({width:390,height:844});
+        await page.locator('[data-draft-mobile-mode="fields"]').click();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        const mobilePanel=await page.locator('#draftFieldsPanel').boundingBox();
+        for(const id of ['draftPrepareBtn','draftPaymentBtn']) {
+            const box=await page.locator('#'+id).boundingBox();
+            assert.ok(box&&mobilePanel&&box.width>30&&box.x>=mobilePanel.x&&box.x+box.width<=mobilePanel.x+mobilePanel.width+1&&
+                box.y+box.height<=844,'The mobile action must not be clipped: '+id);
+        }
+        while(await page.getByRole('button',{name:'Dismiss notification',exact:true}).count()) {
+            await page.getByRole('button',{name:'Dismiss notification',exact:true}).first().click();
+        }
+        await page.screenshot({path:path.join(screenshots,'draft-reading-queued-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+        let releaseReading!:()=>void,readingStarted!:()=>void;
+        const readingGate=new Promise<void>(resolve=>{releaseReading=resolve;});
+        const readingBegan=new Promise<void>(resolve=>{readingStarted=resolve;});
+        const readingPromise=(require('./draftExtraction') as typeof import('./draftExtraction')).ensureDraftComplaintExtraction(db,readingDraft,{
+            download:async()=>readingPdf,extract:async()=>{readingStarted();await readingGate;return originalExtraction;}});
+        try {
+            await readingBegan;
+            await page.evaluate(()=>(window as any).refreshDraftFilingState());
+            assert.match(await page.locator('#draftReadingStatus').innerText(),/Reading Complaint/);
+            await page.locator('#draftDataTab').click();
+            const pendingAddress=page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
+            await pendingAddress.fill('220 Reviewed Avenue');
+            releaseReading();await readingPromise;
+            await page.evaluate(()=>(window as any).refreshDraftFilingState());
+            assert.equal(await pendingAddress.inputValue(),'220 Reviewed Avenue','Refresh cannot discard an unsaved correction while reading finishes');
+            await page.locator('#draftSaveBtn').click();
+            await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
+            const finished=db.getDraftDetail(readingDraft)!;
+            assert.equal(finished.caseDraft!.complaintReading.status,'complete');
+            assert.equal(finished.caseDraft!.filingData.plaintiff.address1,'220 Reviewed Avenue');
+            assert.equal(finished.documents.find(document=>document.id===readingDocument)!.status,'uploaded');
+            assert.equal(db.listFilingJobs(readingDraft).length,0);
+        }finally{releaseReading();await readingPromise;extractionWorkerAvailable=false;}
         await page.locator('#closeDraftBtn').click();
         await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();
         assert.equal(await page.locator('#draftManualCopyBtn').isHidden(), true);
