@@ -151,10 +151,13 @@ async function firstVisible(locator: Locator): Promise<Locator | null> {
     return null;
 }
 
-function transientBundleRead(error: unknown): boolean {
+function transientBundleRead(error: unknown, expectedUrl?: string): boolean {
     if (error instanceof MiFileFilingError) return error.retryableRead;
-    return error instanceof Error && (error.name === 'TimeoutError' ||
-        /\bnet::ERR_(?:CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_REFUSED|TIMED_OUT|NETWORK_CHANGED|EMPTY_RESPONSE)\b/.test(error.message));
+    if (!(error instanceof Error)) return false;
+    const interrupted = error.message.match(/Navigation to "([^"]+)" is interrupted by another navigation to "([^"]+)"/);
+    return error.name === 'TimeoutError' ||
+        /\bnet::ERR_(?:CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_REFUSED|TIMED_OUT|NETWORK_CHANGED|EMPTY_RESPONSE)\b/.test(error.message) ||
+        Boolean(expectedUrl && interrupted && interrupted[1] === expectedUrl && interrupted[2] === expectedUrl);
 }
 
 export class MiFileFilingRunner {
@@ -306,7 +309,7 @@ export class MiFileFilingRunner {
                 courtName: job.payload.courtName, sourcePdfCount: documents.length,
                 connectedPdfCount: documentManifest.filter(document => document.filingRelation === 'connected_to_complaint').length,
                 generatedPdfCount: 1, packageDigest: preparationDigest(job.payload, sources), sources,
-                fees: await this.observeFees(page), paymentAuthorized: false, courtSubmissionAuthorized: false,
+                fees: await this.observeFees(page, job.payload.filingData.defendants.length), paymentAuthorized: false, courtSubmissionAuthorized: false,
             };
 
             const screenshotPath = path.join(jobDirectory, 'prepared.png');
@@ -802,7 +805,7 @@ export class MiFileFilingRunner {
                 await this.verifySavedBundle(page, payload, receipts, username, bundleId, temporaryCaseNumber);
                 return;
             } catch (error) {
-                if (attempt === 3 || !transientBundleRead(error)) throw error;
+                if (attempt === 3 || !transientBundleRead(error, url)) throw error;
                 await this.log('warning', 'verify_saved_bundle',
                     'The saved bundle could not be read yet. Reopening the same bundle without repeating preparation.',
                     {event: 'saved_bundle_read_retry', attempt, maxAttempts: 3, externalBundleId: bundleId});
@@ -865,13 +868,13 @@ export class MiFileFilingRunner {
             }
             await this.reopenSavedBundle(page, String(job.result!.url), job.payload, job.result!.documentManifest as MiFileDocumentReceipt[],
                 account.username, job.externalBundleId, job.temporaryCaseNumber);
-            const fees = await this.observeFees(page);
+            const fees = await this.observeFees(page, job.payload.filingData.defendants.length);
             if (fees.displayedSubtotalCents === null) throw new Error('The current bundle fees could not be read unambiguously.');
             return {packageDigest, sourceFeeSubtotalCents:fees.displayedSubtotalCents};
         } finally { fs.rmSync(directory, {recursive:true, force:true}); }
     }
 
-    private async observeFees(page: Page): Promise<MiFileFeeObservation> {
+    private async observeFees(page: Page, expectedMailingQuantity = 1): Promise<MiFileFeeObservation> {
         const lines = await page.locator('#documentTable tbody[id]').evaluateAll(rows => rows.map(row => {
             const cells = Array.from(row.querySelector('tr')?.children || []) as HTMLElement[];
             return { label: row.querySelector<HTMLInputElement>('input[name^="documentName_"]')?.value || cells[1]?.innerText || 'Case Initiation Form',
@@ -888,7 +891,8 @@ export class MiFileFilingRunner {
         const observed = [...lines, ...additional].map(line => ({ label: line.label.trim().slice(0, 200),
             quantity: line.quantity, cents: usdCents(line.amount) }));
         const subtotal = observed.length && observed.every(line => line.cents !== null) &&
-            additional.every(line => line.quantity === 1) &&
+            Number.isSafeInteger(expectedMailingQuantity) && expectedMailingQuantity > 0 &&
+            additional.every(line => line.quantity === (line.label === 'Mailing Fee' ? expectedMailingQuantity : 1)) &&
             additional.filter(line => line.label === 'Mailing Fee').length === 1
             ? observed.reduce((sum, line) => sum + line.cents!, 0) : null;
         return { source: 'unsubmitted_upload', currency: 'USD', observedAt: new Date().toISOString(), lines: observed,

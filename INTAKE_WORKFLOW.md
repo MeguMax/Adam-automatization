@@ -551,3 +551,10 @@ tester (including borrowed supporting PDFs or pre-prefix filenames). These use
 a manual standard-LT fixture and report that mode separately; they are evidence
 of recognition/completeness, not automatic batch grouping. Production grouping
 is unchanged. Use `verify-batch-intake.cjs` for actual multi-case email acceptance.
+
+Mailing Fee quantity is checked against the named Defendant count, not a fixed
+quantity of one (v113). The displayed monetary row total is included once; no
+per-person tariff is assumed or multiplied again. Mismatched, missing or invalid
+quantities still prevent a verified subtotal. This is the saved-bundle subtotal,
+not a checkout quote or payment authorization. Older saved evidence is not
+rewritten; a new read-only inspection can read its current fees.

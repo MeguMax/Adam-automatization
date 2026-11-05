@@ -668,7 +668,7 @@ test('source fingerprints bind all PDFs and case fields to the preparation snaps
 
 async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;wrongAccount?:boolean;wrongFiler?:boolean;
     missingPdf?:boolean;extraPdf?:boolean;wrongParent?:boolean;warning?:boolean;serve?:boolean;quantity?:number;
-    wrongGeneratedType?:boolean;generatedWarning?:boolean} = {}) {
+    wrongGeneratedType?:boolean;generatedWarning?:boolean;mailingCents?:number} = {}) {
     const page = await browser.newPage();
     const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
     const rows = `<tbody id="filing-0"><tr><td></td><td>Case Initiation Form<input hidden name="documentName_0" value="Case Initiation Form"></td><td>1 KB</td><td>CASE INIT FORM<input hidden placeholder="Select or Type Filing Type" value="${options.wrongGeneratedType?'Other':'ISI_CASE_INIT_FORM_DT'}"></td><td><span class="glyphicon-${options.generatedWarning?'alert':'ok'}" ${options.generatedWarning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>` +
@@ -679,7 +679,7 @@ async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;w
         `<input id="filer-input-selected" value="${options.wrongFiler?'Devlin, Adam (P00000)':'Devlin, Adam (P72877)'}">` +
         `<label><input type="checkbox" ${options.serve?'checked':''}>Serve Document</label><input type="checkbox" id="isEmergency">` +
         `<table id="documentTable"><caption>Filing documents</caption>${rows}</table>` +
-        `<table><thead><tr><th>Additional Payment Type</th><th>Quantity</th><th>Fee</th><th>Actions</th></tr></thead><tbody><tr><td>Mailing Fee</td><td>${options.quantity??1}</td><td>$13.00</td><td>Remove</td></tr></tbody></table>` +
+        `<table><thead><tr><th>Additional Payment Type</th><th>Quantity</th><th>Fee</th><th>Actions</th></tr></thead><tbody><tr><td>Mailing Fee</td><td>${options.quantity??1}</td><td>$${((options.mailingCents??1300)/100).toFixed(2)}</td><td>Remove</td></tr></tbody></table>` +
         `<button onclick="window.submitted=true">Submit</button><button onclick="window.next=true">Next</button>`;
     await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:html}));
     await page.goto(`https://mifile.courts.michigan.gov/filing/create/${id}`);
@@ -739,11 +739,31 @@ test('an incomplete saved-page read is bounded across three attempts and preserv
         let reads=0;
         await f.page.route(f.page.url(),route=>{reads++;return route.fulfill({body:'Still loading'});});
         const runner=new MiFileFilingRunner();
-        (runner as any).timeoutMs=30;(runner as any).savedReadRetryDelayMs=0;
+        (runner as any).timeoutMs=1_000;(runner as any).savedReadRetryDelayMs=0;
         await assert.rejects((runner as any).reopenSavedBundle(f.page,f.page.url(),f.payload,f.receipts,
             'qa@example.com',f.id,'TEMP-QA'), /Timeout/);
         assert.equal(reads,3);
     } finally {await f.page.close();}
+});
+
+test('only a navigation interrupted by the same exact saved-bundle URL may be retried', async () => {
+    for (const sameBundle of [true,false]) {
+        const f=await savedBundlePage();
+        try {
+            const url=f.page.url(), goto=f.page.goto.bind(f.page);
+            let calls=0;
+            f.page.goto=async (...args:Parameters<Page['goto']>)=>{
+                calls++;
+                if(calls===1)throw new Error(`page.goto: Navigation to "${url}" is interrupted by another navigation to "${sameBundle?url:'https://example.com/unexpected'}"`);
+                return goto(...args);
+            };
+            const runner=new MiFileFilingRunner();(runner as any).savedReadRetryDelayMs=0;
+            const check=(runner as any).reopenSavedBundle(f.page,url,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA');
+            if(sameBundle){await check;assert.equal(calls,2);}
+            else {await assert.rejects(check,/interrupted/);assert.equal(calls,1);}
+            assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+        }finally{await f.page.close();}
+    }
 });
 
 test('persisted identity, PDF and connection mismatches do not trigger read retries or corrective writes', async () => {
@@ -780,6 +800,21 @@ test('unfamiliar fee quantities do not produce a guessed subtotal', async () => 
     const f = await savedBundlePage({quantity:2});
     try {assert.equal((await (new MiFileFilingRunner() as any).observeFees(f.page)).displayedSubtotalCents,null);}
     finally {await f.page.close();}
+});
+
+test('mailing quantity follows the exact Defendant count and uses the observed row total only once', async () => {
+    const f=await savedBundlePage({quantity:2,mailingCents:2600});
+    try {
+        const runner=new MiFileFilingRunner();
+        const fees=await (runner as any).observeFees(f.page,2);
+        assert.equal(fees.displayedSubtotalCents,7100);
+        assert.deepEqual(fees.lines.at(-1),{label:'Mailing Fee',quantity:2,cents:2600});
+        assert.equal(fees.checkoutTotalCents,null);
+        for(const expected of [0,1,3,-1,NaN,Infinity,1.5]) {
+            assert.equal((await (runner as any).observeFees(f.page,expected)).displayedSubtotalCents,null);
+        }
+        assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+    }finally{await f.page.close();}
 });
 
 test('preparation acknowledges only the known PII information notice and never accepts or removes other dialogs', async () => {
