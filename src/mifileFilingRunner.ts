@@ -1071,6 +1071,12 @@ export class MiFileFilingRunner {
     }
 
     private async saveProgress(page: Page): Promise<void> {
+        // Saving the initiation form can reset the outer bundle's filer selection.
+        try { await this.selectRequiredFiler(page); }
+        catch (error) {
+            throw new MiFileFilingError(error instanceof Error ? error.message : 'The required filer could not be confirmed.',
+                'SAVED_BUNDLE_FILER_UNCONFIRMED', 'save_progress');
+        }
         await page.getByRole('button', { name: 'Save Progress', exact: true }).click();
         const confirmation = page.getByText('Your progress has been saved.', { exact: false });
         await confirmation.waitFor({ state: 'visible', timeout: this.timeoutMs });

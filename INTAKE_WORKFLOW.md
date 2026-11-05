@@ -517,3 +517,10 @@ bounded retry budget. A late failed read cannot replace a successful retry.
 Exhaustion flows through the existing per-document/per-package error handling;
 no uncertain cloud write or MiFILE operation is retried by this helper. Payment
 and final court submission remain compiled off.
+
+Before Save Progress, preparation reconfirms the exact Devlin, Adam (P72877)
+filer, because completing an initiation form can clear the outer bundle's
+selection. An unavailable or ambiguous filer at this late stage requires
+reconciliation of the existing bundle, never a fresh automatic preparation.
+Reopening the saved bundle still must confirm the persisted filer and full PDF
+manifest before reporting Prepared (v111).

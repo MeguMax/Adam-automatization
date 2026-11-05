@@ -710,7 +710,8 @@ test('preparation acknowledges only the known PII information notice and never a
 test('Save Progress acknowledges only its own success dialog and never an unrelated OK button',async()=>{
     const page=await browser.newPage();
     try {
-        await page.setContent('<button onclick="document.getElementById(\'saved\').hidden=false">Save Progress</button>'+
+        await page.setContent('<input id="filer-input-selected" value="Devlin, Adam (P72877)">'+
+            '<button onclick="document.getElementById(\'saved\').hidden=false">Save Progress</button>'+
             '<div role="dialog">Payment authorization<button onclick="window.wrongOk=true">OK</button></div>'+
             '<div role="dialog" id="saved" hidden>Your progress has been saved.<button onclick="window.savedOk=true;this.parentElement.hidden=true">OK</button></div>'+
             '<button onclick="window.submitted=true">Submit</button>');
@@ -718,6 +719,32 @@ test('Save Progress acknowledges only its own success dialog and never an unrela
         assert.equal(await page.evaluate(()=>Boolean((window as any).savedOk)),true);
         assert.equal(await page.evaluate(()=>Boolean((window as any).wrongOk||(window as any).submitted)),false);
     } finally {await page.close();}
+});
+
+test('Save Progress restores a filer reset by the initiation form and never saves an ambiguous filer', async () => {
+    for (const ambiguous of [false, true]) {
+        const page = await browser.newPage();
+        try {
+            const row='<div role="option" aria-label="Name: Devlin, Adam, Role: Attorney, State: MI, Number: P72877, Organization: Devlin Law, PLLC">Devlin, Adam</div>';
+            await page.setContent('<input id="filer-input-selected" value=""><input id="filer-input-empty">'+
+                `<div id="filer-listbox" hidden>${row}${ambiguous ? row : ''}</div>`+
+                '<button onclick="window.savedFiler=document.getElementById(\'filer-input-selected\').value;document.getElementById(\'saved\').hidden=false">Save Progress</button>'+
+                '<div role="dialog" id="saved" hidden>Your progress has been saved.<button onclick="this.parentElement.hidden=true">OK</button></div>'+
+                '<button onclick="window.submitted=true">Submit</button><script>'+
+                'document.getElementById("filer-input-empty").onclick=()=>document.getElementById("filer-listbox").hidden=false;'+
+                'document.querySelectorAll("[role=option]").forEach(o=>o.onclick=()=>{document.getElementById("filer-input-selected").value="Devlin, Adam (P72877)";document.getElementById("filer-listbox").hidden=true;});</script>');
+            const runner = new MiFileFilingRunner();
+            if (ambiguous) {
+                await assert.rejects((runner as any).saveProgress(page), (error: any) =>
+                    error.code === 'SAVED_BUNDLE_FILER_UNCONFIRMED' && error.checkpoint === 'save_progress');
+                assert.equal(await page.evaluate(() => (window as any).savedFiler), undefined);
+            } else {
+                await (runner as any).saveProgress(page);
+                assert.equal(await page.evaluate(() => (window as any).savedFiler),'Devlin, Adam (P72877)');
+            }
+            assert.equal(await page.evaluate(() => Boolean((window as any).submitted)), false);
+        } finally {await page.close();}
+    }
 });
 
 test('the November webinar information notice is acknowledged but agreements or data-entry notices are never accepted',async()=>{
