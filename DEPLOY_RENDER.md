@@ -79,6 +79,15 @@ Use **Settings > MiFILE account > Verify and save** with admin authentication en
 
 Saved credentials are encrypted in persistent SQLite, take precedence over environment credentials, and are used by both downloading and preparation sessions. Back up the private key separately and securely along with the database and form library. A lost, corrupt or incorrect key is never silently regenerated for an existing saved account, and the system will not fall back to another login. Restore the original key before using that saved account. Standalone `npm run admin` still uses an explicitly configured key. See [INTAKE_WORKFLOW.md](INTAKE_WORKFLOW.md) for sender configuration and rollout checks.
 
+Once the saved primary account has passed a fresh sign-in and a worker PDF-download
+check, the application does not require the old alternate/dummy MiFILE account or
+its delegation link. Both paths use the same saved-account selector. Cached cookies
+are bound to the credential identity, not reused across account changes. Legacy
+environment credentials are only a bootstrap fallback when no account is saved;
+they do not recover an unreadable saved account. Removing a MiFILE delegation is
+an account-owner action and is separate from Microsoft Graph mail/OneDrive access.
+Never delete the persisted credential record or encryption key as part of cleanup.
+
 Both account labels refer to live MiFILE, not a sandbox. The instructions below remain the environment-only fallback until an account has been saved in the admin panel.
 
 The application defaults to `MIFILE_ACCOUNT_ENVIRONMENT=test`. These account-control values use `sync: false` in the Blueprint so a later Blueprint sync cannot overwrite the selection made in Render. The Draft Editor shows the active account class and always states that preparation is unsubmitted-only.

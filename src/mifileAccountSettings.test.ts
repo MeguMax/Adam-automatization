@@ -59,6 +59,22 @@ test('blank password keeps the existing secret only for the same account', () =>
     assert.notEqual(miFileCredentialIdentity(account), miFileCredentialIdentity({ ...account, password: 'rotated' }));
 });
 
+test('the saved primary account remains independent after legacy alternate credentials are removed',()=>{
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'mifile-no-alternate-'));
+    const db=new WorkflowDatabase(path.join(directory,'workflow.sqlite'));
+    try {
+        db.saveMiFileAccountSetting(encryptMiFileAccount(account,environment));
+        const withoutAlternate:NodeJS.ProcessEnv={MIFILE_CREDENTIALS_KEY:environment.MIFILE_CREDENTIALS_KEY};
+        assert.deepEqual(getMiFileCredentials(withoutAlternate,db),account);
+        assert.equal(accountSettingsView(withoutAlternate,db).source,'admin');
+        assert.equal(accountSettingsView(withoutAlternate,db).accountEnvironment,'production');
+        const corrupt=JSON.parse(db.getRuntimeSetting('mifile_account')!);corrupt.data='invalid';
+        db.saveMiFileAccountSetting(JSON.stringify(corrupt));
+        assert.throws(()=>getMiFileCredentials(environment,db),/could not be decrypted/,
+            'A broken primary setting must not silently fall back to the old alternate login');
+    }finally{db.close();fs.rmSync(directory,{recursive:true,force:true});}
+});
+
 test('production key bootstrapping persists one private key and decrypts the account after restart', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mifile-key-'));
     const filename = path.join(directory, 'workflow.sqlite');

@@ -17,6 +17,45 @@ const demandRecognition: DocumentRecognition = {
     message: 'Synthetic Demand title verified from fixture content.',
 };
 
+test('Complaint court-address resolution is automatic, source-specific and preserves manually corrected court/parties',()=>{
+    const directory=fs.mkdtempSync(path.join(os.tmpdir(),'court-address-extraction-'));
+    const db=new WorkflowDatabase(path.join(directory,'workflow.sqlite'));
+    try {
+        const email=db.registerEmail({id:'court-address',subject:'NEW LT FILING - court address QA'});
+        const draft=db.createCaseDraft(email.id,{isMiFile:false,sourceKind:'new_filing_intake',courtName:null,
+            caseNumber:null,caseTitle:null,plaintiff:null,defendant:null,bundleNumber:null,filerName:null,filedAt:null,
+            filedDocuments:[],fileTypeByAttachmentId:{}});
+        const document=db.addDocument({emailId:email.id,caseDraftId:draft,documentType:'Complaint for Possession Only',
+            currentFilename:'Complaint.pdf',oneDriveUrl:'https://onedrive.example/complaint',uploadSource:'test',status:'uploaded'});
+        const extraction:import('./complaintExtractor').ComplaintExtractionResult={extractorVersion:13,
+            extractionMethod:'form_fields',courtAddress:'52420 Van Dyke Ave Shelby Township, MI 48316',
+            formType:'RECOVER POSSESSION OF PROPERTY',pageCount:1,textHash:'initial',warnings:[],
+            data:{courtDistrict:'41A',plaintiff:{displayName:'Example Investments L.L.C.',entityName:'Example Investments L.L.C.'},
+                defendants:[{displayName:'Morgan Tenant',firstName:'Morgan',lastName:'Tenant',address1:'300 Rental Street',city:'Macomb',state:'MI',postalCode:'48044'},
+                    {displayName:'Taylor Resident',firstName:'Taylor',lastName:'Resident',address1:'300 Rental Street',city:'Macomb',state:'MI',postalCode:'48044'}],
+                moneyJudgmentRequested:false,claimAmount:'0.00',relatedCivilAction:'none',includeAllOtherOccupants:true,mailingRequested:true},
+            fieldConfidence:{courtDistrict:'high',defendants:'high'}};
+        const first=db.applyComplaintExtraction(draft,document,extraction);
+        assert.equal(first.caseDraft?.editableData.courtName,'MI Macomb County - Shelby Township - 41A-2 District Court');
+        assert.equal(first.caseDraft?.filingData.courtDistrict,'41A-2');
+        assert.equal(first.caseDraft?.complaintExtraction?.courtAddress,extraction.courtAddress);
+        assert.deepEqual(first.caseDraft?.filingData.defendants.map(p=>p.firstName),['Morgan','Taylor']);
+        const uncertain=db.applyComplaintExtraction(draft,document,{...extraction,extractionMethod:'ocr',textHash:'unverified-address'});
+        assert.equal(uncertain.caseDraft?.editableData.courtName,null,'OCR metadata alone cannot select a division or retain an old auto guess');
+        db.applyComplaintExtraction(draft,document,extraction);
+        const conflict=db.applyComplaintExtraction(draft,document,{...extraction,data:{...extraction.data,courtDistrict:'41A-1'},textHash:'conflicting-division'});
+        assert.equal(conflict.caseDraft?.editableData.courtName,null,'A conflicting division must not keep the previous automatic court');
+        const current=db.applyComplaintExtraction(draft,document,extraction).caseDraft!;
+        const manual=structuredClone(current.filingData);manual.defendants[0].firstName='Reviewed';
+        db.updateCaseDraft(draft,{courtName:'MI Macomb County - Sterling Heights - 41A-1 District Court'},undefined,manual);
+        const updated=db.applyComplaintExtraction(draft,document,{...extraction,textHash:'new-read'}).caseDraft!;
+        assert.equal(updated.editableData.courtName,'MI Macomb County - Sterling Heights - 41A-1 District Court');
+        assert.equal(updated.filingData.defendants[0].firstName,'Reviewed');
+        assert.equal(updated.filingData.defendants[1].firstName,'Taylor');
+        assert.equal(updated.fieldSources.courtName,'manual');
+    }finally{db.close();fs.rmSync(directory,{recursive:true,force:true});}
+});
+
 for (const concurrentChange of ['pdf', 'fields'] as const) {
 test(`supporting review checks concurrent ${concurrentChange} changes inside its write transaction`, () => {
     const tempDir=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-review-transaction-'));

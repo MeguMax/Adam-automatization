@@ -403,3 +403,27 @@ The supplied colleague-attorney example remains recognition-only under the
 Devlin-only filer policy. Missing supporting PDFs and unresolved OCR values
 remain review issues. These changes do not create, repay or resubmit existing
 cases, and final payment/court submission remain disabled.
+
+## Court divisions and multiple Defendants (November 5, v105)
+
+A populated Complaint court-address field can resolve a district that omits its
+division, such as `41A` at the Shelby Township court address. This applies only to
+the canonical DC 102a/DC 102c PDF field, not the Defendant address or unchecked OCR
+metadata. The resolver requires a numbered address, matching Michigan city/ZIP
+tail, the same district family and a unique known court. A conflicting explicit
+division or duplicate court match requires review. The original district/address
+remain extraction evidence; the filing district uses the resolved division so the
+selected court and library Local form agree. Manual court and party edits remain
+protected during re-extraction.
+
+Named Defendants are entered as separate parties with their own inherited address
+values. The attorney block is located after all named Defendants, not assumed to
+be the second party. `All other occupants` stays a separate selection, not another
+named person. Dotted company suffixes such as `L.L.C.` do not create person-name
+fields. The supplied three-PDF termination example still requires a supporting
+PDF; testing two Defendants does not waive package completeness.
+
+The attorney confirmed that the previously supplied examples are historical
+actions for testing, not new authorized filings. Do not pay, submit or recreate
+those cases based on their presence in the QA corpus. Unsubmitted cleanup belongs
+to the account owner. Final payment and court submission remain compiled off.

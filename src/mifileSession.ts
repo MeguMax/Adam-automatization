@@ -174,7 +174,7 @@ export async function authenticateMifilePage(
     options: { strictNotices?: boolean } = {},
 ): Promise<void> {
     if (!credentials.username || !credentials.password) {
-        throw new Error('MIFILE_USER / MIFILE_PASSWORD not set in env');
+        throw new Error('MiFILE login credentials are not configured. Verify the active account under Settings > MiFILE account.');
     }
 
     let lastError: unknown = null;

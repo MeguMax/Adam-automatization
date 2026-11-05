@@ -6685,10 +6685,12 @@ export class WorkflowDatabase {
         };
 
         if (extraction.data.courtDistrict) {
-            apply('courtDistrict', extraction.data.courtDistrict);
+            const court = resolveCourt(extraction.data.courtDistrict, this.getKnownCourtNames(),
+                extraction.extractionMethod === 'form_fields' ? extraction.courtAddress : undefined);
+            apply('courtDistrict', court ? districtCode(court) || extraction.data.courtDistrict : extraction.data.courtDistrict);
             if ((!next.courtName || legacySources.courtName === 'complaint') && !explicitManual.has('courtName') && !manualFields.has('courtDistrict')) {
-                const court = resolveCourt(extraction.data.courtDistrict, this.getKnownCourtNames());
-                if (court) { next.courtName = court; appliedCourtName = court; }
+                next.courtName = court;
+                if (court) appliedCourtName = court;
             }
         }
         if (extraction.data.plaintiff) {

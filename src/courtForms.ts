@@ -5,10 +5,29 @@ export function districtCode(court: string): string | null {
     return match[1].toUpperCase() + (division ? '-' + division : '');
 }
 
-export function resolveCourt(district: string, courts: string[]): string | null {
+export function resolveCourt(district: string, courts: string[], courtAddress?: string): string | null {
     const normalized = normalizeImportCode(district);
     const matches = [...new Set([...courts, ...(KNOWN_MIFILE_COURTS[normalized] || [])]
         .filter(court => districtCode(court) === normalized))];
+    if (courtAddress && courtAddress.length <= 400 && /^\s*\d+[A-Z]?(?:[-/]\d+)?\s+\S/i.test(courtAddress)) {
+        const normalize = (text: string) => text.normalize('NFKC').replace(/\bTwp\.?\b/gi, 'Township')
+            .replace(/[.,]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const address = normalize(courtAddress);
+        const family = normalized.split('-')[0];
+        const candidates = [...new Set([...courts, ...Object.values(KNOWN_MIFILE_COURTS).flat()])]
+            .filter(court => districtCode(court)?.split('-')[0] === family);
+        const located = candidates.filter(court => {
+            const parts = court.split(/\s+-\s+/);
+            if (parts.length !== 3) return false;
+            const city = normalize(parts[1]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return new RegExp(`\\b${city} (?:mi|michigan) \\d{5}(?:[ -]\\d{4})?$`).test(address);
+        });
+        if (located.length) {
+            // A court-address field may disambiguate a division, never override a conflicting explicit division.
+            return located.length === 1 && (!normalized.includes('-') || districtCode(located[0]) === normalized)
+                ? located[0] : null;
+        }
+    }
     return matches.length === 1 ? matches[0] : null;
 }
 

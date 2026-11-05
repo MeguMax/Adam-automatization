@@ -161,6 +161,27 @@ test('AcroForm values preserve spelling, multiline addresses, multiple Defendant
     assert.equal(result.warnings.length, 0);
 });
 
+test('court address is retained only from its own unambiguous field; dotted entity suffixes are not person names',()=>{
+    const address='52420 Van Dyke Ave Shelby Township, MI 48316';
+    for(const prefix of ['dc102a','dc102c']) {
+        const title=prefix==='dc102c' ? 'DC 102c COMPLAINT TO RECOVER POSSESSION OF PROPERTY\nSUPPLEMENTAL COMPLAINT' : FORM_TITLE;
+        const widgets=formWidgets({1:'41A',3:address,5:'Example Investments L.L.C.',
+            7:'Morgan Tenant, Taylor Resident , and all other occupants\r300 Rental Street\rExample City, MI 48002',
+            32:'Off',39:'Off'},prefix);
+        const result=parseComplaintFormFields(title,widgets)!;
+        assert.equal(result.data.courtDistrict,'41A');
+        assert.equal(result.courtAddress,address);
+        assert.equal(result.data.plaintiff?.firstName,undefined);
+        assert.equal(result.data.plaintiff?.lastName,undefined);
+        assert.deepEqual(result.data.defendants?.map(p=>p.displayName),['Morgan Tenant','Taylor Resident']);
+        assert.ok(result.data.defendants?.every(p=>p.address1==='300 Rental Street'));
+        const conflict={fieldName:`${prefix}_03`,fieldType:'Tx',fieldValue:'40111 Dodge Park Rd Sterling Heights, MI 48313'};
+        const ambiguous=parseComplaintFormFields(title,[...widgets,conflict])!;
+        assert.equal(ambiguous.courtAddress,undefined);
+        assert.ok(ambiguous.warnings.some(w=>w.code==='source_conflict' && w.field==='courtDistrict'));
+    }
+});
+
 test('AcroForm missing values and ambiguous boxes do not default to possession only or use monthly rent as the claim', () => {
     const missing = parseComplaintFormFields(FORM_TITLE, formWidgets({8:'Off',9:'Off',37:''}))!;
     assert.equal(missing.data.relatedCivilAction, undefined);

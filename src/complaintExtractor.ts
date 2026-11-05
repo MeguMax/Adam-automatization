@@ -6,7 +6,7 @@ import { recognizeScannedPdf, paragraph2Boundary, ocrDistrictCode, OcrPage, OcrL
 import { createCanvas } from '@napi-rs/canvas';
 import { readComplaintSelections, mergeComplaintSelections, type ComplaintSelections } from './pdfCheckboxes';
 
-export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 12;
+export const CURRENT_COMPLAINT_EXTRACTOR_VERSION = 13;
 
 export type ComplaintFieldConfidence = 'high' | 'medium' | 'low';
 
@@ -61,7 +61,8 @@ export interface ComplaintExtractionWarning {
 export interface ComplaintExtractionResult {
     textSource?: 'pdf' | 'ocr';
     contentHash?: string;
-    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12;
+    extractorVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
+    courtAddress?: string;
     checkboxSelections?: ComplaintSelections;
     scanVerification?: {
         version: 1;
@@ -156,7 +157,7 @@ function normalizedPhone(value: string): string | undefined {
 
 function personNameParts(value: string): Partial<ComplaintPartyExtraction> {
     const name = cleanName(value);
-    if (!name || /[,/&]|\b(?:and|llc|inc|corp|management|property|apartments?)\b/i.test(name)) {
+    if (!name || ENTITY_NAME.test(name) || /[,/&]|\b(?:and|llc|inc|corp|management|property|apartments?)\b/i.test(name)) {
         return {};
     }
     const parts = name.split(/\s+/).filter(Boolean);
@@ -267,7 +268,7 @@ export function parseComplaintFormFields(text: string, widgets: ComplaintFormWid
         data: { mailingRequested: true }, fieldConfidence: { mailingRequested: 'high' }, warnings: [],
     };
     const conflictGroups: Array<[keyof ComplaintExtractionData, number[], string]> = [
-        ['courtDistrict', [1], 'court district'], ['plaintiff', [5], 'Plaintiff'],
+        ['courtDistrict', [1, 3], 'court district/address'], ['plaintiff', [5], 'Plaintiff'],
         ['defendants', [7], 'Defendant names and addresses'], ['attorney', [6], 'attorney'],
         ['relatedCivilAction', [8, 9], 'paragraph 2 answer'],
         ['relatedCaseCourt', [10], 'related court'], ['relatedCaseDocketNumber', [11], 'related case reference'],
@@ -301,6 +302,8 @@ export function parseComplaintFormFields(text: string, widgets: ComplaintFormWid
     if (attorney && bar) { result.data.attorney = { ...attorney, barNumber: bar[0].replace(/[()]/g, '').toUpperCase() }; result.fieldConfidence.attorney = 'high'; }
     const district = value(1).trim().match(/^(\d{1,3}[AB]?(?:-?\d)?)(?:st|nd|rd|th)?$/i);
     if (district) { result.data.courtDistrict = district[1].toUpperCase(); result.fieldConfidence.courtDistrict = 'high'; }
+    const courtAddress = value(3).trim();
+    if (courtAddress && courtAddress.length <= 400) result.courtAddress = courtAddress;
     if (value(2).trim()) { result.data.caseNumber = value(2).trim(); result.fieldConfidence.caseNumber = 'high'; }
     const none = checked(8), previous = checked(9);
     if (none !== undefined && previous !== undefined && none !== previous) {

@@ -376,6 +376,25 @@ test('court matching requires a unique observed court and plans approved special
     assert.throws(() => planFormImport('72 Local.pdf', []), /2 MiFILE courts/);
 });
 
+test('a precise court-address field resolves a missing division, never a Defendant address or conflicting division',()=>{
+    const shelby='MI Macomb County - Shelby Township - 41A-2 District Court';
+    const sterling='MI Macomb County - Sterling Heights - 41A-1 District Court';
+    const address='52420 Van Dyke Ave Shelby Township, MI 48316';
+    assert.equal(resolveCourt('41A',[]),null);
+    assert.equal(resolveCourt('41A',[],address),shelby);
+    assert.equal(resolveCourt('41A',[],'52420 Van Dyke Ave Shelby Twp., Michigan 48316'),shelby);
+    assert.equal(resolveCourt('41A',[],'40111 Dodge Park Rd Sterling Heights, MI 48313'),sterling);
+    assert.equal(resolveCourt('41A-2',[],address),shelby);
+    assert.equal(resolveCourt('41A-1',[],address),null);
+    assert.equal(resolveCourt('41A',[],'21533 Fort Worth Macomb, MI 48044'),null);
+    assert.equal(resolveCourt('41A',[],'Shelby Township, MI 48316'),null);
+    assert.equal(resolveCourt('41A',[],'52420 Van Dyke Ave Shelby Township'),null);
+    assert.equal(resolveCourt('41A',[],'52420 Van Dyke Ave Shelby Township, MI 48316 wrong trailing text'),null);
+    assert.equal(resolveCourt('41A',['MI Another County - Shelby Township - 41A-2 District Court'],address),null);
+    assert.equal(resolveCourt('25',[],'52420 Van Dyke Ave Shelby Township, MI 48316'),
+        'MI Wayne County - Lincoln Park - 25th District Court','An address must not select another district');
+});
+
 test('migration stops phantom report retries without deleting source history or real failed downloads', () => {
     const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'report-repair-'));
     const file = path.join(folder, 'db.sqlite'); let db = new WorkflowDatabase(file);

@@ -363,3 +363,38 @@ Private PDF inputs, read-only payment-audit results and QA logs remain under
 `output/client-intake-2026-11-05/` and are not part of the repository. Payment
 and final court submission are still compiled off. Historical payment
 authorizations are not bank settlement confirmations or permission to pay again.
+
+## Two-Defendant termination and primary-account independence (v105)
+
+The three supplied PDFs passed the real intake pipeline offline with 24 explicit
+Complaint-value comparisons. Both named Defendants retained their shared address;
+the company Plaintiff remained an entity. The populated court-address field
+resolved the missing division to 41A-2 and selected its Local form. Advice and Local
+expanded the package to five PDFs. Only the missing supporting PDF remains a
+validation error; no substitute was invented. Reprocessing was idempotent, manual
+edits survived re-extraction, and network calls/filing jobs remained zero.
+
+New mocked-browser coverage fills the first and second Defendant, then the
+separate attorney block, and verifies saved form values without contacting MiFILE.
+Court resolution tests reject ambiguous addresses, OCR-only metadata and explicit
+division conflicts while preserving manual edits. Credential coverage verifies
+that a saved primary account works without legacy alternate environment values
+and that an unreadable saved record cannot fall back to another account.
+
+An independent read-only check on Render omitted legacy `MIFILE_USER` and
+`MIFILE_PASSWORD` from its one-off process only. It verified the saved primary
+account against MiFILE's signed-in header and downloaded an existing valid PDF
+through the actual worker downloader. The service environment, account links,
+Unsubmitted bundles, payment methods and filing records were not changed. This
+confirms application independence from the dummy login, not unlinking of it.
+
+Six previous full intake packages passed 43 field comparisons, and a separate
+three-Complaint corpus passed 27 comparisons, including the established scan.
+The full regression with the installed Excel PDF Python runtime passed all 425
+tests without failures or skips; all three Excel form templates and their ZIP
+remain covered.
+The authenticated admin smoke passed login/settings, library imports, automatic
+extraction, source replacement, retry recovery and desktop/mobile PDF previews.
+Private source PDFs, hashes and acceptance evidence are under
+`output/ristovski-2026-11-05/`, outside version control. No payment or final court
+submission is enabled by this release.

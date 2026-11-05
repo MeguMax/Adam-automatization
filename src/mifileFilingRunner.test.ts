@@ -122,6 +122,54 @@ test('MiFILE case forms keep business Defendants separate from people',async()=>
     } finally {await page.close();}
 });
 
+test('the case form adds the second Defendant before the deferred attorney section without overwriting parties',async()=>{
+    const page=await browser.newPage();
+    try {
+        const party=(index:number)=>{
+            const p='psn'+index;
+            return `<input type="radio" id="${p}IsPerson_0" name="${p}type"><input type="radio" id="${p}IsPerson_1" name="${p}type">`+
+                ['EntityName','FirstName','MiddleName','FamilyName','Suffix','Address','Address2','City','Zip','Phone','Email']
+                    .map(name=>`<input id="${p}${name}">`).join('')+
+                `<select id="${p}Country"><option value="US">US</option></select><select id="${p}State"><option value="MI">Michigan</option></select>`;
+        };
+        const attorney=party(3)+'<input id="aty3BarNumber"><select id="aty3Jurisdiction"><option value="MI">Michigan</option></select>';
+        const form=party(0)+'<div id="defendants">'+party(1)+'</div><div id="attorney"></div>'+
+            '<input type="radio" id="pty0SelfRepresented_0"><input id="attorneyEmail" value="primary@example.com">'+
+            '<input type="radio" id="relatedCivilActions_0" name="related"><input type="radio" id="relatedCivilActions_1" name="related">'+
+            '<input id="claimAmount"><input type="checkbox" id="requestSecondMail">'+
+            `<button onclick='window.adds=(window.adds||0)+1;document.getElementById("defendants").insertAdjacentHTML("beforeend",${JSON.stringify(party(2))})'>Add Defendant</button>`+
+            `<button onclick='window.saves=(window.saves||0)+1;if(!document.getElementById("psn3FirstName")){document.getElementById("attorney").innerHTML=${JSON.stringify(attorney)};}else{parent.document.body.insertAdjacentHTML("beforeend",\"<input id=fileUpload type=file>\");}'>Save Case Initiation Form</button>`;
+        await page.route('**/*',route=>{
+            if(route.request().url()==='https://mifile.courts.michigan.gov/form/getform')return route.fulfill({contentType:'text/html',body:form});
+            if(route.request().url()==='https://mifile.courts.michigan.gov/qa-form')return route.fulfill({contentType:'text/html',
+                body:'<iframe id="formFrame" src="/form/getform"></iframe><button onclick="window.submitted=true">Submit</button>'});
+            return route.abort();
+        });
+        await page.goto('https://mifile.courts.michigan.gov/qa-form');
+        const base={address1:'300 Rental Street',city:'Macomb',state:'MI',postalCode:'48044',address2:null,phone:null,email:null};
+        const payload={filingData:{plaintiff:{...base,id:'plaintiff',partyType:'entity',displayName:'Example Investments L.L.C.',entityName:'Example Investments L.L.C.'},
+            defendants:[{...base,id:'defendant-1',partyType:'person',displayName:'Morgan Tenant',firstName:'Morgan',lastName:'Tenant'},
+                {...base,id:'defendant-2',partyType:'person',displayName:'Taylor Resident',firstName:'Taylor',lastName:'Resident'}],
+            attorney:{name:'Adam J Devlin',barNumber:'P72877',address1:'200 Legal Avenue',city:'Example City',state:'MI',postalCode:'48001',email:'attorney@example.com'},
+            relatedCivilAction:'none',moneyJudgmentRequested:false,claimAmount:'0.00',mailingRequested:true,includeAllOtherOccupants:true}};
+        await (new MiFileFilingRunner() as any).completeCaseForm(page,payload);
+        const frame=page.frames().find(f=>f.url().endsWith('/form/getform'))!;
+        assert.equal(await frame.locator('#psn0EntityName').inputValue(),'Example Investments L.L.C.');
+        assert.equal(await frame.locator('#psn1FirstName').inputValue(),'Morgan');
+        assert.equal(await frame.locator('#psn2FirstName').inputValue(),'Taylor');
+        assert.equal(await frame.locator('#psn2FamilyName').inputValue(),'Resident');
+        assert.equal(await frame.locator('#psn3FamilyName').inputValue(),'Devlin');
+        assert.equal(await frame.locator('#aty3BarNumber').inputValue(),'P72877');
+        assert.equal(await frame.locator('#psn1Address').inputValue(),'300 Rental Street');
+        assert.equal(await frame.locator('#psn2Address').inputValue(),'300 Rental Street');
+        assert.equal(await frame.locator('#psn3Address').inputValue(),'200 Legal Avenue');
+        assert.equal(await frame.evaluate(()=> (window as any).adds),1);
+        assert.equal(await frame.evaluate(()=> (window as any).saves),2);
+        assert.equal(await frame.locator('[id$="FamilyName"]').count(),4);
+        assert.equal(await page.evaluate(()=>Boolean((window as any).submitted)),false);
+    }finally{await page.close();}
+});
+
 async function uploadPage(options: { missingType?: boolean; missingConnect?: boolean; feeLabels?: boolean; noOther?: boolean;
     noConnectEffect?: boolean; insertFirst?: boolean; failedFile?: string; warningFile?: string; merged?: boolean; systemParent?: boolean } = {}): Promise<Page> {
     const page = await browser.newPage();
