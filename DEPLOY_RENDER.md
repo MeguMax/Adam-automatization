@@ -33,6 +33,14 @@ This project runs the admin UI and court-email worker in one Docker Web Service.
 
    Prepared-package notifications reuse `NOTIFY_TO_EMAIL` and `SENDER_USER_ID`. Optionally override the recipient with `DRAFT_READY_NOTIFY_EMAIL`; disable with `DRAFT_READY_NOTIFICATIONS_ENABLED=false`. Render's `RENDER_EXTERNAL_URL` supplies the authenticated Draft link. Outside Render set `ADMIN_PUBLIC_URL` to an HTTPS origin. Settings > Email intake and `/healthz` indicate whether sending is configured; no historical notification backfill runs on deployment.
 
+   Ready-email queue claims revalidate the saved bundle, current PDF pins and
+   known receipt/execution holds. No additional Graph or MiFILE call is made by
+   this local eligibility check. Notifications deduplicate per bundle, and a
+   newer verification can refresh only an unsent pending notice. Legacy pending
+   notices without a bound snapshot are not sent blindly: Review/Activity show
+   the non-delivery reason and offer explicit retry where the package is still
+   eligible. No schema migration, new variable or historical backfill is needed.
+
    MiFILE preparation is hard-limited to **History -> Unsubmitted**. There is no payment or final court-submission action in the worker.
 
 5. Leave `WORKER_ENABLED=false` for the first deploy. Open `https://<service>.onrender.com/`, authenticate with `ADMIN_USERNAME` and `ADMIN_PASSWORD`, and verify `https://<service>.onrender.com/healthz` returns `{"ok":true}`.

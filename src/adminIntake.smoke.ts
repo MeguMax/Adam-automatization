@@ -715,6 +715,57 @@ async function main() {
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
         await page.screenshot({path:path.join(screenshots,'draft-release-checks-mobile.png'),fullPage:true});
         await page.setViewportSize({width:1440,height:1000});
+        // Delivery-state fixtures exercise the UI without starting the email worker.
+        const delivery={status:'pending',attempts:0,lastError:null as string|null,sentAt:null as string|null,
+            nextAttemptAt:new Date().toISOString() as string|null,recipient:'adam@example.com',canRetry:false};
+        const readyMailDraftRoute='**/api/drafts/'+draftId;
+        const retryRoute='**/api/drafts/'+draftId+'/ready-notification/retry';
+        let retryEmails=0;
+        await page.route(readyMailDraftRoute,async route=>{
+            if(route.request().method()!=='GET'){await route.continue();return;}
+            const response=await route.fetch();
+            await route.fulfill({response,json:{...await response.json(),readyNotification:delivery}});
+        });
+        await page.route(retryRoute,async route=>{
+            assert.equal(route.request().postDataJSON().confirmNotDelivered,true);
+            retryEmails++;delivery.status='pending';delivery.canRetry=false;delivery.lastError=null;
+            await route.fulfill({status:200,json:{queued:true}});
+        });
+        await page.evaluate(id=>(window as any).openDraft(id),draftId);
+        assert.match(await page.locator('#draftReadyNotification').innerText(),/Review email queued/);
+        delivery.status='sent';delivery.sentAt=new Date().toISOString();delivery.nextAttemptAt=null;
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('#draftReadyNotification').innerText(),/Review email sent/);
+        assert.match(await page.locator('#draftReadyNotification').innerText(),/To: adam@example.com/);
+        delivery.status='uncertain';delivery.canRetry=true;delivery.sentAt=null;
+        delivery.lastError='Check the recipient inbox before retrying. The saved MiFILE package is unchanged.';
+        await page.evaluate(()=>(window as any).refreshDraftFilingState(true));
+        await page.locator('#draftReadyNotification').getByRole('button',{name:'Retry review email',exact:true}).click();
+        assert.match(await page.locator('#draftConfirmDialog').innerText(),/not MiFILE preparation or payment/);
+        assert.equal(retryEmails,0);
+        await page.locator('#draftConfirmDialog [value="cancel"]').click();
+        while(await page.getByRole('button',{name:'Dismiss notification',exact:true}).count()) {
+            await page.getByRole('button',{name:'Dismiss notification',exact:true}).first().click();
+        }
+        await page.screenshot({path:path.join(screenshots,'draft-ready-email-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        await page.locator('[data-draft-mobile-mode="fields"]').click();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        assert.equal(await page.locator('#draftReadyNotification').evaluate(element=>element.scrollWidth<=element.clientWidth+1),true);
+        await page.screenshot({path:path.join(screenshots,'draft-ready-email-mobile.png'),fullPage:true});
+        await page.setViewportSize({width:1440,height:1000});
+        await page.locator('#draftReadyNotification').getByRole('button',{name:'Retry review email',exact:true}).click();
+        await page.locator('#draftConfirmAccept').click();
+        await page.waitForFunction(()=>document.getElementById('draftReadyNotification')?.textContent?.includes('Review email queued'));
+        assert.equal(retryEmails,1);
+        delivery.status='failed';delivery.canRetry=false;delivery.lastError='MiFILE already reports payment or filing activity. No Unsubmitted-ready email was sent.';
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.match(await page.locator('#draftReadyNotification').innerText(),/Review email not sent/);
+        assert.equal(await page.locator('#draftReadyNotification [data-retry-ready-email]').count(),0);
+        assert.equal(db.listFilingJobs(draftId).length,1);
+        await page.unroute(readyMailDraftRoute);await page.unroute(retryRoute);
+        await page.evaluate(id=>(window as any).openDraft(id),draftId);
+        await page.locator('#draftActivityTab').click();
         const {getCheckoutAccount}=require('./mifileCheckoutRunner') as typeof import('./mifileCheckoutRunner');
         const {preparationDigest}=require('./mifilePreparationEvidence') as typeof import('./mifilePreparationEvidence');
         const {buildCheckoutQuote,digest}=require('./mifileCheckout') as typeof import('./mifileCheckout');

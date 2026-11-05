@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-05-isolated-document-recognition-v108';
+const ADMIN_BUILD_ID = '2026-11-06-ready-notification-safety-v109';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3152,6 +3152,11 @@ const html = String.raw`<!doctype html>
     .draft-reading-status strong, .draft-reading-status span { display: block; overflow-wrap: anywhere; }
     .draft-reading-status strong { font-size: 12px; }
     .draft-reading-status span { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    .draft-notification-status { display: grid; grid-template-columns: 18px minmax(0,1fr) auto; align-items: start; gap: 8px; padding: 0 0 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+    .draft-notification-status > svg { width: 16px; height: 16px; margin-top: 2px; color: var(--muted); }
+    .draft-notification-status strong, .draft-notification-status small { display: block; overflow-wrap: anywhere; }
+    .draft-notification-status strong { font-size: 12px; }
+    .draft-notification-status small { margin-top: 4px; font-size: 11px; color: var(--muted); }
     .draft-section-tabs { display: flex; gap: 0; padding: 0 12px; border-bottom: 1px solid var(--line); flex: 0 0 auto; }
     .draft-section-tabs button { flex: 1; padding: 11px 6px; min-width: 0; min-height: 42px; border: 0; border-radius: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .draft-section-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 700; }
@@ -3547,6 +3552,7 @@ const html = String.raw`<!doctype html>
               <div id="draftReviewPane" data-draft-pane="review" role="tabpanel" aria-labelledby="draftReviewTab">
                 <div id="draftReadingStatus" class="draft-reading-status hidden" role="status" aria-live="polite"></div>
                 <div id="draftPreparationStatus"></div>
+                <div id="draftReadyNotification"></div>
               <div id="draftValidationSummary"></div>
                 <div id="draftReviewOverview"></div>
               </div>
@@ -5056,12 +5062,8 @@ const html = String.raw`<!doctype html>
           'Automation: Unsubmitted only. This app will not pay or submit to court.' +
         (!config.ready && config.issues && config.issues.length
           ? '<br>' + escapeHtml(config.issues.join(' '))
-          : '') + '</span></div>' + (state.draftDetail?.readyNotification ?
-          '<p class="cell-secondary">' + icon('mail') + 'Ready notification: ' +
-          escapeHtml(statusLabel(state.draftDetail.readyNotification.status)) +
-          (state.draftDetail.readyNotification.lastError ? ' · ' + escapeHtml(state.draftDetail.readyNotification.lastError) : '') +
-          (['failed','uncertain'].includes(state.draftDetail.readyNotification.status) ?
-            ' <button type="button" data-retry-ready-email="' + escapeHtml(state.selectedDraftId) + '">' + icon('mail') + 'Retry notification</button>' : '') + '</p>' : '');
+          : '') + '</span></div>' + renderReadyNotification(state.draftDetail?.readyNotification);
+      document.getElementById('draftReadyNotification').innerHTML = renderReadyNotification(state.draftDetail?.readyNotification);
       const latest = jobs[0];
       const outcome = latest?.status === 'prepared' ? latest.checkout?.outcome : null;
       const checkout = latest?.status === 'prepared' ? latest.checkout : null;
@@ -5214,7 +5216,24 @@ const html = String.raw`<!doctype html>
       showToast(found ? 'Bundle confirmed as prepared.' : 'No bundle recorded. Retry is now available.');
     }
 
-    async function refreshDraftFilingState() {
+    function renderReadyNotification(notification) {
+      if (!notification) return '';
+      const labels = {pending:'Review email queued',sending:'Sending review email',sent:'Review email sent',
+        failed:'Review email not sent',uncertain:'Check review email delivery'};
+      const lines = [];
+      if (notification.recipient) lines.push('To: ' + notification.recipient);
+      if (notification.sentAt) lines.push('Sent: ' + fmtDate(notification.sentAt));
+      if (notification.status === 'sent') lines.push('Microsoft accepted this email; inbox delivery is not confirmed.');
+      if (notification.status === 'pending' && notification.nextAttemptAt) lines.push('Next attempt: ' + fmtDate(notification.nextAttemptAt));
+      if (notification.lastError) lines.push(notification.lastError);
+      return '<div class="draft-notification-status" role="status" aria-live="polite">' + icon('mail') +
+        '<div><strong>' + escapeHtml(labels[notification.status] || 'Review email status') + '</strong>' +
+        lines.map(line => '<small>' + escapeHtml(line) + '</small>').join('') + '</div>' +
+        (notification.canRetry ? '<button type="button" class="icon-button" data-retry-ready-email="' + escapeHtml(state.selectedDraftId) +
+          '" title="Retry review email" aria-label="Retry review email">' + icon('rotate-cw') + '</button>' : '') + '</div>';
+    }
+
+    async function refreshDraftFilingState(force) {
       if (!state.selectedDraftId || !state.draftDetail || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open) return;
       const draftId = state.selectedDraftId;
       const revision = state.draftEditRevision;
@@ -5224,7 +5243,8 @@ const html = String.raw`<!doctype html>
       const previous = state.draftFilingJobs[0];
       const latest = jobs[0];
       state.draftFilingJobs = jobs;
-      if (!previous || !latest || previous.updatedAt !== latest.updatedAt ||
+      if (force || !previous || !latest || previous.updatedAt !== latest.updatedAt ||
+          ['pending','sending'].includes(state.draftDetail.readyNotification?.status) ||
           ['queued','reading','retry_scheduled'].includes(state.draftDetail.caseDraft?.complaintReading?.status) ||
           state.draftDetail.documents.some(doc => doc.recognitionRecovery)) {
         const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
@@ -7784,13 +7804,15 @@ const html = String.raw`<!doctype html>
     document.addEventListener('click', async event => {
       const retryMail = event.target.closest('[data-retry-ready-email]');
       if (retryMail) {
-        if (!confirm('Check the recipient inbox and Sent items first. Confirm this ready-package email was not delivered before retrying.')) return;
+        if (!await confirmDraftAction('Retry review email?',
+          'Check the recipient inbox and Sent items first. Confirm the ready-package email was not delivered. This retries only the email, not MiFILE preparation or payment.',
+          'Retry email')) return;
         retryMail.disabled = true;
         try {
           await api('/api/drafts/' + encodeURIComponent(retryMail.dataset.retryReadyEmail) + '/ready-notification/retry', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmNotDelivered: true }),
           });
-          await refreshDraftFilingState();
+          await refreshDraftFilingState(true);
           showToast('Ready notification queued. The MiFILE package is unchanged.', 'success');
         } catch (error) { showDraftError(error); }
         finally { retryMail.disabled = false; }

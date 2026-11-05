@@ -498,3 +498,36 @@ Excel PDF generation. The final authenticated desktop/mobile smoke passed.
 Six existing intake packages passed all 43 explicit value checks, preserving
 the missing-Request and uncertain-scan review requirements. These are local,
 network-disabled acceptance checks, not new live MiFILE filings.
+
+## Ready email safety (v109)
+
+The notification queue binds its message to the verified MiFILE bundle and
+package digest. Claiming a queue entry revalidates the latest prepared job,
+current included PDF hashes/sizes, active document reading and recorded
+receipt/execution holds. Outdated, incomplete, already-paid/submitted or corrupt
+evidence suppresses the email without changing the case or its saved bundle.
+Suppressed items cannot starve later eligible notices.
+
+A newer job for the same bundle cannot duplicate a sent or uncertain email.
+One still-pending notice can be refreshed in place after re-verification. An
+explicit retry rebuilds the message from current verified data and settings;
+an interrupted or timed-out send is never automatically repeated. No new schema
+or notification backfill is introduced.
+
+Review now exposes recipient and delivery status without opening Activity.
+Pending/sending state refreshes even when the prepared job timestamp is
+unchanged. Retry uses the existing in-app confirmation and makes no MiFILE
+preparation, payment or court-submission request. The Sent label explicitly
+describes Microsoft acceptance rather than inbox delivery confirmation.
+
+Focused fixtures cover paid/uncertain/corrupt evidence, PDF changes/in-progress
+reads, duplicate jobs, pending-message refresh, legacy-message recovery and
+healthy queue progression. The authenticated desktop/mobile smoke covers visible
+state transitions with an unchanged job, retry cancellation/confirmation and
+unavailable retry for blocked evidence. These tests use mock senders only;
+private release evidence is under `output/ready-notification-2026-11-06/`.
+
+The final project regression passed all 462 tests without failures or skips,
+including the 13 notification fixtures and Excel PDF coverage. The final
+authenticated desktop/mobile admin smoke passed with mock delivery-state changes
+and a mock retry endpoint; it sent no email and created no new MiFILE job.

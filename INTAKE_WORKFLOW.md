@@ -50,6 +50,25 @@ The recipient defaults to the existing `NOTIFY_TO_EMAIL`; `DRAFT_READY_NOTIFY_EM
 
 Each verified job has at most one outbox entry. Successful sends persist across restarts. Microsoft throttling receives bounded delayed retries. The send request disables SDK retries and has a 20-second deadline. A timeout, server error or interrupted send remains uncertain rather than automatically sending again. After checking the recipient and Sent items, an operator can explicitly retry the notification from Activity without repeating MiFILE preparation. A notification failure cannot change the saved package or block another case.
 
+Before claiming a ready email, the worker rechecks the current saved-bundle
+evidence, latest preparation attempt, included PDF hashes/sizes and any active
+reading state. Known payment/submission activity, an uncertain execution or
+unreadable receipt evidence prevents an Unsubmitted-ready message. An outdated
+queue entry is retained as not sent with its reason; it does not block the next
+eligible notification or change the case's preparation state.
+
+Deduplication follows the MiFILE bundle, not only the local job. Re-verifying an
+unsent bundle refreshes one pending notice. A sent or uncertain notice cannot be
+automatically recreated by another job. Older queued messages without a bound
+package snapshot require explicit retry; the message is then regenerated from
+the current verified package and configured recipient/link.
+
+Review and Activity show the recipient, delivery state, sent time or next
+attempt and an available retry arrow. Pending/sending state updates even if the
+filing job itself has not changed. The in-panel retry confirmation asks the user
+to check the inbox and Sent items; it retries only the email. `Sent` records
+Microsoft's acceptance, not proof of delivery to the recipient or that it was read.
+
 Document types are recognized from known titles in the PDF text layer or offline OCR when the text layer is insufficient. Filenames are a fallback, not the source of case facts. Filename-only recognition, low-confidence OCR, conflicting titles, combined packages, and unknown files require manual Filing Type confirmation. OCR can suggest Complaint parties and addresses, but scan-derived fields and paragraph 2/10 answers require review. Case facts continue to come from the Complaint.
 
 Complaint extraction first reads populated DC 102a/DC 102c PDF form fields, including their actual checkbox values. Empty overlay fields do not override visible flattened text. If populated form fields are unavailable, the extractor reads the caption's text coordinates before using OCR. Drafts identify these sources as **PDF form fields**, **PDF text layout**, or **Scan OCR**. Clearly separated people and businesses become distinct parties sharing the caption address. Company-name suffixes remain together. Per Adam's instruction, names after "and all other occupants" and the separate Notice per MCL 600.3238(6) block are not parties. Unrecognized additional instructions still require review.
