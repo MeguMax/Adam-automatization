@@ -37,7 +37,11 @@ async function main() {
     };
     drive.createFileLink = async (_driveId: string, itemId: string) => `https://onedrive.example/${encodeURIComponent(itemId)}`;
     drive.resolveSharedDriveItem = async (url: string) => ({ driveId: 'fixture-drive', itemId: decodeURIComponent(url.split('/').pop()!), parentItemId: 'fixture-folder', fileName: 'Advice.pdf' });
-    drive.downloadDriveItemBuffer = async (_driveId: string, itemId: string) => storedFiles.get(itemId);
+    drive.downloadDriveItemBuffer = async (_driveId: string, itemId: string) => {
+        const content=storedFiles.get(itemId);
+        if(!content)throw new Error('Synthetic QA PDF not found: '+itemId);
+        return content;
+    };
     drive.replaceDriveItemContent = async (_driveId:string,itemId:string,buffer:Buffer) => { storedFiles.set(itemId,buffer); };
     const session = require('./mifileSession');
     const microsoft = require('./microsoftAccess');
@@ -1167,6 +1171,53 @@ async function main() {
             assert.equal(finished.documents.find(document=>document.id===readingDocument)!.status,'uploaded');
             assert.equal(db.listFilingJobs(readingDraft).length,0);
         }finally{releaseReading();await readingPromise;extractionWorkerAvailable=false;}
+
+        const recoveryPdf=testPdfFixture('Supporting evidence retained exactly as supplied by the attorney. '.repeat(3));
+        storedFiles.set('Recognition evidence.pdf',recoveryPdf);
+        const recoveryDoc=db.addDocument({emailId:readingEmail.id,caseDraftId:readingDraft,originalFilename:'Recognition evidence.pdf',
+            currentFilename:'Recognition evidence.pdf',documentType:'Unclassified PDF',uploadSource:'email_intake',status:'uploaded',
+            oneDriveUrl:'https://onedrive.example/Recognition%20evidence.pdf',fileSize:recoveryPdf.length});
+        for(let attempt=0;attempt<3;attempt++)db.recordDocumentRecognitionFailure(recoveryDoc,new Error('Synthetic PDF verification timeout\nprivate-path:1'));
+        db.refreshCaseDraftValidation(readingDraft);
+        extractionWorkerAvailable=true;
+        const automatic=await context.request.post(`${url}/api/drafts/${readingDraft}/auto-extract`,{headers:{Origin:url}});
+        assert.equal(automatic.status(),202,'Opening a production Draft must not wait for cloud PDF reads');
+        await page.setViewportSize({width:1440,height:1000});
+        await page.evaluate(id=>(window as any).openDraft(id),readingDraft);
+        assert.equal(await page.locator('#draftFieldsForm').evaluate(element=>element.scrollTop),0);
+        await page.locator('#draftDocumentSelect').selectOption(recoveryDoc);
+        await page.waitForFunction(()=>document.getElementById('draftDocumentState')?.textContent?.includes('Recognition stopped'));
+        assert.match(await page.locator('#draftDocumentState').innerText(),/uploaded.*Recognition stopped.*3 \/ 3/is);
+        assert.doesNotMatch(await page.locator('#draftDocumentState').innerText(),/private-path/);
+        assert.equal(await page.getByRole('button',{name:'Retry PDF recognition',exact:true}).isEnabled(),true);
+        while(await page.getByRole('button',{name:'Dismiss notification',exact:true}).count()) {
+            await page.getByRole('button',{name:'Dismiss notification',exact:true}).first().click();
+        }
+        await page.locator('#draftPdfViewer canvas').first().waitFor({state:'visible'});
+        await page.screenshot({path:path.join(screenshots,'draft-recognition-stopped-desktop.png'),fullPage:true});
+        const recognitionRequest=page.waitForResponse(response=>response.url().endsWith('/retry-recognition'));
+        await page.getByRole('button',{name:'Retry PDF recognition',exact:true}).click();
+        assert.equal((await recognitionRequest).status(),202);
+        await page.waitForFunction(()=>document.getElementById('draftDocumentState')?.textContent?.includes('Recognition retry queued'));
+        const duplicateRecognition=await context.request.post(`${url}/api/documents/${recoveryDoc}/retry-recognition`,{headers:{Origin:url}});
+        assert.equal(duplicateRecognition.status(),202);
+        assert.equal(db.getDraftDetail(readingDraft)!.auditLogs.filter(log=>log.action==='document_recognition_requested').length,1);
+        assert.equal(db.getDraftDetail(readingDraft)!.documents.find(doc=>doc.id===recoveryDoc)!.status,'uploaded');
+        await page.setViewportSize({width:390,height:844});
+        await page.getByRole('button',{name:'Document',exact:true}).click();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        while(await page.getByRole('button',{name:'Dismiss notification',exact:true}).count()) {
+            await page.getByRole('button',{name:'Dismiss notification',exact:true}).first().click();
+        }
+        await page.screenshot({path:path.join(screenshots,'draft-recognition-queued-mobile.png'),fullPage:true});
+        await (require('./draftExtraction') as typeof import('./draftExtraction')).ensureDraftDocumentRecognitions(db,readingDraft,async()=>recoveryPdf);
+        await page.evaluate(()=>(window as any).refreshDraftFilingState());
+        assert.equal(await page.locator('#draftDocumentState').innerText(),'');
+        assert.equal(db.getDraftDetail(readingDraft)!.documents.find(doc=>doc.id===recoveryDoc)!.recognitionRecovery,null);
+        assert.equal(db.getDraftDetail(readingDraft)!.caseDraft!.filingData.plaintiff.address1,'220 Reviewed Avenue');
+        assert.equal(db.listFilingJobs(readingDraft).length,0);
+        extractionWorkerAvailable=false;
+        await page.setViewportSize({width:1440,height:1000});
         await page.locator('#closeDraftBtn').click();
         await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();
         assert.equal(await page.locator('#draftManualCopyBtn').isHidden(), true);

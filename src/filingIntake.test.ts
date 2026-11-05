@@ -262,6 +262,40 @@ test('Complaint extraction failure is visible and does not turn a successfully u
     } finally { f.close(); }
 });
 
+test('intake recognition failure retains the successful upload and still processes later PDFs without duplicate uploads',async()=>{
+    const f=fixture(['Complaint.pdf','Other.pdf']);
+    try {
+        let uploads=0;
+        const detail=await processFilingIntake(f.db,f.email.id,f.draftId,f.parsed,{
+            ...f.dependencies,
+            download:async input=>{
+                const source=input.filedDocuments[0];uploads++;
+                return {downloaded:[{documentName:source.documentName,documentType:source.documentType,
+                    downloadUrl:source.downloadUrl,localPath:'New filings/'+source.documentName,downloadAttempts:1}],
+                    notificationFiles:[{buffer:pdf,fileName:source.documentName!,displayName:source.documentName!,
+                        driveId:'qa-drive',itemId:source.documentName!,
+                        webUrl:'https://onedrive.example/'+encodeURIComponent(source.documentName!)}],failures:[]};
+            },
+            recognize:async(_content,name)=>{
+                if(name==='Complaint.pdf')throw new Error('Recognition service was interrupted');
+                return {...demandRecognition,pdfVerified:true};
+            },
+        });
+        assert.equal(uploads,2);assert.equal(detail.documents.filter(doc=>doc.status==='uploaded').length,2);
+        const complaint=detail.documents.find(doc=>doc.originalFilename==='Complaint.pdf')!;
+        assert.equal(complaint.errorMessage,null);assert.equal(complaint.automaticRetryCount,0);
+        assert.match(complaint.recognitionRecovery!.lastError,/Recognition service/);
+        assert.ok(detail.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+complaint.id && /recognition retry/i.test(issue.message)));
+        assert.equal(detail.email.processingStatus,'processed');
+        assert.equal(detail.documents.find(doc=>doc.originalFilename==='Other.pdf')!.recognition!.pdfVerified,true);
+        await processFilingIntake(f.db,f.email.id,f.draftId,f.parsed,{...f.dependencies,download:async()=>{
+            throw new Error('An uploaded PDF must not be uploaded again');
+        }});
+        assert.equal(f.db.getDraftDetail(f.draftId)!.documents.length,2);
+        assert.equal(f.db.listFilingJobs().length,0);
+    }finally{f.close();}
+});
+
 test('queued intake emails are recovered even after they leave the most recent inbox page', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'intake-backlog-'));
     const db = new WorkflowDatabase(path.join(directory, 'test.sqlite'));

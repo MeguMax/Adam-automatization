@@ -462,3 +462,39 @@ The complete project regression passed all 442 tests with no failures or skips,
 including Excel PDF generation. The six earlier package expectations retained
 their 43 explicit value comparisons; Ristovski retained all 24 checked values,
 both Defendants and its missing-supporting review requirement.
+
+## Independent document recognition (v108)
+
+Recognition failure is scoped to one uploaded PDF. Later PDFs and another case
+continue, while the failed file remains uploaded with its OneDrive link and an
+independent retry/error record. Three attempts use five/ten-minute backoff;
+exhausted files stop automatic work until explicitly retried or replaced.
+Manual retry is persisted, coalesces duplicates and requires package confirmation.
+Full diagnostics remain in audit; the selected PDF shows a short error and retry
+arrow without presenting the recognition failure as a failed upload.
+
+A persisted active-read state blocks preparation even with older valid cached
+recognition. Restart recovery retains its attempt budget. Replacement/source
+hash guards discard late results or errors, and rejecting a case clears pending
+recognition state. Existing manual fields and document choices are retained.
+OneDrive reads used by these recognitions and Complaint extraction have a
+two-minute deadline, receive cancellation and cannot apply a late response.
+
+Production Draft opening returns current state immediately and leaves PDF/OCR
+work to the extraction worker. Standalone admin recovers interrupted reads on
+startup and retains synchronous processing. Opening a Draft resets the review
+scroll position, without resetting it during ordinary live refreshes.
+
+The regression adds broken-first-PDF/healthy-next-case coverage, timeout and late
+read isolation, three-attempt exhaustion across restarts, explicit retry/cache
+bypass, upload/manual-field preservation, rejection and preparation race guards.
+The desktop/mobile smoke exercises the authenticated 202 retry route, duplicate
+requests, error display and recovery without creating a filing job. Evidence is
+under `output/recognition-isolation-2026-11-05/`; no live payment or court filing
+is part of these checks.
+
+Release regression passed all 454 tests with no failures or skips, including
+Excel PDF generation. The final authenticated desktop/mobile smoke passed.
+Six existing intake packages passed all 43 explicit value checks, preserving
+the missing-Request and uncertain-scan review requirements. These are local,
+network-disabled acceptance checks, not new live MiFILE filings.

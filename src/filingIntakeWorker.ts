@@ -14,6 +14,7 @@ export async function processFilingIntake(
     dependencies: {
         download(parsed: ParsedEmailInfo): Promise<DownloadResult>;
         extract(buffer: Buffer, documentType: string | null): Promise<ComplaintExtractionResult>;
+        recognize?: typeof recognizeDocumentPdf;
         forms?: FormUploadDependencies;
         progress?: (phase:WorkerPhase)=>void;
         deferEmailRefresh?: boolean;
@@ -32,6 +33,7 @@ export async function processFilingIntake(
             (nameMatches.length === 1 ? nameMatches[0] : undefined);
         // A removed source document stays removed on reprocessing.
         if (!document || !document.sourceUrl || document.oneDriveUrl || document.status === 'uploaded') continue;
+        let uploaded=false;
         try {
             dependencies.progress?.('downloading_pdf');
             const stableSource = { ...source, downloadUrl: document.sourceUrl || source.downloadUrl };
@@ -61,19 +63,26 @@ export async function processFilingIntake(
                 downloadAttempts: downloaded.downloadAttempts || 1,
                 metadata: { driveId: file.driveId, itemId: file.itemId },
             });
-            dependencies.progress?.('recognizing_pdf');
-            const recognition = downloaded.recognition || await recognizeDocumentPdf(file.buffer, source.documentName || file.displayName);
-            db.recordDocumentRecognition(document.id, recognition);
-            if (recognition.role === 'complaint' && recognition.source !== 'conflict') {
-                try {
-                    dependencies.progress?.('extracting_complaint');
-                    const extraction = await dependencies.extract(file.buffer, source.documentType);
-                    db.applyComplaintExtraction(draftId, document.id, extraction);
-                } catch (error) {
-                    db.recordComplaintExtractionFailure(draftId, document.id, error);
+            uploaded=true;
+            // An uploaded PDF remains uploaded even if its later recognition fails.
+            try {
+                dependencies.progress?.('recognizing_pdf');
+                const recognition = downloaded.recognition || await (dependencies.recognize || recognizeDocumentPdf)(file.buffer, source.documentName || file.displayName);
+                db.recordDocumentRecognition(document.id, recognition);
+                if (recognition.role === 'complaint' && recognition.source !== 'conflict') {
+                    try {
+                        dependencies.progress?.('extracting_complaint');
+                        const extraction = await dependencies.extract(file.buffer, source.documentType);
+                        db.applyComplaintExtraction(draftId, document.id, extraction);
+                    } catch (error) {
+                        db.recordComplaintExtractionFailure(draftId, document.id, error);
+                    }
                 }
+            } catch(error) {
+                db.recordDocumentRecognitionFailure(document.id,error);
             }
         } catch (error) {
+            if(uploaded)throw error;
             db.completeDocumentRetryFailure({
                 documentId: document.id,
                 reason: error instanceof Error ? error.message : String(error),

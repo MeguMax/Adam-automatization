@@ -6,11 +6,14 @@ import type { DocumentRecognition } from './documentRecognition';
 import { createHash } from 'node:crypto';
 import { workerHealth, type WorkerPhase } from './workerHealth';
 import { COMPLAINT_READING_ATTEMPTS } from './complaintReading';
+import { documentRecognitionDue } from './documentRecognitionRecovery';
+import { downloadDraftPdf } from './draftPdfDownload';
 
 const running = new WeakMap<WorkflowDatabase, Map<string, Promise<EmailDetail>>>();
 const recognizing = new WeakMap<WorkflowDatabase, Map<string, Promise<EmailDetail>>>();
 
-export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:string,download?: (url:string)=>Promise<Buffer>,progress?: (phase:WorkerPhase)=>void):Promise<EmailDetail> {
+export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:string,download?: (url:string)=>Promise<Buffer>,progress?: (phase:WorkerPhase)=>void,
+    options:{downloadTimeoutMs?:number}={}):Promise<EmailDetail> {
     let jobs=recognizing.get(db);
     if(!jobs){jobs=new Map();recognizing.set(db,jobs);}
     const active=jobs.get(draftId);if(active)return active;
@@ -24,36 +27,40 @@ export function ensureDraftDocumentRecognitions(db:WorkflowDatabase,draftId:stri
         if(Date.parse(root.supportingRecognitionRetryAt || '')>Date.now())return initial;
         try {
             for(const candidate of initial.documents.filter(doc=>doc.requiredForFiling && doc.uploadSource!=='form_library' && doc.oneDriveUrl &&
-                ['uploaded','downloaded','replaced'].includes(doc.status) && ((doc.recognition?.recognitionVersion || 0)<2 ||
-                    (doc.recognition?.pdfVerified===undefined && doc.recognition?.source!=='content') ||
-                    !/^[a-f0-9]{64}$/.test(doc.recognition?.contentHash || ''))).slice(0,20)) {
+                ['uploaded','downloaded','replaced'].includes(doc.status) && documentRecognitionDue(doc)).slice(0,20)) {
                 const current=db.getDraftDetail(draftId);
                 if(!current || !editable(current))return current || initial;
                 const document=current.documents.find(doc=>doc.id===candidate.id && doc.requiredForFiling && doc.oneDriveUrl &&
                     ['uploaded','downloaded','replaced'].includes(doc.status));
-                if(!document)continue;
+                if(!document || !documentRecognitionDue(document))continue;
                 const version=db.getComplaintSourceVersion(document.id);
-                progress?.('downloading_pdf');
-                const content=await (download || (async url=>{
-                    const drive=await import('./oneDriveClient'),item=await drive.resolveSharedDriveItem(url);
-                    return drive.downloadDriveItemBuffer(item.driveId,item.itemId);
-                }))(document.oneDriveUrl!);
-                progress?.('recognizing_pdf');
-                const recognition=await recognizeDocumentPdf(content,document.originalFilename || document.currentFilename || 'document.pdf');
-                const latest=db.getDraftDetail(draftId);
-                if(!latest || !editable(latest))return latest || initial;
-                if(db.getComplaintSourceVersion(document.id)!==version)continue;
-                if (latest.caseDraft?.primaryDocumentId === document.id &&
-                    latest.caseDraft.complaintExtraction?.contentHash !== recognition.contentHash) {
-                    if(recognition.role === 'complaint' && recognition.source !== 'conflict') {
-                        await ensureDraftComplaintExtraction(db,draftId,{documentId:document.id,content,
-                            recognition,expectedSourceVersion:version,progress});
-                    } else {
-                        db.recordDocumentRecognition(document.id,recognition);
-                        db.recordComplaintExtractionFailure(draftId,document.id,
-                            new Error('The primary PDF changed and cannot be confirmed as a Complaint. Review or replace it before preparation.'));
-                    }
-                } else db.recordDocumentRecognition(document.id,recognition);
+                const pin=document.recognition?.contentHash;
+                if(!db.beginDocumentRecognition(document.id,version,pin))continue;
+                try {
+                    progress?.('downloading_pdf');
+                    const content=await downloadDraftPdf(document.oneDriveUrl!,{download,timeoutMs:options.downloadTimeoutMs});
+                    progress?.('recognizing_pdf');
+                    const recognition=await recognizeDocumentPdf(content,document.originalFilename || document.currentFilename || 'document.pdf');
+                    const latest=db.getDraftDetail(draftId);
+                    if(!latest || !editable(latest))return latest || initial;
+                    if(db.getComplaintSourceVersion(document.id)!==version)continue;
+                    const latestPin=latest.documents.find(item=>item.id===document.id)?.recognition?.contentHash;
+                    if(latestPin!==pin && latestPin!==recognition.contentHash)continue;
+                    if (latest.caseDraft?.primaryDocumentId === document.id &&
+                        latest.caseDraft.complaintExtraction?.contentHash !== recognition.contentHash) {
+                        if(recognition.role === 'complaint' && recognition.source !== 'conflict') {
+                            await ensureDraftComplaintExtraction(db,draftId,{documentId:document.id,content,
+                                recognition,expectedSourceVersion:version,progress});
+                        } else {
+                            db.recordDocumentRecognition(document.id,recognition);
+                            db.recordComplaintExtractionFailure(draftId,document.id,
+                                new Error('The primary PDF changed and cannot be confirmed as a Complaint. Review or replace it before preparation.'));
+                        }
+                    } else db.recordDocumentRecognition(document.id,recognition);
+                } catch(error) {
+                    const latest=db.getDraftDetail(draftId);
+                    if(latest && editable(latest))db.recordDocumentRecognitionFailure(document.id,error,{sourceVersion:version,contentHash:pin});
+                }
             }
             db.recordDocumentRecognitionRefresh(draftId);
         }catch(error){if(editable(db.getDraftDetail(draftId) || initial))db.recordDocumentRecognitionRefresh(draftId,error);}
@@ -71,6 +78,7 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
     download?: (url: string) => Promise<Buffer>;
     recognition?: DocumentRecognition;
     expectedSourceVersion?: string | null;
+    downloadTimeoutMs?: number;
     progress?: (phase:WorkerPhase)=>void;
 } = {}): Promise<EmailDetail> {
     let jobs = running.get(db);
@@ -119,11 +127,8 @@ export function ensureDraftComplaintExtraction(db: WorkflowDatabase, draftId: st
         try {
             if (options.recognition) db.recordDocumentRecognition(source.id,options.recognition);
             options.progress?.('downloading_pdf');
-            const content = options.content || await (options.download || (async url => {
-                const { downloadDriveItemBuffer, resolveSharedDriveItem } = await import('./oneDriveClient');
-                const item = await resolveSharedDriveItem(url);
-                return downloadDriveItemBuffer(item.driveId, item.itemId);
-            }))(source.oneDriveUrl!);
+            const content = options.content || await downloadDraftPdf(source.oneDriveUrl!,{
+                download:options.download,timeoutMs:options.downloadTimeoutMs});
             const contentHash = createHash('sha256').update(content).digest('hex');
             state.contentHash = contentHash;
             options.progress?.('extracting_complaint');
@@ -165,6 +170,7 @@ export async function runDraftExtractionWorker(db: WorkflowDatabase, signal: Abo
     workerHealth.start('extraction', 10_000);
     const progress = (phase:WorkerPhase) => workerHealth.work('extraction', phase, 300_000);
     db.recoverInterruptedComplaintExtractions();
+    db.recoverInterruptedDocumentRecognitions();
     try {
     while (!signal.aborted) {
         let ok = true;

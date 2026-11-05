@@ -18,6 +18,7 @@ import { splitFilingIntake } from './filingIntake';
 import { DraftNotificationStore } from './draftNotifications';
 import { matchesSupportingCase } from './batchCaseMatching';
 import { complaintReadingView, COMPLAINT_READING_ATTEMPTS, type ComplaintReadingView } from './complaintReading';
+import { documentRecognitionDue, DOCUMENT_RECOGNITION_ATTEMPTS, recognitionErrorSummary, type RecognitionRecovery } from './documentRecognitionRecovery';
 import type { CheckoutAccount } from './mifileCheckout';
 import {
     ComplaintExtractionResult,
@@ -419,6 +420,7 @@ export interface EmailPurgeResult extends EmailDeleteResult {
 
 export interface DocumentRecordView {
     sourceVersion?: string | null;
+    recognitionRecovery?: RecognitionRecovery | null;
     supportingEvidence?: SupportingEvidence;
     recognition?: DocumentRecognition | null;
     formTemplate?: { id: string; role: FormRole; courtKey: string; courtName: string; slotKey?: string } | null;
@@ -2988,6 +2990,7 @@ export class WorkflowDatabase {
         const label = DOCUMENT_LABELS[recognition.role];
         const previous=this.safeJson(row.metadata_json);
         const metadata = { ...previous, recognition };
+        delete metadata.recognitionRecovery;
         if(previous?.recognition?.contentHash && recognition.contentHash && previous.recognition.contentHash!==recognition.contentHash) {
             this.db.prepare(`UPDATE case_drafts SET reviewed_at=NULL, normalized_data_json=json_set(normalized_data_json,'$.manualDocumentEdits',json('true')),updated_at=? WHERE id=?`)
                 .run(nowIso(),row.case_draft_id);
@@ -3011,20 +3014,101 @@ export class WorkflowDatabase {
         if(recognition.role==='ancillary') this.applyCourtFilingRule(row.case_draft_id);
     }
 
+    beginDocumentRecognition(documentId:string,sourceVersion:string|null,contentHash?:string):boolean {
+        const row=this.db.prepare('SELECT * FROM document_records WHERE id=? AND is_active=1').get(documentId) as any;
+        if(!row?.case_draft_id || this.getComplaintSourceVersion(documentId)!==sourceVersion)return false;
+        this.assertEditableIntake(row.case_draft_id);
+        const metadata=this.safeJson(row.metadata_json) || {};
+        if(metadata.recognition?.contentHash!==contentHash)return false;
+        const previous=metadata.recognitionRecovery?.sourceVersion===sourceVersion ? metadata.recognitionRecovery : null;
+        if(previous?.status==='reading' || (previous?.attempts || 0)>=DOCUMENT_RECOGNITION_ATTEMPTS)return false;
+        metadata.recognitionRecovery={sourceVersion,attempts:Number(previous?.attempts || 0)+1,
+            lastError:previous?.lastError || '',nextRetryAt:null,status:'reading',startedAt:nowIso()};
+        this.db.prepare('UPDATE document_records SET metadata_json=?,updated_at=? WHERE id=?').run(toJson(metadata),nowIso(),documentId);
+        this.db.prepare('UPDATE case_drafts SET reviewed_at=NULL,updated_at=? WHERE id=?').run(nowIso(),row.case_draft_id);
+        return true;
+    }
+
+    recordDocumentRecognitionFailure(documentId:string,error:unknown,expected?:{sourceVersion:string|null;contentHash?:string}):void {
+        const row=this.db.prepare('SELECT * FROM document_records WHERE id=? AND is_active=1').get(documentId) as any;
+        if(!row?.case_draft_id)return;
+        const version=this.getComplaintSourceVersion(documentId);
+        if(!version || (expected && expected.sourceVersion!==version))return;
+        this.assertEditableIntake(row.case_draft_id);
+        const metadata=this.safeJson(row.metadata_json) || {};
+        if(expected && metadata.recognition?.contentHash!==expected.contentHash)return;
+        const previous=metadata.recognitionRecovery;
+        const attempts=previous?.sourceVersion===version ? Number(previous.attempts || 0)+(previous.status==='reading'?0:1) : 1;
+        metadata.recognitionRecovery={sourceVersion:version,attempts,lastError:recognitionErrorSummary(error),status:'failed',
+            nextRetryAt:attempts<DOCUMENT_RECOGNITION_ATTEMPTS ? new Date(Date.now()+attempts*5*60_000).toISOString() : null};
+        this.db.prepare('UPDATE document_records SET metadata_json=?,updated_at=? WHERE id=?')
+            .run(toJson(metadata),nowIso(),documentId);
+        this.db.prepare('UPDATE case_drafts SET reviewed_at=NULL,updated_at=? WHERE id=?').run(nowIso(),row.case_draft_id);
+        this.insertAuditLog('document_record',documentId,'document_recognition_failed',{
+            ...metadata.recognitionRecovery,diagnostic:normalizeError(error),uploadedFilePreserved:true});
+    }
+
+    recoverInterruptedDocumentRecognitions():number {
+        const rows=this.db.prepare(`SELECT d.id,d.case_draft_id FROM document_records d JOIN case_drafts c ON c.id=d.case_draft_id
+            WHERE d.is_active=1 AND json_extract(d.metadata_json,'$.recognitionRecovery.status')='reading'
+              AND c.filing_status IN ('not_started','failed') AND c.status IN ('parsed','needs_review','validation_failed','ready_to_file','filing_failed')`)
+            .all() as Array<{id:string;case_draft_id:string}>;
+        let recovered=0;
+        for(const row of rows) {
+            if(!this.getDraftDetail(row.case_draft_id)?.caseDraft?.filingEligible)continue;
+            this.recordDocumentRecognitionFailure(row.id,new Error('PDF recognition was interrupted by a server restart.'));
+            recovered++;
+        }
+        return recovered;
+    }
+
+    queueDocumentRecognition(documentId:string):EmailDetail {
+        return this.runInTransaction(()=>{
+            const {detail,document}=this.getDraftDocumentEditContext(documentId);
+            if(document.formTemplate || !document.oneDriveUrl || !['uploaded','downloaded','replaced'].includes(document.status) ||
+                !document.recognitionRecovery)throw new Error('This PDF has no failed recognition to retry.');
+            const root=this.safeJson(detail.caseDraft!.normalizedDataJson);
+            if(document.recognitionRecovery.attempts===0 || (document.recognitionRecovery.status==='reading' && root.manualDocumentEdits===true))return detail;
+            if(document.recognitionRecovery.status!=='reading') {
+                this.db.prepare(`UPDATE document_records SET metadata_json=json_set(metadata_json,
+                    '$.recognitionRecovery.attempts',0,'$.recognitionRecovery.status','queued','$.recognitionRecovery.nextRetryAt',NULL),updated_at=? WHERE id=?`)
+                    .run(nowIso(),documentId);
+            }
+            this.db.prepare(`UPDATE case_drafts SET reviewed_at=NULL,normalized_data_json=json_set(json_remove(normalized_data_json,
+                '$.supportingRecognitionError','$.supportingRecognitionRetryAt'),
+                '$.manualDocumentEdits',json('true')),updated_at=? WHERE id=?`).run(nowIso(),detail.caseDraft!.id);
+            this.insertAuditLog('document_record',documentId,'document_recognition_requested',{uploadedFilePreserved:true});
+            return this.refreshCaseDraftValidation(detail.caseDraft!.id);
+        });
+    }
+
     listPendingDocumentRecognitions(limit=1):string[] {
-        const rows=this.db.prepare(`SELECT c.id,c.normalized_data_json,e.subject,e.sender FROM case_drafts c JOIN email_records e ON e.id=c.email_id
+        const rows=this.db.prepare(`SELECT c.id,c.normalized_data_json,e.subject,e.sender,d.id AS document_id,
+                d.one_drive_url,d.file_size,d.metadata_json FROM case_drafts c JOIN email_records e ON e.id=c.email_id
+                JOIN document_records d ON d.case_draft_id=c.id
             WHERE json_extract(c.normalized_data_json,'$.sourceKind')='new_filing_intake'
               AND c.filing_status IN ('not_started','failed') AND c.status IN ('parsed','needs_review','validation_failed','ready_to_file','filing_failed')
               AND e.processing_status!='processing' AND COALESCE(json_extract(c.normalized_data_json,'$.supportingRecognitionRetryAt'),'')<=?
-              AND EXISTS(SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1 AND d.required_for_filing=1
+              AND d.is_active=1 AND d.required_for_filing=1
                 AND d.upload_source!='form_library' AND d.one_drive_url IS NOT NULL AND d.status IN ('uploaded','downloaded','replaced')
                 AND (COALESCE(json_extract(d.metadata_json,'$.recognition.recognitionVersion'),0)<2
                   OR (json_extract(d.metadata_json,'$.recognition.pdfVerified') IS NULL
                     AND COALESCE(json_extract(d.metadata_json,'$.recognition.source'),'')!='content')
-                  OR length(COALESCE(json_extract(d.metadata_json,'$.recognition.contentHash'),''))!=64))
-            ORDER BY c.updated_at`).all(nowIso()) as Array<{id:string;normalized_data_json:string;subject:string|null;sender:string|null}>;
-        return rows.filter(row=>!validateNewCaseSource(this.safeJson(row.normalized_data_json),row.subject,row.sender).length)
-            .slice(0,Math.min(20,Math.max(0,limit))).map(row=>row.id);
+                  OR length(COALESCE(json_extract(d.metadata_json,'$.recognition.contentHash'),''))!=64
+                  OR COALESCE(json_extract(d.metadata_json,'$.recognition.contentHash'),'') GLOB '*[^0-9a-f]*'
+                  OR json_extract(d.metadata_json,'$.recognitionRecovery') IS NOT NULL)
+            ORDER BY c.updated_at,d.created_at`).all(nowIso()) as Array<{id:string;normalized_data_json:string;subject:string|null;sender:string|null;
+                document_id:string;one_drive_url:string;file_size:number|null;metadata_json:string|null}>;
+        const selected=new Set<string>();
+        for(const row of rows) {
+            const metadata=this.safeJson(row.metadata_json) || {};
+            const version=toJson([row.document_id,row.one_drive_url,row.file_size,metadata.replacement?.token || metadata.lastReplacement?.token || null]);
+            const recognitionRecovery=metadata.recognitionRecovery?.sourceVersion===version ? metadata.recognitionRecovery : null;
+            if(documentRecognitionDue({recognition:metadata.recognition,recognitionRecovery}) &&
+                !validateNewCaseSource(this.safeJson(row.normalized_data_json),row.subject,row.sender).length)selected.add(row.id);
+            if(selected.size>=Math.min(20,Math.max(0,limit)))break;
+        }
+        return limit>0 ? [...selected] : [];
     }
 
     recordDocumentRecognitionRefresh(draftId:string,error?:unknown):void {
@@ -5498,6 +5582,7 @@ export class WorkflowDatabase {
                 .get(metadata.formTemplate.id) as {sha256:string} | undefined)?.sha256 : undefined;
             return {
                 sourceVersion,
+                recognitionRecovery:metadata?.recognitionRecovery?.sourceVersion===sourceVersion ? metadata.recognitionRecovery : null,
                 supportingEvidence:supportingEvidence(recognition,metadata?.supportingKindReview,sourceVersion,libraryHash),
                 id: row.id,
                 originalFilename: row.original_filename,
@@ -6600,6 +6685,7 @@ export class WorkflowDatabase {
         if (metadata.replacement) metadata.lastReplacement = metadata.replacement;
         delete metadata.replacement;
         delete metadata.recognition;
+        delete metadata.recognitionRecovery;
         delete metadata.courtRule;
         const timestamp = nowIso();
         this.runInTransaction(() => {
@@ -6975,6 +7061,15 @@ export class WorkflowDatabase {
     private intakeValidationIssues(data: unknown, documents: DocumentRecordView[]): DraftValidationIssue[] {
         const root = data as Record<string, any> | null;
         const issues: DraftValidationIssue[] = [];
+        for(const document of documents.filter(item=>item.requiredForFiling && item.recognitionRecovery)) {
+            const retry=document.recognitionRecovery!;
+            const status=retry.status==='reading' ? 'PDF recognition is running. Wait for verification before preparation.' :
+                retry.attempts===0 ? 'Recognition retry is queued.' : retry.nextRetryAt
+                ? `Automatic recognition retry is scheduled for ${retry.nextRetryAt}.`
+                : 'Automatic recognition has stopped. Retry recognition or replace this PDF.';
+            issues.push({field:`document.${document.id}`,severity:'error',message:
+                `${document.originalFilename || document.currentFilename || 'PDF'}: ${retry.lastError ? retry.lastError+'. ' : ''}${status}`});
+        }
         if (root?.sourceKind === 'new_filing_intake' && Array.isArray(root.intake?.issues)) {
             for (const message of root.intake.issues) {
                 if (String(message).startsWith('No PDF attachments were received.') && documents.some(document =>
@@ -7305,6 +7400,10 @@ export class WorkflowDatabase {
                 timestamp,
                 caseDraftId,
             );
+
+        if(action==='reject')this.db.prepare(`UPDATE document_records SET metadata_json=json_remove(metadata_json,'$.recognitionRecovery'),updated_at=?
+            WHERE case_draft_id=? AND json_extract(metadata_json,'$.recognitionRecovery.status') IN ('queued','reading')`)
+            .run(timestamp,caseDraftId);
 
         this.insertAuditLog(
             'case_draft',

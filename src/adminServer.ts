@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-05-complaint-reading-recovery-v107';
+const ADMIN_BUILD_ID = '2026-11-05-isolated-document-recognition-v108';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -4575,6 +4575,7 @@ const html = String.raw`<!doctype html>
       document.body.classList.add('draft-editing');
       document.getElementById('toastRegion').classList.add('draft-toast-region');
       renderDraftWorkspace();
+      document.getElementById('draftFieldsForm').scrollTop = 0;
       autoExtractDraft(draftId).catch(showDraftError);
       refreshPreparedReceiptStatus().catch(() => {});
     }
@@ -5224,7 +5225,8 @@ const html = String.raw`<!doctype html>
       const latest = jobs[0];
       state.draftFilingJobs = jobs;
       if (!previous || !latest || previous.updatedAt !== latest.updatedAt ||
-          ['queued','reading','retry_scheduled'].includes(state.draftDetail.caseDraft?.complaintReading?.status)) {
+          ['queued','reading','retry_scheduled'].includes(state.draftDetail.caseDraft?.complaintReading?.status) ||
+          state.draftDetail.documents.some(doc => doc.recognitionRecovery)) {
         const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
         if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open || state.draftEditRevision !== revision) return;
         state.draftDetail = detail;
@@ -6194,7 +6196,7 @@ const html = String.raw`<!doctype html>
           (activeDocument.errorMessage ? '<div class="draft-filing-job-error">' + escapeHtml(activeDocument.errorMessage) + '</div>' : '') +
           renderDocumentRetryInfo(activeDocument, state.draftDetail.retryPolicy) +
           renderDocumentFailureLog(activeDocument)
-        : '';
+        : renderDocumentRecognitionRecovery(activeDocument, canModifyDocuments);
       documentState.querySelectorAll('[data-retry-document]').forEach(button => {
         button.addEventListener('click', async () => {
           button.disabled = true;
@@ -6202,6 +6204,9 @@ const html = String.raw`<!doctype html>
           catch (error) { showDraftError(error); }
           finally { button.disabled = false; }
         });
+      });
+      documentState.querySelectorAll('[data-retry-recognition]').forEach(button => {
+        button.addEventListener('click', () => retryDraftRecognition(button.dataset.retryRecognition).catch(showDraftError));
       });
       if (activeDocument && activeDocument.oneDriveUrl) {
         const previewKey = activeDocument.id + ':' + (activeDocument.updatedAt || '');
@@ -6258,6 +6263,24 @@ const html = String.raw`<!doctype html>
       }
       await loadDrafts(true);
       showToast('Document retry queued.');
+    }
+
+    async function retryDraftRecognition(documentId) {
+      if (state.draftMutationBusy) return;
+      if (state.draftDirty) await saveDraft(true);
+      const draftId = state.selectedDraftId;
+      const revision = state.draftEditRevision;
+      state.draftMutationBusy = true;
+      renderDraftWorkspace();
+      try {
+        const detail = await api('/api/documents/' + encodeURIComponent(documentId) + '/retry-recognition', {method:'POST'});
+        if (state.selectedDraftId === draftId && !state.draftDirty && state.draftEditRevision === revision) state.draftDetail = detail;
+        showToast(detail.documents.some(doc => doc.id === documentId && doc.recognitionRecovery)
+          ? 'PDF recognition retry queued. The uploaded file is unchanged.' : 'PDF recognition completed.');
+      } finally {
+        state.draftMutationBusy = false;
+        if (state.selectedDraftId) renderDraftWorkspace();
+      }
     }
 
     function setDraftDirty(dirty) {
@@ -7051,12 +7074,25 @@ const html = String.raw`<!doctype html>
         links.push('<span class="source-label">' + icon('paperclip') + 'Email attachment</span>');
       }
       if (doc.formTemplate) links.push('<span class="source-label">' + icon('library') + 'Library: ' + escapeHtml(doc.formTemplate.courtName || 'All courts') + '</span>');
+      if (doc.recognitionRecovery) links.push('<span class="source-label error-text">' + icon('scan-text') + 'Recognition needs attention</span>');
       if (doc.recognition) links.push('<span class="source-label" title="' + escapeHtml(doc.recognition.message) + '">' + icon('scan-text') +
         escapeHtml(doc.filingTypeSource === 'manual' ? 'Type confirmed' : 'Type: ' + doc.recognition.source) + '</span>');
       if (!links.length && doc.fileUrl) {
         links.push('<a class="doc-link" href="' + escapeHtml(doc.fileUrl) + '" target="_blank" rel="noreferrer">' + icon('external-link') + 'Legacy file</a>');
       }
       return links.length ? '<div class="doc-links">' + links.join('') + '</div>' : '';
+    }
+
+    function renderDocumentRecognitionRecovery(doc, canRetry) {
+      const retry = doc?.recognitionRecovery;
+      if (!retry) return '';
+      const label = retry.status === 'reading' ? 'Recognizing PDF' : retry.attempts === 0 ? 'Recognition retry queued' : retry.nextRetryAt
+        ? 'Recognition retry: ' + fmtDate(retry.nextRetryAt) : 'Recognition stopped';
+      return '<div class="draft-document-status">' + statusPill(doc.status) +
+        '<span>' + escapeHtml(label) + ' · ' + escapeHtml(retry.attempts) + ' / 3</span>' +
+        (canRetry && retry.status !== 'reading' && retry.attempts > 0 ? '<button type="button" class="icon-button" data-retry-recognition="' + escapeHtml(doc.id) +
+          '" title="Retry PDF recognition" aria-label="Retry PDF recognition">' + icon('rotate-cw') + '</button>' : '') +
+        '</div>' + (retry.lastError ? '<div class="draft-filing-job-error">' + escapeHtml(retry.lastError) + '</div>' : '');
     }
 
     function formatJson(value) {
@@ -7837,6 +7873,10 @@ export function createAdminServer(
 
     const db = getWorkflowDatabase();
     let syncTimer: NodeJS.Timeout | null = null;
+    if (!options.extractionWorkerAvailable?.()) {
+        db.recoverInterruptedComplaintExtractions();
+        db.recoverInterruptedDocumentRecognitions();
+    }
     const automaticStatusRefreshAvailable = () => options.filingWorkerAvailable?.() === true &&
         !['false','0','no','off'].includes((process.env.MIFILE_AUTO_STATUS_REFRESH_ENABLED || 'true').toLowerCase()) &&
         !['false','0','no','off'].includes((process.env.MIFILE_FILING_WORKER_ENABLED || 'true').toLowerCase());
@@ -8779,9 +8819,26 @@ export function createAdminServer(
                 return;
             }
 
+            const recognitionRetryMatch = url.pathname.match(/^\/api\/documents\/([^/]+)\/retry-recognition$/);
+            if (req.method === 'POST' && recognitionRetryMatch) {
+                const documentId = decodeURIComponent(recognitionRetryMatch[1]);
+                const detail = db.queueDocumentRecognition(documentId);
+                if (options.extractionWorkerAvailable?.()) {
+                    sendJson(res, 202, detail);
+                } else {
+                    sendJson(res, 200, await ensureDraftDocumentRecognitions(db, detail.caseDraft!.id));
+                }
+                return;
+            }
+
             const autoExtractMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/auto-extract$/);
             if (req.method === 'POST' && autoExtractMatch) {
                 const draftId = decodeURIComponent(autoExtractMatch[1]);
+                if (options.extractionWorkerAvailable?.()) {
+                    const detail = db.getDraftDetail(draftId);
+                    sendJson(res, detail ? 202 : 404, detail || {error:'Case draft not found'});
+                    return;
+                }
                 await ensureDraftComplaintExtraction(db, draftId);
                 const detail = await ensureDraftDocumentRecognitions(db, draftId);
                 sendJson(res, 200, detail.caseDraft?.complaintExtraction && detail.caseDraft.filingEligible && ['not_started','failed'].includes(detail.caseDraft.filingStatus)

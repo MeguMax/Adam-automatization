@@ -225,6 +225,185 @@ test('legacy unclassified PDFs are freshly inspected before receiving the suppli
     }finally{f.close();}
 });
 
+test('a failed supporting PDF cannot stop later PDFs or another case and keeps uploaded/manual data intact',async()=>{
+    const f=fixture();
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,{...demandRecognition,recognitionVersion:1});
+        const later=f.add('Unclassified PDF','Later evidence.pdf');
+        const before=f.db.getDraftDetail(f.draftId)!;
+        f.db.updateCaseDraft(f.draftId,{},undefined,{...before.caseDraft!.filingData,
+            plaintiff:{...before.caseDraft!.filingData.plaintiff,phone:'248-555-0188'}});
+        const reads:string[]=[];
+        const result=await ensureDraftDocumentRecognitions(f.db,f.draftId,async url=>{
+            reads.push(url);if(url.includes('Demand.pdf'))throw new Error('Cloud PDF read failed\ninternal path stays in audit');
+            return deedPdf;
+        });
+        assert.equal(reads.length,2);
+        const broken=result.documents.find(doc=>doc.id===f.ancillary)!,good=result.documents.find(doc=>doc.id===later)!;
+        assert.equal(broken.status,'uploaded');assert.equal(broken.errorMessage,null);
+        assert.equal(broken.recognitionRecovery!.attempts,1);assert.equal(broken.recognitionRecovery!.lastError,'Cloud PDF read failed');
+        assert.equal(good.recognition!.pdfVerified,true);assert.equal(good.recognitionRecovery,null);
+        assert.equal(result.caseDraft!.filingData.plaintiff.phone,'248-555-0188');
+        assert.ok(result.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+f.ancillary && /Automatic recognition retry/.test(issue.message)));
+        assert.equal(result.documents.filter(doc=>doc.status==='uploaded').length,7);
+        assert.deepEqual(f.db.listPendingDocumentRecognitions(),[]);
+        const message={id:'second-recognition-case',subject:'NEW LT FILING - Second case',from:{emailAddress:{address:'qa@example.com'}}};
+        const email=f.db.registerEmail(message),id=f.db.createCaseDraft(email.id,buildFilingIntake(message,[]));
+        f.db.addDocument({emailId:email.id,caseDraftId:id,originalFilename:'Other.pdf',documentType:'Unclassified PDF',
+            uploadSource:'email_intake',oneDriveUrl:'https://onedrive.example/Second.pdf',status:'uploaded'});
+        f.db.markEmailProcessed(email.id);
+        assert.deepEqual(f.db.listPendingDocumentRecognitions(),[id]);
+        const second=await ensureDraftDocumentRecognitions(f.db,id,async()=>deedPdf);
+        assert.equal(second.documents[0].recognition!.pdfVerified,true);
+        assert.equal(f.db.listFilingJobs().length,0);
+    }finally{f.close();}
+});
+
+test('per-PDF recognition stops after three failures and an idempotent manual retry survives restart',async()=>{
+    const f=fixture();
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,{...demandRecognition,recognitionVersion:1});
+        let reads=0;
+        for(let attempt=1;attempt<=3;attempt++) {
+            const result=await ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>{reads++;throw new Error('Synthetic recognition failure');});
+            const retry=result.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery!;
+            assert.equal(retry.attempts,attempt);assert.equal(Boolean(retry.nextRetryAt),attempt<3);
+            if(attempt<3)(f.db as any).db.prepare("UPDATE document_records SET metadata_json=json_set(metadata_json,'$.recognitionRecovery.nextRetryAt','2000-01-01T00:00:00Z') WHERE id=?").run(f.ancillary);
+        }
+        await ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>{throw new Error('Exhausted PDF must not run again');});
+        assert.equal(reads,3);assert.deepEqual(f.db.listPendingDocumentRecognitions(),[]);
+        const requested=f.db.queueDocumentRecognition(f.ancillary),again=f.db.queueDocumentRecognition(f.ancillary);
+        assert.equal(requested.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery!.attempts,0);
+        assert.equal(again.auditLogs.filter(log=>log.action==='document_recognition_requested').length,1);
+        const reopened=new WorkflowDatabase(f.db.getPath());
+        try {
+            assert.deepEqual(reopened.listPendingDocumentRecognitions(),[f.draftId]);
+            const result=await ensureDraftDocumentRecognitions(reopened,f.draftId,async()=>deedPdf);
+            assert.equal(result.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery,null);
+            assert.equal(result.documents.find(doc=>doc.id===f.ancillary)!.status,'uploaded');
+            assert.equal(JSON.parse(result.caseDraft!.normalizedDataJson!).manualDocumentEdits,true);
+            assert.equal(reopened.queueValidatedIntakes(),0);assert.equal(reopened.listFilingJobs().length,0);
+        }finally{reopened.close();}
+    }finally{f.close();}
+});
+
+test('a failed recheck blocks a PDF even with a current cached recognition and cannot be waived by confirming',()=>{
+    const f=fixture();
+    try {
+        f.db.applyCourtFilingRule(f.draftId);
+        f.db.recordDocumentRecognitionFailure(f.ancillary,new Error('Cannot verify the current source bytes'));
+        const detail=f.db.refreshCaseDraftValidation(f.draftId);
+        assert.ok(detail.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+f.ancillary && /Cannot verify/.test(issue.message)));
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve/);
+        f.db.queueDocumentRecognition(f.ancillary);
+        assert.deepEqual(f.db.listPendingDocumentRecognitions(),[f.draftId],'A current cache cannot bypass an explicit retry');
+    }finally{f.close();}
+});
+
+test('a stalled PDF read times out without blocking the next PDF or applying a late result',async()=>{
+    const f=fixture();let release!:(value:Buffer)=>void;
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,{...demandRecognition,recognitionVersion:1});
+        const later=f.add('Unclassified PDF','Next.pdf');
+        const result=await ensureDraftDocumentRecognitions(f.db,f.draftId,async url=>{
+            if(url.includes('Demand.pdf'))return new Promise<Buffer>(resolve=>{release=resolve;});
+            return deedPdf;
+        },undefined,{downloadTimeoutMs:20});
+        assert.match(result.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery!.lastError,/timed out/);
+        assert.equal(result.documents.find(doc=>doc.id===later)!.recognition!.pdfVerified,true);
+        release(deedPdf);await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery!.attempts,1);
+        assert.equal(f.db.listFilingJobs().length,0);
+    }finally{release?.(deedPdf);f.close();}
+});
+
+test('a recognition failure arriving after replacement cannot contaminate the new PDF',async()=>{
+    const f=fixture();let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
+    let pending:ReturnType<typeof ensureDraftDocumentRecognitions>|undefined;
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,{...demandRecognition,recognitionVersion:1});
+        pending=ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>{entered();await gate;throw new Error('Old source failed');});
+        await started;
+        const reservation=f.db.beginDocumentReplacement(f.ancillary);
+        f.db.recordDocumentReplacement(f.ancillary,{token:reservation.token,fileSize:deedPdf.length});
+        f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        release();await pending;
+        const current=f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.ancillary)!;
+        assert.equal(current.recognitionRecovery,null);assert.equal(current.status,'replaced');
+        assert.equal(current.recognition!.contentHash,deedRecognition.contentHash);
+    }finally{release?.();await pending;f.close();}
+});
+
+test('an active supporting PDF verification blocks preparation even with older valid cached facts',async()=>{
+    const f=fixture();let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
+    let pending:ReturnType<typeof ensureDraftDocumentRecognitions>|undefined;
+    try {
+        f.db.applyComplaintExtraction(f.draftId,f.complaint,{...extraction,extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION});
+        f.db.applyCourtFilingRule(f.draftId);
+        f.db.recordDocumentRecognition(f.ancillary,{...demandRecognition,recognitionVersion:1});
+        pending=ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>{entered();await gate;return deedPdf;});
+        await started;
+        const current=f.db.getDraftDetail(f.draftId)!;
+        assert.equal(current.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery!.status,'reading');
+        assert.ok(current.caseDraft!.validationIssues.some(issue=>/recognition is running/.test(issue.message)));
+        assert.throws(()=>f.db.queueFilingJob(f.draftId,'prepare','admin','admin',true),/Cannot approve draft/);
+        assert.equal(f.db.queueValidatedIntakes(),0);
+        release();await pending;assert.equal(f.db.listFilingJobs().length,0);
+    }finally{release?.();await pending;f.close();}
+});
+
+test('interrupted PDF reads retain their attempt budget across server restarts',()=>{
+    const f=fixture();
+    try {
+        const version=f.db.getComplaintSourceVersion(f.ancillary),pin=demandRecognition.contentHash;
+        for(let attempt=1;attempt<=3;attempt++) {
+            assert.equal(f.db.beginDocumentRecognition(f.ancillary,version,pin),true);
+            const reopened=new WorkflowDatabase(f.db.getPath());
+            try {
+                assert.equal(reopened.recoverInterruptedDocumentRecognitions(),1);
+                const retry=reopened.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery!;
+                assert.equal(retry.attempts,attempt);assert.equal(retry.status,'failed');
+                assert.match(retry.lastError,/server restart/);assert.equal(Boolean(retry.nextRetryAt),attempt<3);
+            }finally{reopened.close();}
+        }
+        assert.equal(f.db.beginDocumentRecognition(f.ancillary,version,pin),false);
+        assert.deepEqual(f.db.listPendingDocumentRecognitions(),[]);
+        assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.ancillary)!.status,'uploaded');
+    }finally{f.close();}
+});
+
+test('a late failed read cannot invalidate a newer recognition pin at the same URL and size',async()=>{
+    const f=fixture();let release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
+    let pending:ReturnType<typeof ensureDraftDocumentRecognitions>|undefined;
+    try {
+        f.db.recordDocumentRecognition(f.ancillary,{...demandRecognition,recognitionVersion:1});
+        const version=f.db.getComplaintSourceVersion(f.ancillary);
+        pending=ensureDraftDocumentRecognitions(f.db,f.draftId,async()=>{entered();await gate;throw new Error('Outdated read failed');});
+        await started;f.db.recordDocumentRecognition(f.ancillary,deedRecognition);
+        assert.equal(f.db.getComplaintSourceVersion(f.ancillary),version);
+        release();await pending;
+        const document=f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.ancillary)!;
+        assert.equal(document.recognitionRecovery,null);assert.equal(document.recognition!.contentHash,deedRecognition.contentHash);
+    }finally{release?.();await pending;f.close();}
+});
+
+test('rejecting a case cancels pending PDF verification and does not leave a false active state',()=>{
+    const f=fixture();
+    try {
+        assert.equal(f.db.beginDocumentRecognition(f.ancillary,f.db.getComplaintSourceVersion(f.ancillary),demandRecognition.contentHash),true);
+        f.db.reviewCaseDraft(f.draftId,'reject');
+        assert.equal(f.db.getDraftDetail(f.draftId)!.documents.find(doc=>doc.id===f.ancillary)!.recognitionRecovery,null);
+        assert.deepEqual(f.db.listPendingDocumentRecognitions(),[]);
+        assert.equal(f.db.recoverInterruptedDocumentRecognitions(),0);
+    }finally{f.close();}
+});
+
 test('legacy recognition refresh re-extracts changed Complaint bytes at a stable OneDrive URL without overwriting manual fields',async()=>{
     const f=fixture();
     try {

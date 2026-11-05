@@ -461,3 +461,22 @@ re-read clears approval and requires package confirmation afterwards; it cannot
 automatically prepare an old historical package. Rejecting the package cancels
 the pending request. Existing automatic reading/preparation of complete new
 email packages remains unchanged. Payment and final court submission stay off.
+
+## Independent PDF recognition recovery (v108)
+
+Each failed PDF verification keeps its own three-attempt budget and retry time.
+Other PDFs in the case and other case packages continue processing. A failure
+after upload leaves the PDF uploaded and linked in OneDrive; recognition errors
+are not counted as new download failures or requests to upload another copy.
+The package remains blocked until every included PDF has been verified.
+
+Select the affected PDF to see its short error, attempts and next retry time.
+The retry arrow restarts recognition of that saved PDF without reuploading it.
+An explicit retry clears package approval; manual fields and document choices
+remain protected. Replacing a PDF clears its old failure identity, and a late
+response from the prior source cannot mark the replacement as failed.
+
+OneDrive reads used by Complaint extraction and document recognition have a
+two-minute deadline and cancellation signal. Timed-out reads cannot apply late
+results. With the production extraction worker enabled, opening a Draft returns
+its current state immediately; it does not hold the page open for PDF/OCR work.

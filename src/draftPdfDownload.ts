@@ -1,0 +1,25 @@
+/** Only read operations belong here: a timeout must never retry an uncertain cloud write. */
+export async function downloadDraftPdf(url: string, options: {
+    download?: (url: string, signal: AbortSignal) => Promise<Buffer>;
+    timeoutMs?: number;
+} = {}): Promise<Buffer> {
+    const controller = new AbortController();
+    const timeoutMs = options.timeoutMs ?? 120_000;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+            reject(new Error('PDF download timed out. Automatic recognition will retry this file separately.'));
+            controller.abort();
+        }, timeoutMs);
+    });
+    try {
+        const read = options.download || (async (shareUrl: string, signal: AbortSignal) => {
+            const drive = await import('./oneDriveClient');
+            const item = await drive.resolveSharedDriveItem(shareUrl, signal);
+            return drive.downloadDriveItemBuffer(item.driveId, item.itemId, signal);
+        });
+        return await Promise.race([read(url, controller.signal), timeout]);
+    } finally {
+        clearTimeout(timer);
+    }
+}

@@ -119,6 +119,17 @@ If the service restarts while **Save Progress** is completing, the Draft becomes
   extraction worker is supplied. Keep `WORKER_ENABLED=true` for background
   processing. Existing complete/historical packages are not bulk requeued.
 
+- Supporting/core PDF verification now retries independently per document, up to
+  three attempts with five/ten-minute backoff. Recovery metadata uses the existing
+  document JSON; no migration or new environment variable is needed. The failed
+  PDF remains uploaded and blocks package preparation until verified, replaced
+  or appropriately excluded. The selected-PDF retry arrow returns 202 in
+  production and requires later package confirmation. Draft auto-extraction
+  requests also return immediately when the background worker is enabled.
+  OneDrive reads for recognition/Complaint extraction have a two-minute deadline;
+  the SDK receives cancellation and a late read cannot update the Draft. These
+  bounds apply only to reads, never retries of payment, upload or submission.
+
 - PDF page inspection and supporting-form text-field reads use a serialized,
   isolated Node parser instead of the admin/inbox event loop. Its V8 heap is capped
   at 256 MB and each read defaults to a 60-second deadline. Optional

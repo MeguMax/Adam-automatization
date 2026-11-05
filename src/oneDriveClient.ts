@@ -65,9 +65,10 @@ export interface OneDriveSharedItem {
     webUrl: string | null;
 }
 
-export async function resolveSharedDriveItem(shareUrl: string): Promise<OneDriveSharedItem> {
+export async function resolveSharedDriveItem(shareUrl: string, signal?: AbortSignal): Promise<OneDriveSharedItem> {
     const item = await oneDriveClient
         .api(`/shares/${shareIdFromUrl(shareUrl)}/driveItem`)
+        .options(signal ? { signal } : {})
         .select('id,name,webUrl,parentReference')
         .get();
     const driveId = item.parentReference?.driveId ?? item.driveId;
@@ -126,9 +127,11 @@ export async function replaceDriveItemContent(
 export async function downloadDriveItemBuffer(
     driveId: string,
     itemId: string,
+    signal?: AbortSignal,
 ): Promise<Buffer> {
     const content = await oneDriveClient
         .api(`/drives/${driveId}/items/${itemId}/content`)
+        .options(signal ? { signal } : {})
         .responseType(ResponseType.ARRAYBUFFER)
         .get();
     return Buffer.from(content);
