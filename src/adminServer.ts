@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-06-excel-batch-recovery-v115';
+const ADMIN_BUILD_ID = '2026-11-06-batch-review-navigation-v116';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2104,6 +2104,14 @@ const html = String.raw`<!doctype html>
     .draft-workspace-title {
       min-width: 0;
     }
+    .draft-email-cases { flex: 0 0 auto; padding: 8px 12px; border-bottom: 1px solid var(--line); background: #fff; }
+    .draft-email-cases label { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+    .draft-email-cases select { flex: 1; min-width: 0; max-width: 640px; min-height: 36px; width: 100%; }
+    .draft-move-field { grid-column: 1 / -1; }
+    .draft-move-controls { display: flex; align-items: center; gap: 8px; }
+    .draft-move-controls select { flex: 1; width: 100%; min-width: 0; }
+    .draft-move-controls button { flex: 0 0 auto; }
+    @media (max-width: 620px) { .draft-email-cases label { display: grid; gap: 4px; } }
     .draft-workspace-title strong,
     .draft-workspace-title span {
       display: block;
@@ -3500,6 +3508,9 @@ const html = String.raw`<!doctype html>
             </details>
           </div>
         </div>
+        <div id="draftEmailCases" class="draft-email-cases hidden">
+          <label for="draftEmailCaseSelect"><span id="draftEmailCaseLabel">Cases in this email</span><select id="draftEmailCaseSelect" aria-label="Case from this email"></select></label>
+        </div>
         <div class="draft-mobile-switch" role="group" aria-label="Draft workspace view">
           <button type="button" data-draft-mobile-mode="document" class="active"><i data-lucide="file-text"></i>Document</button>
           <button type="button" data-draft-mobile-mode="fields"><i data-lucide="clipboard-list"></i>Review</button>
@@ -3794,6 +3805,8 @@ const html = String.raw`<!doctype html>
       draftMobileMode: 'document',
       draftSection: 'review',
       draftMutationBusy: false,
+      draftNavigationBusy: false,
+      draftOpenRevision: 0,
       editingMappingId: null,
       view: 'queue',
       pagination: { page: 1, pageSize: 50, totalItems: 0, totalPages: 1 },
@@ -4560,14 +4573,16 @@ const html = String.raw`<!doctype html>
     async function openDraft(draftId) {
       if (!draftId) return;
       if (state.draftDirty && !window.confirm('Discard unsaved draft changes?')) return;
+      const request = ++state.draftOpenRevision, previous = state.selectedDraftId, revision = state.draftEditRevision;
       const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
       if (!detail.caseDraft) throw new Error('Draft data is not available');
+      const jobs = await api('/api/filing-jobs?caseDraftId=' + encodeURIComponent(draftId));
+      if (request !== state.draftOpenRevision || state.selectedDraftId !== previous || state.draftEditRevision !== revision) return;
       state.selectedDraftId = draftId;
       state.draftMoveTargets = {};
       state.draftSection = 'review';
       state.draftDetail = detail;
-      state.draftFilingJobs = await api('/api/filing-jobs?caseDraftId=' +
-        encodeURIComponent(draftId));
+      state.draftFilingJobs = jobs;
       state.draftDirty = false;
       const primary = (detail.documents || []).find(document => document.isPrimary);
       const viewable = (detail.documents || []).find(document => document.oneDriveUrl);
@@ -4585,6 +4600,46 @@ const html = String.raw`<!doctype html>
       autoExtractDraft(draftId).catch(showDraftError);
       refreshPreparedReceiptStatus().catch(() => {});
     }
+
+    function renderDraftEmailCases() {
+      const cases = (state.draftDetail?.caseDrafts || []).filter(item => item.status !== 'archived' || item.id === state.selectedDraftId);
+      const picker = document.getElementById('draftEmailCaseSelect');
+      document.getElementById('draftEmailCases').classList.toggle('hidden', cases.length < 2);
+      document.getElementById('draftEmailCaseLabel').textContent = 'Cases in this email (' + cases.length + ')';
+      picker.replaceChildren(...cases.map(item => {
+        const option = document.createElement('option'); option.value = item.id;
+        option.textContent = item.label + ' · ' + item.documentCount + (item.documentCount === 1 ? ' PDF · ' : ' PDFs · ') + statusLabel(item.status);
+        option.selected = item.id === state.selectedDraftId;
+        return option;
+      }));
+      picker.disabled = state.draftMutationBusy || state.draftNavigationBusy;
+      document.getElementById('closeDraftBtn').disabled = state.draftMutationBusy || state.draftNavigationBusy;
+    }
+
+    async function switchEmailDraft(draftId, section) {
+      const source = state.selectedDraftId;
+      if (!draftId || draftId === source || state.draftMutationBusy || state.draftNavigationBusy ||
+          !(state.draftDetail?.caseDrafts || []).some(item => item.id === draftId && item.status !== 'archived')) {
+        renderDraftEmailCases(); return;
+      }
+      state.draftNavigationBusy = true; renderDraftEmailCases();
+      try {
+        if (state.draftDirty) {
+          if (!await confirmDraftAction('Save changes before switching?',
+              'Save the current case before opening another case from this email.', 'Save & switch')) return;
+          await saveDraft(true);
+        }
+        if (state.selectedDraftId !== source) return;
+        await openDraft(draftId);
+        if (state.selectedDraftId === draftId && section) {
+          setDraftSection(section, true); setDraftMobileMode('fields');
+        }
+      } finally { state.draftNavigationBusy = false; renderDraftEmailCases(); }
+    }
+
+    document.getElementById('draftEmailCaseSelect').addEventListener('change', event => {
+      switchEmailDraft(event.target.value).catch(showDraftError);
+    });
 
     const receiptRefreshAttempts = new Map();
     let receiptRefreshBusy = false;
@@ -4661,6 +4716,7 @@ const html = String.raw`<!doctype html>
         [JSON.parse(draft.normalizedDataJson || '{}').intake?.packageLabel, detail.email.subject || '(no subject)'].filter(Boolean).join(' · ');
       document.getElementById('draftWorkspaceStatuses').innerHTML =
         statusPill(draft.status);
+      renderDraftEmailCases();
       document.getElementById('draftApproveBtn').innerHTML = icon('check-check') +
         'Confirm package';
       const manualCopyButton = document.getElementById('draftManualCopyBtn');
@@ -4683,7 +4739,7 @@ const html = String.raw`<!doctype html>
           .forEach(control => { control.disabled = true; });
       }
       document.getElementById('draftReviewerNotes').disabled = draftLocked;
-      document.getElementById('closeDraftBtn').disabled = Boolean(state.draftMutationBusy);
+      document.getElementById('closeDraftBtn').disabled = Boolean(state.draftMutationBusy || state.draftNavigationBusy);
       document.getElementById('draftRejectBtn').disabled = draftLocked;
       manualCopyButton.disabled = draftLocked;
       document.getElementById('draftApproveBtn').disabled =
@@ -4878,8 +4934,9 @@ const html = String.raw`<!doctype html>
           const attention = !doc.oneDriveUrl || (draft.validationIssues || []).some(issue => issue.field === 'document.' + doc.id);
           return '<div class="draft-overview-file' + (attention ? ' needs-review' : '') + '">' +
             icon(attention ? 'circle-alert' : 'file-check-2') + '<span>' +
-            escapeHtml(statusLabel(doc.packageRole || doc.documentType || 'Document')) +
-            '<small>' + escapeHtml(doc.filingRelation === 'connected_to_complaint' ? 'Connected to Complaint' :
+            escapeHtml(doc.originalFilename || doc.currentFilename || statusLabel(doc.packageRole || doc.documentType || 'Document')) +
+            '<small>' + escapeHtml(statusLabel(doc.packageRole || doc.documentType || 'Document')) + ' · ' +
+            escapeHtml(doc.filingRelation === 'connected_to_complaint' ? 'Connected to Complaint' :
               doc.filingType || 'Filing type not assigned') +
             (doc.formTemplate ? ' · Form library' : '') +
             (doc.requiredForFiling === false ? ' · Excluded' : '') + '</small></span>' +
@@ -5815,6 +5872,9 @@ const html = String.raw`<!doctype html>
 
     function focusDraftIssue(issue) {
       if (!issue) return;
+      if (issue.relatedDraftId) {
+        switchEmailDraft(issue.relatedDraftId, 'documents').catch(showDraftError); return;
+      }
       if (missingDraftUploadRole(issue)) {
         if (state.draftMutationBusy) return;
         setDraftSection('documents');
@@ -6090,7 +6150,7 @@ const html = String.raw`<!doctype html>
                 '>' + option.label + '</option>').join('') +
           '</select></label>' : '') +
         (supportingDocument && (state.draftDetail?.caseDrafts || []).length > 1 ?
-          '<label class="draft-field"><span class="draft-field-label">Move supporting PDF to case</span>' +
+          '<label class="draft-field draft-move-field"><span class="draft-field-label">Move supporting PDF to case</span><span class="draft-move-controls">' +
           '<select data-move-target="' + escapeHtml(document.id) + '"><option value="">Choose case from this email</option>' +
           state.draftDetail.caseDrafts.filter(item => item.id !== state.selectedDraftId &&
             !['queued','running','prepared','succeeded','reconciliation_required'].includes(item.filingStatus) &&
@@ -6098,7 +6158,7 @@ const html = String.raw`<!doctype html>
             .map(item => '<option value="' + escapeHtml(item.id) + '"' +
               (state.draftMoveTargets[document.id] === item.id ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>').join('') +
           '</select><button type="button" data-move-supporting="' + escapeHtml(document.id) + '">' +
-          icon('arrow-right-left') + 'Move PDF</button></label>' : '') +
+          icon('arrow-right-left') + 'Move PDF</button></span></label>' : '') +
       '</div></details>';
     }
 
@@ -7819,7 +7879,7 @@ const html = String.raw`<!doctype html>
         return;
       }
       const button = event.target.closest('[data-move-supporting]');
-      if (!button || state.draftMutationBusy) return;
+      if (!button || state.draftMutationBusy || state.draftNavigationBusy) return;
       const id = button.dataset.moveSupporting;
       const target = document.querySelector('[data-move-target="' + id + '"]')?.value;
       if (!target) { showToast('Choose the destination case first.', 'error'); return; }
@@ -7827,7 +7887,10 @@ const html = String.raw`<!doctype html>
         if (state.draftDirty) await saveDraft(true);
         const source = state.selectedDraftId;
         const pdf = state.draftDetail.documents.find(item => item.id === id);
-        if (!pdf || !confirm('Move this supporting PDF to the selected case? Both packages will require review. No OneDrive file is deleted.')) return;
+        const destination = state.draftDetail.caseDrafts.find(item => item.id === target);
+        if (!pdf || !destination || !await confirmDraftAction('Move supporting PDF?',
+          'Both packages will require review. The original OneDrive file is preserved.', 'Move PDF',
+          '<strong>' + escapeHtml(pdf.originalFilename || pdf.currentFilename) + '</strong><br>' + escapeHtml(destination.label))) return;
         state.draftMutationBusy = true;
         const updated = await api('/api/drafts/' + encodeURIComponent(source) + '/documents/' + encodeURIComponent(id) + '/move', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },

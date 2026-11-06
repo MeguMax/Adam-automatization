@@ -240,6 +240,34 @@ test('misnamed support can move only within its email, preserves source bytes an
     } finally { f.close(); }
 });
 
+test('unassigned PDF issues follow active document ownership and point sibling review to the unresolved group', async () => {
+    const f = fixture([...names, 'Demand.pdf', 'Second Demand.pdf']);
+    try {
+        await f.library();
+        for (const item of f.packages) await processFilingIntake(f.db, f.email.id, item.draftId, item.parsed, f.dependencies);
+        const orphan = f.packages.find(item => item.parsed.intake?.packageKey === '__unassigned__')!;
+        const target = f.packages.find(item => item.parsed.intake?.packageKey === 'utsey w')!;
+        const source = f.db.getDraftDetail(orphan.draftId)!;
+        const pdf = source.documents.find(document => document.originalFilename === 'Demand.pdf')!;
+        assert.ok(source.caseDraft!.validationIssues.some(issue => issue.field === 'document.' + pdf.id && /assign/i.test(issue.message)));
+        assert.ok(f.db.getDraftDetail(target.draftId)!.caseDraft!.validationIssues.some(issue =>
+            issue.field === 'intake' && issue.relatedDraftId === orphan.draftId));
+        const moved = f.db.moveSupportingDocument(orphan.draftId, pdf.id, target.draftId, pdf.sourceVersion!);
+        assert.ok(!moved.caseDraft!.validationIssues.some(issue => issue.field === 'document.' + pdf.id ||
+            issue.message.includes('Cannot assign Demand.pdf')));
+        const remaining = moved.documents.find(document => document.originalFilename === 'Second Demand.pdf')!;
+        assert.ok(moved.caseDraft!.validationIssues.some(issue => issue.field === 'document.' + remaining.id));
+        const destination = f.db.getDraftDetail(target.draftId)!;
+        assert.equal(destination.documents.find(document => document.id === pdf.id)!.oneDriveUrl, pdf.oneDriveUrl);
+        assert.equal(destination.documents.find(document => document.id === pdf.id)!.sourceUrl, pdf.sourceUrl);
+        f.db.removeDraftDocument(orphan.draftId, remaining.id);
+        assert.ok(!f.db.getDraftDetail(orphan.draftId)!.caseDraft!.validationIssues.some(issue => /Cannot assign/.test(issue.message)));
+        assert.ok(!f.db.getDraftDetail(target.draftId)!.caseDraft!.validationIssues.some(issue => issue.relatedDraftId === orphan.draftId));
+        f.db.createCaseDrafts(f.email.id, f.parsed);
+        assert.equal(f.db.getDraftDetail(orphan.draftId)!.documents.length, 0);
+    } finally { f.close(); }
+});
+
 test('named packages from an authorized original email support ordinary subjects but replies and non-system senders cannot replay a thread', async () => {
     const fetch = async () => names.map(attachment);
     const parsed = await parseWorkflowEmail({ ...message, subject: 'Five more', hasAttachments: true }, fetch);

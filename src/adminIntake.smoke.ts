@@ -1268,6 +1268,101 @@ async function main() {
         assert.equal(db.getDraftDetail(readingDraft)!.caseDraft!.filingData.plaintiff.address1,'220 Reviewed Avenue');
         assert.equal(db.listFilingJobs(readingDraft).length,0);
         extractionWorkerAvailable=false;
+
+        const batchMessage={...message,id:'qa-batch-navigation',subject:'NEW LT FILING - QA batch navigation'};
+        const batchEmail=db.registerEmail(batchMessage);
+        const batchNames=['Batch A Complaint.pdf','Batch B Complaint.pdf','Demand.pdf','Second Demand.pdf'];
+        const batchParsed=buildFilingIntake(batchMessage,batchNames.map((name,index)=>({id:'batch-'+index,name,contentType:'application/pdf',size:readingPdf.length,isInline:false})));
+        const batch=db.createCaseDrafts(batchEmail.id,batchParsed);
+        const recognize=(require('./documentRecognition') as typeof import('./documentRecognition')).recognizeDocumentPdf;
+        for(const group of batch) {
+            for(const document of db.getDraftDetail(group.draftId)!.documents) {
+                const name=document.originalFilename!,content=name.includes('Complaint')?readingPdf:testPdfFixture('DEMAND FOR POSSESSION NONPAYMENT OF RENT');
+                storedFiles.set(name,content);
+                db.completeDocumentRetrySuccess({documentId:document.id,originalFilename:name,currentFilename:name,documentType:document.documentType,
+                    sourceUrl:document.sourceUrl,oneDriveUrl:'https://onedrive.example/'+encodeURIComponent(name),fileSize:content.length,
+                    uploadSource:'email_intake',storagePath:'QA/'+name,downloadAttempts:1,metadata:{driveId:'fixture-drive',itemId:name}});
+                db.recordDocumentRecognition(document.id,await recognize(content,name));
+                if(name.includes('Complaint'))db.applyComplaintExtraction(group.draftId,document.id,originalExtraction);
+            }
+            db.refreshCaseDraftValidation(group.draftId);
+        }
+        db.markEmailProcessed(batchEmail.id);
+        const batchA=batch.find(item=>item.parsed.intake?.packageKey==='batch a')!.draftId;
+        const batchB=batch.find(item=>item.parsed.intake?.packageKey==='batch b')!.draftId;
+        const unassigned=batch.find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        await page.setViewportSize({width:1440,height:1000});
+        await page.evaluate(id=>(window as any).openDraft(id),batchA);
+        assert.equal(await page.locator('#draftEmailCaseSelect option').count(),3);
+        assert.match(await page.locator('#draftReviewOverview').innerText(),/Batch A Complaint.pdf/);
+        await page.locator('#draftDataTab').click();
+        const batchAddress=page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
+        await batchAddress.fill('650 Preserved Review Street');
+        await page.locator('#draftEmailCaseSelect').selectOption(batchB);
+        await page.locator('#draftConfirmDialog').getByRole('button',{name:'Cancel',exact:true}).click();
+        assert.equal(await page.locator('#draftEmailCaseSelect').inputValue(),batchA);
+        assert.equal(await batchAddress.inputValue(),'650 Preserved Review Street');
+        await page.locator('#draftEmailCaseSelect').selectOption(batchB);
+        await page.locator('#draftConfirmAccept').click();
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value===id&&
+            document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.disabled===false,batchB);
+        assert.equal(db.getDraftDetail(batchA)!.caseDraft!.filingData.plaintiff.address1,'650 Preserved Review Street');
+        assert.notEqual(db.getDraftDetail(batchB)!.caseDraft!.filingData.plaintiff.address1,'650 Preserved Review Street');
+        const groupingIssue=page.locator('#draftValidationSummary .draft-validation-row').filter({hasText:'still need a case assignment'});
+        await groupingIssue.locator('[data-review-issue]').click();
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value===id&&
+            document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.disabled===false,unassigned);
+        assert.equal(await page.locator('#draftDocumentsTab').getAttribute('aria-selected'),'true');
+        const unassignedPdf=db.getDraftDetail(unassigned)!.documents.find(document=>document.originalFilename==='Demand.pdf')!;
+        const moveRow=page.locator('[data-draft-document-id="'+unassignedPdf.id+'"]');
+        const moveDetails=page.locator('[data-disclosure="document-'+unassignedPdf.id+'"]');
+        if(!await moveDetails.evaluate(element=>(element as HTMLDetailsElement).open))await moveDetails.locator('summary').click();
+        await moveRow.locator('[data-move-target]').selectOption(batchA);
+        await moveRow.locator('[data-move-supporting]').click();
+        assert.match(await page.locator('#draftConfirmSummary').innerText(),/Demand.pdf.*Batch A/s);
+        await page.locator('#draftConfirmAccept').click();
+        await page.waitForFunction(id=>!document.querySelector('[data-draft-document-id="'+id+'"]'),unassignedPdf.id);
+        assert.ok(db.getDraftDetail(batchA)!.documents.some(document=>document.id===unassignedPdf.id));
+        assert.ok(!db.getDraftDetail(unassigned)!.caseDraft!.validationIssues.some(issue=>issue.field==='document.'+unassignedPdf.id));
+        await page.locator('#draftReviewTab').click();
+        const remainingPdf=db.getDraftDetail(unassigned)!.documents[0];
+        const assignment=db.getDraftDetail(unassigned)!.caseDraft!.validationIssues.find(issue=>issue.field==='document.'+remainingPdf.id)!;
+        await page.locator('#draftValidationSummary .draft-validation-row').filter({hasText:assignment.message}).locator('[data-review-issue]').click();
+        assert.equal(await page.locator('#draftDocumentSelect').inputValue(),remainingPdf.id);
+        await page.locator('#draftPdfViewer canvas').first().waitFor({state:'visible'});
+        await page.locator('#draftPdfViewer .pdf-preview-message').waitFor({state:'hidden'});
+        while(await page.getByRole('button',{name:'Dismiss notification',exact:true}).count())
+            await page.getByRole('button',{name:'Dismiss notification',exact:true}).first().click();
+        await page.screenshot({path:path.join(screenshots,'draft-batch-assignment-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        await page.getByRole('button',{name:'Review',exact:true}).click();
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        assert.equal(await page.locator('#draftEmailCaseSelect').evaluate(element=>element.getBoundingClientRect().right<=innerWidth),true);
+        assert.equal(await page.locator('#draftPrepareBtn').evaluate(element=>element.getBoundingClientRect().bottom<=innerHeight),true);
+        await page.screenshot({path:path.join(screenshots,'draft-batch-assignment-mobile.png'),fullPage:true});
+        await page.locator('#draftEmailCaseSelect').selectOption(batchA);
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value===id&&
+            document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.disabled===false,batchA);
+        await page.locator('#draftDataTab').click();
+        assert.equal(await batchAddress.inputValue(),'650 Preserved Review Street');
+        let releaseNavigation!:()=>void, navigationRequested!:()=>void;
+        const navigationGate=new Promise<void>(resolve=>{releaseNavigation=resolve;});
+        const navigationStarted=new Promise<void>(resolve=>{navigationRequested=resolve;});
+        const destinationRoute=new RegExp('/api/drafts/'+batchB+'$');
+        await context.route(destinationRoute,async route=>{navigationRequested();await navigationGate;await route.continue();});
+        const pendingNavigation=page.evaluate(id=>(window as any).openDraft(id),batchB);
+        try {
+            await navigationStarted;
+            await batchAddress.fill('651 New Unsaved Street');
+            releaseNavigation();await pendingNavigation;
+            assert.equal(await page.locator('#draftEmailCaseSelect').inputValue(),batchA);
+            assert.equal(await batchAddress.inputValue(),'651 New Unsaved Street','A delayed case response must not discard a later edit');
+            assert.equal(await page.locator('#draftSaveBtn').isEnabled(),true);
+        }finally{releaseNavigation();await pendingNavigation;await context.unroute(destinationRoute);}
+        await batchAddress.fill('650 Preserved Review Street');
+        await page.locator('#draftSaveBtn').click();
+        await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
+        assert.equal(db.listFilingJobs().some(job=>batch.some(item=>item.draftId===job.caseDraftId)),false);
         await page.setViewportSize({width:1440,height:1000});
         await page.locator('#closeDraftBtn').click();
         await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();

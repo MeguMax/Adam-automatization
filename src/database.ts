@@ -14,7 +14,7 @@ import { filingPreparationProgress, type FilingPreparationProgress } from './fil
 import { CheckoutStore } from './checkoutStore';
 import {SubmissionStore} from './mifileSubmission';
 import { migrateBundleActivity } from './mifileBundleSafety';
-import { splitFilingIntake } from './filingIntake';
+import { intakeCasePrefix, splitFilingIntake } from './filingIntake';
 import { DraftNotificationStore } from './draftNotifications';
 import { matchesSupportingCase } from './batchCaseMatching';
 import { complaintReadingView, COMPLAINT_READING_ATTEMPTS, type ComplaintReadingView } from './complaintReading';
@@ -299,6 +299,7 @@ export interface DraftValidationIssue {
     severity: 'error' | 'warning';
     message: string;
     reviewField?: string;
+    relatedDraftId?: string;
 }
 
 export type DraftFieldSource = 'email' | 'complaint' | 'manual' | 'derived' | 'empty';
@@ -7044,16 +7045,16 @@ export class WorkflowDatabase {
         const key = data?.intake?.packageKey;
         if (!key || key === '__unassigned__') return [];
         const surname = key.slice(0, key.lastIndexOf(' '));
-        const siblings = this.db.prepare(`SELECT c.normalized_data_json FROM case_drafts c WHERE c.email_id=? AND c.id!=?
+        const siblings = this.db.prepare(`SELECT c.id,c.normalized_data_json FROM case_drafts c WHERE c.email_id=? AND c.id!=?
             AND c.status NOT IN ('archived','rejected')
             AND EXISTS (SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1)
             AND NOT EXISTS (SELECT 1 FROM document_records d WHERE d.case_draft_id=c.id AND d.is_active=1 AND lower(d.document_type) LIKE '%complaint%')`)
-            .all(emailId, draftId) as Array<{ normalized_data_json: string }>;
+            .all(emailId, draftId) as Array<{ id: string; normalized_data_json: string }>;
         return siblings.flatMap(row => {
             const intake = this.safeJson(row.normalized_data_json)?.intake;
             if (!intake?.packageKey || (intake.packageKey !== '__unassigned__' &&
                 intake.packageKey.slice(0, intake.packageKey.lastIndexOf(' ')) !== surname)) return [];
-            return [{ field: 'intake', severity: 'warning' as const,
+            return [{ field: 'intake', severity: 'warning' as const, relatedDraftId: row.id,
                 message: `Supporting files in ${intake.packageLabel || intake.packageKey} still need a case assignment. Review grouping before preparing this case.` }];
         });
     }
@@ -7072,10 +7073,18 @@ export class WorkflowDatabase {
         }
         if (root?.sourceKind === 'new_filing_intake' && Array.isArray(root.intake?.issues)) {
             for (const message of root.intake.issues) {
+                // Assignment follows current document ownership, not the original email snapshot.
+                if (root.intake.packageKey === '__unassigned__' && String(message).startsWith('Cannot assign ')) continue;
                 if (String(message).startsWith('No PDF attachments were received.') && documents.some(document =>
                     !document.formTemplate && document.requiredForFiling && document.oneDriveUrl &&
                     ['uploaded', 'downloaded', 'replaced'].includes(document.status))) continue;
                 issues.push({ field: 'intake', severity: 'warning', message: String(message) });
+            }
+        }
+        if (root?.sourceKind === 'new_filing_intake' && root.intake?.packageKey === '__unassigned__') {
+            for (const document of documents.filter(item => !item.formTemplate && !intakeCasePrefix(item.originalFilename || ''))) {
+                issues.push({ field: `document.${document.id}`, severity: 'warning',
+                    message: `${document.originalFilename || 'PDF'} has no case prefix. Review its case assignment.` });
             }
         }
         const reading = complaintReadingView(root, true, true);

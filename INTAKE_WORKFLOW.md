@@ -38,6 +38,28 @@ Use consistent prefixes, for example `Utsey W Complaint [$].pdf`, `Utsey W Summo
 
 Each group has a stable package key and storage folder. Retrying the same recorded email preserves group IDs, uploaded files and manual corrections. Existing historical one-case records are not silently split or replayed. A complete sibling can proceed to Unsubmitted even when another case has failed downloads. The parent email retains aggregate download counts; the Draft editor and filing jobs use only the selected case's PDFs, fields and activity. Queue record detail links to every case from that email.
 
+The Draft header includes **Cases in this email** when several active groups
+exist. Its options show the package label, PDF count and saved status. Switching
+with unsaved edits offers **Save & switch**; Cancel retains the current case and
+inputs. A delayed case response cannot replace a newer case selection or edits
+made after the request began. The package review lists original PDF filenames,
+with their role and filing relationship underneath.
+
+Grouping review notes open the related case's Documents view. Unassigned-PDF
+notes open the exact document and follow current ownership: moving or removing
+a PDF clears its obsolete assignment note without changing another document's
+note. **Move PDF** identifies the source filename and destination case in an
+in-panel confirmation, preserves its existing OneDrive copy and source identity,
+and still requires package review. Moving supporting PDFs does not assign or
+move a Complaint, change email boundaries, or permit final court submission.
+
+Release v116 passed all 487 automated tests and authenticated desktop/mobile
+browser smoke checks, including canceled/saved switching, exact-document review,
+supporting-PDF movement and delayed-navigation edit protection. The combined
+87-PDF historical corpus retained all 18 named cases' fields and PDF assignments;
+14 packages passed validation, and 288 golden values across 12 cases matched.
+This was offline intake acceptance, not another live MiFILE or payment run.
+
 Unmatched filenames and supporting-only prefixes remain visible review groups, never silently attached to the closest surname. For example, `Marogi M Demand.pdf` does not automatically belong to `Marogi R Complaint.pdf`. After checking the PDF, use its Documents controls to move a supporting file to another editable case from the same email. The move preserves the original OneDrive file, clears approval, resets its court routing and requires package confirmation. It cannot move core/library PDFs or cross email boundaries. Empty review groups are archived. A prefix that contradicts the extracted Defendant also requires review.
 
 There is one content-based correction path for a supporting-only prefix typo: a verified Demand DC 100a with populated PDF fields can be matched to a single typed Complaint only when its full recipient name/address, Plaintiff and rented-premises address all agree exactly. Conflicting or empty PDF fields, different digits/unit numbers, multiple matching cases, scanned-only evidence and manual edits prevent this automatic reassignment. Each move records its PDF hash and matching method; the original filename and bytes stay unchanged. The empty source review group remains archived so email retries cannot recreate it. Unresolved same-surname or unassigned supporting groups prevent automatic preparation until their grouping is resolved or reviewed.
