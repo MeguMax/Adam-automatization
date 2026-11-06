@@ -57,6 +57,21 @@ and six separate multi-case PDFs match their ZIP bytes; both cases retain all
 and cancellation and failed cases expose no partial PDFs. This is not a claim
 of acceptance in Adam's Microsoft 365 tenant.
 
+Windows desktop acceptance on 2026-11-06 used the actual installed panel, Render
+v114 and the fictional `qa-cases.xlsx` workbook. DC105, DC508 and MC202 were each
+generated and downloaded separately from row 2 (101 canonical fields, four
+pages). Selecting rows 2-3 then generated six more PDFs and one cases ZIP. All
+six PDF download buttons worked; ZIP CRC passed, its six members matched the
+separate downloads byte for byte, and all 202 fields matched their own case.
+Canonical fields, page widgets, appearances and editable flags were checked.
+In-memory text/checkbox edits survived reopening all nine downloaded PDFs while
+preserving unrelated fields. All eight batch pages were rendered and visually
+reviewed. The source workbook's on-disk SHA-256 stayed unchanged. Only local
+downloads were invoked, without OneDrive saves or another sign-in between forms.
+Evidence is under `output/excel-native-v114-2026-11-06/`. This does not establish
+current multi-case acceptance in Excel Online or in Adam's tenant; those remain
+separate from this Windows desktop run and the simulated-host regression suite.
+
 ## Multiple-case local generation (v96)
 
 Select 1-10 adjacent data rows, choose any subset of DC105/DC508/MC202 under
