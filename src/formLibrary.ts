@@ -71,7 +71,9 @@ export async function uploadLibraryDocument(db: WorkflowDatabase, draftId: strin
 export async function applyLibraryForms(db: WorkflowDatabase, draftId: string, dependencies = productionUpload,
     options: { refreshEmail?: boolean } = {}) {
     const detail = db.assertEditableIntake(draftId);
-    const court = JSON.parse(detail.caseDraft!.normalizedDataJson || '{}').courtName || '';
+    const data = JSON.parse(detail.caseDraft!.normalizedDataJson || '{}');
+    if (data.intake?.packageKey === '__unassigned__') return detail;
+    const court = data.courtName || '';
     const available = db.listLibraryForms().filter(form => form.active && (form.role === 'advice' || form.courtKey === courtKey(court)));
     for (const form of available) {
         const documentId = db.reserveLibraryDocument(draftId, form);

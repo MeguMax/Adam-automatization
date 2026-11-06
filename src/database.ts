@@ -3188,35 +3188,52 @@ export class WorkflowDatabase {
     }
 
     moveSupportingDocument(draftId: string, documentId: string, targetDraftId: string, sourceVersion: string, automatic = false): EmailDetail {
+        return this.moveSupportingPdfs(draftId, [{documentId, sourceVersion}], targetDraftId, automatic);
+    }
+
+    moveSupportingDocuments(draftId: string, documents: Array<{documentId: string; sourceVersion: string}>, targetDraftId: string): EmailDetail {
+        return this.moveSupportingPdfs(draftId, documents, targetDraftId, false);
+    }
+
+    private moveSupportingPdfs(draftId: string, documents: Array<{documentId: string; sourceVersion: string}>, targetDraftId: string, automatic: boolean): EmailDetail {
+        if (!Array.isArray(documents) || !documents.length || documents.length > 100 || documents.some(item =>
+            !item || typeof item.documentId !== 'string' || !item.documentId || typeof item.sourceVersion !== 'string' || !item.sourceVersion) ||
+            new Set(documents.map(item => item.documentId)).size !== documents.length) {
+            throw new Error('Select 1-100 different supporting PDFs with their current source versions.');
+        }
         if (draftId === targetDraftId) throw new Error('Select a different case from this email');
         this.runInTransaction(() => {
-            const context = automatic ? (() => {
-                const detail = this.assertEditableIntake(draftId);
-                return { detail, document: detail.documents.find(item => item.id === documentId)! };
-            })() : this.getDraftDocumentEditContext(documentId);
-            const { detail, document } = context;
+            const detail = this.assertEditableIntake(draftId);
             const target = this.assertEditableIntake(targetDraftId);
             if (detail.caseDraft!.id !== draftId || detail.email.id !== target.email.id || detail.caseDrafts.length < 2) {
                 throw new Error('A supporting PDF can only move between cases from the same email');
             }
-            if (!document || document.isPrimary || document.formTemplate || document.packageRole !== 'ancillary' || document.sourceVersion !== sourceVersion) {
-                throw new Error('Only a current supporting PDF can be moved. Refresh the Draft before trying again.');
-            }
-            if (automatic && !this.canMatchSupportingCase(detail, document, target)) throw new Error('Automatic case matching no longer agrees with the source PDFs');
+            const selected = documents.map(item => {
+                const document = detail.documents.find(document => document.id === item.documentId);
+                if (!document || document.isPrimary || document.formTemplate || document.packageRole !== 'ancillary' || document.sourceVersion !== item.sourceVersion) {
+                    throw new Error('Only a current supporting PDF can be moved. Refresh the Draft before trying again.');
+                }
+                if (!automatic && (document.status === 'retrying' || detail.email.processingStatus === 'processing')) {
+                    throw new Error('Wait for the current document processing to finish before changing this PDF');
+                }
+                if (automatic && !this.canMatchSupportingCase(detail, document, target)) throw new Error('Automatic case matching no longer agrees with the source PDFs');
+                return document;
+            });
             const timestamp = nowIso();
-            this.db.prepare(`UPDATE document_records SET case_draft_id=?,filing_type='Other',filing_type_source='suggested',
+            const move = this.db.prepare(`UPDATE document_records SET case_draft_id=?,filing_type='Other',filing_type_source='suggested',
                 filing_relation='unknown',filing_relation_source='suggested',required_for_filing=1,
-                metadata_json=json_remove(COALESCE(metadata_json,'{}'),'$.courtRule'),updated_at=? WHERE id=? AND case_draft_id=?`)
-                .run(targetDraftId, timestamp, documentId, draftId);
+                metadata_json=json_remove(COALESCE(metadata_json,'{}'),'$.courtRule'),updated_at=? WHERE id=? AND case_draft_id=?`);
+            for (const document of selected) move.run(targetDraftId, timestamp, document.id, draftId);
             for (const id of [draftId, targetDraftId]) {
                 this.db.prepare(`UPDATE case_drafts SET reviewed_at=NULL,status='needs_review',validation_status='unknown',
                     normalized_data_json=${automatic ? 'normalized_data_json' : "json_set(normalized_data_json,'$.manualDocumentEdits',json('true'))"},updated_at=? WHERE id=?`)
                     .run(timestamp, id);
-                this.insertAuditLog('case_draft', id, automatic ? 'batch_document_matched_by_pdf_fields' : 'batch_document_moved', { documentId, fromDraftId: draftId, toDraftId: targetDraftId,
+                for (const document of selected) this.insertAuditLog('case_draft', id, automatic ? 'batch_document_matched_by_pdf_fields' : 'batch_document_moved', { documentId:document.id, fromDraftId: draftId, toDraftId: targetDraftId,
                     matchingEvidence: automatic ? { method: 'exact_dc100a_parties_and_premises', sourceHash: document.recognition!.caseIdentity!.sourceHash } : null,
                     originalFilename: document.originalFilename, oneDriveFilePreserved: true });
             }
-            const remaining = this.db.prepare('SELECT COUNT(*) AS count FROM document_records WHERE case_draft_id=? AND is_active=1')
+            const remaining = this.db.prepare(`SELECT COUNT(*) AS count FROM document_records WHERE case_draft_id=? AND is_active=1
+                AND COALESCE(upload_source,'')!='form_library' AND COALESCE(source_url,'') NOT LIKE 'form-library:%'`)
                 .get(draftId) as { count: number };
             if (!remaining.count) this.db.prepare("UPDATE case_drafts SET status='archived' WHERE id=?").run(draftId);
         });

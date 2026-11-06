@@ -53,6 +53,30 @@ in-panel confirmation, preserves its existing OneDrive copy and source identity,
 and still requires package review. Moving supporting PDFs does not assign or
 move a Complaint, change email boundaries, or permit final court submission.
 
+**Document tools > Move supporting PDFs** opens a multi-select list and a
+destination from the same email. Up to 100 supporting PDFs can be moved in one
+database transaction. Every source version and both case locks are checked
+before changing ownership; an invalid selection moves nothing. No PDF bytes,
+OneDrive paths or existing links are changed. Manual case fields are retained,
+court routing is reset for the destination, and package approval is cleared.
+Cancel does not save pending edits or move documents. After a failed/uncertain
+request the list must be reloaded before another attempt.
+
+Unassigned attachment groups do not receive new Advice/Local copies. Historical
+library copies are retained, but cannot keep an otherwise empty source group
+active after its last source PDF is moved. The editor opens the destination
+when the source group is archived; archived groups remain read-only and are not
+recreated on email replay. Complaints, core PDFs and library forms cannot be
+included in the supporting-PDF transfer.
+
+Release v117 passed all 490 automated tests and desktop/mobile browser checks
+for multi-selection, Cancel, stale-list recovery and empty-group navigation.
+An offline run using the supplied Moore and Smith PDFs moved the three generic
+Moore supporting files in one explicit manual correction. Moore then had eight
+PDFs and no validation issues; its manual field, the sibling case, source bytes
+and existing links were retained. Replaying intake added no uploads. This was
+not a live MiFILE, notification, payment or court-submission test.
+
 Release v116 passed all 487 automated tests and authenticated desktop/mobile
 browser smoke checks, including canceled/saved switching, exact-document review,
 supporting-PDF movement and delayed-navigation edit protection. The combined

@@ -10,7 +10,7 @@ import { downloadIntakeDocuments } from './filingIntakeDownload';
 import { emailAttachmentSourceName } from './emailAttachmentSource';
 import { testPdfFixture, testTextFieldsFixture } from './testPdfFixture';
 import { readSupportingCaseIdentity, matchesSupportingCase } from './batchCaseMatching';
-import { saveFormPdf } from './formLibrary';
+import { saveFormPdf, applyLibraryForms, uploadLibraryDocument } from './formLibrary';
 import { CURRENT_COMPLAINT_EXTRACTOR_VERSION, type ComplaintExtractionResult } from './complaintExtractor';
 import { parseWorkflowEmail } from './workflowEmail';
 import { resolveCourt } from './courtForms';
@@ -265,6 +265,90 @@ test('unassigned PDF issues follow active document ownership and point sibling r
         assert.ok(!f.db.getDraftDetail(target.draftId)!.caseDraft!.validationIssues.some(issue => issue.relatedDraftId === orphan.draftId));
         f.db.createCaseDrafts(f.email.id, f.parsed);
         assert.equal(f.db.getDraftDetail(orphan.draftId)!.documents.length, 0);
+    } finally { f.close(); }
+});
+
+test('bulk supporting reassignment is atomic, retains source bytes and manual fields, and cannot be replayed', async () => {
+    const f = fixture([...names, 'Demand.pdf', 'Second Demand.pdf', 'Third Demand.pdf']);
+    try {
+        await f.library();
+        for (const item of f.packages) await processFilingIntake(f.db, f.email.id, item.draftId, item.parsed, f.dependencies);
+        const source=f.packages.find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        const target=f.packages.find(item=>item.parsed.intake?.packageKey==='utsey w')!.draftId;
+        const before=f.db.getDraftDetail(source)!,destination=f.db.getDraftDetail(target)!;
+        f.db.updateCaseDraft(target,{},undefined,{...destination.caseDraft!.filingData,
+            plaintiff:{...destination.caseDraft!.filingData.plaintiff,phone:'248-555-0166'}});
+        const selected=before.documents.map(document=>({documentId:document.id,sourceVersion:document.sourceVersion!}));
+        for(const bad of [[], [...selected,selected[0]], Array.from({length:101},(_,i)=>({documentId:'document-'+i,sourceVersion:'current'})), [selected[0],{...selected[1],sourceVersion:'stale'}],
+            [selected[0],{documentId:destination.documents.find(document=>document.isPrimary)!.id,sourceVersion:'wrong-source'}]]) {
+            assert.throws(()=>f.db.moveSupportingDocuments(source,bad,target),/supporting PDF|1-100/);
+            assert.deepEqual(f.db.getDraftDetail(source)!.documents.map(document=>document.id),before.documents.map(document=>document.id));
+            assert.equal(f.db.getDraftDetail(target)!.documents.length,destination.documents.length);
+        }
+        const uploads=f.uploads.length;
+        const result=f.db.moveSupportingDocuments(source,selected,target);
+        assert.equal(result.caseDraft!.status,'archived');assert.equal(result.documents.length,0);
+        const after=f.db.getDraftDetail(target)!;
+        for(const old of before.documents) {
+            const moved=after.documents.find(document=>document.id===old.id)!;
+            assert.equal(moved.oneDriveUrl,old.oneDriveUrl);assert.equal(moved.sourceUrl,old.sourceUrl);
+            assert.deepEqual(moved.recognition,old.recognition);
+        }
+        assert.equal(after.caseDraft!.filingData.plaintiff.phone,'248-555-0166');
+        assert.equal(after.caseDraft!.reviewedAt,null);
+        assert.equal(JSON.parse(after.caseDraft!.normalizedDataJson!).manualDocumentEdits,true);
+        assert.equal(after.auditLogs.filter(log=>log.action==='batch_document_moved').length,3);
+        assert.throws(()=>f.db.moveSupportingDocuments(source,selected,target),/locked/);
+        f.db.createCaseDrafts(f.email.id,f.parsed);
+        assert.equal(f.db.getDraftDetail(source)!.documents.length,0);
+        assert.equal(f.uploads.length,uploads);assert.equal(f.db.listFilingJobs().length,0);
+    } finally { f.close(); }
+});
+
+test('bulk reassignment rejects another email or locked package without changing any documents', async () => {
+    const f=fixture([...names,'Demand.pdf','Second Demand.pdf']);
+    try {
+        await f.library();
+        for(const item of f.packages)await processFilingIntake(f.db,f.email.id,item.draftId,item.parsed,f.dependencies);
+        const source=f.packages.find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        const target=f.packages.find(item=>item.parsed.intake?.packageKey==='utsey w')!.draftId;
+        const selected=f.db.getDraftDetail(source)!.documents.map(document=>({documentId:document.id,sourceVersion:document.sourceVersion!}));
+        const foreignEmail=f.db.registerEmail({...message,id:'foreign-bulk'});
+        const foreign=f.db.createCaseDraft(foreignEmail.id,buildFilingIntake(message,[]));
+        assert.throws(()=>f.db.moveSupportingDocuments(source,selected,foreign),/same email/);
+        const sql=(f.db as any).db;
+        for(const status of ['filing_prepared','filing_reconciliation','filed_successfully','rejected']) {
+            sql.prepare('UPDATE case_drafts SET status=? WHERE id=?').run(status,target);
+            assert.throws(()=>f.db.moveSupportingDocuments(source,selected,target),/locked/);
+            assert.equal(f.db.getDraftDetail(source)!.documents.length,2);
+        }
+    } finally { f.close(); }
+});
+
+test('unassigned groups do not receive standard forms and legacy pinned forms do not prevent source-group archival', async () => {
+    const f=fixture([...names,'Complaint.pdf','Demand.pdf']);
+    try {
+        await f.library();
+        for(const item of f.packages)await processFilingIntake(f.db,f.email.id,item.draftId,item.parsed,f.dependencies);
+        const source=f.packages.find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        const target=f.packages.find(item=>item.parsed.intake?.packageKey==='utsey w')!.draftId;
+        assert.equal(f.db.getDraftDetail(source)!.documents.length,2);
+        const count=f.uploads.length;
+        await applyLibraryForms(f.db,source,f.dependencies.forms);
+        assert.equal(f.uploads.length,count);
+        assert.equal(f.db.getDraftDetail(source)!.documents.some(document=>document.formTemplate),false);
+        const complaint=f.db.getDraftDetail(source)!.documents.find(document=>document.packageRole==='complaint')!;
+        f.db.removeDraftDocument(source,complaint.id);
+        const form=f.db.listLibraryForms().find(form=>form.role==='advice')!;
+        const legacy=f.db.reserveLibraryDocument(source,form)!;
+        await uploadLibraryDocument(f.db,source,legacy,f.dependencies.forms);
+        const stored=f.db.getDraftDetail(source)!.documents.find(document=>document.id===legacy)!;
+        const pdf=f.db.getDraftDetail(source)!.documents.find(document=>document.packageRole==='ancillary')!;
+        const result=f.db.moveSupportingDocuments(source,[{documentId:pdf.id,sourceVersion:pdf.sourceVersion!}],target);
+        assert.equal(result.caseDraft!.status,'archived');assert.equal(result.documents.length,1);
+        assert.equal(result.documents[0].id,legacy);assert.equal(result.documents[0].oneDriveUrl,stored.oneDriveUrl);
+        f.db.createCaseDrafts(f.email.id,f.parsed);
+        assert.equal(f.db.getDraftDetail(source)!.documents.length,1);
     } finally { f.close(); }
 });
 

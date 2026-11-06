@@ -1271,7 +1271,7 @@ async function main() {
 
         const batchMessage={...message,id:'qa-batch-navigation',subject:'NEW LT FILING - QA batch navigation'};
         const batchEmail=db.registerEmail(batchMessage);
-        const batchNames=['Batch A Complaint.pdf','Batch B Complaint.pdf','Demand.pdf','Second Demand.pdf'];
+        const batchNames=['Batch A Complaint.pdf','Batch B Complaint.pdf','Demand.pdf','Second Demand.pdf','Third Demand.pdf','Fourth Demand.pdf'];
         const batchParsed=buildFilingIntake(batchMessage,batchNames.map((name,index)=>({id:'batch-'+index,name,contentType:'application/pdf',size:readingPdf.length,isInline:false})));
         const batch=db.createCaseDrafts(batchEmail.id,batchParsed);
         const recognize=(require('./documentRecognition') as typeof import('./documentRecognition')).recognizeDocumentPdf;
@@ -1362,6 +1362,76 @@ async function main() {
         await batchAddress.fill('650 Preserved Review Street');
         await page.locator('#draftSaveBtn').click();
         await page.waitForFunction(()=>document.getElementById('draftSaveBtn')?.hasAttribute('disabled')===true);
+        await page.locator('#draftEmailCaseSelect').selectOption(unassigned);
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value===id&&
+            document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.disabled===false,unassigned);
+        await page.setViewportSize({width:1440,height:1000});
+        const bulkSource=db.getDraftDetail(unassigned)!;
+        const bulkSelection=bulkSource.documents.slice(0,2).map(document=>({documentId:document.id,sourceVersion:document.sourceVersion!}));
+        const rejectedBulk=await context.request.post(`${url}/api/drafts/${unassigned}/documents/move`,{headers:{Origin:url},
+            data:{targetDraftId:batchA,documents:[bulkSelection[0],{...bulkSelection[1],sourceVersion:'stale'}]}});
+        assert.equal(rejectedBulk.status(),409);
+        assert.equal(db.getDraftDetail(unassigned)!.documents.length,3);
+        await page.locator('#draftActivityTab').click();
+        await page.locator('#draftReviewerNotes').fill('Preserve this note when moving supporting PDFs.');
+        const openBulk=async()=>{
+            const documentMode=page.getByRole('button',{name:'Document',exact:true});
+            if(await documentMode.isVisible())await documentMode.click();
+            await page.locator('#draftDocumentTools summary').click();
+            await page.locator('#draftMovePdfsBtn').click();
+            await page.locator('#draftMoveList input').first().waitFor();
+        };
+        await openBulk();
+        assert.equal(await page.locator('#draftMoveList input').count(),3);
+        await page.locator('#draftMoveCancel').click();
+        assert.equal(db.getDraftDetail(unassigned)!.caseDraft!.reviewerNotes,null);
+        assert.equal(await page.locator('#draftReviewerNotes').inputValue(),'Preserve this note when moving supporting PDFs.');
+        await openBulk();
+        await page.locator('#draftMoveDestination').selectOption(batchA);
+        for(const item of bulkSelection)await page.locator('#draftMoveList input[value="'+item.documentId+'"]').check();
+        assert.equal(await page.locator('#draftMoveCommit').isEnabled(),true);
+        await page.screenshot({path:path.join(screenshots,'draft-bulk-move-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        const bulkBox=await page.locator('#draftMoveDialog').boundingBox();
+        assert.ok(bulkBox&&bulkBox.x>=0&&bulkBox.x+bulkBox.width<=391&&bulkBox.y>=0&&bulkBox.y+bulkBox.height<=845);
+        assert.equal(await page.locator('#draftMoveList label').evaluateAll(labels=>labels.every(label=>{
+            const box=label.getBoundingClientRect(),input=label.querySelector('input')!.getBoundingClientRect(),text=label.querySelector('span')!.getBoundingClientRect();
+            return input.width<=20&&text.width>100&&input.right<=text.left&&text.right<=box.right+1&&label.scrollWidth<=label.clientWidth+1;
+        })),true,'Every mobile PDF name must remain visible beside its checkbox');
+        await page.screenshot({path:path.join(screenshots,'draft-bulk-move-mobile.png'),fullPage:true});
+        const bulkRoute=new RegExp('/api/drafts/'+unassigned+'/documents/move$');
+        await context.route(bulkRoute,route=>route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Source PDFs changed. Reload the source list.'})}));
+        await page.locator('#draftMoveCommit').click();
+        await page.waitForFunction(()=>document.getElementById('draftMoveState')?.textContent?.includes('Source PDFs changed'));
+        assert.equal(await page.locator('#draftMoveCommit').isDisabled(),true);
+        assert.equal(db.getDraftDetail(unassigned)!.documents.length,3);
+        await context.unroute(bulkRoute);
+        await page.locator('#draftMoveReload').click();
+        await page.locator('#draftMoveList input').first().waitFor();
+        assert.equal(await page.locator('#draftMoveList input:checked').count(),0);
+        await page.locator('#draftMoveDestination').selectOption(batchA);
+        for(const item of bulkSelection)await page.locator('#draftMoveList input[value="'+item.documentId+'"]').check();
+        await page.locator('#draftMoveCommit').click();
+        await page.locator('#draftMoveDialog').waitFor({state:'hidden'});
+        assert.equal(db.getDraftDetail(unassigned)!.documents.length,1);
+        assert.equal(db.getDraftDetail(unassigned)!.caseDraft!.reviewerNotes,'Preserve this note when moving supporting PDFs.');
+        for(const item of bulkSelection) {
+            const old=bulkSource.documents.find(document=>document.id===item.documentId)!;
+            const moved=db.getDraftDetail(batchA)!.documents.find(document=>document.id===item.documentId)!;
+            assert.equal(moved.oneDriveUrl,old.oneDriveUrl);assert.equal(moved.sourceUrl,old.sourceUrl);
+        }
+        await openBulk();
+        await page.locator('#draftMoveDestination').selectOption(batchA);
+        await page.locator('#draftMoveList input').check();
+        await page.locator('#draftMoveCommit').click();
+        await page.locator('#draftMoveDialog').waitFor({state:'hidden'});
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value===id,batchA);
+        assert.equal(db.getDraftDetail(unassigned)!.caseDraft!.status,'archived');
+        assert.equal(await page.locator('#draftEmailCaseSelect option[value="'+unassigned+'"]').count(),0);
+        assert.equal(db.getDraftDetail(batchA)!.caseDraft!.filingData.plaintiff.address1,'650 Preserved Review Street');
+        await page.evaluate(id=>(window as any).openDraft(id),unassigned);
+        assert.equal(await page.locator('#draftAddDocumentBtn').isDisabled(),true);
+        assert.equal(await page.locator('#draftSaveBtn').isDisabled(),true);
         assert.equal(db.listFilingJobs().some(job=>batch.some(item=>item.draftId===job.caseDraftId)),false);
         await page.setViewportSize({width:1440,height:1000});
         await page.locator('#closeDraftBtn').click();

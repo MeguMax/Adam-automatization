@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-06-batch-review-navigation-v116';
+const ADMIN_BUILD_ID = '2026-11-06-bulk-supporting-reassignment-v117';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2111,6 +2111,15 @@ const html = String.raw`<!doctype html>
     .draft-move-controls { display: flex; align-items: center; gap: 8px; }
     .draft-move-controls select { flex: 1; width: 100%; min-width: 0; }
     .draft-move-controls button { flex: 0 0 auto; }
+    .draft-move-dialog { width: min(560px, calc(100vw - 24px)); max-height: calc(100dvh - 32px); overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 20px; }
+    .draft-move-dialog::backdrop { background: rgba(20, 29, 35, .35); }
+    .draft-move-dialog h2 { margin: 0; font-size: 18px; }
+    .draft-move-dialog .draft-section-heading { margin-bottom: 14px; }
+    .draft-move-list { max-height: 34vh; min-inline-size: 0; overflow: auto; margin: 14px 0; border: 0; padding: 0; }
+    .draft-move-list legend { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+    .draft-move-list label { display: flex; align-items: flex-start; gap: 9px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere; }
+    .draft-move-list input[type="checkbox"] { flex: 0 0 16px; width: 16px; height: 16px; min-height: 0; padding: 0; margin: 3px 0 0; accent-color: var(--accent); }
+    .draft-move-list span { flex: 1; min-width: 0; white-space: normal; }
     @media (max-width: 620px) { .draft-email-cases label { display: grid; gap: 4px; } }
     .draft-workspace-title strong,
     .draft-workspace-title span {
@@ -3531,6 +3540,7 @@ const html = String.raw`<!doctype html>
                 <button id="draftExtractBtn" type="button" title="Read the Complaint again; manual corrections are preserved"><i data-lucide="scan-text"></i>Re-read Complaint</button>
                 <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
                 <button id="draftCourtRuleBtn" type="button" title="Apply the current rule to documents without a manual submission choice"><i data-lucide="list-checks"></i>Apply court rule</button>
+                <button id="draftMovePdfsBtn" type="button"><i data-lucide="arrow-right-left"></i>Move supporting PDFs</button>
                 <button id="draftRemoveFormBtn" class="icon-button danger" type="button" title="Remove PDF from Draft only" aria-label="Remove PDF from Draft"><i data-lucide="trash-2"></i></button>
                 <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF or upload a corrected file"><i data-lucide="replace"></i>Replace PDF</button>
                   </div>
@@ -3586,6 +3596,16 @@ const html = String.raw`<!doctype html>
           </section>
         </div>
       </div>
+      <dialog id="draftMoveDialog" class="draft-move-dialog" aria-labelledby="draftMoveTitle">
+        <form method="dialog">
+          <div class="draft-section-heading"><h2 id="draftMoveTitle">Move supporting PDFs</h2><button id="draftMoveReload" class="icon-button" type="button" title="Reload source PDFs" aria-label="Reload source PDFs"><i data-lucide="refresh-cw"></i></button></div>
+          <label class="draft-field"><span class="draft-field-label">Destination case</span><select id="draftMoveDestination" aria-label="Destination case"></select></label>
+          <fieldset id="draftMoveList" class="draft-move-list"><legend>Supporting PDFs</legend></fieldset>
+          <p id="draftMoveState" class="muted" role="status"></p>
+          <p class="muted">Both packages require review. Original OneDrive files are preserved.</p>
+          <div class="draft-confirm-actions"><button id="draftMoveCancel" value="cancel">Cancel</button><button id="draftMoveCommit" type="button" class="primary" disabled>Move selected</button></div>
+        </form>
+      </dialog>
       <dialog id="draftConfirmDialog" class="draft-confirm-dialog" aria-labelledby="draftConfirmTitle" aria-describedby="draftConfirmMessage">
         <form method="dialog">
           <h2 id="draftConfirmTitle"></h2>
@@ -3807,6 +3827,9 @@ const html = String.raw`<!doctype html>
       draftMutationBusy: false,
       draftNavigationBusy: false,
       draftOpenRevision: 0,
+      draftMoveContext: null,
+      draftMoveLoadRevision: 0,
+      draftMoveSubmitting: false,
       editingMappingId: null,
       view: 'queue',
       pagination: { page: 1, pageSize: 50, totalItems: 0, totalPages: 1 },
@@ -4733,6 +4756,7 @@ const html = String.raw`<!doctype html>
         'filing_reconciliation',
         'filing_prepared',
         'filed_successfully',
+        'archived', 'rejected',
       ].includes(draft.status);
       if (draftLocked) {
         document.querySelectorAll('#draftFieldsForm input, #draftFieldsForm select, #draftFieldsForm textarea, #draftFieldGroups button:not([data-complaint-source]):not([data-preview-draft-document])')
@@ -4757,7 +4781,7 @@ const html = String.raw`<!doctype html>
       const errors = issues.filter(issue => issue.severity === 'error').length;
       const prepared = ['filing_prepared', 'filed_successfully'].includes(draft.status);
       const filed = draft.status === 'filed_successfully';
-      const unavailable = draft.filingEligible === false || draft.status === 'rejected';
+      const unavailable = draft.filingEligible === false || ['rejected','archived'].includes(draft.status);
       const reconcile = draft.status === 'filing_reconciliation';
       const running = draft.filingStatus === 'queued' || draft.status === 'filing_in_progress';
       const reading = ['queued','reading'].includes(draft.complaintReading?.status);
@@ -6217,6 +6241,118 @@ const html = String.raw`<!doctype html>
       renderActiveDraftDocument(documents);
     }
 
+    function draftMoveTargets(detail) {
+      return (detail?.caseDrafts || []).filter(item => item.id !== detail.caseDraft?.id &&
+        !['queued','running','prepared','succeeded','reconciliation_required'].includes(item.filingStatus) &&
+        !['filing_in_progress','filing_reconciliation','filing_prepared','filed_successfully','archived','rejected'].includes(item.status));
+    }
+
+    function updateDraftMoveSelection() {
+      const count = document.querySelectorAll('#draftMoveList input:checked').length;
+      document.getElementById('draftMoveCommit').disabled = state.draftMutationBusy || state.draftMoveSubmitting || !count || count > 100 ||
+        !state.draftMoveContext || !document.getElementById('draftMoveDestination').value;
+      document.getElementById('draftMoveState').textContent = count > 100 ? 'Select at most 100 PDFs.' : count + ' selected';
+    }
+
+    async function loadDraftMoveList() {
+      if (state.draftMoveSubmitting) return;
+      const dialog = document.getElementById('draftMoveDialog'), source = state.selectedDraftId;
+      const request = ++state.draftMoveLoadRevision;
+      state.draftMoveContext = null;
+      document.getElementById('draftMoveCommit').disabled = true;
+      document.getElementById('draftMoveReload').disabled = true;
+      document.getElementById('draftMoveDestination').replaceChildren();
+      document.getElementById('draftMoveList').replaceChildren();
+      document.getElementById('draftMoveState').textContent = 'Loading supporting PDFs...';
+      try {
+        const detail = await api('/api/drafts/' + encodeURIComponent(source));
+        if (!dialog.open || request !== state.draftMoveLoadRevision || source !== state.selectedDraftId) return;
+        const draft = detail.caseDraft;
+        if (!draft || draft.filingEligible === false || detail.email.processingStatus === 'processing' || draft.filingStatus === 'queued' ||
+            ['filing_in_progress','filing_reconciliation','filing_prepared','filed_successfully','archived','rejected'].includes(draft.status)) {
+          throw new Error('This package is not available for document changes.');
+        }
+        const documents = detail.documents.filter(document => document.packageRole === 'ancillary' && !document.isPrimary &&
+          !document.formTemplate && document.status !== 'retrying' && document.sourceVersion);
+        const targets = draftMoveTargets(detail);
+        const destination = document.getElementById('draftMoveDestination');
+        const empty = document.createElement('option'); empty.value = ''; empty.textContent = 'Choose destination case'; destination.append(empty);
+        for (const target of targets) {
+          const option = document.createElement('option'); option.value = target.id; option.textContent = target.label; destination.append(option);
+        }
+        const list = document.getElementById('draftMoveList'), legend = document.createElement('legend');
+        legend.textContent = 'Supporting PDFs (' + documents.length + ')'; list.append(legend);
+        for (const item of documents) {
+          const label = document.createElement('label'), checkbox = document.createElement('input'), text = document.createElement('span');
+          checkbox.type = 'checkbox'; checkbox.value = item.id;
+          text.textContent = item.originalFilename || item.currentFilename || 'PDF';
+          checkbox.addEventListener('change', updateDraftMoveSelection); label.append(checkbox, text); list.append(label);
+        }
+        state.draftMoveContext = {source, documents, targets};
+        updateDraftMoveSelection();
+        if (!documents.length || !targets.length) document.getElementById('draftMoveState').textContent =
+          !documents.length ? 'No movable supporting PDFs remain.' : 'No editable destination case is available in this email.';
+      } catch (error) {
+        if (dialog.open && request === state.draftMoveLoadRevision) document.getElementById('draftMoveState').textContent = error.message;
+      } finally {
+        if (request === state.draftMoveLoadRevision) document.getElementById('draftMoveReload').disabled = false;
+      }
+    }
+
+    document.getElementById('draftMovePdfsBtn').addEventListener('click', () => {
+      if (state.draftMutationBusy || state.draftNavigationBusy) return;
+      document.getElementById('draftDocumentTools').open = false;
+      document.getElementById('draftMoveDialog').showModal();
+      loadDraftMoveList();
+    });
+    document.getElementById('draftMoveReload').addEventListener('click', loadDraftMoveList);
+    document.getElementById('draftMoveDestination').addEventListener('change', updateDraftMoveSelection);
+    document.getElementById('draftMoveDialog').addEventListener('cancel', event => { if (state.draftMoveSubmitting) event.preventDefault(); });
+    document.getElementById('draftMoveDialog').addEventListener('close', () => {
+      ++state.draftMoveLoadRevision; state.draftMoveContext = null;
+    });
+    document.getElementById('draftMoveCommit').addEventListener('click', async () => {
+      const snapshot = state.draftMoveContext;
+      if (!snapshot || state.draftMutationBusy || state.draftMoveSubmitting || state.selectedDraftId !== snapshot.source) return;
+      const target = document.getElementById('draftMoveDestination').value;
+      if (!snapshot.targets.some(item => item.id === target)) return;
+      const ids = new Set(Array.from(document.querySelectorAll('#draftMoveList input:checked')).map(input => input.value));
+      const documents = snapshot.documents.filter(item => ids.has(item.id)).map(item => ({documentId:item.id,sourceVersion:item.sourceVersion}));
+      if (!documents.length || documents.length > 100) return;
+      const dialog = document.getElementById('draftMoveDialog');
+      let updated = null;
+      state.draftMoveSubmitting = true;
+      dialog.querySelectorAll('button,input,select').forEach(input => { input.disabled = true; });
+      try {
+        if (state.draftDirty) await saveDraft(true);
+        if (state.selectedDraftId !== snapshot.source) throw new Error('The selected case changed. Reload the source list.');
+        state.draftMutationBusy = true;
+        dialog.querySelectorAll('button,input,select').forEach(input => { input.disabled = true; });
+        document.getElementById('draftMoveState').textContent = 'Moving ' + documents.length + ' PDFs...';
+        updated = await api('/api/drafts/' + encodeURIComponent(snapshot.source) + '/documents/move', {
+          method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetDraftId:target,documents}),
+        });
+        if (state.selectedDraftId === snapshot.source) state.draftDetail = updated;
+        dialog.close();
+        showToast(documents.length + (documents.length === 1 ? ' PDF moved.' : ' PDFs moved.') + ' Review the destination package.', 'success');
+      } catch (error) {
+        state.draftMoveContext = null;
+        document.getElementById('draftMoveState').textContent = error.message;
+      }
+      finally {
+        state.draftMutationBusy = false;
+        state.draftMoveSubmitting = false;
+        dialog.querySelectorAll('button,input,select').forEach(input => { input.disabled = false; });
+        document.getElementById('draftMoveCommit').disabled = !state.draftMoveContext || !ids.size;
+        if (updated && state.selectedDraftId === snapshot.source) renderDraftWorkspace();
+        else renderActiveDraftDocument(state.draftDetail?.documents || []);
+      }
+      if (updated?.caseDraft?.status === 'archived' && state.selectedDraftId === snapshot.source) {
+        try { await openDraft(target); }
+        catch (error) { showToast('PDFs moved, but the destination could not be opened: ' + error.message, 'error'); }
+      }
+    });
+
     let draftPdfPreview = null;
     function renderActiveDraftDocument(documents) {
       const activeDocument = documents.find(
@@ -6238,7 +6374,7 @@ const html = String.raw`<!doctype html>
       const draft = state.draftDetail && state.draftDetail.caseDraft;
       const canModifyDocuments = Boolean(
         draft && !state.draftMutationBusy && state.draftDetail.email.processingStatus !== 'processing' && draft.filingEligible !== false && draft.filingStatus !== 'queued' &&
-        !['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully']
+        !['filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived', 'rejected']
           .includes(draft.status),
       );
       primaryButton.disabled = !canBePrimary || !canModifyDocuments;
@@ -6263,8 +6399,12 @@ const html = String.raw`<!doctype html>
       extractButton.disabled = !canExtract;
       addButton.disabled = !canModifyDocuments;
       window.document.getElementById('draftLibraryBtn').disabled = !canModifyDocuments ||
-        JSON.parse(draft?.normalizedDataJson || '{}').sourceKind !== 'new_filing_intake';
+        JSON.parse(draft?.normalizedDataJson || '{}').sourceKind !== 'new_filing_intake' ||
+        JSON.parse(draft?.normalizedDataJson || '{}').intake?.packageKey === '__unassigned__';
       window.document.getElementById('draftCourtRuleBtn').disabled = !canModifyDocuments || !draft?.editableData?.courtName;
+      window.document.getElementById('draftMovePdfsBtn').disabled = !canModifyDocuments ||
+        !documents.some(document => document.packageRole === 'ancillary' && !document.isPrimary && !document.formTemplate && document.status !== 'retrying') ||
+        !draftMoveTargets(state.draftDetail).length;
       replaceButton.disabled = !canModifyDocuments ||
         !activeDocument || activeDocument.status === 'retrying' || Boolean(activeDocument.formTemplate);
       window.document.getElementById('draftRemoveFormBtn').disabled = !canModifyDocuments || !activeDocument || activeDocument.status === 'retrying';
@@ -6373,6 +6513,7 @@ const html = String.raw`<!doctype html>
         'filing_reconciliation',
         'filing_prepared',
         'filed_successfully',
+        'archived', 'rejected',
       ].includes(draft.status));
       document.getElementById('draftSaveBtn').disabled = !dirty || Boolean(locked);
       updateDraftPreparationButton();
@@ -8082,6 +8223,15 @@ export function createAdminServer(
                     db.draftNotifications().retry(decodeURIComponent(retryReadyMatch[1]), input.confirmNotDelivered === true);
                     sendJson(res, 200, { queued: true });
                 } catch (error) { sendJson(res, 409, { error: error instanceof Error ? error.message : 'The notification could not be queued' }); }
+                return;
+            }
+            const moveDocumentsMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/documents\/move$/);
+            if (req.method === 'POST' && moveDocumentsMatch) {
+                try {
+                    const input = JSON.parse((await readRequestBuffer(req, 32768)).toString('utf8'));
+                    if (typeof input?.targetDraftId !== 'string') throw new Error('Select a destination case from this email.');
+                    sendJson(res, 200, db.moveSupportingDocuments(decodeURIComponent(moveDocumentsMatch[1]), input.documents, input.targetDraftId));
+                } catch (error) { sendJson(res, 409, { error: error instanceof Error ? error.message : 'The supporting PDFs could not be moved' }); }
                 return;
             }
             const moveDocumentMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/documents\/([^/]+)\/move$/);
