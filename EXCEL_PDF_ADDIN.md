@@ -34,7 +34,30 @@ Downloads remain available independently of OneDrive. The panel does **not**
 silently write to `C:\Users\adamj\OneDrive\Documents`; that local path cannot
 identify the correct cloud folder on Render.
 
-## Multiple-case local ZIP (v96)
+## Separate PDF and ZIP downloads (v114)
+
+**Generate all 3 forms** provides a download icon for each fillable PDF as well as
+the existing ZIP. **Multiple cases** likewise lists separate PDFs under each
+successful case; ZIP download remains optional. Separate batch filenames start
+with the source row to distinguish cases with identical party names. Downloads
+are explicit, one file at a time, not a burst of automatic browser downloads.
+
+Every separate download rechecks the same source snapshot as the ZIP, including
+all mapped form values, selected rows and chosen forms. Any change, cancellation,
+disconnect or expiry removes the available file controls and object URLs. Only
+complete successful cases get file controls. PDF bytes are extracted unchanged
+from the bounded in-memory result on demand; their signatures and size limits
+are verified before download. Temporary individual URLs expire after one minute.
+No extra PDF request, cloud save or workbook mutation occurs when downloading.
+
+Release verification: all 481 automated project tests pass. The browser smoke
+uses an explicitly simulated Office 1.9 host: three separate single-case PDFs
+and six separate multi-case PDFs match their ZIP bytes; both cases retain all
+202 editable fields. Silent source changes block both PDF and ZIP downloads,
+and cancellation and failed cases expose no partial PDFs. This is not a claim
+of acceptance in Adam's Microsoft 365 tenant.
+
+## Multiple-case local generation (v96)
 
 Select 1-10 adjacent data rows, choose any subset of DC105/DC508/MC202 under
 **Multiple cases**, then **Generate selected cases**. One Excel calculation reads
@@ -47,7 +70,7 @@ or cloud copy is delivered. Archives are limited to 16 MiB and each PDF to 8 MiB
 
 Before starting, after each case and before download, the panel checks all mapped
 values, case identities, selection and chosen forms. Any change discards the old
-archive. It never changes the worksheet selection or source values to iterate
+result. It never changes the worksheet selection or source values to iterate
 cases. Numeric dates retain the existing Excel-calendar conversion. ZIPs stay
 in the browser until an explicit local download; no batch archive is stored on
 Render or OneDrive. The existing single-PDF and single-case three-form ZIP

@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
-import { unzipSync } from 'fflate';
+import { unzipSync, zipSync } from 'fflate';
 import { createAdminAuth } from './adminAuth';
 import { createExcelPdfHandler, EXCEL_FORMS, EXCEL_SESSION_MS, ExcelSessionStore, ExcelPdfFieldError, excelManifest, generateExcelPdf, validateExcelValues } from './excelPdf';
 import { WorkflowDatabase } from './database';
@@ -130,7 +130,44 @@ test('case ZIP retains successful cases, isolates a failed form, and includes a 
     assert.match(Buffer.from(files['results.txt']).toString(),/Row 3.*failed.*Fictional form error/);
     assert.match(Buffer.from(files['results.txt']).toString(),/Row 4.*Missing required value/);
     assert.deepEqual(result.results.map((record:any)=>record.status),['ready','failed','failed']);
+    assert.equal(result.members.length,1);
+    assert.equal(result.members[0].row,2);
+    assert.match(result.members[0].filename,/^Row 2 - DC105.*\.pdf$/);
+    assert.deepEqual(batch.readPdf(result.bytes,result.members[0].path),files[result.members[0].path]);
     assert.ok(progress.some(record=>record.status==='generating'));
+});
+
+test('separate batch PDFs preserve exact bytes, unique local names and whole-case failure isolation',async()=>{
+    const forms=[{id:'dc105',fields:['dc105_01']},{id:'dc508',fields:['dc508_01']},{id:'mc202',fields:['mc202_01']}];
+    const source={sheet:'Cases',sheetId:'sheet-1',startRow:2,rowCount:3,formIds:forms.map(form=>form.id),
+        rows:[2,3,4].map(row=>({row,error:null,data:{form:'batch',row,name:'Same Tenant',metadata:{defendant:'Same Tenant'},
+            values:Object.fromEntries(forms.map(form=>[form.fields[0],String(row)]))}}))};
+    const inputs:any[]=[];
+    const result=await batch.generate(source,forms,{readCurrent:async()=>structuredClone(source),generate:async(input:any)=>{
+        inputs.push(input);if(input.form==='mc202' && input.values.mc202_01==='3')throw new Error('Fictional last-form failure');
+        return Buffer.from('%PDF-'+input.form+'-'+Object.values(input.values)[0]);
+    }});
+    assert.deepEqual(result.results.map((record:any)=>record.status),['ready','failed','ready']);
+    assert.equal(result.members.length,6);assert.equal(new Set(result.members.map((member:any)=>member.filename)).size,6);
+    assert.ok(result.members.every((member:any)=>member.row!==3 && !member.filename.includes('/')));
+    for(const member of result.members)assert.equal(Buffer.from(batch.readPdf(result.bytes,member.path)).toString(),'%PDF-'+member.form+'-'+member.row);
+    assert.equal(inputs.length,9);
+    assert.equal(Object.keys(unzipSync(result.bytes)).filter(name=>name.endsWith('.pdf')).length,6);
+});
+
+test('separate PDF extraction rejects missing, non-PDF, duplicate and oversized ZIP members',()=>{
+    const bytes=Buffer.from('%PDF-editable-fixture');
+    const archive=zipSync({'a.pdf':bytes,'results.txt':Buffer.from('Ready')},{level:0});
+    assert.deepEqual(batch.readPdf(archive,'a.pdf'),new Uint8Array(bytes));
+    assert.throws(()=>batch.readPdf(archive,'missing.pdf'),/missing or invalid/);
+    assert.throws(()=>batch.readPdf(archive,'results.txt'),/invalid/);
+    assert.throws(()=>batch.readPdf(Buffer.from('PK garbage'),'a.pdf'));
+    assert.throws(()=>batch.readPdf(zipSync({'a.pdf':Buffer.from('<html>bad response</html>')}),'a.pdf'),/missing or invalid/);
+    const duplicate=Buffer.from(zipSync({'a.pdf':bytes,'b.pdf':bytes},{level:0}));
+    for(let at=duplicate.indexOf('b.pdf');at!==-1;at=duplicate.indexOf('b.pdf',at+5))duplicate.write('a.pdf',at,'ascii');
+    assert.throws(()=>batch.readPdf(duplicate,'a.pdf'),/duplicated/);
+    const oversized=zipSync({'a.pdf':new Uint8Array(8*1024*1024+1)},{level:9});
+    assert.throws(()=>batch.readPdf(oversized,'a.pdf'),/download limit/);
 });
 
 test('batch cancellation, changed data, invalid PDF responses and oversized output cannot expose a ZIP',async()=>{

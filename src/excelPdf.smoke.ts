@@ -243,12 +243,21 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.equal(zipPayload.forms[0].values.dc105_24,'10/5/2026');
         await page.waitForSelector('#packageResult:visible');
         assert.equal(await page.locator('#packageFiles li').count(),3);
+        assert.equal(await page.locator('#packageFiles .pdf-download svg').count(),3);
         assert.equal(savedCopies.length,savesBeforeZip,'ZIP never triggers optional cloud delivery');
         await page.screenshot({path:path.join(output,'three-form-zip-mobile.png'),fullPage:true});
         const zipEvent=page.waitForEvent('download');await page.click('#downloadPackage');
         const zipDownload=await zipEvent;
         assert.equal(zipDownload.suggestedFilename(),'FORMS - 29th - 26-00001-LT - Example Property LLC v Morgan Tenant.zip');
         const zipPath=path.join(output,zipDownload.suggestedFilename());await zipDownload.saveAs(zipPath);
+        const packageMembers=unzipSync(fs.readFileSync(zipPath));
+        for(const form of EXCEL_FORMS){
+            const event=page.waitForEvent('download');
+            await page.locator('#packageFiles').getByRole('button',{name:'Download '+form.id.toUpperCase()+' PDF',exact:true}).click();
+            const download=await event,filename=path.join(output,'separate-'+download.suggestedFilename());await download.saveAs(filename);
+            assert.deepEqual(fs.readFileSync(filename),Buffer.from(packageMembers[download.suggestedFilename()]));
+        }
+        assert.equal(savedCopies.length,savesBeforeZip,'Separate downloads never trigger cloud delivery');
         const zipReadback=spawnSync(process.env.EXCEL_PDF_PYTHON||'python3',['-c',
             'import sys,io,json,zipfile; from pypdf import PdfReader; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; result=[]\nfor name in z.namelist():\n r=PdfReader(io.BytesIO(z.read(name))); f=r.get_fields(); assert any(str(v.get("/V"))=="Morgan Tenant" for v in f.values()); result.append({"name":name,"fields":len(f),"pages":len(r.pages)})\nprint(json.dumps(result))',zipPath],{windowsHide:true});
         assert.equal(zipReadback.status,0,zipReadback.stderr.toString());
@@ -285,6 +294,14 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.click('#generatePackage');await page.waitForSelector('#packageResult:visible');
         await page.screenshot({path:path.join(output,'three-form-zip-desktop.png'),fullPage:true});
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('mc202_01')]='Changed after generation';});
+        let stalePdfDownloaded=false;const stalePdf=()=>{stalePdfDownloaded=true;};page.on('download',stalePdf);
+        await page.locator('#packageFiles .pdf-download').first().click();
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since these PDFs'));
+        assert.equal(stalePdfDownloaded,false);page.off('download',stalePdf);
+        assert.equal(await page.locator('#packageFiles .pdf-download').count(),0);
+        assert.equal(await page.locator('#packageResult').isVisible(),false);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.values[qa.headers.indexOf('mc202_01')]='';});
         // Restore individual preview before the existing single-form regression scenarios.
         await page.setViewportSize({width:380,height:850});
         await page.click('#generate');
@@ -535,6 +552,8 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.click('#generateBatch');await page.locator('#downloadBatch').waitFor({state:'visible'});
         assert.match(await page.locator('#batchStatus').innerText(),/2 of 3 cases ready \/ 6 PDFs/);
         assert.match(await page.locator('#batchRows').innerText(),/Row 38.*\nFailed: The selected row has no Defendant/);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),6);
+        assert.equal(await page.locator('#batchRows li').filter({has:page.locator('strong', {hasText:'Row 38'})}).locator('.pdf-download').count(),0);
         assert.equal(savedCopies.length,previousSaves);
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
         await page.screenshot({path:path.join(output,'batch-cases-mobile.png'),fullPage:true});
@@ -555,9 +574,29 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         const batchCheck=spawnSync(process.env.EXCEL_PDF_PYTHON||'python3',['-c',
             'import sys,json; from pypdf import PdfReader\nfor x in json.loads(sys.argv[1]):\n r=PdfReader(x["file"]); f=r.get_fields(); assert len(f)==len(x["expected"]); assert all(not (int(v.get("/Ff",0)) & 1) for v in f.values())\n for name,value in x["expected"].items():\n  actual=f[name].get("/V", ""); expected=("/Yes" if value else "/Off") if f[name]["/FT"]=="/Btn" else str(value); assert str(actual)==expected,(name,actual,expected)\nprint("All 202 batch fields remain fillable and match their case")',JSON.stringify(verification)],{windowsHide:true});
         assert.equal(batchCheck.status,0,batchCheck.stderr.toString());
+        let requestsDuringDownloads=0;
+        const countRequest=(request:any)=>{if(/\/excel\/(generate|generate-package|save)$/.test(request.url()))requestsDuringDownloads++;};
+        page.on('request',countRequest);
+        for(let index=0;index<6;index++){
+            const event=page.waitForEvent('download');await page.locator('#batchRows .pdf-download').nth(index).click();
+            const download=await event,filename=path.join(output,'separate-'+download.suggestedFilename());await download.saveAs(filename);
+            const member=pdfNames.find(name=>'Row '+(name.includes('Row 36')?'36':'37')+' - '+name.split('/')[1]===download.suggestedFilename())!;
+            assert.ok(member,'Separate filename identifies exactly one case and form');
+            assert.deepEqual(fs.readFileSync(filename),Buffer.from(members[member]));
+        }
+        page.off('request',countRequest);assert.equal(requestsDuringDownloads,0);assert.equal(savedCopies.length,previousSaves);
         await page.evaluate(()=>{const qa=(window as any).qa;qa.rows[36][qa.headers.indexOf('Defendant')]='Silent change';});
+        let staleBatchDownloaded=false;const staleBatch=()=>{staleBatchDownloaded=true;};page.on('download',staleBatch);
+        await page.locator('#batchRows .pdf-download').first().click();
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since these PDFs'));
+        assert.equal(staleBatchDownloaded,false);page.off('download',staleBatch);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),0);
+        assert.equal(await page.locator('#downloadBatch').isVisible(),false);
+        await page.click('#generateBatch');await page.locator('#downloadBatch').waitFor({state:'visible'});
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.rows[36][qa.headers.indexOf('Defendant')]='Second silent change';});
         await page.click('#downloadBatch');await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('changed since this ZIP'));
         assert.equal(await page.locator('#downloadBatch').isVisible(),false);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),0);
         await page.uncheck('#batchForms input[value="mc202"]');
         await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
         let cancelRelease!:()=>void;
@@ -567,6 +606,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('canceled'));
         cancelRelease();await page.unroute('**/excel/generate');
         assert.equal(await page.locator('#downloadBatch').isVisible(),false);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),0);
         await page.evaluate(()=>{const qa=(window as any).qa;qa.rowCount=1;qa.rows={};qa.events[0]();});
         await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.click('#logout');await page.waitForSelector('#signIn:visible');
@@ -585,7 +625,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.ok((await page.locator('#error').innerText()).includes('12-hour Excel connection expired'));
         assert.equal(await page.locator('#result').isVisible(), false);
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: catalog timeout/schema/outage recovery, ordinary-browser and unavailable/unsupported/stalled Office startup states, mobile/desktop help, password-free online recovery, a local three-form ZIP (101 fillable fields, four pages), ZIP change guards and partial-failure recovery, 12-hour session restoration after reload and reopening, logout and expired-session cleanup, disabled-storage fallback, individual fillable downloads, all 31 checkbox marks rendered and compared on/off, source-cell errors, formula PDF readback, simulated OneDrive delivery, responsive previews and calculation/change guards. No real OneDrive uploads.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: separate local downloads of all three forms and six multi-case PDFs match ZIP bytes, all 202 batch fields remain editable, stale PDF/ZIP guards and canceled/failed case isolation, catalog timeout/schema/outage recovery, ordinary-browser and unavailable/unsupported/stalled Office startup states, mobile/desktop help, password-free online recovery, 12-hour session restoration, source-cell errors, formula PDF readback, all 31 checkbox marks rendered and compared on/off, responsive previews and calculation/change guards. Separate downloads make no extra generation or cloud-save requests. No real OneDrive uploads.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

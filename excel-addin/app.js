@@ -5,8 +5,9 @@
     let selectedData = null, resultSnapshot = null, refreshTimer;
     let generationId = '', deliveryAvailable = false, savedCopy = null;
     let filenameOwner = '', resultFilename = '';
-    let packageUrl = '', packageSnapshot = null, packageFilename = '';
-    let batchData=null,batchUrl='',batchSnapshot=null,batchFilename='',batchController=null;
+    let packageUrl = '', packageSnapshot = null, packageFilename = '', packageBlob=null;
+    let batchData=null,batchUrl='',batchSnapshot=null,batchFilename='',batchController=null,batchBlob=null;
+    const downloadUrls=new Map();
     const FORM_KEY = 'devlin.excel.form.v1';
     let storage;
     try { storage = window.localStorage; } catch { /* Excel may disable persistent browser storage. */ }
@@ -37,13 +38,16 @@
         $('saveCloud').disabled = busy || !generationId || !!savedCopy;
         $('saveCloud').querySelector('span').textContent = savedCopy ? 'Saved to OneDrive' : 'Save to OneDrive';
         $('sourceIssueList').querySelectorAll('button').forEach(button=>{button.disabled=busy || !officeReady || !token;});
+        document.querySelectorAll('.pdf-download').forEach(button=>{button.disabled=busy || !token;});
     }
     function clearResult() {
+        for(const [url,timer] of downloadUrls){clearTimeout(timer);URL.revokeObjectURL(url);}downloadUrls.clear();
+        $('batchRows').querySelectorAll('.pdf-files').forEach(list=>list.remove());
         if(batchUrl)URL.revokeObjectURL(batchUrl);
-        batchUrl='';batchSnapshot=null;batchFilename='';$('downloadBatch').hidden=true;
+        batchUrl='';batchSnapshot=null;batchFilename='';batchBlob=null;$('downloadBatch').hidden=true;
         $('downloadBatch').removeAttribute('href');$('downloadBatch').removeAttribute('download');
         if (packageUrl) URL.revokeObjectURL(packageUrl);
-        packageUrl = ''; packageSnapshot = null; packageFilename = '';
+        packageUrl = ''; packageSnapshot = null; packageFilename = ''; packageBlob=null;
         $('packageResult').hidden = true; $('packageFiles').replaceChildren();
         $('downloadPackage').removeAttribute('href'); $('downloadPackage').removeAttribute('download');
         if (pdfUrl) URL.revokeObjectURL(pdfUrl);
@@ -96,7 +100,7 @@
             if ((await blob.slice(0,5).text()) !== '%PDF-') throw new Error('The generated PDF is invalid. Please try again.');
             return { blob, generationId:response.headers.get('x-excel-generation-id') || '' };
         } catch(error) {
-            if (signal?.aborted)throw Object.assign(new Error('Generation canceled. No archive created.'),{code:'batch_cancelled'});
+            if (signal?.aborted)throw Object.assign(new Error('Generation canceled. No files are available.'),{code:'batch_cancelled'});
             if (abort.signal.aborted) throw new Error('The request timed out. Check your connection, then try again.');
             if (error instanceof TypeError) throw new Error('Could not reach the PDF service. Check your connection and try again.');
             throw error;
@@ -358,16 +362,46 @@
             if (current !== revision || !DevlinExcelWorkbook.sameSnapshot(source, latest)) {
                 selectedData = null; throw new Error('The worksheet changed during generation. Generate the package again.');
             }
-            packageSnapshot = source; packageUrl = URL.createObjectURL(blob);
+            const bytes=new Uint8Array(await blob.arrayBuffer());
+            for(const item of items)DevlinExcelBatch.readPdf(bytes,item.filename);
+            if(!token || current!==revision)throw new Error('The worksheet changed during generation. Generate the package again.');
+            packageSnapshot = source; packageBlob=blob; packageUrl = URL.createObjectURL(blob);
             packageFilename = DevlinExcelRow.pdfFilename({...source,form:'Forms'}).replace(/\.pdf$/i,'.zip');
-            $('packageFiles').replaceChildren(...items.map(item => { const li=document.createElement('li'); li.textContent=item.filename; return li; }));
+            $('packageFiles').replaceChildren(...items.map(item=>pdfDownloadItem(item.filename,item.form,
+                ()=>downloadMember('package',item.filename,item.filename))));
             $('downloadPackage').href = packageUrl; $('downloadPackage').download = packageFilename;
             $('packageResult').hidden = false;
-            message('', 'All 3 fillable PDFs are ready in one ZIP.');
+            message('', 'All 3 fillable PDFs are ready.');
             $('packageResult').scrollIntoView({block:'nearest'});
         } catch(error) { clearResult(); showSourceError(error,source); }
-        finally { busy=false; controls(); if (!selectedData && token) refresh(true); }
+        finally { busy=false; controls(); if(window.lucide)lucide.createIcons(); if (!selectedData && token) refresh(true); }
     });
+    function pdfDownloadItem(filename,form,action) {
+        const li=document.createElement('li'),name=document.createElement('span'),button=document.createElement('button');
+        name.textContent=filename;button.type='button';button.className='icon pdf-download';
+        button.title='Download '+form.toUpperCase()+' PDF';button.setAttribute('aria-label',button.title);
+        const icon=document.createElement('i');icon.dataset.lucide='download';button.append(icon);
+        button.addEventListener('click',action);li.append(name,button);return li;
+    }
+    async function downloadMember(kind,path,filename) {
+        const source=kind==='batch'?batchSnapshot:packageSnapshot,blob=kind==='batch'?batchBlob:packageBlob;
+        if(busy || !source || !blob || !token)return;
+        const current=revision,owner=token;busy=true;controls();message('','Checking current case data...');
+        try {
+            const bytes=DevlinExcelBatch.readPdf(new Uint8Array(await blob.arrayBuffer()),path);
+            const chosen=kind==='batch'?source.formIds.map(id=>forms.find(form=>form.id===id)):forms;
+            const latest=kind==='batch'?await DevlinExcelWorkbook.readBatch(Excel,chosen,{recalculate:false}):
+                await DevlinExcelWorkbook.readPackage(Excel,forms,{recalculate:false});
+            const same=kind==='batch'?DevlinExcelWorkbook.sameBatchSnapshot(source,latest):DevlinExcelWorkbook.sameSnapshot(source,latest);
+            if(owner!==token || current!==revision || blob!==(kind==='batch'?batchBlob:packageBlob) || !same)
+                throw new Error('The worksheet changed since these PDFs were generated. Generate the files again.');
+            const url=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));
+            const timer=setTimeout(()=>{URL.revokeObjectURL(url);downloadUrls.delete(url);},60000);downloadUrls.set(url,timer);
+            const link=document.createElement('a');link.href=url;link.download=filename;document.body.append(link);link.click();link.remove();
+            message('','PDF download requested. Fillable fields retained.');
+        }catch(error){clearResult();message(error.message);}
+        finally{busy=false;controls();}
+    }
     $('downloadPackage').addEventListener('click', async event => {
         event.preventDefault();
         if (busy || !packageUrl || !packageSnapshot) return;
@@ -384,7 +418,7 @@
         finally {busy=false; controls(); if (!selectedData && token) refresh(true);}
     });
     function batchForms() {return forms.filter(form=>Array.from($('batchForms').querySelectorAll('input:checked')).some(input=>input.value===form.id));}
-    function renderBatchRows(records) {
+    function renderBatchRows(records,members=[]) {
         $('batchRows').replaceChildren(...records.map(record=>{
             const li=document.createElement('li'),name=document.createElement('strong'),status=document.createElement('span');
             name.textContent='Row '+record.row+(record.name?' / '+record.name:'');
@@ -392,7 +426,12 @@
             status.textContent=record.status==='generating'?'Generating '+record.completed+' / '+record.total:
                 record.status==='ready'?'Ready':record.status==='queued'?'Queued':record.status==='skipped'?'Skipped':'Failed';
             if(record.error)status.textContent+=': '+record.error;
-            li.append(name,status);return li;
+            li.append(name,status);
+            const files=members.filter(member=>member.row===record.row);
+            if(files.length){const list=document.createElement('ul');list.className='pdf-files';
+                list.append(...files.map(member=>pdfDownloadItem(member.filename,member.form,
+                    ()=>downloadMember('batch',member.path,member.filename))));li.append(list);}
+            return li;
         }));
     }
     $('batchForms').addEventListener('change',()=>{++revision;clearResult();batchData=null;controls();if(token)refresh();});
@@ -413,15 +452,16 @@
                 onProgress:record=>{progress.set(record.row,record);renderBatchRows([...progress.values()]);
                     $('batchStatus').textContent=[...progress.values()].filter(row=>row.status==='ready').length+' / '+source.rowCount+' cases ready';},
             });
-            batchSnapshot=source;batchUrl=URL.createObjectURL(new Blob([generated.bytes],{type:'application/zip'}));
+            batchSnapshot=source;batchBlob=new Blob([generated.bytes],{type:'application/zip'});batchUrl=URL.createObjectURL(batchBlob);
+            renderBatchRows(generated.results,generated.members);
             batchFilename='CASES - Rows '+source.startRow+'-'+(source.startRow+source.rowCount-1)+'.zip';
             $('downloadBatch').href=batchUrl;$('downloadBatch').download=batchFilename;$('downloadBatch').hidden=false;
             const ready=generated.results.filter(row=>row.status==='ready').length;
             $('batchStatus').textContent=ready+' of '+source.rowCount+' cases ready / '+ready*chosen.length+' PDFs';
-            message('',ready===source.rowCount?'Cases ZIP is ready.':'Cases ZIP is ready. Check the failed or skipped rows.');
+            message('',ready===source.rowCount?'PDFs are ready.':'PDFs are ready. Check the failed or skipped rows.');
             $('downloadBatch').scrollIntoView({block:'nearest'});
         }catch(error){clearResult();message(error.message);}
-        finally{batchController=null;busy=false;controls();if(!selectedData && !batchData && token)refresh(true);}
+        finally{batchController=null;busy=false;controls();if(window.lucide)lucide.createIcons();if(!selectedData && !batchData && token)refresh(true);}
     });
     $('downloadBatch').addEventListener('click',async event=>{
         event.preventDefault();if(busy || !batchUrl || !batchSnapshot)return;
