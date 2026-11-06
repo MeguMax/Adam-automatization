@@ -100,6 +100,18 @@ backoff cancellation, source navigation and failed-case isolation. It also
 checked the six individual PDFs against the multi-case ZIP and all 202 fields.
 These checks are separate from native Excel acceptance.
 
+Native Windows desktop acceptance for v115 also passed against Render. Closing
+and reopening the pane restored the existing session without another login.
+Selecting A2:A4 in the fictional QA book generated six PDFs for the two valid
+cases, while the empty fourth row had its own source issue and was omitted from
+the ZIP. Opening that issue retained the ready PDF controls; following its cell
+link selected A4 without editing it. The downloaded archive passed CRC,
+all 202 fields and editable text/checkbox round trips, and visual review of all
+eight pages. The workbook file hash stayed unchanged. Evidence is under
+`output/excel-recovery-2026-11-06/`, including `native-zip-verification.json` and
+the source-navigation screenshots. Excel Online native v115 acceptance is not
+claimed by this run. Saving remains local; no OneDrive or MiFILE actions ran.
+
 ## Multiple-case local generation (v96)
 
 Select 1-10 adjacent data rows, choose any subset of DC105/DC508/MC202 under
