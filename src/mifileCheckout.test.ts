@@ -910,7 +910,9 @@ async function historyPageFixture(page:import('playwright').Page,job:FilingJobVi
     await page.route('**/*',async route=>{
         const url=new URL(route.request().url());
         if(url.pathname.startsWith('/filing/create/')) {
-            await route.fulfill({status:302,headers:{location:'https://mifile.courts.michigan.gov/filings/myHistory'}});return;
+            // HTTP redirect chains can bypass page routing; keep this missing-editable-bundle fixture offline.
+            await route.fulfill({contentType:'text/html',body:`<header>${account.username}</header><main>
+                <table id="documentTable"><tbody><tr><td>Fixture: no editable package available</td></tr></tbody></table></main>`});return;
         }
         if(url.pathname.startsWith('/receipts/')) {
             await route.fulfill({contentType:'application/pdf',body:receiptPdf || testPdfFixture('Unknown receipt format')});return;
