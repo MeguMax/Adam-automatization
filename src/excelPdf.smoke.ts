@@ -43,7 +43,7 @@ window.qa.events = []; window.qa.calculations = 0; window.qa.pending = 0;
 const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(callback)}};
 const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'},load(){return this},
  getUsedRange(){return {columnIndex:0,columnCount:qa.headers.length,load(){return this}}},
- activate(){qa.activatedSheet='sheet-1'},getRangeByIndexes(row,column=0){return {get values(){return [row===0?qa.headers:(qa.rows?.[row] || qa.values)]},get rowHidden(){return (qa.hiddenRows || []).includes(row)},get valueTypes(){return [(qa.rows?.[row] || qa.values).map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}},select(){qa.sourceSelection=[row,column];qa.rowIndex=row;qa.events.forEach(callback=>callback())}}}};
+ activate(){qa.activatedSheet='sheet-1'},getRangeByIndexes(row,column=0){return {get values(){return [row===0?qa.headers:(qa.rows?.[row] || qa.values)]},get rowHidden(){return (qa.hiddenRows || []).includes(row)},get valueTypes(){return [(qa.rows?.[row] || qa.values).map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}},select(){qa.sourceSelection=[row,column];qa.rowIndex=row;qa.rowCount=1;qa.events.forEach(callback=>callback())}}}};
 window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const values of [qa.values,...Object.values(qa.rows || {})]) {for(const field of ['dc105_05','dc508_06','mc202_08']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Defendant')];}},load(){}},workbook:{
  getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
  worksheets:{getItem(id){if(id!=='sheet-1')throw new Error('Unknown source sheet');return sheet},onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
@@ -74,7 +74,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
             } else await route.abort();
         });
         await framedPage.goto('https://onedrive.live.com/devlin-qa');
-        await framedPage.frameLocator('iframe').frameLocator('iframe').getByRole('heading',{name:'Connect Excel',exact:true}).waitFor({state:'visible'});
+        await framedPage.frameLocator('iframe').frameLocator('iframe').getByRole('heading',{name:'Connect Legal Workflow',exact:true}).waitFor({state:'visible'});
         await framedPage.close();
         const startupPage=await browser.newPage({viewport:{width:360,height:740}});
         startupPage.on('pageerror',error=>errors.push(error.message));
@@ -87,22 +87,28 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         });
         await startupPage.route('**/excel/catalog',route=>route.fulfill({status:502,contentType:'text/html',body:'Gateway unavailable'}));
         await startupPage.goto(base+'/excel/');await startupPage.waitForSelector('#retryCatalog:visible');
+        await startupPage.fill('#username','excel-qa');await startupPage.fill('#password','wrong-qa-password');await startupPage.click('#login');
+        await startupPage.waitForFunction(()=>document.getElementById('error')?.textContent==='The Legal Workflow username or password is incorrect.');
+        assert.equal(await startupPage.locator('#signIn').isVisible(),true);
+        assert.equal(await startupPage.evaluate(()=>localStorage.getItem('devlin.excel.session.v1')),null);
         await startupPage.fill('#username','excel-qa');await startupPage.fill('#password','excel-qa-only');await startupPage.click('#login');
         await startupPage.waitForSelector('#workspace:visible');
         assert.equal(await startupPage.locator('#generate').isEnabled(),false);
         assert.ok((await startupPage.locator('#catalogStatus').innerText()).includes('Forms are unavailable'));
         assert.equal(await startupPage.locator('#form').innerText(),'Forms unavailable');
+        assert.equal(await startupPage.getByLabel('Legal Workflow username',{exact:true}).count(),1);
+        assert.equal(await startupPage.getByLabel('Legal Workflow password',{exact:true}).count(),1);
         await startupPage.screenshot({path:path.join(output,'forms-outage.png'),fullPage:true});
         await startupPage.unroute('**/excel/catalog');await startupPage.click('#retryCatalog');
         await startupPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
-        assert.equal(startupLogins,1);assert.equal(startupGeneration,0);
+        assert.equal(startupLogins,2);assert.equal(startupGeneration,0);
         await startupPage.route('**/excel/catalog',route=>route.fulfill({contentType:'application/json',body:'[{}]'}));
         await startupPage.reload();await startupPage.waitForSelector('#retryCatalog:visible');
         assert.ok((await startupPage.locator('#catalogStatus').innerText()).includes('forms list is invalid'));
         assert.equal(await startupPage.locator('#signIn').isVisible(),false);
         await startupPage.unroute('**/excel/catalog');await startupPage.evaluate(()=>window.dispatchEvent(new Event('online')));
         await startupPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
-        assert.equal(startupLogins,1);assert.equal(startupGeneration,0);
+        assert.equal(startupLogins,2);assert.equal(startupGeneration,0);
         await startupPage.clock.install();let releaseCatalog:(()=>void)|undefined;
         await startupPage.route('**/excel/catalog',route=>new Promise<void>(resolve=>{releaseCatalog=()=>{route.abort().catch(()=>{}).finally(resolve);};}));
         const catalogStalled=startupPage.waitForRequest(request=>request.url().endsWith('/excel/catalog'));
@@ -112,7 +118,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.ok((await startupPage.locator('#catalogStatus').innerText()).includes('timed out'));
         releaseCatalog!();await startupPage.unroute('**/excel/catalog');await startupPage.click('#retryCatalog');
         await startupPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
-        assert.equal(startupLogins,1);assert.equal(startupGeneration,0);
+        assert.equal(startupLogins,2);assert.equal(startupGeneration,0);
         await startupPage.close();
         for(const scenario of ['browser','unsupported','office-missing','office-stalled']) {
             const hostPage=await browser.newPage({viewport:{width:340,height:600}});
@@ -549,18 +555,33 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
         assert.equal(await page.locator('#generate').isDisabled(),true);
         await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
-        await page.click('#generateBatch');await page.locator('#downloadBatch').waitFor({state:'visible'});
+        let recoveryRequests=0;
+        const recoveryRoute=async(route:any)=>{if(++recoveryRequests===1)await route.fulfill({status:503,headers:{'retry-after':'1'},
+            contentType:'application/json',body:JSON.stringify({error:'Fictional temporary PDF outage'})});else await route.continue();};
+        await page.route('**/excel/generate',recoveryRoute);
+        await page.click('#generateBatch');
+        await page.locator('#batchRows [data-status="retrying"]').waitFor({state:'visible'});
+        assert.match(await page.locator('#batchRows').innerText(),/Retrying DC105 \/ attempt 2 of 3/);
+        assert.equal(await page.locator('#cancelBatch').isVisible(),true);
+        await page.locator('#downloadBatch').waitFor({state:'visible'});
+        await page.unroute('**/excel/generate',recoveryRoute);assert.equal(recoveryRequests,7);
         assert.match(await page.locator('#batchStatus').innerText(),/2 of 3 cases ready \/ 6 PDFs/);
+        assert.match(await page.locator('#batchRows').innerText(),/Ready \(1 retry\)/);
         assert.match(await page.locator('#batchRows').innerText(),/Row 38.*\nFailed: The selected row has no Defendant/);
         assert.equal(await page.locator('#batchRows .pdf-download').count(),6);
         assert.equal(await page.locator('#batchRows li').filter({has:page.locator('strong', {hasText:'Row 38'})}).locator('.pdf-download').count(),0);
         assert.equal(savedCopies.length,previousSaves);
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+        await page.getByRole('button',{name:'Source issues for row 38',exact:true}).click();
+        await page.locator('#sourceIssues').waitFor({state:'visible'});
+        assert.equal(await page.getByRole('button',{name:'Select cell A38',exact:true}).count(),1);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),6,'Inspecting a failed row does not discard completed downloads');
         await page.screenshot({path:path.join(output,'batch-cases-mobile.png'),fullPage:true});
         const batchEvent=page.waitForEvent('download');await page.click('#downloadBatch');const batchDownload=await batchEvent;
         const batchPath=path.join(output,batchDownload.suggestedFilename());await batchDownload.saveAs(batchPath);
         const members=unzipSync(fs.readFileSync(batchPath)),pdfNames=Object.keys(members).filter(name=>name.endsWith('.pdf'));
         assert.equal(pdfNames.length,6);assert.ok(members['results.txt']);
+        assert.match(Buffer.from(members['results.txt']).toString(),/Row 36.*ready.*retries: 1/);
         const batchSource=await page.evaluate(()=>{const qa=(window as any).qa;return {headers:qa.headers,rows:qa.rows};});
         const verification=[];
         for(const [index,name] of pdfNames.entries()){
@@ -607,6 +628,36 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         cancelRelease();await page.unroute('**/excel/generate');
         assert.equal(await page.locator('#downloadBatch').isVisible(),false);
         assert.equal(await page.locator('#batchRows .pdf-download').count(),0);
+        let backoffRequests=0;
+        const backoffRoute=async(route:any)=>{backoffRequests++;await route.fulfill({status:503,headers:{'retry-after':'5'},
+            contentType:'application/json',body:JSON.stringify({error:'Fictional retry wait'})});};
+        await page.route('**/excel/generate',backoffRoute);await page.click('#generateBatch');
+        await page.locator('#batchRows [data-status="retrying"]').waitFor({state:'visible'});
+        await page.click('#cancelBatch');await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('canceled'));
+        await page.unroute('**/excel/generate',backoffRoute);assert.equal(backoffRequests,1);
+        assert.equal(await page.locator('#downloadBatch').isVisible(),false);
+        const rowsBeforeSource=await page.evaluate(()=>JSON.stringify((window as any).qa.rows));
+        await page.getByRole('button',{name:'Source issues for row 38',exact:true}).click();
+        await page.getByRole('button',{name:'Select cell A38',exact:true}).click();
+        await page.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('no Defendant'));
+        assert.deepEqual(await page.evaluate(()=>(window as any).qa.sourceSelection),[37,0]);
+        assert.equal(await page.evaluate(()=>JSON.stringify((window as any).qa.rows)),rowsBeforeSource);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),0);
+        await page.evaluate(()=>{const qa=(window as any).qa;qa.rowIndex=35;qa.rowCount=2;qa.events[0]();});
+        await page.waitForFunction(()=>!(document.getElementById('generateBatch') as HTMLButtonElement).disabled);
+        let fieldFailures=0;
+        const fieldRoute=async(route:any)=>{const input=route.request().postDataJSON();
+            if(input.form==='dc508' && input.filename.includes('26-BATCH-0')){fieldFailures++;await route.fulfill({status:422,contentType:'application/json',
+                body:JSON.stringify({error:'DC508: Fictional source date problem',field:'dc508_13'})});}else await route.continue();};
+        await page.route('**/excel/generate',fieldRoute);await page.click('#generateBatch');await page.locator('#downloadBatch').waitFor({state:'visible'});
+        await page.unroute('**/excel/generate',fieldRoute);assert.equal(fieldFailures,1);
+        assert.match(await page.locator('#batchStatus').innerText(),/1 of 2 cases ready \/ 2 PDFs/);
+        assert.equal(await page.locator('#batchRows .pdf-download').count(),2);
+        await page.getByRole('button',{name:'Source issues for row 36',exact:true}).click();
+        const dateColumn=await page.evaluate(()=>(window as any).qa.headers.indexOf('dc508_13'));
+        const address=require('../excel-addin/row.js').columnName(dateColumn)+'36';
+        assert.equal(await page.getByRole('button',{name:'Select cell '+address,exact:true}).count(),1);
+        await page.screenshot({path:path.join(output,'batch-pdf-source-error.png'),fullPage:true});
         await page.evaluate(()=>{const qa=(window as any).qa;qa.rowCount=1;qa.rows={};qa.events[0]();});
         await page.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
         await page.click('#logout');await page.waitForSelector('#signIn:visible');
@@ -625,7 +676,7 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.ok((await page.locator('#error').innerText()).includes('12-hour Excel connection expired'));
         assert.equal(await page.locator('#result').isVisible(), false);
         assert.deepEqual(errors, []);
-        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: separate local downloads of all three forms and six multi-case PDFs match ZIP bytes, all 202 batch fields remain editable, stale PDF/ZIP guards and canceled/failed case isolation, catalog timeout/schema/outage recovery, ordinary-browser and unavailable/unsupported/stalled Office startup states, mobile/desktop help, password-free online recovery, 12-hour session restoration, source-cell errors, formula PDF readback, all 31 checkbox marks rendered and compared on/off, responsive previews and calculation/change guards. Separate downloads make no extra generation or cloud-save requests. No real OneDrive uploads.');
+        console.log('Excel task-pane smoke passed with an explicit simulated Excel 1.9 host: bounded 503 recovery and retry reporting, cancellation during backoff, exact cell links for invalid rows and PDF field failures, explicit Legal Workflow sign-in errors, separate local downloads of all three forms and six multi-case PDFs matching ZIP bytes, 202 editable batch fields, stale PDF/ZIP guards, complete-case isolation, catalog/startup recovery, responsive help/previews, 12-hour session restoration, source-cell navigation, formula PDF readback and all 31 checkbox marks rendered and compared on/off. Separate downloads make no extra generation or cloud-save requests. No real OneDrive uploads.');
     } finally {
         await browser.close();
         await new Promise<void>(resolve => { server.close(() => resolve()); server.closeIdleConnections(); });

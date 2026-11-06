@@ -38,7 +38,7 @@
         $('saveCloud').disabled = busy || !generationId || !!savedCopy;
         $('saveCloud').querySelector('span').textContent = savedCopy ? 'Saved to OneDrive' : 'Save to OneDrive';
         $('sourceIssueList').querySelectorAll('button').forEach(button=>{button.disabled=busy || !officeReady || !token;});
-        document.querySelectorAll('.pdf-download').forEach(button=>{button.disabled=busy || !token;});
+        document.querySelectorAll('.pdf-download,.batch-issues').forEach(button=>{button.disabled=busy || !token;});
     }
     function clearResult() {
         for(const [url,timer] of downloadUrls){clearTimeout(timer);URL.revokeObjectURL(url);}downloadUrls.clear();
@@ -85,6 +85,8 @@
                 if (response.status === 401 && token && token === owner) signedOut();
                 const error = new Error(result?.error || (response.status >= 500 ? 'The PDF service is temporarily unavailable. Try again shortly.' : 'Request failed. Please try again.'));
                 error.status = response.status;
+                const retryAfter=response.headers.get('retry-after');
+                if(retryAfter!==null)error.retryAfterMs=/^\d+$/.test(retryAfter)?Number(retryAfter)*1000:Infinity;
                 if (typeof result?.field === 'string') error.field = result.field;
                 throw error;
             }
@@ -102,7 +104,7 @@
         } catch(error) {
             if (signal?.aborted)throw Object.assign(new Error('Generation canceled. No files are available.'),{code:'batch_cancelled'});
             if (abort.signal.aborted) throw new Error('The request timed out. Check your connection, then try again.');
-            if (error instanceof TypeError) throw new Error('Could not reach the PDF service. Check your connection and try again.');
+            if (error instanceof TypeError) throw Object.assign(new Error('Could not reach the PDF service. Check your connection and try again.'),{retryable:true});
             throw error;
         } finally { clearTimeout(timer);signal?.removeEventListener('abort',cancel); }
     }
@@ -204,7 +206,7 @@
                     $('selection').textContent=snapshot.sheet+' / Rows '+snapshot.startRow+'-'+(snapshot.startRow+snapshot.rowCount-1);
                     $('caseName').textContent=snapshot.rowCount+' selected rows';$('caseContext').textContent='';
                     renderBatchRows(snapshot.rows.map(row=>({row:row.row,name:row.data?.name || '',
-                        status:row.error?row.error.code==='hidden_row'?'skipped':'failed':'queued',error:row.error?.message || ''})));
+                        status:row.error?row.error.code==='hidden_row'?'skipped':'failed':'queued',error:row.error?.message || '',sourceError:row.error || null})));
                     return;
                 }catch(batchError){error=batchError;}
             }
@@ -279,7 +281,7 @@
             if (!officeReady) throw new Error('Open the panel in a supported Excel workbook.');
             const session = await api('/excel/session', { username:$('username').value, password:$('password').value });
             await connected(session.token, session.expiresIn);
-        } catch(error) { message(error.message); }
+        } catch(error) { message(error.status===401?'The Legal Workflow username or password is incorrect.':error.message); }
         finally { $('login').disabled = false; }
     });
     $('logout').addEventListener('click', async () => {
@@ -420,19 +422,32 @@
     function batchForms() {return forms.filter(form=>Array.from($('batchForms').querySelectorAll('input:checked')).some(input=>input.value===form.id));}
     function renderBatchRows(records,members=[]) {
         $('batchRows').replaceChildren(...records.map(record=>{
-            const li=document.createElement('li'),name=document.createElement('strong'),status=document.createElement('span');
+            const li=document.createElement('li'),name=document.createElement('strong'),status=document.createElement('span'),heading=document.createElement('div');
+            heading.className='batch-row-heading';
             name.textContent='Row '+record.row+(record.name?' / '+record.name:'');
             status.dataset.status=record.status;
-            status.textContent=record.status==='generating'?'Generating '+record.completed+' / '+record.total:
+            status.textContent=record.status==='retrying'?'Retrying '+record.form.toUpperCase()+' / attempt '+record.attempt+' of '+record.maxAttempts:
+                record.status==='generating'?'Generating '+record.completed+' / '+record.total:
                 record.status==='ready'?'Ready':record.status==='queued'?'Queued':record.status==='skipped'?'Skipped':'Failed';
+            if(record.retries && record.status==='ready')status.textContent+=' ('+record.retries+(record.retries===1?' retry)':' retries)');
             if(record.error)status.textContent+=': '+record.error;
-            li.append(name,status);
+            heading.append(name);
+            if(record.status==='failed' && record.sourceError?.issues?.length && record.sourceError.source) {
+                const button=document.createElement('button'),icon=document.createElement('i');button.type='button';button.className='icon batch-issues';
+                button.title='Source issues for row '+record.row;button.setAttribute('aria-label',button.title);
+                button.disabled=busy || !token || !officeReady;icon.dataset.lucide='arrow-up-right';button.append(icon);
+                button.addEventListener('click',()=>{if(busy || !token || !officeReady)return;
+                    showSourceError(record.sourceError);$('sourceIssues').scrollIntoView({block:'nearest'});});
+                heading.append(button);
+            }
+            li.append(heading,status);
             const files=members.filter(member=>member.row===record.row);
             if(files.length){const list=document.createElement('ul');list.className='pdf-files';
                 list.append(...files.map(member=>pdfDownloadItem(member.filename,member.form,
                     ()=>downloadMember('batch',member.path,member.filename))));li.append(list);}
             return li;
         }));
+        if(!busy && window.lucide)lucide.createIcons();
     }
     $('batchForms').addEventListener('change',()=>{++revision;clearResult();batchData=null;controls();if(token)refresh();});
     $('cancelBatch').addEventListener('click',()=>batchController?.abort());

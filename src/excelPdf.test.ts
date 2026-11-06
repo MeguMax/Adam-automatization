@@ -155,6 +155,79 @@ test('separate batch PDFs preserve exact bytes, unique local names and whole-cas
     assert.equal(Object.keys(unzipSync(result.bytes)).filter(name=>name.endsWith('.pdf')).length,6);
 });
 
+function recoveryBatch() {
+    const form={id:'dc105',fields:['dc105_01']};
+    const source={sheet:'Cases',sheetId:'sheet-1',startRow:2,rowCount:2,formIds:['dc105'],
+        rows:[2,3].map(row=>({row,error:null,data:{form:'batch',row,name:'Tenant '+row,metadata:{defendant:'Tenant '+row},
+            columns:{dc105_01:4},values:{dc105_01:String(row)}}}))};
+    return {form,source,base:{readCurrent:async()=>structuredClone(source)}};
+}
+
+test('batch generation recovers transient failures with bounded retries and keeps later cases independent',async()=>{
+    const {form,source,base}=recoveryBatch(),calls:Record<string,number>={},delays:number[]=[],progress:any[]=[];
+    const result=await batch.generate(source,[form],{...base,sleep:async(ms:number)=>{delays.push(ms);},onProgress:(record:any)=>progress.push(record),
+        generate:async(input:any)=>{const row=input.values.dc105_01;calls[row]=(calls[row]||0)+1;
+            if(row==='2' && calls[row]<3)throw Object.assign(new Error('Fictional unavailable response'),{status:503,retryAfterMs:3000});
+            return Buffer.from('%PDF-'+row);}});
+    assert.deepEqual(calls,{'2':3,'3':1});assert.deepEqual(delays,[3000,3000]);
+    assert.deepEqual(result.results.map((record:any)=>[record.status,record.retries]),[['ready',2],['ready',0]]);
+    assert.deepEqual(progress.filter(record=>record.status==='retrying').map(record=>record.attempt),[2,3]);
+    assert.match(Buffer.from(unzipSync(result.bytes)['results.txt']).toString(),/Row 2.*ready.*retries: 2/);
+});
+
+test('exhausted temporary failures omit only their case, while data/authentication errors are never retried',async()=>{
+    for(const status of [400,401,403,422,429,500,502,503,504]) {
+        const {form,source,base}=recoveryBatch();let failedCalls=0;
+        const result=await batch.generate(source,[form],{...base,sleep:async()=>{},generate:async(input:any)=>{
+            if(input.values.dc105_01==='2'){failedCalls++;throw Object.assign(new Error('Fictional error'),{status,retryable:true,field:'dc105_01'});}
+            return Buffer.from('%PDF-later-case');}});
+        assert.equal(failedCalls,[502,503,504].includes(status)?3:1,String(status));
+        assert.deepEqual(result.results.map((record:any)=>record.status),['failed','ready']);
+        assert.equal(result.members.length,1);assert.equal(result.members[0].row,3);
+        assert.equal(result.results[0].sourceError.source.row,2);
+        assert.deepEqual(result.results[0].sourceError.issues[0].columns,[4]);
+    }
+});
+
+test('batch network recovery uses short backoff, but longer or invalid Retry-After leaves the case retryable manually',async()=>{
+    const {form,source,base}=recoveryBatch();let calls=0;const delays:number[]=[];
+    const recovered=await batch.generate(source,[form],{...base,sleep:async(ms:number)=>{delays.push(ms);},generate:async()=>{
+        if(++calls<3)throw Object.assign(new Error('Fictional network outage'),{retryable:true});return Buffer.from('%PDF-network-recovery');}});
+    assert.equal(calls,4);assert.deepEqual(delays,[1000,2000]);assert.equal(recovered.results[0].retries,2);
+    for(const retryAfterMs of [11000,Infinity,NaN,-1]) {
+        let attempts=0;
+        const result=await batch.generate(source,[form],{...base,sleep:async()=>{assert.fail('Do not bypass Retry-After');},generate:async(input:any)=>{
+            if(input.values.dc105_01==='2'){attempts++;throw Object.assign(new Error('Fictional retry later'),{status:503,retryAfterMs});}
+            return Buffer.from('%PDF-other-case');}});
+        assert.equal(attempts,1);assert.equal(result.results[0].status,'failed');assert.equal(result.results[1].status,'ready');
+    }
+});
+
+test('cancellation during real retry backoff and changed cells stop before another PDF request',async()=>{
+    const {form,source,base}=recoveryBatch(),abort=new AbortController();let calls=0;
+    await assert.rejects(batch.generate(source,[form],{...base,signal:abort.signal,onProgress:(record:any)=>{
+        if(record.status==='retrying')setTimeout(()=>abort.abort(),5);},generate:async()=>{
+        calls++;throw Object.assign(new Error('Fictional gateway outage'),{status:502});}}),/canceled/);
+    assert.equal(calls,1);
+    let changed=false;calls=0;
+    await assert.rejects(batch.generate(source,[form],{readCurrent:async()=>{
+        const current=structuredClone(source);if(changed)current.rows[0].data.values.dc105_01='Changed';return current;},
+        sleep:async()=>{changed=true;},generate:async()=>{calls++;throw Object.assign(new Error('Fictional gateway outage'),{status:502});}}),/worksheet changed/);
+    assert.equal(calls,1);
+});
+
+test('batch source diagnostics retain exact header/cell issues without guessing unrelated server fields',async()=>{
+    const {form,source,base}=recoveryBatch();
+    const problem={message:'Missing column: dc105_01',source:{sheet:'Cases',sheetId:'sheet-1',row:2},
+        issues:[{field:'dc105_01',code:'missing_column',columns:[],message:'Missing column: dc105_01'}]};
+    const invalid:any=structuredClone(source);invalid.rows[0].data=null;invalid.rows[0].error=problem;
+    const result=await batch.generate(invalid,[form],{...base,readCurrent:async()=>structuredClone(invalid),generate:async()=>Buffer.from('%PDF-other-case')});
+    assert.deepEqual(result.results[0].sourceError,problem);
+    const unknown=await batch.generate(source,[form],{...base,generate:async(input:any)=>{
+        if(input.values.dc105_01==='2')throw Object.assign(new Error('Fictional unknown field'),{field:'unrelated_01'});return Buffer.from('%PDF-ok');}});
+    assert.equal(unknown.results[0].sourceError,null);
+});
+
 test('separate PDF extraction rejects missing, non-PDF, duplicate and oversized ZIP members',()=>{
     const bytes=Buffer.from('%PDF-editable-fixture');
     const archive=zipSync({'a.pdf':bytes,'results.txt':Buffer.from('Ready')},{level:0});
@@ -504,7 +577,7 @@ test('public Excel help provides installation and local-download instructions wi
     assert.equal(response.status,200);
     assert.equal(response.headers.get('cache-control'),'no-store');
     const html=await response.text();
-    for (const text of ['href="/excel/manifest.xml"','Just me','Legal Workflow admin username and password','local only',
+    for (const text of ['href="/excel/manifest.xml"','Just me','Legal Workflow username','Legal Workflow password','local only',
         'Download ZIP','Source issues','dc105_01','dc508_01','mc202_01']) assert.ok(html.includes(text),text);
     assert.ok(!html.includes('<script'));
     assert.ok(!html.includes('test-password'));

@@ -72,6 +72,34 @@ Evidence is under `output/excel-native-v114-2026-11-06/`. This does not establis
 current multi-case acceptance in Excel Online or in Adam's tenant; those remain
 separate from this Windows desktop run and the simulated-host regression suite.
 
+## Batch recovery and source navigation (v115)
+
+The connection screen now names the Legal Workflow account explicitly instead
+of a generic admin sign-in. Credentials, session duration and permissions are
+unchanged; no password is embedded or stored by the panel.
+
+Batch generation retries only temporary HTTP 502/503/504 or classified network
+failures, up to three attempts per PDF, with 1/2-second fallback delays. Numeric
+`Retry-After` is respected up to 10 seconds; longer or unsupported delays leave
+that case failed for a later manual retry, without retrying too soon. Data,
+authentication and rate-limit responses are not retried. Existing request
+deadlines remain in force. Cancel aborts backoff immediately; source snapshots
+are checked before and after waiting. Recovered-case retry counts appear in the
+panel and ZIP report. Exhausted failures still omit only the affected case.
+
+Failed rows with known worksheet issues expose a source-issues arrow, including
+before generation and when all selected rows are invalid. It opens the existing
+cell/header diagnostics without discarding ready PDFs. Following a cell link
+selects the exact sheet and cell without rewriting data; the resulting selection
+change invalidates old downloads. PDF service field errors are mapped only to
+known columns in the selected forms. Generic network errors never guess a cell.
+
+Verification: all 486 automated tests passed, including 48 Excel unit tests.
+The simulated Office 1.9 browser smoke passed with temporary-service recovery,
+backoff cancellation, source navigation and failed-case isolation. It also
+checked the six individual PDFs against the multi-case ZIP and all 202 fields.
+These checks are separate from native Excel acceptance.
+
 ## Multiple-case local generation (v96)
 
 Select 1-10 adjacent data rows, choose any subset of DC105/DC508/MC202 under

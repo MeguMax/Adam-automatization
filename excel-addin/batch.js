@@ -12,6 +12,16 @@
             .normalize('NFC').replace(/[<>:"/\\|?*\x00-\x1f\x7f]/g,'_').replace(/\s+/g,' ').trim();
         return ('Row '+data.row+' - '+label).slice(0,70).replace(/[. ]+$/g,'');
     }
+    function pause(ms,signal) {
+        cancelled(signal);
+        return new Promise((resolve,reject)=>{
+            const finish=()=>{signal?.removeEventListener('abort',abort);resolve();};
+            const timer=setTimeout(finish,ms);
+            const abort=()=>{clearTimeout(timer);signal.removeEventListener('abort',abort);
+                reject(Object.assign(new Error('Generation canceled. No files are available.'),{code:'batch_cancelled'}));};
+            signal?.addEventListener('abort',abort,{once:true});
+        });
+    }
     async function generate(snapshot,forms,options) {
         if(!snapshot || !Array.isArray(snapshot.rows) || snapshot.rows.length<1 || snapshot.rows.length>10 ||
             !Array.isArray(forms) || !forms.length || forms.length>3 || new Set(forms.map(form=>form.id)).size!==forms.length ||
@@ -27,10 +37,11 @@
         }
         await fresh();
         snapshot.rows.forEach(record=>progress({row:record.row,name:record.data?.name || '',
-            status:record.error ? record.error.code==='hidden_row'?'skipped':'failed' : 'queued',error:record.error?.message || ''}));
+            status:record.error ? record.error.code==='hidden_row'?'skipped':'failed' : 'queued',error:record.error?.message || '',sourceError:record.error || null}));
         for(const record of snapshot.rows) {
             cancelled(options.signal,options.isCurrent);
-            const result={row:record.row,name:record.data?.name || '',status:'failed',error:record.error?.message || ''};
+            const result={row:record.row,name:record.data?.name || '',status:'failed',error:record.error?.message || '',
+                sourceError:record.error || null,retries:0};
             if(record.error) {if(record.error.code==='hidden_row')result.status='skipped';results.push(result);continue;}
             const pending={},pendingMembers=[];
             try {
@@ -39,7 +50,20 @@
                     cancelled(options.signal,options.isCurrent);
                     const filename=rows.pdfFilename({...record.data,form:form.id}).slice(0,-4).slice(0,100).replace(/[. ]+$/g,'')+'.pdf';
                     const values=Object.fromEntries(form.fields.map(field=>[field,record.data.values[field]]));
-                    const bytes=await options.generate({form:form.id,values,filename},options.signal);
+                    let bytes;
+                    for(let attempt=1;attempt<=3;attempt++) {
+                        try {bytes=await options.generate({form:form.id,values,filename},options.signal);break;}
+                        catch(error) {
+                            cancelled(options.signal,options.isCurrent);
+                            const delay=error.retryAfterMs ?? attempt*1000;
+                            if(attempt===3 || !([502,503,504].includes(error.status) || error.status===undefined && error.retryable===true) ||
+                                !Number.isFinite(delay) || delay<0 || delay>10000)throw error;
+                            await fresh();result.retries++;
+                            progress({...result,status:'retrying',form:form.id,completed:index,total:forms.length,attempt:attempt+1,maxAttempts:3});
+                            await (options.sleep || pause)(delay,options.signal);
+                            await fresh();
+                        }
+                    }
                     cancelled(options.signal,options.isCurrent);
                     if(!(bytes instanceof Uint8Array) || bytes.length<5 || new TextDecoder().decode(bytes.slice(0,5))!=='%PDF-')throw new Error('The PDF service returned an invalid PDF.');
                     if(bytes.length>8*1024*1024 || byteCount+bytes.length>MAX_BYTES)throw Object.assign(new Error('The archive exceeds 16 MB. Select fewer cases.'),{code:'batch_size'});
@@ -54,6 +78,10 @@
                 cancelled(options.signal,options.isCurrent);
                 if(error.code==='batch_size' || /worksheet changed/i.test(error.message))throw error;
                 result.error=error.message;
+                const column=record.data.columns?.[error.field];
+                if(typeof error.field==='string' && forms.some(form=>form.fields.includes(error.field)) && Number.isInteger(column) && column>=0 && column<2048)
+                    result.sourceError={message:error.message,source:{sheet:snapshot.sheet,sheetId:snapshot.sheetId,row:record.row},
+                        issues:[{field:error.field,columns:[column],message:error.message,code:'pdf_field'}]};
                 Object.values(pending).forEach(bytes=>{byteCount-=bytes.length;});
                 await fresh();
             }
@@ -63,7 +91,8 @@
         if(!results.some(result=>result.status==='ready'))throw new Error('No cases generated. Correct the row errors and try again.');
         const plain=value=>String(value || '').replace(/[\r\n\t]/g,' ').slice(0,350);
         files['results.txt']=new TextEncoder().encode('Sheet: '+plain(snapshot.sheet)+'\r\nForms: '+forms.map(form=>form.id.toUpperCase()).join(', ')+
-            '\r\n\r\n'+results.map(result=>'Row '+result.row+' | '+plain(result.name)+' | '+result.status+(result.error?' | '+plain(result.error):'')).join('\r\n'));
+            '\r\n\r\n'+results.map(result=>'Row '+result.row+' | '+plain(result.name)+' | '+result.status+
+                (result.error?' | '+plain(result.error):'')+(result.retries?' | retries: '+result.retries:'')).join('\r\n'));
         return {bytes:zip.zipSync(files,{level:0}),results,members};
     }
     function readPdf(archive,path) {

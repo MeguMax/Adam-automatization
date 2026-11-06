@@ -22,7 +22,7 @@
     </section>
     <section>
       <h2>2. Connect</h2>
-      <p>In the right-hand panel, enter your <strong>Legal Workflow admin username and password</strong> and select <strong>Connect for 12 hours</strong>. Do not use your MiFILE or Microsoft password here. Passwords are not stored in the add-in or workbook.</p>
+      <p>In the right-hand panel, enter your <strong>Legal Workflow username</strong> and <strong>Legal Workflow password</strong>, the same credentials used for the admin panel, and select <strong>Connect for 12 hours</strong>. Do not use your MiFILE or Microsoft password here. Passwords are not stored in the add-in or workbook.</p>
       <p>The panel restores its valid connection when reopened. Desktop Excel and Excel Online may each need an initial connection. After 12 hours, connect again. <strong>Disconnect</strong> ends the current connection.</p>
     </section>
     <section>
@@ -37,6 +37,7 @@
       <h3>Several Cases at Once</h3>
       <p>Select up to 10 adjacent data rows. Under <strong>Multiple cases</strong>, check the forms you need and select <strong>Generate selected cases</strong>. Download separate PDFs using the icons under each ready case, or choose <strong>Download cases ZIP</strong> for case folders and <code>results.txt</code>. Separate filenames include the source row so cases with the same name do not collide. Your browser may add a suffix if a filename already exists locally.</p>
       <p>Hidden rows are skipped; failed cases appear in the panel without preventing the other cases from downloading. A failed case is omitted as a whole, not exported with missing forms. Correct it in Excel and regenerate. Cancel discards all pending files. The panel rechecks the selected rows before every PDF or ZIP download. Changing the selection, mapped values or chosen forms invalidates the result. All PDF fields remain editable; batch generation also saves locally only. Files download one at a time, without needing permission for automatic multiple downloads.</p>
+      <p>Temporary PDF service failures are retried automatically, up to three attempts per PDF. A retry count appears beside a recovered case. <strong>Cancel</strong> also stops retry waiting. Data errors are not retried without correction.</p>
     </section>
     <section>
       <h2>Workbook Requirements</h2>
@@ -50,6 +51,7 @@
         <dt>Reconnecting</dt><dd>Use <strong>Reconnect</strong> or wait for your connection to return. A temporary outage does not discard a valid 12-hour connection. Do not reinstall the add-in.</dd>
         <dt>No case selected</dt><dd>Select one data row. Use the refresh icon beside <strong>Selected case</strong> if the name has not updated.</dd>
         <dt>Source issues</dt><dd>Use the cell button beside the issue to select the affected worksheet cell, or <strong>Header row</strong> for a missing column. Correct the source value or formula in Excel, select the case row again, and regenerate. The add-in does not overwrite or guess the correction.</dd>
+        <dt>One case fails in a batch</dt><dd>Use the source-issues arrow beside that failed row to see the exact worksheet cells involved. Other ready cases can still be downloaded while you inspect the issue. Selecting a source cell or changing the workbook invalidates the generated result, so download any ready files you need first. Correct the source, select the desired case rows again, and regenerate. A repeated service error may have no source-cell link; try again when the service is available.</dd>
         <dt>Excel is still calculating</dt><dd>Wait for the workbook's calculations to finish, then retry. Unfinished or error values are not exported silently.</dd>
         <dt>Text does not fit or preview is unavailable</dt><dd>For a text-fit error, correct the identified cell without losing the required content. If only the preview fails and a download button remains, download and inspect the PDF in your normal PDF application.</dd>
         <dt>Open in Excel or Update Excel</dt><dd>A normal browser tab is not connected to your workbook. Open the installed panel inside Excel. Older Excel versions without Excel API 1.9 support need a current Microsoft 365 Excel version.</dd>
