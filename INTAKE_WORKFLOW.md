@@ -99,6 +99,20 @@ reusing the ID for different PDFs is rejected. If a response is interrupted,
 PDFs remain frozen until the result is checked. No fresh package is automatically
 created after an uncertain response.
 
+Release v118 passed 492 automated tests and authenticated desktop/mobile smoke
+checks, including a simulated gateway failure after the split committed. The
+read-only lookup opened the existing case without another POST. A production
+email with 13 fictional PDFs created two complete cases and one missing-Request
+negative control. SplitAlpha A automatically prepared `TEMP-522KL4OR`; the
+explicitly split LegacyBeta case prepared `TEMP-MY85ON02` after confirmation.
+Each saved bundle was reopened and verified with seven source PDFs and one
+MiFILE-generated PDF. Alpha's two Connected PDFs matched its Complaint; Beta's
+two supporting PDFs remained Other and both named Defendants were retained.
+Each case had one preparation attempt and no manual field corrections. The
+empty source group was archived, its split lookup still found the prepared
+case, and the missing-Request case had no filing job. Payment and final court
+submission remained disabled. These fictional bundles are not valid filings.
+
 Release v116 passed all 487 automated tests and authenticated desktop/mobile
 browser smoke checks, including canceled/saved switching, exact-document review,
 supporting-PDF movement and delayed-navigation edit protection. The combined
