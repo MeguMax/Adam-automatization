@@ -57,7 +57,7 @@ import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 import { recheckSavedFilingJob } from './savedBundleRecheck';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-07-saved-bundle-recheck-v120';
+const ADMIN_BUILD_ID = '2026-11-07-safe-email-replay-v121';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -7510,7 +7510,8 @@ const html = String.raw`<!doctype html>
       if (state.detail.email.processingStatus === 'processed') {
         const confirmed = window.confirm(
           'Reprocess this completed email?\n\n' +
-          'The worker will parse it again and may upload new document copies to OneDrive.',
+          'New filing packages: saved MiFILE cases stay unchanged; only unfinished cases are reprocessed. ' +
+          'Other email types may upload new document copies to OneDrive.',
         );
         if (!confirmed) return;
       }
@@ -7529,8 +7530,9 @@ const html = String.raw`<!doctype html>
       if (!emailIds.length) return;
       const confirmed = window.confirm(
         'Reprocess ' + emailIds.length + ' selected email(s)?\n\n' +
-        'Each email will be parsed again and may upload new document copies to OneDrive. ' +
-        'Emails already processing or retrying will be skipped.',
+        'For new filing packages, saved MiFILE cases stay unchanged; only unfinished cases are reprocessed. ' +
+        'Other email types may upload new OneDrive copies. Emails already processing, retrying, ' +
+        'or awaiting MiFILE reconciliation will be skipped.',
       );
       if (!confirmed) return;
 

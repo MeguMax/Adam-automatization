@@ -189,6 +189,109 @@ test('a failed sibling attachment does not prevent the other complete case from 
     } finally { f.close(); }
 });
 
+test('replaying a mixed email preserves its saved bundle, manual edits and removed PDFs without uploads or filing jobs', async () => {
+    const f = fixture(names.filter(name => name !== 'Walker W Request.pdf'));
+    try {
+        await f.library();
+        for (const item of f.packages) await processFilingIntake(f.db, f.email.id, item.draftId, item.parsed, f.dependencies);
+        const [utsey, walker] = f.packages;
+        const editable = f.db.getDraftDetail(walker.draftId)!;
+        f.db.updateCaseDraft(walker.draftId, {}, 'Keep my review note', {
+            ...editable.caseDraft!.filingData,
+            plaintiff: { ...editable.caseDraft!.filingData.plaintiff, phone: '(248) 703-6201' },
+        });
+        const removed = editable.documents.find(document => document.packageRole === 'ancillary')!;
+        f.db.removeDraftDocument(walker.draftId, removed.id);
+        assert.equal(f.db.queueValidatedIntakes(), 1);
+        const job = f.db.claimNextFilingJob()!;
+        assert.equal(job.caseDraftId, utsey.draftId);
+        f.db.completeFilingJob({ filingJobId: job.id, status: 'prepared', checkpoint: 'saved_unsubmitted',
+            externalBundleId: randomUUID(), temporaryCaseNumber: 'TEMP-REPLAY', result: { testSnapshot: true } });
+        const beforeSaved = f.db.getDraftDetail(utsey.draftId)!;
+        const beforeEditable = f.db.getDraftDetail(walker.draftId)!;
+        const beforeJobs = f.db.listFilingJobs();
+        const beforeUploads = f.uploads.length;
+        for (let replay = 0; replay < 2; replay++) {
+            f.db.queueEmailRetry(f.email.id, 'Explicit replay acceptance');
+            assert.equal(f.db.shouldSkipEmail(message.id), false);
+            f.db.markEmailProcessing(f.email.id);
+            for (const item of f.db.createCaseDrafts(f.email.id, f.parsed)) {
+                const draft = f.db.getDraftDetail(item.draftId)!.caseDraft!;
+                if (!['not_started', 'failed'].includes(draft.filingStatus) || ['rejected', 'archived'].includes(draft.status)) continue;
+                item.parsed.intake = JSON.parse(draft.normalizedDataJson!).intake;
+                await processFilingIntake(f.db, f.email.id, item.draftId, item.parsed, { ...f.dependencies, deferEmailRefresh: true });
+            }
+            f.db.reconcileBatchSupportingDocuments(f.email.id);
+            f.db.refreshEmailAfterDocumentRetries(f.email.id);
+            assert.equal(f.db.queueValidatedIntakes(), 0);
+            assert.equal(f.db.shouldSkipEmail(message.id), true);
+            assert.equal(f.db.listDrafts().totalItems, 2);
+            assert.deepEqual(f.db.listFilingJobs(), beforeJobs);
+            assert.equal(f.uploads.length, beforeUploads);
+            const saved = f.db.getDraftDetail(utsey.draftId)!;
+            assert.deepEqual(saved.caseDraft, beforeSaved.caseDraft);
+            assert.deepEqual(saved.documents, beforeSaved.documents);
+            const after = f.db.getDraftDetail(walker.draftId)!;
+            assert.deepEqual(after.caseDraft!.filingData, beforeEditable.caseDraft!.filingData);
+            assert.equal(after.caseDraft!.reviewerNotes, 'Keep my review note');
+            for (const field of ['manualFilingPaths', 'manualFilingFields', 'manualEditableFields', 'manualDocumentEdits']) {
+                assert.deepEqual(JSON.parse(after.caseDraft!.normalizedDataJson!)[field], JSON.parse(beforeEditable.caseDraft!.normalizedDataJson!)[field]);
+            }
+            assert.deepEqual(after.documents, beforeEditable.documents);
+            assert.ok(!after.documents.some(document => document.id === removed.id));
+            assert.ok(after.caseDraft!.validationIssues.some(issue => issue.field === 'package.request'));
+        }
+        const reopened = new WorkflowDatabase(path.join(f.directory, 'workflow.sqlite'));
+        try {
+            reopened.queueEmailRetry(f.email.id, 'Replay after reopening the database');
+            assert.deepEqual(reopened.createCaseDrafts(f.email.id, f.parsed).map(item => item.draftId), f.packages.map(item => item.draftId));
+            assert.deepEqual(reopened.listFilingJobs(), beforeJobs);
+            assert.equal(reopened.getDraftDetail(walker.draftId)!.caseDraft!.filingData.plaintiff.phone, '(248) 703-6201');
+            assert.deepEqual(reopened.getDraftDetail(utsey.draftId)!.caseDraft, beforeSaved.caseDraft);
+        } finally { reopened.close(); }
+    } finally { f.close(); }
+});
+
+test('email replay still rejects queued, running or uncertain MiFILE work but preserves closed sibling states', () => {
+    const f = fixture();
+    try {
+        const sql = (f.db as any).db, id = f.packages[0].draftId;
+        for (const [status, filingStatus] of [
+            ['ready_to_file', 'queued'], ['filing_in_progress', 'running'], ['filing_reconciliation', 'reconciliation_required'],
+            ['needs_review', 'running'], ['needs_review', 'reconciliation_required'],
+        ]) {
+            sql.prepare('UPDATE case_drafts SET status=?,filing_status=? WHERE id=?').run(status, filingStatus, id);
+            assert.throws(() => f.db.queueEmailRetry(f.email.id), /locked/);
+            assert.equal(f.db.getDraftDetail(id)!.caseDraft!.filingStatus, filingStatus);
+        }
+        for (const [status, filingStatus] of [
+            ['filing_prepared', 'prepared'], ['filed_successfully', 'succeeded'], ['archived', 'not_started'], ['rejected', 'not_started'],
+        ]) {
+            sql.prepare('UPDATE case_drafts SET status=?,filing_status=? WHERE id=?').run(status, filingStatus, id);
+            const before = f.db.getDraftDetail(id)!;
+            f.db.queueEmailRetry(f.email.id);
+            f.db.createCaseDrafts(f.email.id, f.parsed);
+            assert.deepEqual(f.db.getDraftDetail(id)!.caseDraft, before.caseDraft);
+            assert.deepEqual(f.db.getDraftDetail(id)!.documents, before.documents);
+            assert.equal(f.db.listFilingJobs().length, 0);
+        }
+    } finally { f.close(); }
+});
+
+test('an active filing job blocks email replay even if its Draft status is inconsistent', async () => {
+    const f = fixture();
+    try {
+        await f.library();
+        for (const item of f.packages) await processFilingIntake(f.db, f.email.id, item.draftId, item.parsed, f.dependencies);
+        assert.equal(f.db.queueValidatedIntakes(1), 1);
+        const job = f.db.listFilingJobs()[0], sql = (f.db as any).db;
+        sql.prepare("UPDATE case_drafts SET status='filing_prepared',filing_status='prepared' WHERE id=?").run(job.caseDraftId);
+        assert.throws(() => f.db.queueEmailRetry(f.email.id), /locked/);
+        assert.equal(f.db.getFilingJob(job.id)!.status, 'queued');
+        assert.equal(f.db.listFilingJobs().length, 1);
+    } finally { f.close(); }
+});
+
 test('eighteen named cases paginate as drafts while their source email and document totals remain singular', () => {
     const f = fixture(Array.from({ length: 18 }, (_, index) => `Tenant${index} A`).flatMap(prefix =>
         ['Complaint', 'Summons', 'Request', 'Other'].map(role => `${prefix} ${role}.pdf`)));

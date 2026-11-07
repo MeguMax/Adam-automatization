@@ -3692,8 +3692,12 @@ export class WorkflowDatabase {
         const lockedDraft = this.db.prepare(`
             SELECT 1 FROM case_drafts WHERE email_id = ?
               AND json_extract(normalized_data_json, '$.sourceKind') = 'new_filing_intake'
-              AND (filing_status = 'queued' OR status IN ('filing_in_progress', 'filing_reconciliation', 'filing_prepared', 'filed_successfully', 'archived'))
+              AND (filing_status IN ('queued', 'running', 'reconciliation_required')
+                OR status IN ('filing_in_progress', 'filing_reconciliation')
+                OR EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = case_drafts.id
+                  AND j.status IN ('queued', 'running', 'reconciliation_required')))
         `).get(emailId);
+        // Saved/closed siblings are skipped by intake; only unresolved external work blocks a replay.
         if (lockedDraft) throw new Error('This new-case package is locked by its current MiFILE filing state.');
 
         const activeRetry = this.db

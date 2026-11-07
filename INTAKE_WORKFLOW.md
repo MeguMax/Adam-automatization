@@ -143,6 +143,14 @@ supporting-PDF movement and delayed-navigation edit protection. The combined
 14 packages passed validation, and 288 golden values across 12 cases matched.
 This was offline intake acceptance, not another live MiFILE or payment run.
 
+Explicit email reprocessing can retry unfinished cases alongside saved or closed
+siblings. Prepared, filed, archived and rejected Drafts retain their exact IDs,
+source PDFs, filing jobs and saved-bundle references; intake skips them rather
+than reopening or preparing them again. Queued, running or uncertain MiFILE work
+still blocks the retry. Existing uploaded PDFs are reused, removed PDFs stay
+removed, and manual fields, document decisions and reviewer notes remain pinned.
+Reprocessing an email does not authorize payment or final court submission.
+
 Unmatched filenames and supporting-only prefixes remain visible review groups, never silently attached to the closest surname. For example, `Marogi M Demand.pdf` does not automatically belong to `Marogi R Complaint.pdf`. After checking the PDF, use its Documents controls to move a supporting file to another editable case from the same email. The move preserves the original OneDrive file, clears approval, resets its court routing and requires package confirmation. It cannot move core/library PDFs or cross email boundaries. Empty review groups are archived. A prefix that contradicts the extracted Defendant also requires review.
 
 There is one content-based correction path for a supporting-only prefix typo: a verified Demand DC 100a with populated PDF fields can be matched to a single typed Complaint only when its full recipient name/address, Plaintiff and rented-premises address all agree exactly. Conflicting or empty PDF fields, different digits/unit numbers, multiple matching cases, scanned-only evidence and manual edits prevent this automatic reassignment. Each move records its PDF hash and matching method; the original filename and bytes stay unchanged. The empty source review group remains archived so email retries cannot recreate it. Unresolved same-surname or unassigned supporting groups prevent automatic preparation until their grouping is resolved or reviewed.
