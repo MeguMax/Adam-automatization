@@ -97,6 +97,8 @@ function safePathToken(value: string): string {
 }
 
 function courtDisplayName(value: string): string {
+    // MiFILE's published display label omits Macomb County for this court.
+    if (value.trim() === 'MI Macomb County - 37th District Court') return '37th District Court';
     return value.replace(/^MI\s+/i, '').trim();
 }
 
@@ -453,22 +455,7 @@ export class MiFileFilingRunner {
         }
         await page.waitForTimeout(1_000);
         await dismissMifilePreparationNotice(page);
-        const courtName = courtDisplayName(payload.courtName);
-        const courtInput = page.locator('#court_select_dropdown');
-        await courtInput.fill(courtName);
-        await page.waitForTimeout(300);
-        await dismissMifilePreparationNotice(page);
-        const courtOption = await firstVisible(
-            page.locator('li.inner-list-item').filter({ hasText: courtName }),
-        );
-        if (!courtOption) {
-            throw new MiFileFilingError(
-                `Court is not available in MiFILE: ${payload.courtName}`,
-                'COURT_NOT_AVAILABLE',
-                'select_filing',
-            );
-        }
-        await courtOption.click();
+        await this.selectCourt(page, payload.courtName);
         await page.selectOption('#actionSelect', { label: 'Initiate a new case' });
         await this.selectRequiredFiler(page);
         await this.selectCaseType(page, payload.caseType);
@@ -478,6 +465,24 @@ export class MiFileFilingRunner {
             courtName: payload.courtName,
             caseType: payload.caseType,
         });
+    }
+
+    private async selectCourt(page: Page, canonicalName: string): Promise<void> {
+        const courtName = courtDisplayName(canonicalName);
+        await page.locator('#court_select_dropdown').fill(courtName);
+        await dismissMifilePreparationNotice(page);
+        const escaped = courtName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const candidates = page.locator('li.inner-list-item').filter({hasText:new RegExp('(?:^|\\s)' + escaped + '(?:$|\\s)')}).filter({visible:true});
+        await candidates.first().waitFor({state:'visible',timeout:Math.min(this.timeoutMs,10_000)}).catch(() => {});
+        const visible = [];
+        for (const option of await candidates.all()) if (await option.isVisible()) visible.push(option);
+        if (visible.length !== 1) throw new MiFileFilingError(
+            visible.length ? `Several MiFILE courts match ${canonicalName}. Review the court before continuing.` :
+                `Court is not available in MiFILE: ${canonicalName}`,
+            visible.length ? 'COURT_SELECTION_AMBIGUOUS' : 'COURT_NOT_AVAILABLE', 'select_filing');
+        const label = (await visible[0].innerText()).trim();
+        await visible[0].click();
+        await this.log('info','select_filing','Selected the unique MiFILE court option.',{courtName:canonicalName,displayLabel:label});
     }
 
     private async selectRequiredFiler(page: Page): Promise<void> {

@@ -113,6 +113,14 @@ empty source group was archived, its split lookup still found the prepared
 case, and the missing-Request case had no filing job. Payment and final court
 submission remained disabled. These fictional bundles are not valid filings.
 
+MiFILE court selection retains the canonical court name in Drafts and form-library
+assignments. The portal's published short label `37th District Court` is used only
+when searching for `MI Macomb County - 37th District Court`. It is not a general
+district-only fallback. Selection waits for the matching visible option (up to
+ten seconds) and requires exactly one result. Missing or ambiguous options stop
+before new-case initiation. Substring matches such as `137th District Court`
+cannot satisfy this lookup. Court names and manual case fields are not rewritten.
+
 Release v116 passed all 487 automated tests and authenticated desktop/mobile
 browser smoke checks, including canceled/saved switching, exact-document review,
 supporting-PDF movement and delayed-navigation edit protection. The combined

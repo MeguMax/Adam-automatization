@@ -65,6 +65,60 @@ async function caseTypePage(options: { delayed?: boolean; ignoreClick?: boolean;
     return page;
 }
 
+async function courtSelectionPage(labels:string[],delay=0):Promise<Page> {
+    const page=await browser.newPage();
+    await page.route('**/*',route=>route.abort());
+    await page.setContent('<input id="court_select_dropdown"><ul id="court-list"></ul><script>'+
+        'document.getElementById("court_select_dropdown").addEventListener("input",()=>setTimeout(()=>{'+
+        'document.getElementById("court-list").innerHTML="";'+
+        'for(const text of '+JSON.stringify(labels)+'){const li=document.createElement("li");li.className="inner-list-item";li.textContent=text;'+
+        'li.onclick=()=>window.selectedCourt=text;document.getElementById("court-list").append(li);}'+
+        '},'+delay+'));<\/script>');
+    return page;
+}
+
+test('MiFILE uses the published short 37th court label and waits for its delayed option without selecting 137th',async()=>{
+    const page=await courtSelectionPage(['137th District Court','37th District Court'],450);
+    try {
+        const runner=new MiFileFilingRunner();(runner as any).timeoutMs=1500;
+        await (runner as any).selectCourt(page,'MI Macomb County - 37th District Court');
+        assert.equal(await page.locator('#court_select_dropdown').inputValue(),'37th District Court');
+        assert.equal(await page.evaluate(()=>(window as any).selectedCourt),'37th District Court');
+    } finally {await page.close();}
+});
+
+test('MiFILE court search preserves ordinary canonical names and requires a unique visible option',async()=>{
+    const name='Wayne County - Wayne - 29th District Court';
+    for(const labels of [[name], [name,name]]) {
+        const page=await courtSelectionPage(labels);
+        try {
+            const runner=new MiFileFilingRunner();(runner as any).timeoutMs=1000;
+            if(labels.length===1) {
+                await (runner as any).selectCourt(page,'MI '+name);
+                assert.equal(await page.evaluate(()=>(window as any).selectedCourt),name);
+            } else {
+                await assert.rejects((runner as any).selectCourt(page,'MI '+name),(error:any)=>error.code==='COURT_SELECTION_AMBIGUOUS');
+                assert.equal(await page.evaluate(()=>(window as any).selectedCourt),undefined);
+            }
+        } finally {await page.close();}
+    }
+});
+
+test('MiFILE does not broaden the Macomb display alias to another county, an unavailable court, or another district',async()=>{
+    for(const [canonical,labels] of [
+        ['MI Macomb County - 37th District Court',['137th District Court']],
+        ['MI Another County - 37th District Court',['37th District Court']],
+        ['MI Macomb County - 37th District Court',[]],
+    ] as Array<[string,string[]]>) {
+        const page=await courtSelectionPage(labels);
+        try {
+            const runner=new MiFileFilingRunner();(runner as any).timeoutMs=200;
+            await assert.rejects((runner as any).selectCourt(page,canonical),(error:any)=>error.code==='COURT_NOT_AVAILABLE');
+            assert.equal(await page.evaluate(()=>(window as any).selectedCourt),undefined);
+        } finally {await page.close();}
+    }
+});
+
 test('MiFILE waits for the court case-type tree before filtering and verifies the LT selection', async () => {
     for (const delayed of [false, true]) {
         const page = await caseTypePage({ delayed });
