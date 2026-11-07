@@ -81,6 +81,51 @@ test('Excel adapter times out busy calculation without reading cached field valu
     assert.equal(state.reads,0);
 });
 
+test('a stalled Office run is bounded, cannot queue more reads and cannot begin late recalculation', async () => {
+    const f=officeFixture(), run=f.excel.run;
+    let release!:()=>void, pending!:Promise<unknown>;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    f.excel.run=(callback:any)=>{pending=gate.then(()=>run(callback));return pending as any;};
+    try {
+        await assert.rejects(workbook.readSelection(f.excel,f.form,{hostTimeoutMs:10}),{code:'excel_host_timeout'});
+        assert.equal(f.state.calculations,0);assert.equal(f.state.reads,0);
+        await assert.rejects(workbook.readSelection(f.excel,f.form),{code:'excel_host_timeout'});
+        assert.equal(f.state.selectionReads,0);
+    } finally { release();await assert.rejects(pending,{code:'excel_host_timeout'}); }
+    f.excel.run=run;
+    const fresh=await workbook.readSelection(f.excel,f.form);
+    assert.equal(fresh.name,'Morgan Tenant');assert.equal(f.state.calculations,1);
+});
+
+test('a late Office sync cannot return stale values after the read watchdog expires', async () => {
+    const f=officeFixture(), run=f.excel.run;
+    let release!:()=>void, pending!:Promise<unknown>;
+    const gate=new Promise<void>(resolve=>{release=resolve;});
+    f.excel.run=(callback:any)=>{pending=run((context:any)=>{
+        const sync=context.sync;
+        context.sync=async()=>{await gate;await sync();};
+        return callback(context);
+    });return pending as any;};
+    try {
+        await assert.rejects(workbook.readBatch(f.excel,[f.form],{hostTimeoutMs:10}),{code:'excel_host_timeout'});
+        assert.equal(f.state.calculations,1);assert.equal(f.state.reads,0);
+        f.state.values[0]='Changed while Office was stalled';
+    } finally { release();await assert.rejects(pending,{code:'excel_host_timeout'}); }
+    assert.equal(f.state.reads,0,'A late response must not continue reading the old context');
+    f.excel.run=run;
+    const fresh=await workbook.readBatch(f.excel,[f.form]);
+    assert.equal(fresh.rows[0].data.name,'Changed while Office was stalled');
+});
+
+test('late Office cleanup cannot win over the read deadline before the timer callback runs', async () => {
+    const f=officeFixture(), run=f.excel.run;
+    let now=1000;
+    f.excel.run=async(callback:any)=>{const value=await run(callback);now+=21;return value;};
+    await assert.rejects(workbook.readSelection(f.excel,f.form,{hostTimeoutMs:20,now:()=>now}),{code:'excel_host_timeout'});
+    f.excel.run=run;
+    assert.equal((await workbook.readSelection(f.excel,f.form)).name,'Morgan Tenant');
+});
+
 test('three-form adapter reads one calculated row, formats both form date sets and guards every field', async () => {
     const {state,excel,sleep}=officeFixture();
     state.headers.push(...EXCEL_FORMS.slice(1).flatMap(form=>form.fields));

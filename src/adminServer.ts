@@ -57,7 +57,7 @@ import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 import { recheckSavedFilingJob } from './savedBundleRecheck';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-07-email-replay-confirm-v122';
+const ADMIN_BUILD_ID = '2026-11-07-excel-read-watchdog-v123';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(

@@ -2,11 +2,37 @@
     'use strict';
     const rowTools = typeof module !== 'undefined' && module.exports ? require('./row.js') : root.DevlinExcelRow;
     const MIN_EXCEL_API = '1.9';
+    const expiredReads = new Set();
+
+    function hostTimeout() {
+        return Object.assign(new Error('Excel did not respond in time. Reopen PDF Forms if Refresh does not recover the connection.'),
+            {code:'excel_host_timeout'});
+    }
+    async function boundedRead(excel, work, options) {
+        if (expiredReads.size) throw hostTimeout();
+        const timeout = options.hostTimeoutMs ?? 20000;
+        if (!Number.isFinite(timeout) || timeout <= 0) throw new Error('Invalid Excel read deadline.');
+        const now = options.now || Date.now, deadline = now() + timeout;
+        const attempt = {expired:false};
+        const check = () => { if (attempt.expired || expiredReads.size || now() >= deadline) throw hostTimeout(); };
+        // Office requests cannot be canceled. Quarantine a timed-out read until it settles.
+        const operation = Promise.resolve().then(() => excel.run(async context => {
+            check();
+            const sync = async () => { check(); await context.sync(); check(); };
+            return work(context, sync);
+        })).then(value => { check(); return value; }).finally(() => { expiredReads.delete(attempt); });
+        let timer;
+        try {
+            return await Promise.race([operation, new Promise((_, reject) => {
+                timer = setTimeout(() => { attempt.expired=true; expiredReads.add(attempt); reject(hostTimeout()); }, timeout);
+            })]);
+        } finally { clearTimeout(timer); }
+    }
 
     async function readRows(excel, form, options = {}, batch = false) {
         const timeoutMs = options.timeoutMs ?? 15000;
         const sleep = options.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
-        return excel.run(async context => {
+        return boundedRead(excel, async (context, sync) => {
             const deadline = Date.now() + timeoutMs;
             const selection = context.workbook.getSelectedRange();
             selection.load('rowIndex,rowCount');
@@ -15,7 +41,7 @@
             const used = sheet.getUsedRange(true);
             used.load('columnIndex,columnCount');
             if (options.recalculate !== false) context.application.calculate(excel.CalculationType.recalculate);
-            await context.sync();
+            await sync();
             if(batch) {
                 if(!Number.isInteger(selection.rowIndex) || selection.rowIndex<1 || !Number.isInteger(selection.rowCount) ||
                     selection.rowCount<1 || selection.rowCount>10 || selection.rowIndex+selection.rowCount>1048576) {
@@ -31,11 +57,11 @@
             let loaded=false;
             do {
                 context.application.load('calculationState');
-                await context.sync();
+                await sync();
                 if (context.application.calculationState === excel.CalculationState.done) {
                     headers.load('values'); rows.forEach(row=>row.load(batch?'values,valueTypes,rowHidden':'values,valueTypes'));
                     context.application.load('calculationState');
-                    await context.sync();
+                    await sync();
                     if (context.application.calculationState === excel.CalculationState.done) {
                         loaded=true;
                         break;
@@ -65,7 +91,7 @@
                 }catch(error){record.error=sourceError(error,index);}
                 return record;
             });
-            if(dates.length)await context.sync();
+            if(dates.length)await sync();
             for(const date of dates) {
                 const parts=date.parts.map(part=>part.value),formatted=parts.join('/');
                 if(!parts.every(Number.isInteger) || !rowTools.isCalendarDate(formatted)) {
@@ -77,7 +103,7 @@
             context.application.load('calculationState');
             const current = context.workbook.getSelectedRange();
             current.load('rowIndex,rowCount'); current.worksheet.load('id');
-            await context.sync();
+            await sync();
             if (current.rowIndex !== selection.rowIndex || current.rowCount !== selection.rowCount || current.worksheet.id !== sheet.id ||
                 context.application.calculationState !== excel.CalculationState.done) {
                 throw new Error('The worksheet changed while reading the case. Select the row and try again.');
@@ -89,7 +115,7 @@
             return {sheet:sheet.name,sheetId:sheet.id,startRow:selection.rowIndex+1,rowCount:selection.rowCount,
                 rows:records.map(record=>record.error ? {row:record.row,data:null,error:{message:record.error.message,
                     code:record.error.code || 'source',issues:record.error.issues || [],source:record.error.source}} : {row:record.row,data:record.data,error:null})};
-        });
+        }, options);
     }
     async function readSelection(excel,form,options={}) {return readRows(excel,form,options);}
     async function selectSource(excel, source) {

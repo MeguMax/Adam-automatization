@@ -44,7 +44,7 @@ const event = {add: callback => {if(!qa.disableEvents) window.qa.events.push(cal
 const sheet = {id:'sheet-1',get name(){return qa.sheetName || 'Working Document'},load(){return this},
  getUsedRange(){return {columnIndex:0,columnCount:qa.headers.length,load(){return this}}},
  activate(){qa.activatedSheet='sheet-1'},getRangeByIndexes(row,column=0){return {get values(){return [row===0?qa.headers:(qa.rows?.[row] || qa.values)]},get rowHidden(){return (qa.hiddenRows || []).includes(row)},get valueTypes(){return [(qa.rows?.[row] || qa.values).map(x=>typeof x==='number'?'Double':'String')]},load(){return this},getCell(){return {isDate:true}},select(){qa.sourceSelection=[row,column];qa.rowIndex=row;qa.rowCount=1;qa.events.forEach(callback=>callback())}}}};
-window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const values of [qa.values,...Object.values(qa.rows || {})]) {for(const field of ['dc105_05','dc508_06','mc202_08']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Defendant')];}},load(){}},workbook:{
+window.Excel = {CalculationType:{recalculate:'Recalculate'},CalculationState:{done:'Done'},run:async callback=>callback({sync:async()=>{if(qa.stallOffice){qa.stalledSyncs=(qa.stalledSyncs||0)+1;await new Promise(resolve=>{qa.releaseOfficeRead=resolve})}},application:{get calculationState(){if(qa.pending>0){qa.pending--;return 'Calculating'} return 'Done'},calculate(){qa.calculations++;for(const values of [qa.values,...Object.values(qa.rows || {})]) {for(const field of ['dc105_05','dc508_06','mc202_08']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Landlord')];for(const field of ['dc105_06','dc508_08','mc202_10']) values[qa.headers.indexOf(field)]=values[qa.headers.indexOf('Defendant')];}},load(){}},workbook:{
  getSelectedRange(){return {rowIndex:qa.rowIndex,rowCount:qa.rowCount,worksheet:sheet,load(){return this}}},
  worksheets:{getItem(id){if(id!=='sheet-1')throw new Error('Unknown source sheet');return sheet},onChanged:event,onSelectionChanged:event,onActivated:event,onAdded:event,onDeleted:event},
  functions:Object.fromEntries(['month','day','year'].map((name,index)=>[name,()=>({value:Number((qa.date || '10/5/2026').split('/')[index]),load(){return this}})]))
@@ -199,6 +199,38 @@ window.Office = {HostType:{Excel:'Excel'},context:{requirements:{isSetSupported:
         assert.equal(await page.locator('#form').inputValue(), 'mc202');
         assert.equal(loginRequests, 1);
         await page.screenshot({ path: path.join(output, 'selected-row.png') });
+        const hostReadPage=await browser.newPage({viewport:{width:380,height:850}});
+        hostReadPage.on('pageerror',error=>errors.push(error.message));
+        let stalledGenerationRequests=0;
+        hostReadPage.on('request',request=>{if(/\/excel\/generate(?:-package)?$/.test(request.url()))stalledGenerationRequests++;});
+        await hostReadPage.route('**/*',async route=>{
+            if(route.request().url().startsWith('https://appsforoffice.microsoft.com/'))await route.fulfill({contentType:'text/javascript',body:fake});
+            else if(route.request().url().startsWith(base))await route.continue();else await route.abort();
+        });
+        try {
+            await hostReadPage.goto(base+'/excel/');
+            await hostReadPage.locator('#username').fill('excel-qa');
+            await hostReadPage.locator('#password').fill('excel-qa-only');
+            await hostReadPage.locator('#login').click();
+            await hostReadPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+            await hostReadPage.clock.install();
+            await hostReadPage.evaluate(()=>{(window as any).qa.stallOffice=true;});
+            await hostReadPage.locator('#refresh').click();
+            await hostReadPage.waitForFunction(()=>(window as any).qa.stalledSyncs===1);
+            await hostReadPage.clock.fastForward(20001);await hostReadPage.clock.resume();
+            await hostReadPage.waitForFunction(()=>document.getElementById('error')?.textContent?.includes('Excel did not respond in time'));
+            assert.equal(await hostReadPage.locator('#refresh').isEnabled(),true);
+            assert.equal(await hostReadPage.locator('#generate').isDisabled(),true);
+            assert.equal(await hostReadPage.locator('#signIn').isHidden(),true);
+            await hostReadPage.locator('#refresh').click();
+            assert.equal(await hostReadPage.evaluate(()=>(window as any).qa.stalledSyncs),1,'An unresolved read must not queue another Office operation');
+            await hostReadPage.screenshot({path:path.join(output,'office-read-timeout-mobile.png'),fullPage:true});
+            await hostReadPage.evaluate(()=>{const qa=(window as any).qa;qa.stallOffice=false;qa.releaseOfficeRead();});
+            await hostReadPage.locator('#refresh').click();
+            await hostReadPage.waitForFunction(()=>!(document.getElementById('generate') as HTMLButtonElement).disabled);
+            assert.equal(stalledGenerationRequests,0,'A timed-out Office read never sends stale data to PDF generation');
+            assert.equal(await hostReadPage.locator('#signIn').isHidden(),true);
+        } finally { await hostReadPage.close(); }
         let invalidPackageRequests=0;
         const countInvalidPackage=(request:any)=>{if(request.url().endsWith('/excel/generate-package'))invalidPackageRequests++;};
         page.on('request',countInvalidPackage);

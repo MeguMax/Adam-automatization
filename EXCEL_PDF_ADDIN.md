@@ -10,6 +10,7 @@ sends email, modifies case records, pays fees or submits a filing.
 - A **PDF Forms** button in the **Devlin Law** group on Excel's **Home** ribbon opens the panel. It does not generate or upload anything by itself.
 - Current selected row is recalculated and read from the open workbook immediately before generation. No XLSX cache or workbook upload is used.
 - Generation waits up to 15 seconds for Excel to finish calculating. If calculation does not finish, no PDF is generated from cached values.
+- A separate 20-second deadline covers the complete Office row read, including a stalled Excel.run or context.sync. Timed-out reads cannot return late values or begin late recalculation. Further reads are blocked until the abandoned Office operation settles; if the host never recovers, reopen PDF Forms. No worksheet values or formulas are rewritten.
 - The selected sheet, row, case identity and mapped field values are checked again after generation and immediately before download. A changed case or formula invalidates the PDF and requires regeneration.
 - Changes and selections are tracked across the worksheet collection, including newly added sheets. Rechecks still protect downloads when host change events are unavailable.
 - Exact matching column names; missing/duplicate columns and mapped Excel errors stop generation. Errors in unrelated columns do not block a valid form.
@@ -111,6 +112,24 @@ eight pages. The workbook file hash stayed unchanged. Evidence is under
 `output/excel-recovery-2026-11-06/`, including `native-zip-verification.json` and
 the source-navigation screenshots. Excel Online native v115 acceptance is not
 claimed by this run. Saving remains local; no OneDrive or MiFILE actions ran.
+
+## Office read recovery (v123)
+
+A 20-second outer watchdog now covers Excel.run startup, every context.sync,
+date-part reads and the final source-selection check. The 15-second calculation
+check remains separate. A timed-out Office operation is not cancelable by the
+add-in, so it is quarantined until it settles. Another read cannot accumulate
+behind that abandoned operation, and a delayed callback cannot begin a fresh
+calculation or return old field values. Refresh can recover once Office responds;
+reopening the panel recovers from a permanently stalled host. Values and formulas
+are never repaired or overwritten by this recovery.
+
+Dedicated regressions cover delayed Excel.run startup, stalled batch sync,
+late-result rejection and recovery to the current row. The explicitly simulated
+Excel 1.9 browser smoke checks the timeout message, retained PDF session, available
+Refresh, blocked generation, absence of stale PDF requests and successful refresh
+after Office recovers. Existing three-form and multi-case PDF/ZIP checks remain
+separate from a new real Excel Online pilot. Delivery remains local-only.
 
 ## Multiple-case local generation (v96)
 
