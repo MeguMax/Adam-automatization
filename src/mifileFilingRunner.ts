@@ -16,7 +16,7 @@ import { validCompletenessSnapshot } from './packageCompleteness';
 import { getMiFileRuntimeConfig } from './mifileRuntimeConfig';
 import { getMiFileCredentials, MiFileCredentials } from './mifileAccountSettings';
 import { authenticateMifilePage, dismissMifilePreparationNotice, matchesMiFileAccountHeader } from './mifileSession';
-import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents,
+import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, REQUIRED_MIFILE_FILER, usdCents, savedBundleRecoverySnapshot,
     type FilingSourceFingerprint, type MiFileFeeObservation, type MiFileSavedBundleEvidence } from './mifilePreparationEvidence';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -369,6 +369,41 @@ export class MiFileFilingRunner {
                     fs.rmSync(documentDirectory, { recursive: true, force: true });
                 }
             }
+        }
+    }
+
+    async recheckSavedBundle(job:FilingJobView):Promise<MiFilePreparationResult> {
+        if (job.status !== 'running' || job.checkpoint !== 'verify_saved_bundle') throw new Error('The read-only saved-bundle check is not active.');
+        const saved=savedBundleRecoverySnapshot(job), credentials=getMiFileCredentials();
+        if (!getMiFileRuntimeConfig().ready || credentials.username.trim().toLowerCase() !== saved.accountEmail) {
+            throw new Error('Use the same verified MiFILE account that created this saved bundle.');
+        }
+        const directory=fs.mkdtempSync(path.join(os.tmpdir(),'mifile-saved-check-'));
+        let browser:Awaited<ReturnType<typeof chromium.launch>>|null=null;
+        const screenshotPath=path.join(this.debugRoot,safePathToken(job.id),'rechecked.png');
+        try {
+            await this.log('info','verify_saved_bundle','Read-only check of the exact saved bundle; no uploads, Save, checkout or submission.',{event:'saved_bundle_read_only_check'});
+            const documents=await this.materializeDocuments(job.payload!,directory);
+            if (preparationDigest(job.payload!,documents.map(document=>document.fingerprint)) !== saved.packageDigest) {
+                throw new Error('A source PDF changed after this bundle was saved. No MiFILE changes were made.');
+            }
+            browser=await chromium.launch({headless:envFlag(process.env.MIFILE_FILING_HEADLESS,true),args:['--no-sandbox','--disable-dev-shm-usage']});
+            const page=await browser.newPage({viewport:{width:1440,height:1000}});
+            page.setDefaultTimeout(this.timeoutMs);
+            await this.login(page,credentials);
+            await this.reopenSavedBundle(page,saved.url,job.payload!,saved.documentManifest,credentials.username,saved.externalBundleId,saved.temporaryCaseNumber);
+            const savedBundleEvidence:MiFileSavedBundleEvidence={version:1,verifiedAt:new Date().toISOString(),
+                externalBundleId:saved.externalBundleId,temporaryCaseNumber:saved.temporaryCaseNumber,accountEmail:saved.accountEmail,
+                filer:REQUIRED_MIFILE_FILER,courtName:job.payload!.courtName,sourcePdfCount:documents.length,
+                generatedPdfCount:1,connectedPdfCount:saved.documentManifest.filter(document=>document.filingRelation==='connected_to_complaint').length,
+                packageDigest:saved.packageDigest,sources:saved.sources,fees:await this.observeFees(page,job.payload!.filingData.defendants.length),
+                paymentAuthorized:false,courtSubmissionAuthorized:false};
+            fs.mkdirSync(path.dirname(screenshotPath),{recursive:true});
+            await page.screenshot({path:screenshotPath,fullPage:true});
+            return {checkpoint:'saved_unsubmitted',url:saved.url,externalBundleId:saved.externalBundleId,temporaryCaseNumber:saved.temporaryCaseNumber,
+                uploadedDocuments:documents.length,mifileVersion:null,screenshotPath,documentManifest:saved.documentManifest,savedBundleEvidence};
+        } finally {
+            try {await browser?.close();} finally {fs.rmSync(directory,{recursive:true,force:true});}
         }
     }
 
@@ -825,7 +860,9 @@ export class MiFileFilingRunner {
             if (miFileBundleId(page.url()) !== bundleId) throw new Error('MiFILE did not reopen the expected saved bundle.');
             await this.verifyAccount(page, username);
             const body = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
-            if (!body.includes(payload.courtName.replace(/\s+/g, ' ')) ||
+            const courtMatches=body.includes(payload.courtName.replace(/\s+/g, ' ')) ||
+                (payload.courtName === 'MI Macomb County - 37th District Court' && /\bFile to:\s*MI 37th District Court\s+Case Number:/i.test(body));
+            if (!courtMatches ||
                 body.match(/\bTEMP-[A-Z0-9-]+\b/i)?.[0] !== temporaryCaseNumber ||
                 !isRequiredMiFileFiler(await page.locator('#filer-input-selected').inputValue())) {
                 throw new Error('Saved bundle court, temporary case or filer did not match the preparation snapshot.');

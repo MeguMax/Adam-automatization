@@ -5,8 +5,9 @@ import path from 'node:path';
 import test, { after, before } from 'node:test';
 import { chromium, Browser, Page } from 'playwright';
 import type { FilingDocumentPayload, FilingJobView, FilingPayload } from './database';
-import { createHash } from 'node:crypto';
-import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, usdCents } from './mifilePreparationEvidence';
+import { createHash, randomUUID } from 'node:crypto';
+import { filingReleaseChecks, isRequiredMiFileFiler, isRequiredMiFileFilerOption, miFileBundleId, preparationDigest, usdCents, savedBundleRecoverySnapshot } from './mifilePreparationEvidence';
+import { recheckSavedFilingJob } from './savedBundleRecheck';
 import { testPdfFixture } from './testPdfFixture';
 import { completenessContext, evaluatePackageCompleteness } from './packageCompleteness';
 import { recognizeDocumentText } from './documentRecognition';
@@ -722,14 +723,14 @@ test('source fingerprints bind all PDFs and case fields to the preparation snaps
 
 async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;wrongAccount?:boolean;wrongFiler?:boolean;
     missingPdf?:boolean;extraPdf?:boolean;wrongParent?:boolean;warning?:boolean;serve?:boolean;quantity?:number;
-    wrongGeneratedType?:boolean;generatedWarning?:boolean;mailingCents?:number} = {}) {
+    wrongGeneratedType?:boolean;generatedWarning?:boolean;mailingCents?:number;courtHeader?:string} = {}) {
     const page = await browser.newPage();
     const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
     const rows = `<tbody id="filing-0"><tr><td></td><td>Case Initiation Form<input hidden name="documentName_0" value="Case Initiation Form"></td><td>1 KB</td><td>CASE INIT FORM<input hidden placeholder="Select or Type Filing Type" value="${options.wrongGeneratedType?'Other':'ISI_CASE_INIT_FORM_DT'}"></td><td><span class="glyphicon-${options.generatedWarning?'alert':'ok'}" ${options.generatedWarning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>` +
         `<tbody id="filing-1"><tr><td></td><td><input name="documentName_1" value="${options.wrongName?'Wrong PDF':'Document 0'}"></td><td></td><td>1 KB</td><td><input id="selectFilingTypeInput_1" value="${options.wrongType?'Other':'Complaint for Possession Only'}"></td><td><span class="glyphicon-ok">Uploaded</span></td><td>$45.00</td><td>View</td></tr></tbody>` +
         (options.missingPdf?'':`<tbody id="child-${options.wrongParent?2:1}-0"><tr><td></td><td><input name="documentName_0" value="Document 1"></td><td></td><td>1 KB</td><td>CONNECTED FILING</td><td><span class="glyphicon-${options.warning?'alert':'ok'}" ${options.warning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>`) +
         (options.extraPdf?'<tbody id="filing-2"><tr><td>Unexpected PDF</td></tr></tbody>':'');
-    const html = `<header>${options.wrongAccount?'other@example.com':'qa@example.com'}</header><main>MI Example County - 45th District Court TEMP-QA</main>` +
+    const html = `<header>${options.wrongAccount?'other@example.com':'qa@example.com'}</header><main>${options.courtHeader || 'MI Example County - 45th District Court'} TEMP-QA</main>` +
         `<input id="filer-input-selected" value="${options.wrongFiler?'Devlin, Adam (P00000)':'Devlin, Adam (P72877)'}">` +
         `<label><input type="checkbox" ${options.serve?'checked':''}>Serve Document</label><input type="checkbox" id="isEmergency">` +
         `<table id="documentTable"><caption>Filing documents</caption>${rows}</table>` +
@@ -754,6 +755,127 @@ test('saved-bundle readback verifies account, filer, generated form and Connecte
         assert.equal(fees.lines.at(-1).label,'Mailing Fee');
         assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
     } finally {await f.page.close();}
+});
+
+test('saved 37th court short header is verified only in the File to identity field',async()=>{
+    for(const header of ['File to: MI 37th District Court Case Number:',
+        'File to: MI 137th District Court Case Number:',
+        'File to: MI Another County - 37th District Court Case Number:',
+        'Other document mentions MI 37th District Court']) {
+        const f=await savedBundlePage({courtHeader:header});
+        try {
+            f.payload.courtName='MI Macomb County - 37th District Court';
+            const runner=new MiFileFilingRunner();
+            if(header==='File to: MI 37th District Court Case Number:') await (runner as any).verifySavedBundle(f.page,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA');
+            else await assert.rejects((runner as any).verifySavedBundle(f.page,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA'));
+            assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
+        } finally {await f.page.close();}
+    }
+});
+
+function savedRecheckFixture() {
+    const {WorkflowDatabase}=require('./database') as typeof import('./database');
+    const {buildFilingIntake}=require('./filingIntake') as typeof import('./filingIntake');
+    const db=new WorkflowDatabase(path.join(directory,'recheck-'+randomUUID()+'.sqlite'));
+    const parsed=buildFilingIntake({id:randomUUID()},[]);parsed.intake!.manual=true;
+    const email=db.registerEmail({id:randomUUID(),subject:'NEW LT FILING - QA saved recheck'}),draft=db.createCaseDraft(email.id,parsed);
+    const pdf=testPdfFixture('AFFIDAVIT OF SERVICE'),hash=createHash('sha256').update(pdf).digest('hex');
+    db.addDocument({emailId:email.id,caseDraftId:draft,currentFilename:'Other.pdf',documentType:'Other',oneDriveUrl:'https://onedrive.example/other',
+        status:'uploaded',fileSize:pdf.length,uploadSource:'test',metadata:{recognition:{...recognizeDocumentText(['AFFIDAVIT OF SERVICE'],'Other.pdf'),contentHash:hash,recognitionVersion:2}}});
+    const party={displayName:'Example Owner LLC',entityName:'Example Owner LLC',partyType:'entity',address1:'100 Main Street',city:'Lincoln Park',state:'MI',postalCode:'48146'};
+    db.updateCaseDraft(draft,{courtName:'MI Example County - 45th District Court',caseTitle:'Example Owner v Tenant',plaintiff:'Example Owner LLC',defendant:'Morgan Tenant',
+        supportingRequirement:'none',supportingRequirementReason:'Attorney reviewed this custom QA package and its supporting-document exception.'},undefined,
+    {caseType:'LT - Landlord-Tenant Summary Proceedings',action:'Initiate a new case',relatedCivilAction:'none',moneyJudgmentRequested:false,claimAmount:'0.00',mailingRequested:true,
+        plaintiff:party,defendants:[{...party,partyType:'person',entityName:null,displayName:'Morgan Tenant',firstName:'Morgan',lastName:'Tenant'}]});
+    db.reviewCaseDraft(draft,'approve');const job=db.queueFilingJob(draft),payload=job.payload!,document=payload.documents[0];
+    const sources=[{documentId:document.id,sha256:hash,bytes:pdf.length}],digest=preparationDigest(payload,sources);
+    const manifest=[{documentId:document.id,filename:document.filename,filingName:document.filingName,filingType:document.filingType,
+        filingRelation:'separate' as const,parentDocumentId:null,mifileRowId:'filing-1'}];
+    const id='fd2c1ad4-633d-429a-0166-08df32c555de',temporary='TEMP-QA';
+    db.appendFilingJobLog(job.id,{level:'info',checkpoint:'verify_saved_bundle',message:'Saved the exact bundle',details:{event:'bundle_saved',
+        externalBundleId:id,temporaryCaseNumber:temporary,accountEmail:'qa@example.com',documentManifest:manifest,sources,packageDigest:digest}});
+    db.completeFilingJob({filingJobId:job.id,status:'reconciliation_required',checkpoint:'reconciliation_required'});
+    const result={checkpoint:'saved_unsubmitted' as const,url:'https://mifile.courts.michigan.gov/filing/create/'+id,externalBundleId:id,temporaryCaseNumber:temporary,
+        uploadedDocuments:1,mifileVersion:null,screenshotPath:null,documentManifest:manifest,savedBundleEvidence:{version:1 as const,verifiedAt:new Date().toISOString(),
+            externalBundleId:id,temporaryCaseNumber:temporary,accountEmail:'qa@example.com',filer:'Devlin, Adam (P72877)',courtName:payload.courtName,
+            sourcePdfCount:1,generatedPdfCount:1,connectedPdfCount:0,packageDigest:digest,sources,fees:{source:'unsubmitted_upload' as const,currency:'USD' as const,
+                observedAt:new Date().toISOString(),lines:[],displayedSubtotalCents:0,checkoutTotalCents:null,processingFeeCents:null},paymentAuthorized:false as const,courtSubmissionAuthorized:false as const}};
+    return {db,job,hash,result};
+}
+
+test('read-only saved-bundle recheck retains the same attempt, original fields, PDFs and exact verified result',async()=>{
+    const f=savedRecheckFixture();
+    try {
+        const before=f.db.getDraftDetail(f.job.caseDraftId)!,original=f.db.getFilingJob(f.job.id)!;
+        assert.equal(savedBundleRecoverySnapshot(original).externalBundleId,original.externalBundleId);
+        const active=f.db.beginSavedBundleVerification(f.job.id);
+        assert.throws(()=>f.db.beginSavedBundleVerification(f.job.id),/Only a saved attempt/);
+        await recheckSavedFilingJob(f.db,active,async()=>f.result);
+        const finished=f.db.getFilingJob(f.job.id)!;
+        assert.equal(finished.status,'prepared');assert.equal(finished.result!.readOnlyRecheck,true);
+        assert.equal(filingReleaseChecks(finished,null).savedBundleVerified,true);
+        assert.equal(f.db.listFilingJobs(f.job.caseDraftId).length,1);
+        const after=f.db.getDraftDetail(f.job.caseDraftId)!;
+        assert.deepEqual(after.caseDraft!.filingData,before.caseDraft!.filingData);
+        assert.deepEqual(after.documents,before.documents);
+        assert.throws(()=>f.db.beginSavedBundleVerification(f.job.id),/Only a saved attempt/);
+    } finally {f.db.close();}
+});
+
+test('saved-bundle recheck refuses stale sources, manifests and identity before changing state',()=>{
+    const f=savedRecheckFixture();
+    try {
+        const original=f.db.getFilingJob(f.job.id)!;
+        for(const change of [{externalBundleId:randomUUID()},{packageDigest:'ab'.repeat(32)},
+            {sources:[]},{documentManifest:[]},{documentManifest:[{...f.result.documentManifest[0],filingType:'Wrong'}]}]) {
+            const damaged=structuredClone(original),saved=damaged.executionLog.find(entry=>entry.details?.event==='bundle_saved')!;
+            Object.assign(saved.details!,change);assert.throws(()=>savedBundleRecoverySnapshot(damaged));
+        }
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'reconciliation_required');
+    } finally {f.db.close();}
+});
+
+test('a failed or interrupted saved check cannot create a new attempt or apply a late Prepared result',async()=>{
+    const f=savedRecheckFixture();
+    try {
+        await recheckSavedFilingJob(f.db,f.db.beginSavedBundleVerification(f.job.id),async()=>{throw Error('Read timed out');});
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'reconciliation_required');
+        assert.equal(f.db.getFilingJob(f.job.id)!.externalBundleId,f.result.externalBundleId);
+        const active=f.db.beginSavedBundleVerification(f.job.id);
+        let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+        const pending=recheckSavedFilingJob(f.db,active,async()=>{await gate;return f.result;});
+        assert.equal(f.db.recoverInterruptedFilingJobs(),1);
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'reconciliation_required');
+        release();await pending;
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'reconciliation_required');
+        assert.equal(f.db.listFilingJobs(f.job.caseDraftId).length,1);
+    } finally {f.db.close();}
+});
+
+test('a saved check cannot bind a result to a different bundle or a stale source digest',async()=>{
+    const f=savedRecheckFixture();
+    try {
+        await recheckSavedFilingJob(f.db,f.db.beginSavedBundleVerification(f.job.id),async()=>({...f.result,externalBundleId:randomUUID()}));
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'reconciliation_required');
+        await recheckSavedFilingJob(f.db,f.db.beginSavedBundleVerification(f.job.id),async()=>({...f.result,savedBundleEvidence:{...f.result.savedBundleEvidence,packageDigest:'ab'.repeat(32)}}));
+        assert.equal(f.db.getFilingJob(f.job.id)!.status,'reconciliation_required');
+    } finally {f.db.close();}
+});
+
+test('saved-bundle recheck rejects changed OneDrive bytes before opening MiFILE or calling any write method',async()=>{
+    const f=savedRecheckFixture(),drive=require('./oneDriveClient'),resolve=drive.resolveSharedDriveItem,download=drive.downloadDriveItemBuffer;
+    drive.resolveSharedDriveItem=async()=>({driveId:'qa',itemId:'qa'});
+    drive.downloadDriveItemBuffer=async()=>testPdfFixture('Changed affidavit');
+    let browserCalls=0,writes=0;
+    const runner=new MiFileFilingRunner();
+    (runner as any).login=async()=>{browserCalls++;throw Error('Browser must not open');};
+    for(const method of ['openNewLtCase','completeCaseForm','uploadDocuments','saveProgress'])
+        (runner as any)[method]=async()=>{writes++;throw Error('MiFILE writes are forbidden');};
+    try {
+        await assert.rejects(runner.recheckSavedBundle(f.db.beginSavedBundleVerification(f.job.id)),
+            (error:any)=>error.code==='PACKAGE_CONTENT_CHANGED');
+        assert.equal(browserCalls,0);assert.equal(writes,0);
+    } finally {drive.resolveSharedDriveItem=resolve;drive.downloadDriveItemBuffer=download;f.db.close();}
 });
 
 test('persisted bundle mismatches stop for reconciliation; no missing PDF, warning or other filer is accepted', async () => {

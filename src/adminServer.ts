@@ -54,9 +54,10 @@ import { filingReleaseChecks } from './mifilePreparationEvidence';
 import { draftNotificationConfig } from './draftNotifications';
 import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
+import { recheckSavedFilingJob } from './savedBundleRecheck';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-07-real-batch-court-selection-v119';
+const ADMIN_BUILD_ID = '2026-11-07-saved-bundle-recheck-v120';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -5249,6 +5250,8 @@ const html = String.raw`<!doctype html>
           '<div class="reconciliation-notice"><strong>Check MiFILE first.</strong> ' +
           'Open History → Unsubmitted and look for this case. Do not retry until the result is confirmed.</div>' +
           '<div class="draft-filing-job-actions">' +
+          (job.externalBundleId && job.executionLog.some(entry => entry.details?.event === 'bundle_saved') ?
+            '<button type="button" data-recheck-saved-bundle>' + icon('refresh-cw') + 'Recheck saved bundle</button>' : '') +
           '<button type="button" data-reconcile-filing-job="found">' +
           icon('circle-check') + 'Bundle found</button>' +
           '<button type="button" data-reconcile-filing-job="not_found">' +
@@ -5283,6 +5286,16 @@ const html = String.raw`<!doctype html>
           reconcileFilingJob(job.id, button.dataset.reconcileFilingJob)
             .catch(showDraftError);
         });
+      });
+      root.querySelector('[data-recheck-saved-bundle]')?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          await api('/api/filing-jobs/' + encodeURIComponent(job.id) + '/recheck-saved', {method:'POST'});
+          showToast('Checking the existing Unsubmitted bundle. PDFs will not be uploaded again.');
+          await refreshDraftFilingState();
+        } catch (error) { showDraftError(error); }
+        finally { if (button.isConnected) button.disabled = false; }
       });
       updateDraftPreparationButton();
       renderIcons();
@@ -8767,6 +8780,16 @@ export function createAdminServer(
                 return;
             }
 
+            const recheckSavedMatch = url.pathname.match(/^\/api\/filing-jobs\/([^/]+)\/recheck-saved$/);
+            if (req.method === 'POST' && recheckSavedMatch) {
+                try {
+                    if (!getMiFileRuntimeConfig().ready) throw new Error('Verify the saved MiFILE account before checking this bundle.');
+                    const job=db.beginSavedBundleVerification(decodeURIComponent(recheckSavedMatch[1]));
+                    void recheckSavedFilingJob(db,job).catch(error=>console.error('Saved-bundle check could not be finalized:',error instanceof Error ? error.message : 'Unknown error'));
+                    sendJson(res,202,{queued:true,filingJobId:job.id});
+                } catch(error) {sendJson(res,409,{error:error instanceof Error ? error.message : 'The saved-bundle check could not start'});}
+                return;
+            }
             const reconcileFilingJobMatch = url.pathname.match(
                 /^\/api\/filing-jobs\/([^/]+)\/reconcile$/,
             );

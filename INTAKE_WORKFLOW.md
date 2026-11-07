@@ -121,6 +121,21 @@ ten seconds) and requires exactly one result. Missing or ambiguous options stop
 before new-case initiation. Substring matches such as `137th District Court`
 cannot satisfy this lookup. Court names and manual case fields are not rewritten.
 
+The saved 37th court's `File to: MI 37th District Court` header is accepted only
+for this canonical Macomb court. The exact temporary number, account, filer,
+complete PDF manifest, parent connections and generated initiation form must
+still match. Mentions in other document text and another county/district do not
+satisfy the short-header check.
+
+For an uncertain result with a complete recorded `bundle_saved` snapshot,
+**Recheck saved bundle** reopens only that exact existing bundle. It re-downloads
+the original source PDFs to compare the saved fingerprints before opening MiFILE,
+then verifies the saved court, filer, PDF rows and connections. It never starts a
+new case, uploads documents, saves changes, opens checkout, accepts payment terms
+or submits a filing. A successful read updates the same attempt to Prepared;
+failure or interruption keeps reconciliation required, with no automatic retry.
+Older/incomplete snapshots still require the existing manual reconciliation.
+
 Release v116 passed all 487 automated tests and authenticated desktop/mobile
 browser smoke checks, including canceled/saved switching, exact-document review,
 supporting-PDF movement and delayed-navigation edit protection. The combined

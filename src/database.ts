@@ -14,6 +14,7 @@ import { filingPreparationProgress, type FilingPreparationProgress } from './fil
 import { CheckoutStore } from './checkoutStore';
 import {SubmissionStore} from './mifileSubmission';
 import { migrateBundleActivity } from './mifileBundleSafety';
+import { savedBundleRecoverySnapshot } from './mifilePreparationEvidence';
 import { buildFilingIntake, intakeCasePrefix, splitFilingIntake } from './filingIntake';
 import { DraftNotificationStore } from './draftNotifications';
 import { matchesSupportingCase } from './batchCaseMatching';
@@ -6287,6 +6288,21 @@ export class WorkflowDatabase {
         const completed = this.getFilingJob(input.filingJobId);
         if (!completed) throw new Error('Completed MiFILE job could not be loaded');
         return completed;
+    }
+
+    beginSavedBundleVerification(filingJobId:string): FilingJobView {
+        this.runInTransaction(() => {
+            const job=this.getFilingJob(filingJobId);
+            if (!job || job.status !== 'reconciliation_required') throw new Error('Only a saved attempt requiring reconciliation can be checked.');
+            savedBundleRecoverySnapshot(job);
+            const timestamp=nowIso();
+            this.db.prepare("UPDATE filing_jobs SET status='running',checkpoint='verify_saved_bundle',started_at=?,finished_at=NULL,error_code=NULL,error_message=NULL,last_heartbeat_at=?,updated_at=? WHERE id=?")
+                .run(timestamp,timestamp,timestamp,filingJobId);
+            this.db.prepare("UPDATE case_drafts SET status='filing_in_progress',filing_status='running',updated_at=? WHERE id=?")
+                .run(timestamp,job.caseDraftId);
+            this.insertAuditLog('filing_job',filingJobId,'saved_bundle_read_only_check_started',{externalBundleId:job.externalBundleId});
+        });
+        return this.getFilingJob(filingJobId)!;
     }
 
     resolveFilingJobReconciliation(input: {

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { FilingJobView, FilingPayload } from './database';
+import type { MiFileDocumentReceipt } from './mifileFilingRunner';
 
 export const REQUIRED_MIFILE_FILER = 'Devlin, Adam (P72877)';
 
@@ -72,6 +73,32 @@ export interface MiFileSavedBundleEvidence {
     fees: MiFileFeeObservation;
     paymentAuthorized: false;
     courtSubmissionAuthorized: false;
+}
+
+export function savedBundleRecoverySnapshot(job: FilingJobView) {
+    const saved = [...job.executionLog].reverse().find(entry => entry.details?.event === 'bundle_saved')?.details;
+    const payload = job.payload;
+    if (!saved || !payload || !job.externalBundleId || !job.temporaryCaseNumber ||
+        saved.externalBundleId !== job.externalBundleId || saved.temporaryCaseNumber !== job.temporaryCaseNumber ||
+        typeof saved.accountEmail !== 'string' || !saved.accountEmail.trim() ||
+        !Array.isArray(saved.documentManifest) || !Array.isArray(saved.sources) ||
+        typeof saved.packageDigest !== 'string') throw new Error('No complete saved-bundle snapshot is available. Check MiFILE manually.');
+    const sources = saved.sources as FilingSourceFingerprint[];
+    if (preparationDigest(payload, sources) !== saved.packageDigest) throw new Error('The saved PDF snapshot no longer matches this attempt.');
+    const manifest = saved.documentManifest as MiFileDocumentReceipt[], primary = payload.documents.find(document => document.isPrimary)?.id;
+    if (manifest.length !== payload.documents.length || new Set(manifest.map(item => item.documentId)).size !== manifest.length ||
+        new Set(manifest.map(item => item.mifileRowId)).size !== manifest.length || payload.documents.some(document =>
+            !manifest.some(item => item.documentId === document.id && item.filename === document.filename &&
+                item.filingName === document.filingName && item.filingRelation === document.filingRelation &&
+                item.filingType === (document.filingRelation === 'connected_to_complaint' ? 'CONNECTED FILING' : document.filingType) &&
+                item.parentDocumentId === (document.filingRelation === 'connected_to_complaint' ? primary : null) &&
+                /^(?:filing-\d+|child-\d+-\d+)$/.test(item.mifileRowId)))) {
+        throw new Error('The saved PDF manifest is incomplete or inconsistent. Check MiFILE manually.');
+    }
+    const url = 'https://mifile.courts.michigan.gov/filing/create/' + job.externalBundleId;
+    if (miFileBundleId(url) !== job.externalBundleId) throw new Error('The saved bundle reference is invalid.');
+    return {url, externalBundleId:job.externalBundleId, temporaryCaseNumber:job.temporaryCaseNumber,
+        accountEmail:saved.accountEmail.trim().toLowerCase(), documentManifest:manifest, sources, packageDigest:saved.packageDigest};
 }
 
 export function filingReleaseChecks(job: FilingJobView, currentAccount: {
