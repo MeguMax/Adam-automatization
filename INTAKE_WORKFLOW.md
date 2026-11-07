@@ -77,6 +77,28 @@ PDFs and no validation issues; its manual field, the sibling case, source bytes
 and existing links were retained. Replaying intake added no uploads. This was
 not a live MiFILE, notification, payment or court-submission test.
 
+**Document tools > Create case from PDFs** is available in an editable
+**Unassigned attachments** group. Choose exactly one verified Complaint, a case
+label, and the other PDFs belonging to that case (up to 100 total). The server
+validates every current source version before atomically moving the existing
+records into an independent standard LT Draft from the same email. It preserves
+the original OneDrive files, links and recognition evidence. Library copies
+cannot be selected. Cancel leaves pending group edits untouched.
+
+The selected Complaint is queued for automatic reading in the new case. Mixed
+group fields and review notes are not copied; its existing manual corrections
+remain in the source. Advice/Local follow the newly extracted court. The new
+case requires review and **Confirm & prepare**; splitting cannot submit a filing
+or charge an account. An empty source group is archived, not deleted, and email
+replay cannot recreate the transferred documents.
+
+Case creation has a persistent request ID and a digest of the exact selection.
+An identical retry returns the existing Draft even after a restart or preparation;
+reusing the ID for different PDFs is rejected. If a response is interrupted,
+**Check result** performs a read-only lookup before another attempt. The chosen
+PDFs remain frozen until the result is checked. No fresh package is automatically
+created after an uncertain response.
+
 Release v116 passed all 487 automated tests and authenticated desktop/mobile
 browser smoke checks, including canceled/saved switching, exact-document review,
 supporting-PDF movement and delayed-navigation edit protection. The combined

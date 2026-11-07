@@ -13,6 +13,7 @@ export interface FilingIntakeInfo {
     packageKey?: string;
     packageLabel?: string;
     batchSize?: number;
+    manualSplit?: { requestId: string; sourceDraftId: string; digest: string; complaintDocumentId: string };
     groups?: Array<{ key: string; label: string; sources: string[]; issues: string[] }>;
 }
 

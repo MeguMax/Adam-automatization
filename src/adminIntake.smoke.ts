@@ -1433,7 +1433,102 @@ async function main() {
         assert.equal(await page.locator('#draftAddDocumentBtn').isDisabled(),true);
         assert.equal(await page.locator('#draftSaveBtn').isDisabled(),true);
         assert.equal(db.listFilingJobs().some(job=>batch.some(item=>item.draftId===job.caseDraftId)),false);
+        const splitMessage={...message,id:'qa-whole-case-split',subject:'NEW LT FILING - QA legacy filenames'};
+        const splitEmail=db.registerEmail(splitMessage);
+        const splitNames=['Reference R Complaint.pdf',...['LegacyAlpha','LegacyBeta'].flatMap(prefix=>['Complaint','Summons','Request','Demand'].map(role=>prefix+' '+role+'.pdf'))];
+        const splitParsed=buildFilingIntake(splitMessage,splitNames.map((name,index)=>({id:'split-'+index,name,contentType:'application/pdf',size:readingPdf.length,isInline:false})));
+        const splitSource=db.createCaseDrafts(splitEmail.id,splitParsed).find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        for(const document of db.getDraftDetail(splitSource)!.documents){
+            const name=document.originalFilename!,role=name.split(' ')[1].replace('.pdf','');
+            const content=role==='Complaint'?readingPdf:testPdfFixture({Summons:'SUMMONS LANDLORD TENANT',Request:'REQUEST FOR COURT MAILING AND RECORD',Demand:'DEMAND FOR POSSESSION NONPAYMENT OF RENT'}[role]!);
+            storedFiles.set(name,content);
+            db.completeDocumentRetrySuccess({documentId:document.id,originalFilename:name,currentFilename:name,documentType:document.documentType,
+                sourceUrl:document.sourceUrl,oneDriveUrl:'https://onedrive.example/'+encodeURIComponent(name),fileSize:content.length,
+                uploadSource:'email_intake',storagePath:'QA/'+name,downloadAttempts:1,metadata:{driveId:'fixture-drive',itemId:name}});
+            db.recordDocumentRecognition(document.id,await recognize(content,name));
+        }
+        db.markEmailProcessed(splitEmail.id);
+        db.refreshCaseDraftValidation(splitSource);
+        extractionWorkerAvailable=true;
         await page.setViewportSize({width:1440,height:1000});
+        await page.evaluate(id=>(window as any).openDraft(id),splitSource);
+        await page.locator('#draftActivityTab').click();
+        await page.locator('#draftReviewerNotes').fill('Source-only note; do not copy to a new case.');
+        const openSplit=async()=>{
+            const documentMode=page.getByRole('button',{name:'Document',exact:true});
+            if(await documentMode.isVisible())await documentMode.click();
+            await clickDocumentTool('draftSplitCaseBtn');
+            await page.locator('#draftSplitComplaint option').nth(1).waitFor({state:'attached'});
+        };
+        await openSplit();
+        assert.equal(await page.locator('#draftSplitCheck').isHidden(),true);
+        assert.equal(await page.locator('#draftSplitComplaint option').count(),3);
+        assert.equal(await page.locator('#draftSplitList input').count(),6);
+        await page.locator('#draftSplitCancel').click();
+        assert.equal(db.getDraftDetail(splitSource)!.caseDraft!.reviewerNotes,null);
+        assert.equal(await page.locator('#draftReviewerNotes').inputValue(),'Source-only note; do not copy to a new case.');
+        const splitBefore=db.getDraftDetail(splitSource)!;
+        const alphaDocs=splitBefore.documents.filter(doc=>doc.originalFilename!.startsWith('LegacyAlpha'));
+        const alphaComplaint=alphaDocs.find(doc=>doc.packageRole==='complaint')!;
+        const splitInput={requestId:crypto.randomUUID(),label:'Alpha case',complaintDocumentId:alphaComplaint.id,
+            documents:alphaDocs.map(doc=>({documentId:doc.id,sourceVersion:doc.sourceVersion!}))};
+        assert.equal((await context.request.post(`${url}/api/drafts/${splitSource}/split-case`,{headers:{Origin:url},
+            data:{...splitInput,documents:splitInput.documents.map((doc,index)=>index?doc:{...doc,sourceVersion:'stale'})}})).status(),409);
+        assert.equal(db.getDraftDetail(splitSource)!.documents.length,8);
+        await openSplit();
+        await page.locator('#draftSplitLabel').fill('Alpha case');
+        await page.locator('#draftSplitComplaint').selectOption(alphaComplaint.id);
+        for(const doc of alphaDocs.filter(doc=>doc.id!==alphaComplaint.id))await page.locator('#draftSplitList input[value="'+doc.id+'"]').check();
+        await page.screenshot({path:path.join(screenshots,'draft-split-case-desktop.png'),fullPage:true});
+        await page.setViewportSize({width:390,height:844});
+        const splitBox=await page.locator('#draftSplitDialog').boundingBox();
+        assert.ok(splitBox&&splitBox.x>=0&&splitBox.x+splitBox.width<=391&&splitBox.y>=0&&splitBox.y+splitBox.height<=845);
+        assert.equal(await page.locator('#draftSplitList label').evaluateAll(labels=>labels.every(label=>label.scrollWidth<=label.clientWidth+1)),true);
+        await page.screenshot({path:path.join(screenshots,'draft-split-case-mobile.png'),fullPage:true});
+        const splitRoute=new RegExp('/api/drafts/'+splitSource+'/split-case$');
+        let committedSplit:any=null,splitPosts=0;
+        await context.route(splitRoute,async route=>{
+            splitPosts++;
+            const response=await route.fetch();
+            committedSplit=await response.json();
+            assert.equal(response.status(),201);
+            await route.fulfill({status:502,contentType:'text/html',body:'<html>Gateway interrupted after commit</html>'});
+        });
+        await page.locator('#draftSplitCommit').click();
+        await page.locator('#draftSplitCheck').waitFor();
+        assert.equal(await page.locator('#draftSplitCommit').isDisabled(),true);
+        assert.equal(await page.locator('#draftSplitLabel').isDisabled(),true);
+        assert.equal(db.getDraftDetail(splitSource)!.documents.length,4);
+        await page.locator('#draftSplitCheck').click();
+        await page.locator('#draftSplitDialog').waitFor({state:'hidden'});
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value===id,committedSplit.draftId);
+        assert.equal(splitPosts,1,'Uncertain success is recovered by read-only lookup, not another POST');
+        await context.unroute(splitRoute);
+        const alphaDetail=db.getDraftDetail(committedSplit.draftId)!;
+        assert.equal(alphaDetail.caseDraft!.primaryDocumentId,alphaComplaint.id);
+        assert.equal(alphaDetail.caseDraft!.reviewerNotes,null);
+        assert.equal(db.getDraftDetail(splitSource)!.caseDraft!.reviewerNotes,'Source-only note; do not copy to a new case.');
+        assert.equal(alphaDetail.caseDraft!.complaintReading.status,'queued');
+        assert.match(await page.locator('#draftSplitCaseBtn').getAttribute('class') || '',/\bhidden\b/);
+        for(const doc of alphaDetail.documents)assert.equal(doc.oneDriveUrl,splitBefore.documents.find(item=>item.id===doc.id)!.oneDriveUrl);
+        assert.equal((await context.request.post(`${url}/api/drafts/${splitSource}/split-case`,{headers:{Origin:url},
+            data:{...splitInput,requestId:JSON.parse(alphaDetail.caseDraft!.normalizedDataJson!).intake.manualSplit.requestId}})).status(),200);
+        await (require('./draftExtraction') as typeof import('./draftExtraction')).ensureDraftComplaintExtraction(db,committedSplit.draftId,{content:readingPdf});
+        assert.equal(db.getDraftDetail(committedSplit.draftId)!.caseDraft!.filingData.defendants[0].displayName,originalExtraction.data.defendants![0].displayName);
+        await page.setViewportSize({width:1440,height:1000});
+        await page.evaluate(id=>(window as any).openDraft(id),splitSource);
+        await openSplit();
+        await page.locator('#draftSplitLabel').fill('Beta case');
+        const betaDocs=db.getDraftDetail(splitSource)!.documents;
+        await page.locator('#draftSplitComplaint').selectOption(betaDocs.find(doc=>doc.packageRole==='complaint')!.id);
+        for(const doc of betaDocs.filter(doc=>doc.packageRole!=='complaint'))await page.locator('#draftSplitList input[value="'+doc.id+'"]').check();
+        await page.locator('#draftSplitCommit').click();
+        await page.locator('#draftSplitDialog').waitFor({state:'hidden'});
+        await page.waitForFunction(id=>document.querySelector<HTMLSelectElement>('#draftEmailCaseSelect')?.value!==id,splitSource);
+        assert.equal(db.getDraftDetail(splitSource)!.caseDraft!.status,'archived');
+        assert.equal(db.getDraftDetail(splitSource)!.documents.length,0);
+        assert.equal(db.listFilingJobs().some(job=>job.caseDraftId===committedSplit.draftId),false);
+        extractionWorkerAvailable=false;
         await page.locator('#closeDraftBtn').click();
         await page.locator(`[data-open-draft="${notificationDraftId}"]`).click();
         assert.equal(await page.locator('#draftManualCopyBtn').isHidden(), true);

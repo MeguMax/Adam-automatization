@@ -56,7 +56,7 @@ import { getCheckoutAccount } from './mifileCheckoutRunner';
 import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-06-bulk-supporting-reassignment-v117';
+const ADMIN_BUILD_ID = '2026-11-07-unassigned-case-splitting-v118';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -2120,6 +2120,7 @@ const html = String.raw`<!doctype html>
     .draft-move-list label { display: flex; align-items: flex-start; gap: 9px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere; }
     .draft-move-list input[type="checkbox"] { flex: 0 0 16px; width: 16px; height: 16px; min-height: 0; padding: 0; margin: 3px 0 0; accent-color: var(--accent); }
     .draft-move-list span { flex: 1; min-width: 0; white-space: normal; }
+    #draftSplitDialog .draft-field + .draft-field { margin-top: 10px; }
     @media (max-width: 620px) { .draft-email-cases label { display: grid; gap: 4px; } }
     .draft-workspace-title strong,
     .draft-workspace-title span {
@@ -3541,6 +3542,7 @@ const html = String.raw`<!doctype html>
                 <button id="draftLibraryBtn" type="button" title="Add missing Advice and Local forms"><i data-lucide="library"></i>Add standard forms</button>
                 <button id="draftCourtRuleBtn" type="button" title="Apply the current rule to documents without a manual submission choice"><i data-lucide="list-checks"></i>Apply court rule</button>
                 <button id="draftMovePdfsBtn" type="button"><i data-lucide="arrow-right-left"></i>Move supporting PDFs</button>
+                <button id="draftSplitCaseBtn" type="button" class="hidden"><i data-lucide="folder-plus"></i>Create case from PDFs</button>
                 <button id="draftRemoveFormBtn" class="icon-button danger" type="button" title="Remove PDF from Draft only" aria-label="Remove PDF from Draft"><i data-lucide="trash-2"></i></button>
                 <button id="draftReplaceDocumentBtn" type="button" title="Replace the selected PDF or upload a corrected file"><i data-lucide="replace"></i>Replace PDF</button>
                   </div>
@@ -3604,6 +3606,17 @@ const html = String.raw`<!doctype html>
           <p id="draftMoveState" class="muted" role="status"></p>
           <p class="muted">Both packages require review. Original OneDrive files are preserved.</p>
           <div class="draft-confirm-actions"><button id="draftMoveCancel" value="cancel">Cancel</button><button id="draftMoveCommit" type="button" class="primary" disabled>Move selected</button></div>
+        </form>
+      </dialog>
+      <dialog id="draftSplitDialog" class="draft-move-dialog" aria-labelledby="draftSplitTitle">
+        <form method="dialog">
+          <div class="draft-section-heading"><h2 id="draftSplitTitle">Create case from unassigned PDFs</h2><button id="draftSplitReload" class="icon-button" type="button" title="Reload source PDFs" aria-label="Reload source PDFs"><i data-lucide="refresh-cw"></i></button></div>
+          <label class="draft-field"><span class="draft-field-label">Case label</span><input id="draftSplitLabel" maxlength="120" required></label>
+          <label class="draft-field"><span class="draft-field-label">Complaint</span><select id="draftSplitComplaint" required></select></label>
+          <fieldset id="draftSplitList" class="draft-move-list"><legend>Other PDFs belonging to this case</legend></fieldset>
+          <p id="draftSplitState" class="muted" role="status" aria-live="polite"></p>
+          <p class="muted">Source: selected Complaint, not mixed-group edits. OneDrive files stay unchanged. New case requires review before Unsubmitted.</p>
+          <div class="draft-confirm-actions"><button id="draftSplitCancel" value="cancel" formnovalidate>Cancel</button><button id="draftSplitCheck" type="button" class="hidden">Check result</button><button id="draftSplitCommit" type="button" class="primary" disabled>Create case</button></div>
         </form>
       </dialog>
       <dialog id="draftConfirmDialog" class="draft-confirm-dialog" aria-labelledby="draftConfirmTitle" aria-describedby="draftConfirmMessage">
@@ -3830,6 +3843,9 @@ const html = String.raw`<!doctype html>
       draftMoveContext: null,
       draftMoveLoadRevision: 0,
       draftMoveSubmitting: false,
+      draftSplitContext: null,
+      draftSplitSubmitting: false,
+      draftSplitLoadRevision: 0,
       editingMappingId: null,
       view: 'queue',
       pagination: { page: 1, pageSize: 50, totalItems: 0, totalPages: 1 },
@@ -6353,6 +6369,141 @@ const html = String.raw`<!doctype html>
       }
     });
 
+    function updateDraftSplitSelection() {
+      const snapshot = state.draftSplitContext;
+      const busy = state.draftSplitSubmitting;
+      const frozen = busy || Boolean(snapshot?.body);
+      document.querySelectorAll('#draftSplitDialog input,#draftSplitDialog select').forEach(input => { input.disabled = frozen; });
+      document.getElementById('draftSplitCancel').disabled = busy;
+      document.getElementById('draftSplitReload').disabled = busy || Boolean(snapshot?.uncertain);
+      document.getElementById('draftSplitCheck').classList.toggle('hidden', !snapshot?.uncertain);
+      document.getElementById('draftSplitCheck').disabled = busy;
+      const count = 1 + document.querySelectorAll('#draftSplitList input:checked').length;
+      document.getElementById('draftSplitCommit').disabled = busy || !snapshot || snapshot.uncertain || count > 100 ||
+        !document.getElementById('draftSplitComplaint').value || !document.getElementById('draftSplitLabel').value.trim();
+    }
+
+    async function loadDraftSplitList() {
+      if (state.draftSplitSubmitting || state.draftSplitContext?.uncertain) return;
+      const source = state.selectedDraftId, revision = ++state.draftSplitLoadRevision;
+      const dialog = document.getElementById('draftSplitDialog');
+      state.draftSplitContext = null;
+      document.getElementById('draftSplitLabel').value = '';
+      document.getElementById('draftSplitComplaint').replaceChildren();
+      document.getElementById('draftSplitList').replaceChildren();
+      document.getElementById('draftSplitState').textContent = 'Loading verified source PDFs...';
+      updateDraftSplitSelection();
+      document.getElementById('draftSplitReload').disabled = true;
+      try {
+        const detail = await api('/api/drafts/' + encodeURIComponent(source));
+        if (!dialog.open || revision !== state.draftSplitLoadRevision || source !== state.selectedDraftId) return;
+        const draft = detail.caseDraft;
+        if (!draft || JSON.parse(draft.normalizedDataJson || '{}').intake?.packageKey !== '__unassigned__' ||
+            detail.email.processingStatus === 'processing' ||
+            ['queued','running','prepared','succeeded','reconciliation_required'].includes(draft.filingStatus) ||
+            ['filing_in_progress','filing_reconciliation','filing_prepared','filed_successfully','archived','rejected'].includes(draft.status)) {
+          throw new Error('This unassigned group is not available for case creation.');
+        }
+        const documents = detail.documents.filter(item => !item.formTemplate && item.oneDriveUrl && item.sourceVersion &&
+          ['uploaded','downloaded','replaced'].includes(item.status) && item.recognition?.source !== 'conflict' &&
+          /^[a-f0-9]{64}$/.test(item.recognition?.contentHash || '') && !item.recognitionRecovery);
+        const complaint = document.getElementById('draftSplitComplaint');
+        const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = 'Choose one Complaint'; complaint.append(placeholder);
+        for (const item of documents.filter(item => item.packageRole === 'complaint')) {
+          const option = document.createElement('option'); option.value = item.id;
+          option.textContent = item.originalFilename || item.currentFilename || 'Complaint'; complaint.append(option);
+        }
+        const list = document.getElementById('draftSplitList'), legend = document.createElement('legend');
+        legend.textContent = 'Other PDFs belonging to this case'; list.append(legend);
+        for (const item of documents.filter(item => item.packageRole !== 'complaint')) {
+          const label = document.createElement('label'), checkbox = document.createElement('input'), text = document.createElement('span');
+          checkbox.type = 'checkbox'; checkbox.value = item.id;
+          text.textContent = item.originalFilename || item.currentFilename || 'PDF';
+          checkbox.addEventListener('change', () => {
+            updateDraftSplitSelection();
+            document.getElementById('draftSplitState').textContent = (1 + list.querySelectorAll('input:checked').length) + ' PDFs selected (including Complaint).';
+          });
+          label.append(checkbox, text); list.append(label);
+        }
+        state.draftSplitContext = {source, documents, requestId:crypto.randomUUID(), body:null, uncertain:false};
+        document.getElementById('draftSplitState').textContent = complaint.options.length > 1
+          ? 'Choose a Complaint, name the case and select only its PDFs.' : 'No verified Complaint is available. Finish recognition or correct the document type first.';
+      } catch (error) {
+        if (dialog.open && revision === state.draftSplitLoadRevision) document.getElementById('draftSplitState').textContent = error.message;
+      } finally {
+        if (revision === state.draftSplitLoadRevision) updateDraftSplitSelection();
+      }
+    }
+
+    async function finishDraftSplit(result) {
+      document.getElementById('draftSplitDialog').close();
+      showToast('Case created. Reading its Complaint; review the fields before preparing Unsubmitted.', 'success');
+      try { await openDraft(result.draftId); await loadDrafts(true); }
+      catch (error) { showToast('Case created, but could not be opened: ' + error.message, 'error'); }
+    }
+
+    document.getElementById('draftSplitCaseBtn').addEventListener('click', () => {
+      if (state.draftMutationBusy || state.draftNavigationBusy) return;
+      document.getElementById('draftDocumentTools').open = false;
+      document.getElementById('draftSplitDialog').showModal();
+      loadDraftSplitList();
+    });
+    document.getElementById('draftSplitReload').addEventListener('click', loadDraftSplitList);
+    document.getElementById('draftSplitLabel').addEventListener('input', updateDraftSplitSelection);
+    document.getElementById('draftSplitComplaint').addEventListener('change', () => {
+      document.querySelectorAll('#draftSplitList input').forEach(input => { input.checked = false; });
+      document.getElementById('draftSplitState').textContent = 'Select the remaining PDFs for this Complaint.';
+      updateDraftSplitSelection();
+    });
+    document.getElementById('draftSplitDialog').addEventListener('cancel', event => {
+      if (state.draftSplitSubmitting) event.preventDefault();
+    });
+    document.getElementById('draftSplitDialog').addEventListener('close', () => {
+      ++state.draftSplitLoadRevision; state.draftSplitContext = null;
+    });
+    document.getElementById('draftSplitCommit').addEventListener('click', async () => {
+      const snapshot = state.draftSplitContext;
+      if (!snapshot || snapshot.uncertain || state.draftMutationBusy || state.draftSplitSubmitting || state.selectedDraftId !== snapshot.source) return;
+      const complaint = document.getElementById('draftSplitComplaint').value, label = document.getElementById('draftSplitLabel').value.trim();
+      const ids = new Set([complaint, ...Array.from(document.querySelectorAll('#draftSplitList input:checked')).map(input => input.value)]);
+      if (!complaint || !label || ids.size > 100) return;
+      state.draftSplitSubmitting = true;
+      updateDraftSplitSelection();
+      let result = null;
+      try {
+        if (state.draftDirty) await saveDraft(true);
+        if (state.selectedDraftId !== snapshot.source) throw new Error('The source group changed. Reload the source list.');
+        snapshot.body ||= {requestId:snapshot.requestId, label, complaintDocumentId:complaint,
+          documents:snapshot.documents.filter(item => ids.has(item.id)).map(item => ({documentId:item.id,sourceVersion:item.sourceVersion}))};
+        state.draftMutationBusy = true;
+        document.getElementById('draftSplitState').textContent = 'Creating the case...';
+        snapshot.uncertain = true;
+        result = await api('/api/drafts/' + encodeURIComponent(snapshot.source) + '/split-case', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(snapshot.body),
+        });
+      } catch (error) {
+        document.getElementById('draftSplitState').textContent = error.message + (snapshot.uncertain ? ' Check the result before retrying.' : '');
+      } finally {
+        state.draftMutationBusy = false; state.draftSplitSubmitting = false; updateDraftSplitSelection();
+      }
+      if (result) await finishDraftSplit(result);
+    });
+    document.getElementById('draftSplitCheck').addEventListener('click', async () => {
+      const snapshot = state.draftSplitContext;
+      if (!snapshot?.uncertain || state.draftSplitSubmitting) return;
+      state.draftSplitSubmitting = true; updateDraftSplitSelection();
+      let result = null;
+      try {
+        result = await api('/api/drafts/' + encodeURIComponent(snapshot.source) + '/split-requests/' + encodeURIComponent(snapshot.requestId));
+        if (!result.found) {
+          snapshot.uncertain = false;
+          document.getElementById('draftSplitState').textContent = 'No case was created. Retry the same selection, or reload to change the PDFs.';
+        }
+      } catch (error) { document.getElementById('draftSplitState').textContent = error.message + ' The result is still unknown; do not create another package.'; }
+      finally { state.draftSplitSubmitting = false; updateDraftSplitSelection(); }
+      if (result?.found) await finishDraftSplit(result);
+    });
+
     let draftPdfPreview = null;
     function renderActiveDraftDocument(documents) {
       const activeDocument = documents.find(
@@ -6405,6 +6556,9 @@ const html = String.raw`<!doctype html>
       window.document.getElementById('draftMovePdfsBtn').disabled = !canModifyDocuments ||
         !documents.some(document => document.packageRole === 'ancillary' && !document.isPrimary && !document.formTemplate && document.status !== 'retrying') ||
         !draftMoveTargets(state.draftDetail).length;
+      const splitButton = window.document.getElementById('draftSplitCaseBtn');
+      splitButton.classList.toggle('hidden', JSON.parse(draft?.normalizedDataJson || '{}').intake?.packageKey !== '__unassigned__');
+      splitButton.disabled = !canModifyDocuments || !documents.some(document => document.packageRole === 'complaint' && !document.formTemplate);
       replaceButton.disabled = !canModifyDocuments ||
         !activeDocument || activeDocument.status === 'retrying' || Boolean(activeDocument.formTemplate);
       window.document.getElementById('draftRemoveFormBtn').disabled = !canModifyDocuments || !activeDocument || activeDocument.status === 'retrying';
@@ -8223,6 +8377,24 @@ export function createAdminServer(
                     db.draftNotifications().retry(decodeURIComponent(retryReadyMatch[1]), input.confirmNotDelivered === true);
                     sendJson(res, 200, { queued: true });
                 } catch (error) { sendJson(res, 409, { error: error instanceof Error ? error.message : 'The notification could not be queued' }); }
+                return;
+            }
+            const splitResultMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/split-requests\/([^/]+)$/);
+            if (req.method === 'GET' && splitResultMatch) {
+                try {
+                    const sourceDraftId = decodeURIComponent(splitResultMatch[1]);
+                    const draftId = db.findCaseSplit(sourceDraftId, decodeURIComponent(splitResultMatch[2]));
+                    sendJson(res, 200, {found: Boolean(draftId), draftId, sourceDraftId});
+                } catch (error) { sendJson(res, 409, {error: error instanceof Error ? error.message : 'The case result could not be checked'}); }
+                return;
+            }
+            const splitCaseMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/split-case$/);
+            if (req.method === 'POST' && splitCaseMatch) {
+                try {
+                    const input = JSON.parse((await readRequestBuffer(req, 65536)).toString('utf8'));
+                    const result = db.splitUnassignedCase(decodeURIComponent(splitCaseMatch[1]), input);
+                    sendJson(res, result.replayed ? 200 : 201, result);
+                } catch (error) { sendJson(res, 409, {error: error instanceof Error ? error.message : 'The case could not be created'}); }
                 return;
             }
             const moveDocumentsMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/documents\/move$/);

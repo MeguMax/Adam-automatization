@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { ParsedEmailInfo } from './emailProcessor';
 import { DOCUMENT_LABELS, documentLabel, DocumentRecognition, applySuppliedSupportingPolicy } from './documentRecognition';
@@ -14,7 +14,7 @@ import { filingPreparationProgress, type FilingPreparationProgress } from './fil
 import { CheckoutStore } from './checkoutStore';
 import {SubmissionStore} from './mifileSubmission';
 import { migrateBundleActivity } from './mifileBundleSafety';
-import { intakeCasePrefix, splitFilingIntake } from './filingIntake';
+import { buildFilingIntake, intakeCasePrefix, splitFilingIntake } from './filingIntake';
 import { DraftNotificationStore } from './draftNotifications';
 import { matchesSupportingCase } from './batchCaseMatching';
 import { complaintReadingView, COMPLAINT_READING_ATTEMPTS, type ComplaintReadingView } from './complaintReading';
@@ -300,6 +300,13 @@ export interface DraftValidationIssue {
     message: string;
     reviewField?: string;
     relatedDraftId?: string;
+}
+
+export interface CaseSplitInput {
+    requestId: string;
+    label: string;
+    complaintDocumentId: string;
+    documents: Array<{ documentId: string; sourceVersion: string }>;
 }
 
 export type DraftFieldSource = 'email' | 'complaint' | 'manual' | 'derived' | 'empty';
@@ -3185,6 +3192,94 @@ export class WorkflowDatabase {
             extraction?.extractionMethod === 'form_fields' && extraction.fieldConfidence.defendants === 'high' &&
             extraction.fieldConfidence.plaintiff === 'high' &&
             !extraction.warnings.some(warning => warning.code === 'source_conflict') && matchesSupportingCase(identity, extraction.data));
+    }
+
+    findCaseSplit(sourceDraftId: string, requestId: string): string | null {
+        if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(requestId)) throw new Error('Invalid case-split request.');
+        const source = this.db.prepare('SELECT email_id FROM case_drafts WHERE id=?').get(sourceDraftId) as {email_id:string} | undefined;
+        if (!source) throw new Error('Source Draft not found');
+        const row = this.db.prepare('SELECT id,extracted_data_json FROM case_drafts WHERE email_id=? AND intake_package_key=?')
+            .get(source.email_id, 'split:' + requestId.toLowerCase()) as {id:string;extracted_data_json:string} | undefined;
+        if (!row) return null;
+        if (this.safeJson(row.extracted_data_json)?.intake?.manualSplit?.sourceDraftId !== sourceDraftId) {
+            throw new Error('This split request belongs to a different source group.');
+        }
+        return row.id;
+    }
+
+    splitUnassignedCase(sourceDraftId: string, input: CaseSplitInput): { draftId: string; sourceDraftId: string; replayed: boolean } {
+        if (!input || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(input.requestId) || typeof input.label !== 'string' ||
+            !input.label.trim() || input.label.trim().length > 120 || /[\x00-\x1f\x7f]/.test(input.label) ||
+            typeof input.complaintDocumentId !== 'string' || !Array.isArray(input.documents) ||
+            !input.documents.length || input.documents.length > 100 || input.documents.some(item => !item ||
+                typeof item.documentId !== 'string' || typeof item.sourceVersion !== 'string' || !item.sourceVersion) ||
+            new Set(input.documents.map(item => item.documentId)).size !== input.documents.length) {
+            throw new Error('Choose a case label, one Complaint and 1-100 different verified source PDFs.');
+        }
+        const requestId = input.requestId.toLowerCase(), label = input.label.trim();
+        const digest = createHash('sha256').update(JSON.stringify({sourceDraftId,label,complaintDocumentId:input.complaintDocumentId,
+            documents:[...input.documents].sort((a,b)=>a.documentId.localeCompare(b.documentId))})).digest('hex');
+        const result = this.runInTransaction(() => {
+            const existing = this.findCaseSplit(sourceDraftId, requestId);
+            if (existing) {
+                const row = this.db.prepare('SELECT extracted_data_json FROM case_drafts WHERE id=?').get(existing) as {extracted_data_json:string};
+                if (this.safeJson(row.extracted_data_json)?.intake?.manualSplit?.digest !== digest) {
+                    throw new Error('This request already created a different package. Check its result before creating another case.');
+                }
+                return {draftId:existing,sourceDraftId,replayed:true};
+            }
+            const source = this.assertEditableIntake(sourceDraftId), original = this.safeJson(source.caseDraft!.normalizedDataJson);
+            if (original?.intake?.packageKey !== '__unassigned__') throw new Error('Only unassigned attachment groups can create a case from selected PDFs.');
+            if (source.email.processingStatus === 'processing') throw new Error('Wait for email processing to finish.');
+            const selected = input.documents.map(item => {
+                const document = source.documents.find(document => document.id === item.documentId);
+                if (!document || document.formTemplate || document.sourceVersion !== item.sourceVersion || !document.oneDriveUrl ||
+                    !['uploaded','downloaded','replaced'].includes(document.status) || document.recognition?.source === 'conflict' ||
+                    !/^[a-f0-9]{64}$/.test(document.recognition?.contentHash || '') || document.recognitionRecovery) {
+                    throw new Error('A selected source PDF changed or is not verified. Reload the source list before creating a case.');
+                }
+                return document;
+            });
+            const complaints = selected.filter(document => document.packageRole === 'complaint');
+            if (complaints.length !== 1 || complaints[0].id !== input.complaintDocumentId) throw new Error('Select exactly one recognized Complaint for this case.');
+            const complaint = complaints[0], id = randomUUID(), timestamp = nowIso(), key = 'split:' + requestId;
+            const parsed: ParsedEmailInfo = {...buildFilingIntake({id:source.email.externalMessageId},[]),
+                intake:{manual:true,packageMode:'standard_lt',packageKey:key,packageLabel:label,
+                    storageKey:createHash('sha256').update(source.email.id+'\n'+key).digest('hex').slice(0,24),issues:[],
+                    manualSplit:{requestId,sourceDraftId,digest,complaintDocumentId:complaint.id}},
+                filedDocuments:selected.map(document=>({documentName:document.originalFilename,documentType:document.documentType,
+                    downloadUrl:document.sourceUrl,status:'Received',comments:null}))};
+            const normalized = {...parsed,supportingPolicyVersion:2,manualDocumentEdits:true,filingData:draftFilingData(parsed)};
+            this.db.prepare(`INSERT INTO case_drafts (id,email_id,intake_package_key,workflow_mode,status,validation_status,filing_status,
+                extracted_data_json,normalized_data_json,primary_document_id,created_at,updated_at)
+                VALUES (?,?,?,?,'needs_review','unknown','not_started',?,?,?,?,?)`)
+                .run(id,source.email.id,key,source.caseDraft!.workflowMode,toJson(parsed),toJson(normalized),complaint.id,timestamp,timestamp);
+            const move = this.db.prepare(`UPDATE document_records SET case_draft_id=?,required_for_filing=1,
+                filing_relation=?,filing_relation_source='suggested',
+                metadata_json=json_remove(COALESCE(metadata_json,'{}'),'$.courtRule'),updated_at=? WHERE id=? AND case_draft_id=?`);
+            for (const document of selected) move.run(id,document.packageRole === 'ancillary' ? 'unknown' : 'separate',timestamp,document.id,sourceDraftId);
+            if (selected.some(document=>document.id===source.caseDraft!.primaryDocumentId || document.id===source.caseDraft!.complaintExtraction?.documentId)) {
+                this.invalidateComplaintData(sourceDraftId);
+                this.db.prepare('UPDATE case_drafts SET primary_document_id=NULL WHERE id=?').run(sourceDraftId);
+            }
+            this.db.prepare(`UPDATE case_drafts SET reviewed_at=NULL,status='needs_review',validation_status='unknown',
+                normalized_data_json=json_set(normalized_data_json,'$.manualDocumentEdits',json('true')),updated_at=? WHERE id=?`)
+                .run(timestamp,sourceDraftId);
+            const remaining = this.db.prepare(`SELECT COUNT(*) AS count FROM document_records WHERE case_draft_id=? AND is_active=1
+                AND COALESCE(upload_source,'')!='form_library' AND COALESCE(source_url,'') NOT LIKE 'form-library:%'`).get(sourceDraftId) as {count:number};
+            if (!remaining.count) this.db.prepare("UPDATE case_drafts SET status='archived' WHERE id=?").run(sourceDraftId);
+            this.setComplaintAutoExtractionState(id,{documentId:complaint.id,sourceVersion:this.getComplaintSourceVersion(complaint.id),
+                contentHash:complaint.recognition!.contentHash,expectedContentHash:complaint.recognition!.contentHash,
+                extractorVersion:CURRENT_COMPLAINT_EXTRACTOR_VERSION,requestId:randomUUID(),requestedAt:timestamp,status:'queued',attempts:0});
+            for (const draft of [sourceDraftId,id]) this.insertAuditLog('case_draft',draft,'case_split_from_unassigned',{
+                requestId,sourceDraftId,destinationDraftId:id,complaintDocumentId:complaint.id,
+                documentIds:selected.map(document=>document.id),originalFilesPreserved:true,sourceEditsCopied:false});
+            return {draftId:id,sourceDraftId,replayed:false};
+        });
+        if (result.replayed) return result;
+        this.refreshCaseDraftValidation(result.draftId);
+        this.refreshCaseDraftValidation(sourceDraftId);
+        return result;
     }
 
     moveSupportingDocument(draftId: string, documentId: string, targetDraftId: string, sourceVersion: string, automatic = false): EmailDetail {
@@ -7116,7 +7211,7 @@ export class WorkflowDatabase {
         });
         if (root?.intake?.processingError) issues.push({ field: 'intake', severity: 'error',
             message: `Case package processing could not finish: ${root.intake.processingError}. Reprocess this email after correcting the issue.` });
-        if (root?.intake?.packageKey && root.intake.packageKey !== '__unassigned__' && root.complaintExtraction) {
+        if (root?.intake?.packageKey && root.intake.packageKey !== '__unassigned__' && !root.intake.manualSplit && root.complaintExtraction) {
             const key = String(root.intake.packageKey);
             const surname = key.slice(0, key.lastIndexOf(' '));
             const initial = key.slice(-1);

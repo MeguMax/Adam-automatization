@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { WorkflowDatabase } from './database';
+import { WorkflowDatabase, type CaseSplitInput } from './database';
+import { randomUUID } from 'node:crypto';
+import { ensureDraftComplaintExtraction } from './draftExtraction';
 import { buildFilingIntake, intakeCasePrefix, splitFilingIntake } from './filingIntake';
 import { processFilingIntake } from './filingIntakeWorker';
 import { downloadIntakeDocuments } from './filingIntakeDownload';
@@ -349,6 +351,89 @@ test('unassigned groups do not receive standard forms and legacy pinned forms do
         assert.equal(result.documents[0].id,legacy);assert.equal(result.documents[0].oneDriveUrl,stored.oneDriveUrl);
         f.db.createCaseDrafts(f.email.id,f.parsed);
         assert.equal(f.db.getDraftDetail(source)!.documents.length,1);
+    } finally { f.close(); }
+});
+
+test('a whole case is split atomically, re-read independently and replayed without duplicate drafts or source uploads', async () => {
+    const legacy=['LegacyAlpha','LegacyBeta'].flatMap(prefix=>['Complaint','Summons','Request','Demand'].map(role=>prefix+' '+role+'.pdf'));
+    const f=fixture([...names,...legacy]);
+    try {
+        await f.library();
+        for(const item of f.packages)await processFilingIntake(f.db,f.email.id,item.draftId,item.parsed,f.dependencies);
+        const source=f.packages.find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        f.db.updateCaseDraft(source,{},'Keep source review notes', {...f.db.getDraftDetail(source)!.caseDraft!.filingData,
+            plaintiff:{...f.db.getDraftDetail(source)!.caseDraft!.filingData.plaintiff,phone:'248-555-0188'}});
+        const before=f.db.getDraftDetail(source)!,uploadCount=f.uploads.length;
+        const makeInput=(prefix:string):CaseSplitInput=>{
+            const documents=f.db.getDraftDetail(source)!.documents.filter(document=>document.originalFilename!.startsWith(prefix));
+            return {requestId:randomUUID(),label:prefix+' case',complaintDocumentId:documents.find(document=>document.packageRole==='complaint')!.id,
+                documents:documents.map(document=>({documentId:document.id,sourceVersion:document.sourceVersion!}))};
+        };
+        const alpha=makeInput('LegacyAlpha'),first=f.db.splitUnassignedCase(source,alpha);
+        assert.equal(first.replayed,false);assert.equal(f.db.getDraftDetail(source)!.documents.length,4);
+        assert.equal(f.db.findCaseSplit(source,alpha.requestId),first.draftId);
+        const created=f.db.getDraftDetail(first.draftId)!;
+        assert.equal(created.caseDraft!.primaryDocumentId,alpha.complaintDocumentId);
+        assert.equal(created.caseDraft!.complaintReading.status,'queued');
+        assert.notEqual(created.caseDraft!.filingData.plaintiff.phone,'248-555-0188');
+        assert.equal(created.caseDraft!.complaintExtraction,null);
+        assert.equal(JSON.parse(created.caseDraft!.normalizedDataJson!).intake.manual,true);
+        for(const document of created.documents){
+            const original=before.documents.find(item=>item.id===document.id)!;
+            assert.equal(document.oneDriveUrl,original.oneDriveUrl);assert.equal(document.sourceUrl,original.sourceUrl);
+            assert.deepEqual(document.recognition,original.recognition);
+        }
+        assert.deepEqual(f.db.splitUnassignedCase(source,{...alpha,documents:[...alpha.documents].reverse()}),{...first,replayed:true});
+        assert.throws(()=>f.db.splitUnassignedCase(source,{...alpha,label:'Changed label'}),/different package/);
+        const beta=makeInput('LegacyBeta'),second=f.db.splitUnassignedCase(source,beta);
+        assert.equal(f.db.getDraftDetail(source)!.caseDraft!.status,'archived');
+        assert.equal(f.db.getDraftDetail(source)!.caseDraft!.reviewerNotes,'Keep source review notes');
+        assert.equal(f.db.getDraftDetail(source)!.caseDraft!.filingData.plaintiff.phone,'248-555-0188');
+        for(const [result,prefix,defendant,court] of [[first,'LegacyAlpha','Arthur Alpha','17'],[second,'LegacyBeta','Blair Beta','25']] as const){
+            const content=Buffer.concat([testPdfFixture(titles.Complaint),Buffer.from('\n% '+prefix+' Complaint.pdf')]);
+            await ensureDraftComplaintExtraction(f.db,result.draftId,{content,extract:async()=>extraction(defendant,court)});
+            await applyLibraryForms(f.db,result.draftId,f.dependencies.forms);
+            const detail=f.db.getDraftDetail(result.draftId)!;
+            assert.equal(detail.documents.length,6);assert.deepEqual(detail.caseDraft!.validationIssues,[]);
+            assert.equal(detail.caseDraft!.filingData.defendants[0].displayName,defendant);
+            assert.equal(detail.documents.find(document=>document.packageRole==='ancillary')!.filingRelation,court==='17'?'connected_to_complaint':'separate');
+        }
+        assert.equal(f.uploads.length,uploadCount+4,'Only the two new cases\' Advice/Local files are uploaded');
+        for(const item of f.db.createCaseDrafts(f.email.id,f.parsed)){
+            if(f.db.getDraftDetail(item.draftId)!.caseDraft!.status!=='archived')await processFilingIntake(f.db,f.email.id,item.draftId,item.parsed,f.dependencies);
+        }
+        assert.equal(f.uploads.length,uploadCount+4);
+        assert.equal(f.db.getDraftDetail(source)!.documents.length,0);
+        assert.equal(f.db.listDrafts().totalItems,f.packages.length+2);
+        f.db.queueValidatedIntakes();
+        assert.ok(f.db.listFilingJobs().every(job=>job.caseDraftId!==first.draftId&&job.caseDraftId!==second.draftId),'Manually split cases still need confirmation');
+        const reopened=new WorkflowDatabase(path.join(f.directory,'workflow.sqlite'));
+        try { assert.equal(reopened.splitUnassignedCase(source,alpha).draftId,first.draftId); }
+        finally { reopened.close(); }
+    } finally { f.close(); }
+});
+
+test('case splitting rejects stale, duplicate, conflicting, foreign or core-incomplete selections without creating a draft', async () => {
+    const f=fixture([...names,'LegacyAlpha Complaint.pdf','LegacyAlpha Summons.pdf','LegacyBeta Complaint.pdf']);
+    try {
+        await f.library();
+        for(const item of f.packages)await processFilingIntake(f.db,f.email.id,item.draftId,item.parsed,f.dependencies);
+        const source=f.packages.find(item=>item.parsed.intake?.packageKey==='__unassigned__')!.draftId;
+        const detail=f.db.getDraftDetail(source)!,complaints=detail.documents.filter(document=>document.packageRole==='complaint');
+        const pin=(document:typeof detail.documents[number])=>({documentId:document.id,sourceVersion:document.sourceVersion!});
+        const input:CaseSplitInput={requestId:randomUUID(),label:'Case',complaintDocumentId:complaints[0].id,documents:[pin(complaints[0])]};
+        const count=f.db.listDrafts().totalItems;
+        for(const bad of [{...input,documents:[]},{...input,documents:[pin(complaints[0]),pin(complaints[0])]},
+            {...input,documents:complaints.map(pin)},{...input,documents:[{...pin(complaints[0]),sourceVersion:'stale'}]},
+            {...input,complaintDocumentId:'not-selected'}, {...input,documents:[{documentId:f.db.getDraftDetail(f.packages.find(item=>item.draftId!==source)!.draftId)!.documents[0].id,sourceVersion:'wrong'}]}]){
+            assert.throws(()=>f.db.splitUnassignedCase(source,bad),/Choose|Complaint|source PDF/);
+            assert.equal(f.db.listDrafts().totalItems,count);
+            assert.equal(f.db.getDraftDetail(source)!.documents.length,detail.documents.length);
+        }
+        const sql=(f.db as any).db;
+        sql.prepare("UPDATE case_drafts SET status='filing_prepared' WHERE id=?").run(source);
+        assert.throws(()=>f.db.splitUnassignedCase(source,input),/locked/);
+        assert.equal(f.db.listDrafts().totalItems,count);
     } finally { f.close(); }
 });
 

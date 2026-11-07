@@ -51,7 +51,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-11-06-bulk-supporting-reassignment-v117';
+const WORKER_BUILD_ID = '2026-11-07-unassigned-case-splitting-v118';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
