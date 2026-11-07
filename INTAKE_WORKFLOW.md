@@ -150,6 +150,8 @@ than reopening or preparing them again. Queued, running or uncertain MiFILE work
 still blocks the retry. Existing uploaded PDFs are reused, removed PDFs stay
 removed, and manual fields, document decisions and reviewer notes remain pinned.
 Reprocessing an email does not authorize payment or final court submission.
+The queue's single and bulk replay confirmations use the accessible in-app
+dialog rather than a browser-native modal. Cancel sends no retry request.
 
 Unmatched filenames and supporting-only prefixes remain visible review groups, never silently attached to the closest surname. For example, `Marogi M Demand.pdf` does not automatically belong to `Marogi R Complaint.pdf`. After checking the PDF, use its Documents controls to move a supporting file to another editable case from the same email. The move preserves the original OneDrive file, clears approval, resets its court routing and requires package confirmation. It cannot move core/library PDFs or cross email boundaries. Empty review groups are archived. A prefix that contradicts the extracted Defendant also requires review.
 

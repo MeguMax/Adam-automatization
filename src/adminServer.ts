@@ -57,7 +57,7 @@ import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 import { recheckSavedFilingJob } from './savedBundleRecheck';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-07-safe-email-replay-v121';
+const ADMIN_BUILD_ID = '2026-11-07-email-replay-confirm-v122';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -3321,6 +3321,14 @@ const html = String.raw`<!doctype html>
     <form method="dialog"><div class="section-heading"><h2 id="workerStatusTitle">Background workers</h2><button class="icon-button" aria-label="Close worker status" title="Close"><i data-lucide="x"></i></button></div></form>
     <div id="workerStatusList" aria-live="polite">Checking...</div>
   </dialog>
+  <dialog id="draftConfirmDialog" class="draft-confirm-dialog" aria-labelledby="draftConfirmTitle" aria-describedby="draftConfirmMessage">
+    <form method="dialog">
+      <h2 id="draftConfirmTitle"></h2>
+      <p id="draftConfirmMessage"></p>
+      <div id="draftConfirmSummary"></div>
+      <div class="draft-confirm-actions"><button value="cancel">Cancel</button><button id="draftConfirmAccept" class="primary" value="confirm">Confirm</button></div>
+    </form>
+  </dialog>
   <main>
     <section id="queuePane">
       <div class="summary" id="summary"></div>
@@ -3618,14 +3626,6 @@ const html = String.raw`<!doctype html>
           <p id="draftSplitState" class="muted" role="status" aria-live="polite"></p>
           <p class="muted">Source: selected Complaint, not mixed-group edits. OneDrive files stay unchanged. New case requires review before Unsubmitted.</p>
           <div class="draft-confirm-actions"><button id="draftSplitCancel" value="cancel" formnovalidate>Cancel</button><button id="draftSplitCheck" type="button" class="hidden">Check result</button><button id="draftSplitCommit" type="button" class="primary" disabled>Create case</button></div>
-        </form>
-      </dialog>
-      <dialog id="draftConfirmDialog" class="draft-confirm-dialog" aria-labelledby="draftConfirmTitle" aria-describedby="draftConfirmMessage">
-        <form method="dialog">
-          <h2 id="draftConfirmTitle"></h2>
-          <p id="draftConfirmMessage"></p>
-          <div id="draftConfirmSummary"></div>
-          <div class="draft-confirm-actions"><button value="cancel">Cancel</button><button id="draftConfirmAccept" class="primary" value="confirm">Confirm</button></div>
         </form>
       </dialog>
       <dialog id="draftPaymentDialog" class="draft-payment-dialog" aria-labelledby="draftPaymentTitle" aria-describedby="draftPaymentNotice">
@@ -7507,15 +7507,16 @@ const html = String.raw`<!doctype html>
 
     async function retrySelected() {
       if (!state.selectedId || !state.detail) return;
+      const emailId = state.selectedId;
       if (state.detail.email.processingStatus === 'processed') {
-        const confirmed = window.confirm(
-          'Reprocess this completed email?\n\n' +
+        const confirmed = await confirmDraftAction('Reprocess this email?',
           'New filing packages: saved MiFILE cases stay unchanged; only unfinished cases are reprocessed. ' +
           'Other email types may upload new document copies to OneDrive.',
+          'Reprocess', '<strong>' + escapeHtml(state.detail.email.subject || 'No subject') + '</strong>',
         );
-        if (!confirmed) return;
+        if (!confirmed || state.selectedId !== emailId) return;
       }
-      await api('/api/emails/' + encodeURIComponent(state.selectedId) + '/retry', {
+      await api('/api/emails/' + encodeURIComponent(emailId) + '/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'Queued from admin UI' }),
@@ -7528,11 +7529,11 @@ const html = String.raw`<!doctype html>
     async function retrySelectedEmails() {
       const emailIds = Array.from(state.selectedIds);
       if (!emailIds.length) return;
-      const confirmed = window.confirm(
-        'Reprocess ' + emailIds.length + ' selected email(s)?\n\n' +
+      const confirmed = await confirmDraftAction('Reprocess ' + emailIds.length + ' selected email(s)?',
         'For new filing packages, saved MiFILE cases stay unchanged; only unfinished cases are reprocessed. ' +
         'Other email types may upload new OneDrive copies. Emails already processing, retrying, ' +
         'or awaiting MiFILE reconciliation will be skipped.',
+        'Reprocess selected',
       );
       if (!confirmed) return;
 
