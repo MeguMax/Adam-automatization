@@ -128,8 +128,37 @@ Dedicated regressions cover delayed Excel.run startup, stalled batch sync,
 late-result rejection and recovery to the current row. The explicitly simulated
 Excel 1.9 browser smoke checks the timeout message, retained PDF session, available
 Refresh, blocked generation, absence of stale PDF requests and successful refresh
-after Office recovers. Existing three-form and multi-case PDF/ZIP checks remain
-separate from a new real Excel Online pilot. Delivery remains local-only.
+after Office recovers. These simulated-host recovery checks remain separate
+from real Office acceptance. Delivery remains local-only.
+
+### Real Excel Online acceptance (2026-11-08, v123)
+
+The installed panel was tested against Render in the real Excel Online host
+using only the fictional `qa-cases.xlsx` book. DC105, both DC508 pages and MC202
+were generated and downloaded separately from row 2. Selecting A2:A3 then
+generated six more PDFs for two distinct cases, downloaded both individually
+and in one cases ZIP. All 303 canonical fields across the nine downloaded PDFs
+matched their source rows; widget values, appearances and editable flags were
+also checked. Text and checkbox edits survived an in-memory save/reopen check
+for every PDF without changing the original downloads. ZIP CRC passed and all
+six PDF members matched their separate downloads byte for byte. The separate
+**Generate all 3 forms** action also produced a valid single-case ZIP whose
+three members matched the verified individual PDFs. All eight batch pages were
+rendered and visually reviewed.
+
+Selecting the empty A4 row removed the previous download controls, identified
+the missing Defendant at `QA Cases / A4` and disabled generation. Selecting A2
+restored the valid case without rewriting any source cells or formulas. Closing
+and reopening PDF Forms restored the existing connection without another login.
+In a compact ribbon the command is under **Home > ... > Devlin Law > PDF Forms**;
+it is not a public Office Store add-in. If the ribbon is collapsed, expand Home
+first (switch to another tab and back if needed).
+
+Evidence is under `output/excel-online-v123-2026-11-08/verification.json` and its
+rendered pages. The fixture intentionally leaves most form fields blank, so
+this is not a claim of legal completeness, acceptance in Adam's tenant, or a
+new native fault-injection test of the Office watchdog. Only local downloads
+were used; OneDrive delivery, payment and court submission remain disabled.
 
 ## Multiple-case local generation (v96)
 
