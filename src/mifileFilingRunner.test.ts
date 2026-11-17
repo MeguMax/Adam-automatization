@@ -723,7 +723,8 @@ test('source fingerprints bind all PDFs and case fields to the preparation snaps
 
 async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;wrongAccount?:boolean;wrongFiler?:boolean;
     missingPdf?:boolean;extraPdf?:boolean;wrongParent?:boolean;warning?:boolean;serve?:boolean;quantity?:number;
-    wrongGeneratedType?:boolean;generatedWarning?:boolean;mailingCents?:number;courtHeader?:string} = {}) {
+    wrongGeneratedType?:boolean;generatedWarning?:boolean;mailingCents?:number;courtHeader?:string;
+    filerPersistence?:'restored'|'lost'} = {}) {
     const page = await browser.newPage();
     const id = 'fd2c1ad4-633d-429a-0166-08df32c555de';
     const rows = `<tbody id="filing-0"><tr><td></td><td>Case Initiation Form<input hidden name="documentName_0" value="Case Initiation Form"></td><td>1 KB</td><td>CASE INIT FORM<input hidden placeholder="Select or Type Filing Type" value="${options.wrongGeneratedType?'Other':'ISI_CASE_INIT_FORM_DT'}"></td><td><span class="glyphicon-${options.generatedWarning?'alert':'ok'}" ${options.generatedWarning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>` +
@@ -731,11 +732,31 @@ async function savedBundlePage(options: {wrongName?:boolean;wrongType?:boolean;w
         (options.missingPdf?'':`<tbody id="child-${options.wrongParent?2:1}-0"><tr><td></td><td><input name="documentName_0" value="Document 1"></td><td></td><td>1 KB</td><td>CONNECTED FILING</td><td><span class="glyphicon-${options.warning?'alert':'ok'}" ${options.warning?'ng-show="parent.uploadStatus==WARNING"':''}>Uploaded</span></td><td>$0.00</td><td>View</td></tr></tbody>`) +
         (options.extraPdf?'<tbody id="filing-2"><tr><td>Unexpected PDF</td></tr></tbody>':'');
     const html = `<header>${options.wrongAccount?'other@example.com':'qa@example.com'}</header><main>${options.courtHeader || 'MI Example County - 45th District Court'} TEMP-QA</main>` +
-        `<input id="filer-input-selected" value="${options.wrongFiler?'Devlin, Adam (P00000)':'Devlin, Adam (P72877)'}">` +
+        `<input id="filer-input-selected" ${options.filerPersistence?'hidden':''} value="${options.filerPersistence?'':options.wrongFiler?'Devlin, Adam (P00000)':'Devlin, Adam (P72877)'}">` +
         `<label><input type="checkbox" ${options.serve?'checked':''}>Serve Document</label><input type="checkbox" id="isEmergency">` +
         `<table id="documentTable"><caption>Filing documents</caption>${rows}</table>` +
         `<table><thead><tr><th>Additional Payment Type</th><th>Quantity</th><th>Fee</th><th>Actions</th></tr></thead><tbody><tr><td>Mailing Fee</td><td>${options.quantity??1}</td><td>$${((options.mailingCents??1300)/100).toFixed(2)}</td><td>Remove</td></tr></tbody></table>` +
-        `<button onclick="window.submitted=true">Submit</button><button onclick="window.next=true">Next</button>`;
+        `<button onclick="window.submitted=true">Submit</button><button onclick="window.next=true">Next</button>` +
+        `<input id="filer-input-empty" placeholder="Select Filer" ${options.filerPersistence?'':'hidden'}>
+        <div id="filer-listbox" role="listbox" hidden><div role="option" aria-label="Name: Devlin, Adam, Role: Attorney, State: MI, Number: P72877, Organization: Devlin Law, PLLC">Devlin, Adam</div></div>
+        <button id="save">Save Progress</button><div role="dialog" id="saved" hidden>Your progress has been saved.<button onclick="this.parentElement.hidden=true">OK</button></div>
+        <script>
+            const el = id => document.getElementById(id);
+            function selectFiler() {
+                el('filer-input-selected').value = 'Devlin, Adam (P72877)';
+                el('filer-input-selected').hidden = false;
+                el('filer-input-empty').hidden = true;
+                el('filer-listbox').hidden = true;
+            }
+            if (${options.filerPersistence === 'restored'} && sessionStorage.filerSaved) selectFiler();
+            el('filer-input-empty').onclick = () => { el('filer-listbox').hidden = false; };
+            el('filer-listbox').firstElementChild.onclick = selectFiler;
+            el('save').onclick = () => {
+                sessionStorage.saves = Number(sessionStorage.saves || 0) + 1;
+                sessionStorage.filerSaved = el('filer-input-selected').value;
+                el('saved').hidden = false;
+            };
+        </script>`;
     await page.route('**/*',route=>route.fulfill({contentType:'text/html',body:html}));
     await page.goto(`https://mifile.courts.michigan.gov/filing/create/${id}`);
     const receipts = [0,1].map(index=>({documentId:'doc-'+index,filename:`Document-${index}.pdf`,filingName:`Document ${index}`,
@@ -755,6 +776,36 @@ test('saved-bundle readback verifies account, filer, generated form and Connecte
         assert.equal(fees.lines.at(-1).label,'Mailing Fee');
         assert.equal(await f.page.evaluate(()=>Boolean((window as any).submitted||(window as any).next)),false);
     } finally {await f.page.close();}
+});
+
+test('new preparation repairs a cleared filer on the exact verified Unsubmitted bundle at most once', async () => {
+    for (const {options, repair, result} of [
+        {options:{filerPersistence:'restored' as const}, repair:1, result:'ok'},
+        {options:{filerPersistence:'lost' as const}, repair:1, result:'SAVED_BUNDLE_FILER_EMPTY'},
+        {options:{filerPersistence:'restored' as const,wrongParent:true}, repair:0, result:'SAVED_BUNDLE_VERIFICATION_FAILED'},
+        {options:{wrongFiler:true}, repair:0, result:'SAVED_BUNDLE_VERIFICATION_FAILED'},
+    ]) {
+        const f = await savedBundlePage(options);
+        try {
+            const url = f.page.url();
+            const verify = (new MiFileFilingRunner() as any).verifyNewlySavedBundle(f.page,url,f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA');
+            if (result === 'ok') await verify;
+            else await assert.rejects(verify, (error: any) => error.code === result);
+            assert.equal(f.page.url(), url);
+            assert.equal(await f.page.evaluate(() => Number(sessionStorage.saves || 0)), repair);
+            if (repair) assert.equal(await f.page.evaluate(() => sessionStorage.filerSaved), 'Devlin, Adam (P72877)');
+            assert.equal(await f.page.evaluate(() => Boolean((window as any).submitted || (window as any).next)), false);
+        } finally { await f.page.close(); }
+    }
+});
+
+test('ordinary saved-bundle reopens leave a cleared filer for manual reconciliation', async () => {
+    const f = await savedBundlePage({filerPersistence:'restored'});
+    try {
+        await assert.rejects((new MiFileFilingRunner() as any).reopenSavedBundle(f.page,f.page.url(),f.payload,f.receipts,'qa@example.com',f.id,'TEMP-QA'),
+            (error: any) => error.code === 'SAVED_BUNDLE_FILER_EMPTY');
+        assert.equal(await f.page.evaluate(() => sessionStorage.saves), undefined);
+    } finally { await f.page.close(); }
 });
 
 test('saved 37th court short header is verified only in the File to identity field',async()=>{

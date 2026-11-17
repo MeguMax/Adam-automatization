@@ -545,6 +545,20 @@ export interface FilingPayload {
     createdAt: string;
 }
 
+type DuplicateCheckDocument = Pick<FilingDocumentPayload, 'packageRole' | 'isPrimary' | 'supportingEvidence'>;
+
+function filingSourceIdentity(documents: DuplicateCheckDocument[]) {
+    if (documents.some(doc => !doc || typeof doc !== 'object')) return null;
+    // Library forms can change without making the submitted source package a new case.
+    const sources = documents.filter(doc => !['advice', 'local', 'fee'].includes(doc.packageRole));
+    const primary = sources.filter(doc => doc.isPrimary && doc.packageRole === 'complaint');
+    if (primary.length !== 1 || sources.some(doc => !/^[a-f0-9]{64}$/.test(doc.supportingEvidence?.contentHash || ''))) return null;
+    return { complaint: primary[0].supportingEvidence!.contentHash!,
+        files: sources.map(doc => doc.supportingEvidence!.contentHash!).sort().join(':') };
+}
+
+class DuplicateFilingPackageError extends Error {}
+
 export interface FilingJobLogEntry {
     at: string;
     level: 'info' | 'warning' | 'error';
@@ -2850,14 +2864,19 @@ export class WorkflowDatabase {
               AND json_extract(c.normalized_data_json, '$.supportingPolicyVersion') = 2
               AND EXISTS (SELECT 1 FROM email_records e WHERE e.id = c.email_id AND e.processing_status IN ('processed','partial_failure','failed'))
               AND NOT EXISTS (SELECT 1 FROM filing_jobs j WHERE j.case_draft_id = c.id)
-            ORDER BY c.created_at LIMIT ?`).all(CURRENT_COMPLAINT_EXTRACTOR_VERSION, limit) as Array<{id:string}>;
+            ORDER BY c.created_at, c.id`).all(CURRENT_COMPLAINT_EXTRACTOR_VERSION) as Array<{id:string}>;
         let queued = 0;
         for (const row of rows) {
+            if (queued >= limit) break;
             const detail = this.getDraftDetail(row.id);
             if (!detail?.caseDraft?.filingEligible || detail.caseDraft.validationIssues.length ||
                 ['demand','notice_to_quit','none'].includes(String(detail.caseDraft.editableData.supportingRequirement))) continue;
-            this.queueFilingJob(row.id, 'prepare', 'validated_intake', 'worker');
-            queued++;
+            try {
+                this.queueFilingJob(row.id, 'prepare', 'validated_intake', 'worker');
+                queued++;
+            } catch (error) {
+                if (!(error instanceof DuplicateFilingPackageError)) throw error;
+            }
         }
         return queued;
     }
@@ -5805,6 +5824,11 @@ export class WorkflowDatabase {
                 email.sender,
             )
             : [];
+        if (caseDraft && !filingEligibilityIssues.length && !validationIssues.some(issue => issue.severity === 'error') &&
+            ['not_started', 'failed'].includes(caseDraft.filing_status)) {
+            const duplicate = this.findDuplicateFiling(caseDraft.id, documentViews.filter(doc => doc.requiredForFiling));
+            if (duplicate) validationIssues.push({ field: 'package.duplicate', severity: 'error', message: duplicate });
+        }
 
         return {
             caseDrafts: siblings.map(item => ({ id: item.id, status: item.status, filingStatus: item.filing_status, validationStatus: item.validation_status,
@@ -5975,6 +5999,8 @@ export class WorkflowDatabase {
             }
             let detail = this.getDraftDetail(caseDraftId);
             if (!detail?.caseDraft) throw new Error('Case draft not found');
+            const duplicate = detail.caseDraft.validationIssues.find(issue => issue.field === 'package.duplicate');
+            if (duplicate) throw new DuplicateFilingPackageError(duplicate.message);
             if (['queued','running'].includes(this.safeJson(detail.caseDraft.normalizedDataJson)?.complaintAutoExtraction?.status)) {
                 throw new Error('Filing is blocked: Complaint extraction is queued or still running.');
             }
@@ -6050,6 +6076,34 @@ export class WorkflowDatabase {
             if (!job) throw new Error('Queued MiFILE job could not be loaded');
             return job;
         });
+    }
+
+    private findDuplicateFiling(caseDraftId: string, documents: DuplicateCheckDocument[], includeQueued = true): string | null {
+        const identity = filingSourceIdentity(documents);
+        if (!identity) return null;
+        const candidates = this.db.prepare(`
+            SELECT j.payload_json, j.temporary_case_number, e.subject
+            FROM filing_jobs j JOIN case_drafts c ON c.id = j.case_draft_id JOIN email_records e ON e.id = c.email_id
+            WHERE j.case_draft_id <> ? AND j.mode = 'prepare'
+                AND (j.status IN ('running','reconciliation_required','prepared','succeeded')
+                    OR (j.status = 'queued' AND ? = 1)
+                    OR (j.status = 'failed' AND j.external_bundle_id IS NOT NULL
+                        AND COALESCE(j.error_code, '') <> 'RECONCILED_NOT_CREATED'))
+                AND json_valid(j.payload_json)
+                AND EXISTS (SELECT 1 FROM json_each(j.payload_json, '$.documents') d
+                    WHERE json_extract(j.payload_json, d.fullkey || '.isPrimary') = 1
+                    AND json_extract(j.payload_json, d.fullkey || '.supportingEvidence.contentHash') = ?)
+            ORDER BY j.rowid
+        `).iterate(caseDraftId, Number(includeQueued), identity.complaint) as Iterable<{
+            payload_json: string; temporary_case_number: string | null; subject: string | null;
+        }>;
+        for (const candidate of candidates) {
+            const payload = this.safeJson(candidate.payload_json) as FilingPayload | null;
+            if (!Array.isArray(payload?.documents) || filingSourceIdentity(payload.documents)?.files !== identity.files) continue;
+            const reference = candidate.temporary_case_number || candidate.subject || 'another Draft';
+            return `The same filing PDFs already have a MiFILE preparation attempt (${reference}). Review the existing attempt. No duplicate will be prepared.`;
+        }
+        return null;
     }
 
     recoverInterruptedFilingJobs(): number {
@@ -6129,13 +6183,23 @@ export class WorkflowDatabase {
         const jobId = this.runInTransaction(() => {
             if (this.db.prepare("SELECT 1 FROM mifile_checkout_inspections WHERE status = 'running' LIMIT 1").get() ||
                 this.db.prepare("SELECT 1 FROM mifile_submission_intents WHERE status IN ('checking','committing') LIMIT 1").get()) return null;
-            const queued = this.db.prepare(`
-                SELECT id, case_draft_id
-                FROM filing_jobs
-                WHERE status = 'queued'
-                ORDER BY created_at ASC
-                LIMIT 1
-            `).get() as { id: string; case_draft_id: string } | undefined;
+            const select = this.db.prepare(`SELECT id, case_draft_id, payload_json FROM filing_jobs
+                WHERE status = 'queued' ORDER BY created_at, rowid LIMIT 1`);
+            type QueuedJob = {id:string; case_draft_id:string; payload_json:string};
+            let queued: QueuedJob | undefined;
+            while ((queued = select.get() as QueuedJob | undefined)) {
+                const payload = this.safeJson(queued.payload_json) as FilingPayload | null;
+                // The oldest queued attempt wins over other queued attempts, but never over a started one.
+                const duplicate = Array.isArray(payload?.documents) && this.findDuplicateFiling(queued.case_draft_id, payload.documents, false);
+                if (!duplicate) break;
+                const timestamp = nowIso();
+                this.db.prepare(`UPDATE filing_jobs SET status='cancelled', checkpoint='duplicate_package',
+                    error_code='DUPLICATE_FILING_PACKAGE', error_message=?, finished_at=?, updated_at=? WHERE id=?`)
+                    .run(duplicate, timestamp, timestamp, queued.id);
+                this.db.prepare("UPDATE case_drafts SET status='filing_failed', filing_status='failed', updated_at=? WHERE id=?")
+                    .run(timestamp, queued.case_draft_id);
+                this.insertAuditLog('filing_job', queued.id, 'duplicate_filing_package_blocked', { caseDraftId: queued.case_draft_id });
+            }
             if (!queued) return null;
             const timestamp = nowIso();
             const result = this.db.prepare(`

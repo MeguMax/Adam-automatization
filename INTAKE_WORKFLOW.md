@@ -270,7 +270,7 @@ Upload failures use the normal per-document automatic and manual retries. Inacti
 
 By default, accepted senders are `ajd@devlinlawpllc.com` and the `USER_EMAIL` address. Override the list with `FILING_INTAKE_ALLOWED_SENDERS`, a comma-separated list of exact email addresses. The sender list is visible in Settings.
 
-Replies and forwards with `Re:` or `FW:` subjects do not create another intake. Original court notifications are processed only from exact `@truefiling.com` addresses. Client replies quoting a court notification are ignored, including delayed retries previously queued from those replies. `Document Sent` reads the case number and title from the actual email Subject header. Reprocessing the same recorded email resumes missing documents; sending the package as a completely new email creates a separate Draft.
+Replies and forwards with `Re:` or `FW:` subjects do not create another intake. Original court notifications are processed only from exact `@truefiling.com` addresses. Client replies quoting a court notification are ignored, including delayed retries previously queued from those replies. `Document Sent` reads the case number and title from the actual email Subject header. Reprocessing the same recorded email resumes missing documents. A new email is still recorded separately, but an exact match of the pinned Complaint and included source PDF hashes blocks a second MiFILE preparation while the original is queued, active, prepared or unresolved. The email reference, file order, filenames and standard Advice/Local forms are not part of this comparison. Other cases in the email remain eligible.
 
 Court notifications are download history and cannot create a new case package, including through the former manual-copy API. Notification reports do not announce filing readiness. To prepare a new case, the user must send an authorized intake or create a new manual Draft with original case documents.
 
@@ -658,6 +658,12 @@ each successful load. Persisted identity, document/type/connection mismatches,
 unrecognized notices and permanent access errors stop without corrective writes.
 Exhausted reads retain reconciliation-required status rather than queuing a new
 filing. Read retries are recorded in the existing preparation activity log.
+
+During a new preparation only, if the account, bundle, court, temporary case and
+full PDF manifest match but the filer is visibly empty, the worker reselects
+Devlin, Adam (P72877) and uses Save Progress once on that same bundle. It reopens
+and verifies the entire result again. A different filer or another mismatch is
+not repaired automatically. Read-only rechecks of existing bundles never save.
 
 Offline acceptance defaults to automatic email assembly and refuses to collapse
 several intake groups into one Draft. A manifest may explicitly declare

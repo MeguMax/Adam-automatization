@@ -189,6 +189,69 @@ test('a failed sibling attachment does not prevent the other complete case from 
     } finally { f.close(); }
 });
 
+test('the same source PDFs in a new email cannot queue a second MiFILE preparation', async () => {
+    const sources = names.filter(name => name.startsWith('Utsey'));
+    const f = fixture(sources);
+    try {
+        await f.library();
+        const original = f.packages[0];
+        await processFilingIntake(f.db, f.email.id, original.draftId, original.parsed, f.dependencies);
+        assert.equal(f.db.queueValidatedIntakes(1), 1);
+        const originalJob = f.db.listFilingJobs(original.draftId)[0];
+        const resend = { ...message, id: 'new-email', subject: 'NEW LT FILING - Different reference' };
+        const email = f.db.registerEmail(resend);
+        const [duplicate, independent] = f.db.createCaseDrafts(email.id, buildFilingIntake(resend, [...names].reverse().map(attachment)));
+        for (const item of [duplicate, independent]) await processFilingIntake(f.db, email.id, item.draftId, item.parsed, f.dependencies);
+        const detail = f.db.getDraftDetail(duplicate.draftId)!.caseDraft!;
+        assert.equal(detail.filingEligible, true);
+        assert.ok(detail.validationIssues.some(issue => issue.field === 'package.duplicate'));
+        assert.throws(() => f.db.queueFilingJob(duplicate.draftId), /same filing PDFs/);
+        assert.equal(f.db.claimNextFilingJob()!.id, originalJob.id);
+        f.db.completeFilingJob({ filingJobId: originalJob.id, status: 'reconciliation_required', checkpoint: 'verify_saved_bundle',
+            temporaryCaseNumber: 'TEMP-DUPLICATE', externalBundleId: randomUUID() });
+        assert.throws(() => f.db.queueFilingJob(duplicate.draftId), /TEMP-DUPLICATE/);
+        assert.equal(f.db.queueValidatedIntakes(1), 1);
+        assert.equal(f.db.listFilingJobs(independent.draftId).length, 1);
+        assert.equal(f.db.listFilingJobs(duplicate.draftId).length, 0);
+        assert.equal(f.db.getFilingJob(originalJob.id)!.status, 'reconciliation_required');
+    } finally { f.close(); }
+});
+
+test('a changed source PDF is not an exact duplicate, but a historical queued copy is stopped before dispatch', async () => {
+    const input = names.filter(name => name.startsWith('Utsey'));
+    const f = fixture(input);
+    try {
+        await f.library();
+        const original = f.packages[0];
+        await processFilingIntake(f.db, f.email.id, original.draftId, original.parsed, f.dependencies);
+        const firstJob = f.db.queueFilingJob(original.draftId);
+        const revisedEmail = { ...message, id: 'revised-email', subject: 'NEW LT FILING - Revised PDF' };
+        const email = f.db.registerEmail(revisedEmail);
+        const [revised] = f.db.createCaseDrafts(email.id, buildFilingIntake(revisedEmail, input.map(attachment)));
+        await processFilingIntake(f.db, email.id, revised.draftId, revised.parsed, {
+            ...f.dependencies,
+            download: item => downloadIntakeDocuments(item, { upload: f.upload, wait: async () => {},
+                download: async document => {
+                    const name = emailAttachmentSourceName(document.downloadUrl)!;
+                    const role = Object.keys(titles).find(role => name.includes(role))!;
+                    return Buffer.concat([testPdfFixture(titles[role]), Buffer.from('\n% ' + name + (role === 'Demand' ? ' revised' : ''))]);
+                },
+            }),
+        });
+        const secondJob = f.db.queueFilingJob(revised.draftId);
+        // Simulate two identical jobs queued before the guard existed.
+        (f.db as any).db.prepare('UPDATE filing_jobs SET payload_json = ? WHERE id = ?')
+            .run(JSON.stringify(firstJob.payload), secondJob.id);
+        assert.equal(f.db.claimNextFilingJob()!.id, firstJob.id);
+        f.db.completeFilingJob({ filingJobId: firstJob.id, status: 'prepared', checkpoint: 'saved_unsubmitted',
+            temporaryCaseNumber: 'TEMP-ORIGINAL', externalBundleId: randomUUID(), result: { testSnapshot: true } });
+        assert.equal(f.db.claimNextFilingJob(), null);
+        assert.equal(f.db.getFilingJob(firstJob.id)!.status, 'prepared');
+        assert.equal(f.db.getFilingJob(secondJob.id)!.status, 'cancelled');
+        assert.equal(f.db.getFilingJob(secondJob.id)!.errorCode, 'DUPLICATE_FILING_PACKAGE');
+    } finally { f.close(); }
+});
+
 test('replaying a mixed email preserves its saved bundle, manual edits and removed PDFs without uploads or filing jobs', async () => {
     const f = fixture(names.filter(name => name !== 'Walker W Request.pdf'));
     try {

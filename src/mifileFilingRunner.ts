@@ -302,7 +302,7 @@ export class MiFileFilingRunner {
                 packageDigest: preparationDigest(job.payload, documents.map(document => document.fingerprint)),
             });
             lastCheckpoint = 'verify_saved_bundle';
-            await this.reopenSavedBundle(page, savedUrl, job.payload, documentManifest,
+            await this.verifyNewlySavedBundle(page, savedUrl, job.payload, documentManifest,
                 credentials.username, externalBundleId, temporaryCaseNumber);
             const sources = documents.map(document => document.fingerprint);
             const savedBundleEvidence: MiFileSavedBundleEvidence = {
@@ -854,6 +854,23 @@ export class MiFileFilingRunner {
         }
     }
 
+    private async verifyNewlySavedBundle(page: Page, url: string, payload: FilingPayload, receipts: MiFileDocumentReceipt[],
+        username: string, bundleId: string, temporaryCaseNumber: string): Promise<void> {
+        try {
+            await this.reopenSavedBundle(page, url, payload, receipts, username, bundleId, temporaryCaseNumber);
+            return;
+        } catch (error) {
+            if (!(error instanceof MiFileFilingError) || error.code !== 'SAVED_BUNDLE_FILER_EMPTY') throw error;
+        }
+        // Only this in-flight preparation may repair its own verified bundle, once.
+        await this.log('warning', 'verify_saved_bundle', 'MiFILE cleared the filer on the saved bundle; restoring it on the same bundle once.',
+            { event: 'saved_filer_repair', externalBundleId: bundleId, temporaryCaseNumber });
+        if (miFileBundleId(page.url()) !== bundleId) throw new MiFileFilingError('The saved bundle changed before filer repair.',
+            'SAVED_BUNDLE_VERIFICATION_FAILED', 'verify_saved_bundle');
+        await this.saveProgress(page);
+        await this.reopenSavedBundle(page, url, payload, receipts, username, bundleId, temporaryCaseNumber);
+    }
+
     private async verifySavedBundle(page: Page, payload: FilingPayload, receipts: MiFileDocumentReceipt[],
         username: string, bundleId: string, temporaryCaseNumber: string): Promise<void> {
         try {
@@ -862,10 +879,8 @@ export class MiFileFilingRunner {
             const body = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
             const courtMatches=body.includes(payload.courtName.replace(/\s+/g, ' ')) ||
                 (payload.courtName === 'MI Macomb County - 37th District Court' && /\bFile to:\s*MI 37th District Court\s+Case Number:/i.test(body));
-            if (!courtMatches ||
-                body.match(/\bTEMP-[A-Z0-9-]+\b/i)?.[0] !== temporaryCaseNumber ||
-                !isRequiredMiFileFiler(await page.locator('#filer-input-selected').inputValue())) {
-                throw new Error('Saved bundle court, temporary case or filer did not match the preparation snapshot.');
+            if (!courtMatches || body.match(/\bTEMP-[A-Z0-9-]+\b/i)?.[0] !== temporaryCaseNumber) {
+                throw new Error('Saved bundle court or temporary case did not match the preparation snapshot.');
             }
             if (await page.getByRole('checkbox', { name: 'Serve Document', exact: true }).isChecked() ||
                 await page.locator('#isEmergency').isChecked()) {
@@ -887,7 +902,22 @@ export class MiFileFilingRunner {
                 throw new Error('The generated Case Initiation Form is missing or ambiguous.');
             }
             await this.verifyDocumentManifest(page, receipts);
+            await page.waitForFunction(() => ['#filer-input-selected', '#filer-input-empty'].some(selector => {
+                const input = document.querySelector(selector);
+                return input && input.getClientRects().length > 0 && getComputedStyle(input).visibility !== 'hidden';
+            }), undefined, { timeout: this.timeoutMs });
+            const selected = page.locator('#filer-input-selected');
+            const empty = page.locator('#filer-input-empty');
+            const selectedVisible = await selected.isVisible();
+            const emptyVisible = await empty.isVisible();
+            if (selectedVisible && !emptyVisible && isRequiredMiFileFiler(await selected.inputValue())) return;
+            if (emptyVisible && !selectedVisible && !(await empty.inputValue()).trim()) {
+                throw new MiFileFilingError('MiFILE did not retain the required filer on the saved bundle.',
+                    'SAVED_BUNDLE_FILER_EMPTY', 'verify_saved_bundle');
+            }
+            throw new Error('The saved bundle filer did not match the required attorney.');
         } catch (error) {
+            if (error instanceof MiFileFilingError && error.code === 'SAVED_BUNDLE_FILER_EMPTY') throw error;
             throw new MiFileFilingError(error instanceof Error ? error.message : 'Saved bundle verification failed.',
                 'SAVED_BUNDLE_VERIFICATION_FAILED', 'verify_saved_bundle', null, transientBundleRead(error));
         }
