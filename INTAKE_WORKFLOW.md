@@ -32,7 +32,9 @@ Attach individual PDFs: Complaint, Summons, Request, and applicable Demand/Notic
 
 ### Several cases in one email
 
-Use consistent prefixes, for example `Utsey W Complaint [$].pdf`, `Utsey W Summons.pdf`, `Utsey W Request.pdf`, `Utsey W Demand.pdf`, then the corresponding `Walker W ...` files. Bracketed filename markers do not determine the money claim; paragraph 10 and the amount still come from the Complaint. Multiple supporting PDFs sharing a prefix stay separate uploads in that case.
+Use consistent prefixes, for example `Myles K Complaint.pdf`, `Myles K Summons.pdf`, and `Myles K Request.pdf`. Supporting PDFs may use descriptive names such as `Myles K Demand.pdf`, `Myles K Lease.pdf`, or `Myles K Payment Ledger.pdf`. A custom descriptor only groups automatically when the prefix matches exactly one named Complaint, and the usual PDF checks and court-specific Other/Connected rule still apply. Bracketed filename markers do not determine the money claim; paragraph 10 and the amount still come from the Complaint.
+
+Use a semicolon to separate street and unit in the Complaint. For example, `329 E Edgewood Blvd; 10` becomes Address Line 1 `329 E Edgewood Blvd` and Address Line 2 `10`. Without the separator, the street line stays intact rather than guessing a unit.
 
 `NEW LT FILING` remains the recommended subject. An original email from an authorized sender can also use an ordinary subject such as `Five more` when it includes a named Complaint using this convention. Replies, forwards, unrelated attachments and court notification subjects cannot trigger this fallback. Court notifications still require the original TrueFiling sender.
 
@@ -157,13 +159,13 @@ Unmatched filenames and supporting-only prefixes remain visible review groups, n
 
 There is one content-based correction path for a supporting-only prefix typo: a verified Demand DC 100a with populated PDF fields can be matched to a single typed Complaint only when its full recipient name/address, Plaintiff and rented-premises address all agree exactly. Conflicting or empty PDF fields, different digits/unit numbers, multiple matching cases, scanned-only evidence and manual edits prevent this automatic reassignment. Each move records its PDF hash and matching method; the original filename and bytes stay unchanged. The empty source review group remains archived so email retries cannot recreate it. Unresolved same-surname or unassigned supporting groups prevent automatic preparation until their grouping is resolved or reviewed.
 
-### Ready package notifications
+### Intake result notifications
 
-After a newly completed preparation passes saved-bundle verification, a persistent outbox sends a plain-text email with the case, court, temporary number, source PDF count, Connected count and a direct authenticated Draft link. It explicitly says that no payment or court submission occurred. Opening the link preserves the selected Draft through sign-in. Notifications are not backfilled across historical bundles, not sent for partial/uncertain preparations, and not sent for controlled `NEW LT FILING - QA` fixtures.
+For new email intakes, the outbox sends one plain-text summary after all cases are either verified in Unsubmitted or require attention. Active automatic retries and preparations delay the summary. It lists each result and links to its authenticated Draft. Individual ready and retry-completed messages are suppressed for that intake. The summary is not a filing or payment receipt and is not sent for `NEW LT FILING - QA` fixtures. Existing intakes are not backfilled. The original per-draft ready notification still applies to other eligible preparations.
 
 The recipient defaults to the existing `NOTIFY_TO_EMAIL`; `DRAFT_READY_NOTIFY_EMAIL` can override it. `DRAFT_READY_NOTIFICATIONS_ENABLED=false` disables these messages. `ADMIN_PUBLIC_URL` supplies the public admin origin outside Render; on Render, its built-in `RENDER_EXTERNAL_URL` is used. `SENDER_USER_ID` must have the existing Microsoft Graph send permission. Settings > Email intake shows the configured recipient, and the Draft Activity view shows sending state and failures.
 
-Each verified job has at most one outbox entry. Successful sends persist across restarts. Microsoft throttling receives bounded delayed retries. The send request disables SDK retries and has a 20-second deadline. A timeout, server error or interrupted send remains uncertain rather than automatically sending again. After checking the recipient and Sent items, an operator can explicitly retry the notification from Activity without repeating MiFILE preparation. A notification failure cannot change the saved package or block another case.
+Each source email has one summary outbox entry. Successful sends persist across restarts and replay. Microsoft throttling receives bounded delayed retries. The send request disables SDK retries and has a 20-second deadline. A timeout, server error or interrupted send remains uncertain rather than automatically sending again. Check the recipient and Sent items in that case. For legacy per-draft notices, the Activity view offers an explicit retry after that check. A notification failure cannot change saved packages or block other cases.
 
 Before claiming a ready email, the worker rechecks the current saved-bundle
 evidence, latest preparation attempt, included PDF hashes/sizes and any active

@@ -51,7 +51,7 @@ const MAX_DOCUMENT_RETRIES_PER_POLL = Math.min(
     10,
 );
 const RUN_ONCE = process.argv.includes('--once') || process.env.WORKER_RUN_ONCE === '1';
-const WORKER_BUILD_ID = '2026-11-07-excel-read-watchdog-v123';
+const WORKER_BUILD_ID = '2026-11-19-intake-feedback-v125';
 
 export interface WorkerRunOptions {
     runOnce?: boolean;
@@ -545,7 +545,7 @@ async function processDueDocumentRetries(db: WorkflowDatabase): Promise<void> {
             ? db.refreshCaseDraftValidation(caseDraftId)
             : null;
 
-        if (recoveredFiles.length) {
+        if (recoveredFiles.length && !db.draftNotifications().hasIntake(emailId)) {
             try {
                 const reportPlaintiffNaming = lookupPlaintiffNaming(db, reportParsed);
                 await sendProcessingReport({
@@ -674,6 +674,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
             }
 
             if (parsed.sourceKind === 'new_filing_intake') {
+                db.draftNotifications().enrollIntake(emailRecord.id, msg.subject || null);
                 const packages = db.createCaseDrafts(emailRecord.id, parsed);
                 const resolver = createEmailAttachmentResolver(async () => msg);
                 const packageErrors: string[] = [];
@@ -838,6 +839,7 @@ async function processOnce(db: WorkflowDatabase): Promise<void> {
                 db.setCaseDraftStatus(caseDraftId, 'validation_failed', 'failed', 'not_started');
             }
 
+            if (db.draftNotifications().hasIntake(emailRecord.id)) continue;
             try {
                 await sendFailureReport({ msg, parsed, error: err });
             } catch (e) {

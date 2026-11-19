@@ -19,6 +19,7 @@ export interface ComplaintPartyExtraction {
     lastName?: string;
     suffix?: string;
     address1?: string;
+    address2?: string;
     city?: string;
     state?: string;
     postalCode?: string;
@@ -183,6 +184,13 @@ function complaintFormType(text: string): string | null {
         ?? (/COMPLAINT\s+TO\s+RECOVER POSSESSION OF PROPERTY/i.test(text) ? 'RECOVER POSSESSION OF PROPERTY' : null);
 }
 
+function parseStreetAddress(value = ''): Pick<ComplaintPartyExtraction, 'address1' | 'address2'> {
+    const separator = value.indexOf(';');
+    if (separator <= 0) return { address1: value.trim() || undefined };
+    const unit = value.slice(separator + 1).trim();
+    return { address1: value.slice(0, separator).trim(), ...(unit ? { address2: unit } : {}) };
+}
+
 function partyFromLines(lines: string[]): ComplaintPartyExtraction | undefined {
     if (!lines[0] || !/[a-z]{2}/i.test(lines[0])) return;
     const name = cleanName(lines[0]);
@@ -190,7 +198,7 @@ function partyFromLines(lines: string[]): ComplaintPartyExtraction | undefined {
     const addressLines = cityIndex > 0 ? lines.slice(1, cityIndex).filter(line => !/^(?:devlin law|.*P\d{5})/i.test(line)) : [];
     return {
         displayName: name, ...personNameParts(name),
-        ...(cityIndex > 0 ? { address1: addressLines.join(' '), ...parseCityStateZip(lines[cityIndex]) } : {}),
+        ...(cityIndex > 0 ? { ...parseStreetAddress(addressLines.join(' ')), ...parseCityStateZip(lines[cityIndex]) } : {}),
         phone: lines.map(normalizedPhone).find(Boolean),
     };
 }
@@ -580,7 +588,7 @@ export function parseComplaintText(
             displayName: attorneyName,
             ...personNameParts(attorneyName),
             barNumber: barMatch?.[0].toUpperCase(),
-            address1: filled[addressIndex],
+            ...parseStreetAddress(filled[addressIndex]),
             ...(cityIndex > attorneyIndex ? parseCityStateZip(filled[cityIndex]) : {}),
             phone: phoneIndex > attorneyIndex ? normalizedPhone(filled[phoneIndex]) : undefined,
         };
@@ -601,7 +609,7 @@ export function parseComplaintText(
             const defendantCity = parseCityStateZip(filled[defendantIndex + 2] ?? '');
             applyDefendants({data,fieldConfidence,warnings},{
                 displayName: rawDefendant,
-                address1: filled[defendantIndex + 1],
+                ...parseStreetAddress(filled[defendantIndex + 1]),
                 ...defendantCity,
             },'high');
         }

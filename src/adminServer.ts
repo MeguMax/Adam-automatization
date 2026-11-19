@@ -57,7 +57,7 @@ import {FINAL_MIFILE_ACTIONS_ENABLED} from './mifileCheckout';
 import { recheckSavedFilingJob } from './savedBundleRecheck';
 
 const DEFAULT_PORT = Number(process.env.PORT || process.env.ADMIN_PORT || 3000);
-const ADMIN_BUILD_ID = '2026-11-07-excel-read-watchdog-v123';
+const ADMIN_BUILD_ID = '2026-11-19-intake-feedback-v125';
 const SYNC_EMAIL_LIMIT = Number(process.env.ADMIN_SYNC_EMAIL_LIMIT || 100);
 const AUTO_SYNC_INTERVAL_MS = Number(process.env.ADMIN_AUTO_SYNC_MS || 30_000);
 const ADMIN_SYNC_ENABLED = !['0', 'false', 'no', 'off'].includes(
@@ -441,6 +441,9 @@ async function syncRecentInboxMetadata(limit = SYNC_EMAIL_LIMIT): Promise<{
                 continue;
             }
             if (parsed) {
+                if (parsed.sourceKind === 'new_filing_intake') {
+                    db.draftNotifications().enrollIntake(emailRecord.id, msg.subject || null);
+                }
                 miFileDrafts += db.createCaseDrafts(emailRecord.id, parsed).length;
             } else {
                 db.markEmailIgnored(emailRecord.id, 'Not a court notification or authorized NEW LT FILING intake');
@@ -3993,12 +3996,12 @@ const html = String.raw`<!doctype html>
       try {
         payload = text ? JSON.parse(text) : null;
       } catch {
-        throw new Error(fallback);
+        throw Object.assign(new Error(fallback), { status: res.status });
       }
       if (!res.ok) {
         const message = payload && typeof payload.error === 'string' && !/<!doctype|<html[\s>]/i.test(payload.error)
           ? payload.error : fallback;
-        throw new Error(message);
+        throw Object.assign(new Error(message), { status: res.status });
       }
       return payload;
     }
@@ -4556,7 +4559,7 @@ const html = String.raw`<!doctype html>
       renderIcons();
     }
 
-    async function loadDrafts(force) {
+    async function loadDrafts(force, background) {
       if (state.draftLoadPromise) {
         try {
           await state.draftLoadPromise;
@@ -4584,6 +4587,10 @@ const html = String.raw`<!doctype html>
         if (dateTo) params.set('dateTo', localDateBoundaryIso(dateTo, true));
 
         const page = await api('/api/drafts?' + params.toString());
+        if (background && refreshInteractionActive()) return;
+        const signature = JSON.stringify(page);
+        if (!force && signature === state.draftListPollSnapshot) return;
+        state.draftListPollSnapshot = signature;
         state.drafts = page.items || [];
         state.draftPagination = {
           page: Number(page.page || 1),
@@ -4694,7 +4701,7 @@ const html = String.raw`<!doctype html>
       try {
         const checkout = await api('/api/filing-jobs/' + encodeURIComponent(job.id) + '/checkout/refresh-status',
           {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-        if (state.selectedDraftId !== draftId || state.draftFilingJobs[0]?.id !== job.id) return;
+        if (state.selectedDraftId !== draftId || state.draftFilingJobs[0]?.id !== job.id || refreshInteractionActive()) return;
         state.draftFilingJobs[0].checkout = checkout;
         renderDraftFilingJobs();
       } finally { receiptRefreshBusy = false; }
@@ -5328,8 +5335,11 @@ const html = String.raw`<!doctype html>
 
     function renderReadyNotification(notification) {
       if (!notification) return '';
-      const labels = {pending:'Review email queued',sending:'Sending review email',sent:'Review email sent',
-        failed:'Review email not sent',uncertain:'Check review email delivery'};
+      const labels = notification.batch
+        ? {pending:'Email summary pending',sending:'Sending email summary',sent:'Email summary sent',
+            failed:'Email summary not sent',uncertain:'Check email summary delivery'}
+        : {pending:'Review email queued',sending:'Sending review email',sent:'Review email sent',
+            failed:'Review email not sent',uncertain:'Check review email delivery'};
       const lines = [];
       if (notification.recipient) lines.push('To: ' + notification.recipient);
       if (notification.sentAt) lines.push('Sent: ' + fmtDate(notification.sentAt));
@@ -5343,25 +5353,30 @@ const html = String.raw`<!doctype html>
           '" title="Retry review email" aria-label="Retry review email">' + icon('rotate-cw') + '</button>' : '') + '</div>';
     }
 
-    async function refreshDraftFilingState(force) {
-      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open) return;
+    async function refreshDraftFilingState(force, background) {
+      const blocked = () => document.getElementById('draftConfirmDialog').open || (background && refreshInteractionActive());
+      if (!state.selectedDraftId || !state.draftDetail || state.draftDirty || state.draftMutationBusy || blocked()) return;
       const draftId = state.selectedDraftId;
       const revision = state.draftEditRevision;
       const jobs = await api('/api/filing-jobs?caseDraftId=' +
         encodeURIComponent(draftId));
-      if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open || state.draftEditRevision !== revision) return;
+      if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || blocked() || state.draftEditRevision !== revision) return;
       const previous = state.draftFilingJobs[0];
       const latest = jobs[0];
-      state.draftFilingJobs = jobs;
-      if (force || !previous || !latest || previous.updatedAt !== latest.updatedAt ||
+      const jobsChanged = JSON.stringify(jobs) !== JSON.stringify(state.draftFilingJobs);
+      if (force || !previous || !latest || previous.id !== latest.id || previous.updatedAt !== latest.updatedAt ||
           ['pending','sending'].includes(state.draftDetail.readyNotification?.status) ||
           ['queued','reading','retry_scheduled'].includes(state.draftDetail.caseDraft?.complaintReading?.status) ||
           state.draftDetail.documents.some(doc => doc.recognitionRecovery)) {
         const detail = await api('/api/drafts/' + encodeURIComponent(draftId));
-        if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || document.getElementById('draftConfirmDialog').open || state.draftEditRevision !== revision) return;
-        state.draftDetail = detail;
-        renderDraftWorkspace();
-      } else {
+        if (state.selectedDraftId !== draftId || state.draftDirty || state.draftMutationBusy || blocked() || state.draftEditRevision !== revision) return;
+        if (force || JSON.stringify(detail) !== JSON.stringify(state.draftDetail) || jobsChanged) {
+          state.draftFilingJobs = jobs;
+          state.draftDetail = detail;
+          renderDraftWorkspace();
+        }
+      } else if (jobsChanged) {
+        state.draftFilingJobs = jobs;
         renderDraftFilingJobs();
       }
       refreshPreparedReceiptStatus().catch(() => {});
@@ -7067,7 +7082,7 @@ const html = String.raw`<!doctype html>
           '<button type="button" class="ghost icon-button" data-cancel-inline-mapping="' + id + '" title="Cancel editing" aria-label="Cancel editing">' + icon('x') + '</button>'
         : '<button type="button" class="icon-button" data-edit-mapping="' + id + '" title="Edit mapping" aria-label="Edit mapping">' + icon('pencil') + '</button>' +
           (row.shortName ? '<button type="button" class="icon-button" data-clear-short-name="' + id + '" title="Remove short name" aria-label="Remove short name">' + icon('eraser') + '</button>' : '') +
-          (row.shortName ? '<button type="button" class="icon-button" data-toggle-mapping="' + id + '" data-active="' + escapeHtml(!row.isActive) + '" title="' + escapeHtml(row.isActive ? 'Deactivate mapping' : 'Activate mapping') + '" aria-label="' + escapeHtml(row.isActive ? 'Deactivate mapping' : 'Activate mapping') + '">' + icon(row.isActive ? 'circle-pause' : 'circle-play') + '</button>' : '') +
+          (row.shortName ? '<button type="button" class="' + (row.isActive ? 'icon-button' : '') + '" data-toggle-mapping="' + id + '" data-active="' + escapeHtml(!row.isActive) + '" title="' + (row.isActive ? 'Deactivate mapping' : 'Use this short name in new filenames') + '" aria-label="' + (row.isActive ? 'Deactivate mapping' : 'Activate short name') + '">' + icon(row.isActive ? 'circle-pause' : 'circle-play') + (row.isActive ? '' : 'Activate') + '</button>' : '') +
           (row.isActive && row.shortName ? '<button type="button" class="icon-button" data-apply-plaintiff-files="' + id + '" title="Apply to existing OneDrive files" aria-label="Apply to existing OneDrive files">' + icon('files') + '</button>' : '');
 
       return '<tr data-mapping-row="' + id + '">' +
@@ -7840,7 +7855,7 @@ const html = String.raw`<!doctype html>
       renderIcons();
     }
 
-    async function loadActivity(force) {
+    async function loadActivity(force, background) {
       if (state.activityLoadPromise) {
         try {
           await state.activityLoadPromise;
@@ -7865,6 +7880,10 @@ const html = String.raw`<!doctype html>
         if (dateTo) params.set('dateTo', localDateBoundaryIso(dateTo, true));
 
         const page = await api('/api/activity?' + params.toString());
+        if (background && refreshInteractionActive()) return;
+        const signature = JSON.stringify(page);
+        if (!force && signature === state.activityPollSnapshot) return;
+        state.activityPollSnapshot = signature;
         state.activity = page.items || [];
         state.activityPagination = {
           page: Number(page.page || 1),
@@ -7919,7 +7938,25 @@ const html = String.raw`<!doctype html>
     void loadWorkerStatus();
     setInterval(() => { if (!document.hidden) void loadWorkerStatus(); }, 15_000);
 
-    async function loadData(force) {
+    const activeControlPointers = new Set();
+    window.addEventListener('pointerdown', event => {
+      if (event.target.closest?.('button, a, input, select, textarea, summary, [role="button"], tr[data-id], [data-open-draft]')) {
+        activeControlPointers.add(event.pointerId);
+      }
+    }, true);
+    const finishControlPointer = event => {
+      // Leave the clicked control intact until its click handler has run.
+      setTimeout(() => activeControlPointers.delete(event.pointerId), 100);
+    };
+    window.addEventListener('pointerup', finishControlPointer, true);
+    window.addEventListener('pointercancel', finishControlPointer, true);
+    window.addEventListener('blur', () => activeControlPointers.clear());
+
+    function refreshInteractionActive() {
+      return activeControlPointers.size > 0 || Boolean(document.querySelector('dialog[open]'));
+    }
+
+    async function loadData(force, background) {
       if (state.loadPromise) {
         try {
           await state.loadPromise;
@@ -7950,6 +7987,10 @@ const html = String.raw`<!doctype html>
           api('/api/live-status'),
           api('/api/mifile-config'),
         ]);
+        if (background && refreshInteractionActive()) return;
+        const queueSignature = JSON.stringify(queuePage);
+        const renderQueuePage = force || queueSignature !== state.queuePollSnapshot;
+        state.queuePollSnapshot = queueSignature;
         state.summary = summary;
         state.queue = queuePage.items || [];
         state.pagination = {
@@ -7961,14 +8002,21 @@ const html = String.raw`<!doctype html>
         state.live = live;
         state.mifileConfig = mifileConfig;
         renderSummary();
-        renderQueue();
+        if (renderQueuePage) renderQueue();
         renderLiveStatus();
 
         if (state.selectedId) {
+          const id = state.selectedId;
           try {
-            state.detail = await api('/api/emails/' + encodeURIComponent(state.selectedId));
-            renderDetail();
-          } catch {
+            const detail = await api('/api/emails/' + encodeURIComponent(id));
+            if (state.selectedId !== id || (background && refreshInteractionActive())) return;
+            if (force || JSON.stringify(detail) !== JSON.stringify(state.detail)) {
+              state.detail = detail;
+              renderDetail();
+            }
+          } catch (error) {
+            if (state.selectedId !== id || (background && refreshInteractionActive())) return;
+            if (error.status !== 404 && !force) return;
             state.selectedId = null;
             state.detail = null;
             renderDetail();
@@ -8235,17 +8283,17 @@ const html = String.raw`<!doctype html>
       event.returnValue = '';
     });
     setInterval(() => {
-      if (document.hidden) return;
-      loadData().catch(error => {
+      if (document.hidden || refreshInteractionActive()) return;
+      loadData(false, true).catch(error => {
         state.live = { running: false, lastError: error.message, lastFinishedAt: null, lastStartedAt: null, lastSyncedEmails: 0, lastMiFileDrafts: 0 };
         renderLiveStatus();
       });
-      if (state.view === 'activity') loadActivity().catch(showActivityError);
+      if (state.view === 'activity') loadActivity(false, true).catch(showActivityError);
       if (state.view === 'drafts' && !state.selectedDraftId) {
-        loadDrafts().catch(showDraftError);
+        loadDrafts(false, true).catch(showDraftError);
       }
       if (state.view === 'drafts' && state.selectedDraftId) {
-        refreshDraftFilingState().catch(showDraftError);
+        refreshDraftFilingState(false, true).catch(showDraftError);
       }
     }, 3000);
   </script>

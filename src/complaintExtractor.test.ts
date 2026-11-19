@@ -45,6 +45,20 @@ test('recognizes Complaint documents without treating every filing as primary', 
     assert.equal(isComplaintDocument('Summons, Landlord-Tenant', 'Summons.pdf'), false);
 });
 
+test('uses a semicolon in the Complaint to populate the separate unit field', async () => {
+    const typed = await extractComplaintPdf(testComplaintFormFixture({
+        7: 'Morgan Tenant, and all other occupants\r200 Rental Avenue; 4\rLincoln Park, MI 48146',
+    }));
+    assert.equal(typed.data.defendants?.[0].address1, '200 Rental Avenue');
+    assert.equal(typed.data.defendants?.[0].address2, '4');
+    const extracted = parseComplaintText(POSSESSION_ONLY_TEXT.replace(/300 Rental Street Apt 4/g, '300 Rental Street; Apt 4'));
+    assert.equal(extracted.data.defendants?.[0].address1, '300 Rental Street');
+    assert.equal(extracted.data.defendants?.[0].address2, 'Apt 4');
+    const legacy = parseComplaintText(POSSESSION_ONLY_TEXT);
+    assert.equal(legacy.data.defendants?.[0].address1, '300 Rental Street Apt 4');
+    assert.equal(legacy.data.defendants?.[0].address2, undefined);
+});
+
 test('termination Complaints use the same LT fields without an unsupported-form blocker', () => {
     const result = parseComplaintText(POSSESSION_ONLY_TEXT.replace('NONPAYMENT OF RENT', 'TERMINATION OF TENANCY'));
     assert.equal(result.formType, 'TERMINATION OF TENANCY');

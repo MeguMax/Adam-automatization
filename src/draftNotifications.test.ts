@@ -12,12 +12,16 @@ import { bundleExecutionKey } from './mifileBundleSafety';
 const environment = { DRAFT_READY_NOTIFY_EMAIL: 'adam@example.com', SENDER_USER_ID: 'sender@example.com',
     ADMIN_PUBLIC_URL: 'https://workflow.example', DRAFT_READY_NOTIFICATIONS_ENABLED: 'true' };
 
-function fixture() {
+function fixture(enroll = false) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'draft-notifications-'));
     const db = new WorkflowDatabase(path.join(directory, 'workflow.sqlite'));
     const sql = (db as any).db;
     const msg = { id: 'ready-notification', subject: 'NEW LT FILING - Example', receivedDateTime: new Date().toISOString() };
-    const email = db.registerEmail(msg), draftId = db.createCaseDraft(email.id, buildFilingIntake(msg, []));
+    const email = db.registerEmail(msg);
+    let clock = Date.now();
+    const store = new DraftNotificationStore(sql, () => new Date(clock).toISOString());
+    if (enroll) store.enrollIntake(email.id, msg.subject);
+    const draftId = db.createCaseDraft(email.id, buildFilingIntake(msg, []));
     const complaintId=db.addDocument({emailId:email.id,caseDraftId:draftId,documentType:'Complaint',status:'uploaded',uploadSource:'email_intake',
         originalFilename:'Complaint.pdf',oneDriveUrl:'https://onedrive.example/complaint',fileSize:500,
         metadata:{recognition:{role:'complaint',source:'content',contentHash:'ab'.repeat(32),recognitionVersion:2,pdfVerified:true}}});
@@ -45,11 +49,53 @@ function fixture() {
     sql.prepare(`INSERT INTO filing_jobs(id,case_draft_id,attempt_number,mode,status,payload_json,result_json,external_bundle_id,temporary_case_number,created_at,updated_at)
         VALUES (?,?,1,'prepare','prepared',?,?,?,?,?,?)`).run(job.id,draftId,JSON.stringify(payload),JSON.stringify(result),bundle,'TEMP-READY',new Date().toISOString(),new Date().toISOString());
     db.setCaseDraftStatus(draftId, 'filing_prepared', 'passed', 'prepared');
-    let clock = Date.now();
-    const store = new DraftNotificationStore(sql, () => new Date(clock).toISOString());
-    return { db, sql, store, job, draftId, advance(ms: number) { clock += ms; },
+    return { db, sql, store, job, draftId, emailId: email.id, msg, advance(ms: number) { clock += ms; },
         close() { db.close(); fs.rmSync(directory, { recursive: true, force: true }); } };
 }
+
+test('one intake summary waits for a sibling to finish and survives replays and restarts', () => {
+    const f = fixture(true);
+    try {
+        f.store.enrollIntake(f.emailId, f.msg.subject);
+        assert.equal(f.store.hasIntake(f.emailId), true);
+        const historic = f.db.registerEmail({ ...f.msg, id: 'historic-intake' });
+        f.db.createCaseDraft(historic.id, buildFilingIntake(f.msg, []));
+        f.store.enrollIntake(historic.id, f.msg.subject);
+        assert.equal(f.store.hasIntake(historic.id), false, 'existing cases retain their notification history');
+        const qa = f.db.registerEmail({ ...f.msg, id: 'qa-intake' });
+        f.store.enrollIntake(qa.id, 'NEW LT FILING - QA do not send');
+        assert.equal(f.store.hasIntake(qa.id), false);
+
+        const digest = (emailId: string) => f.db.intakeResultNotification(emailId, true);
+        assert.equal(f.store.claimIntake(digest, environment), null, 'email still new');
+        f.db.markEmailProcessed(f.emailId);
+        const sibling = buildFilingIntake(f.msg, []);
+        sibling.intake!.packageKey = 'other d';
+        sibling.intake!.packageLabel = 'Other D';
+        const siblingId = f.db.createCaseDraft(f.emailId, sibling);
+        f.db.setCaseDraftStatus(siblingId, 'filing_in_progress', 'passed', 'running');
+        f.advance(31_000);
+        assert.equal(f.store.claimIntake(digest, environment), null, 'a sibling is still preparing');
+        f.db.setCaseDraftStatus(siblingId, 'needs_review', 'failed', 'not_started');
+        const document = f.db.addDocument({ emailId: f.emailId, caseDraftId: siblingId, documentType: 'Summons',
+            status: 'retry_queued', originalFilename: 'Summons.pdf', sourceUrl: 'https://example.com/test.pdf', uploadSource: 'email_intake' });
+        f.advance(31_000);
+        assert.equal(f.store.claimIntake(digest, environment), null, 'automatic document retry still pending');
+        f.sql.prepare("UPDATE document_records SET status='failed',next_retry_at=NULL WHERE id=?").run(document);
+        f.advance(31_000);
+        const mail = f.store.claimIntake(digest, environment)!;
+        assert.match(mail.bodyText, /1 ready, 1 to check/);
+        assert.match(mail.bodyText, /TEMP-READY/);
+        assert.match(mail.bodyText, /Review required/);
+        assert.match(mail.bodyText, new RegExp(siblingId));
+        assert.equal(f.store.claimIntake(digest, environment), null);
+        f.store.finishIntake(mail, { sent: true });
+        f.store.recover();
+        f.store.enrollIntake(f.emailId, f.msg.subject);
+        f.advance(600_000);
+        assert.equal(f.store.claimIntake(digest, environment), null, 'a replay cannot send a second summary');
+    } finally { f.close(); }
+});
 
 function secondJob(f:ReturnType<typeof fixture>,sameBundle=true) {
     const bundle=sameBundle?f.job.externalBundleId!:'a12c1ad4-633d-429a-0166-08df32c555de';

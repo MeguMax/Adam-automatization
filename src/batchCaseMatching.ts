@@ -31,7 +31,8 @@ export function matchesSupportingCase(identity: SupportingCaseIdentity, data: Co
     if (![party.displayName, party.address1, party.city, party.state, party.postalCode].every(value => Boolean(value?.trim()))) return false;
     const normalize = (value: string) => value.normalize('NFKC').replace(/,?\s+and all other occupants\b/ig, '')
         .toLowerCase().replace(/[\s,.'-]+/g, '');
-    const address = [party.address1, party.city, party.state, party.postalCode].join(' ');
-    return normalize(identity.plaintiff) === normalize(data.plaintiff.displayName) && normalize(identity.premises) === normalize(address) &&
-        normalize(identity.recipient) === normalize(party.displayName + ' ' + address);
+    const address = [party.address1, party.address2, party.city, party.state, party.postalCode].join(' ');
+    const normalizeAddress = (value: string) => normalize(value.replace(/;/g, ' '));
+    return normalize(identity.plaintiff) === normalize(data.plaintiff.displayName) && normalizeAddress(identity.premises) === normalizeAddress(address) &&
+        normalizeAddress(identity.recipient) === normalizeAddress(party.displayName + ' ' + address);
 }

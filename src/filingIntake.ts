@@ -17,18 +17,22 @@ export interface FilingIntakeInfo {
     groups?: Array<{ key: string; label: string; sources: string[]; issues: string[] }>;
 }
 
-export function intakeCasePrefix(filename: string): { key: string; label: string } | null {
+function namedIntakeFile(filename: string): { key: string; label: string; role: string } | null {
     const match = filename.normalize('NFKC').trim().match(
-        /^(.+?)\s+([a-z])\s+(?:complaint|summons|request|demand|other|connected|notice|lease|deed|advice|local|affidavit)\b.*\.pdf$/i,
+        /^(.+?)\s+([a-z])\s+(complaint|summons|request|demand|other|connected|notice|lease|deed|advice|local|affidavit)\b.*\.pdf$/i,
     );
     if (!match || !/[a-z\p{L}]/iu.test(match[1])) return null;
     const surname = match[1].replace(/\s+/g, ' ').trim();
-    return { key: `${surname.toLowerCase()} ${match[2].toLowerCase()}`, label: `${surname} ${match[2].toUpperCase()}` };
+    return { key: `${surname.toLowerCase()} ${match[2].toLowerCase()}`, label: `${surname} ${match[2].toUpperCase()}`, role: match[3].toLowerCase() };
+}
+
+export function intakeCasePrefix(filename: string): { key: string; label: string } | null {
+    const named = namedIntakeFile(filename);
+    return named && { key: named.key, label: named.label };
 }
 
 export function hasNamedFilingPackage(attachments: CourtEmailAttachment[]): boolean {
-    return attachments.some(file => isPdfAttachment(file) && intakeCasePrefix(file.name) &&
-        /\bcomplaint\b/i.test(file.name));
+    return attachments.some(file => isPdfAttachment(file) && namedIntakeFile(file.name)?.role === 'complaint');
 }
 
 export function splitFilingIntake(parsed: ParsedEmailInfo): ParsedEmailInfo[] {
@@ -91,9 +95,18 @@ export function buildFilingIntake(
         names.add(name);
     }
     const groups = new Map<string, { key: string; label: string; sources: string[]; issues: string[] }>();
-    const named = pdfs.some(file => intakeCasePrefix(file.name));
+    const namesByFile = new Map(pdfs.map(file => [file, namedIntakeFile(file.name)]));
+    const complaintPrefixes = new Map<string, { key: string; label: string; count: number }>();
+    for (const prefix of namesByFile.values()) {
+        if (prefix?.role !== 'complaint') continue;
+        complaintPrefixes.set(prefix.key, { ...prefix, count: (complaintPrefixes.get(prefix.key)?.count ?? 0) + 1 });
+    }
+    const named = [...namesByFile.values()].some(Boolean);
     for (const file of named ? pdfs : []) {
-        const prefix = intakeCasePrefix(file.name);
+        const stem = file.name.normalize('NFKC').trim().replace(/\.pdf$/i, '').replace(/\s+/g, ' ').toLowerCase();
+        const matches = [...complaintPrefixes.values()].filter(candidate => stem.startsWith(candidate.key + ' '));
+        const exact = namesByFile.get(file);
+        const prefix = exact || (matches.length === 1 && matches[0].count === 1 ? matches[0] : null);
         const key = prefix?.key || '__unassigned__';
         const group = groups.get(key) || { key, label: prefix?.label || 'Unassigned attachments', sources: [], issues: [] };
         group.sources.push(createEmailAttachmentSource(file.name, file.id));

@@ -85,12 +85,31 @@ test('typed Demand identities require exact recipient, Plaintiff and premises an
         'mailmerge[40]_dc100a_02': 'Example Property LLC', 'mailmerge[40]_dc100a_04': '101 Main Street Lincoln Park, MI 48146' };
     const identity = (await readSupportingCaseIdentity(testTextFieldsFixture('DEMAND FOR POSSESSION', fields)))!;
     assert.ok(identity); assert.equal(matchesSupportingCase(identity, extraction('William Utsey', '17').data), true);
+    const withUnit = extraction('William Utsey', '17').data;
+    withUnit.defendants![0].address2 = '10';
+    const matchingUnit = { ...identity, premises: identity.premises.replace('Street', 'Street; 10'),
+        recipient: identity.recipient.replace('Street', 'Street; 10') };
+    assert.equal(matchesSupportingCase(matchingUnit, withUnit), true);
+    assert.equal(matchesSupportingCase(identity, withUnit), false);
+    assert.equal(matchesSupportingCase({ ...matchingUnit, premises: matchingUnit.premises.replace('; 10', '; 11') }, withUnit), false);
     for (const changed of [ { ...identity, recipient: identity.recipient.replace('William', 'Wayne') },
         { ...identity, premises: identity.premises.replace('101', '110') }, { ...identity, plaintiff: 'Other Property LLC' },
         { ...identity, sourceHash: 'old' } ]) assert.equal(matchesSupportingCase(changed, extraction('William Utsey', '17').data), false);
     assert.equal(await readSupportingCaseIdentity(testPdfFixture('DEMAND FOR POSSESSION')), null);
     assert.equal(await readSupportingCaseIdentity(testTextFieldsFixture('DEMAND FOR POSSESSION', { ...fields,
         dc100a_01: 'Wayne Utsey\r101 Main Street\rLincoln Park, MI 48146' })), null);
+});
+
+test('only a unique matching Complaint prefix assigns a custom supporting filename', () => {
+    const files = [...names, 'Utsey W Payment Ledger.pdf', 'Walker W Signed Agreement.pdf',
+        'Walker A Payment Ledger.pdf', 'Payment Ledger.pdf'];
+    const grouped = (input: string[]) => Object.fromEntries(splitFilingIntake(buildFilingIntake(message, input.map(attachment)))
+        .map(item => [item.intake?.packageKey, item.filedDocuments.map(doc => doc.documentName)]));
+    const result = grouped(files);
+    assert.ok(result['utsey w'].includes('Utsey W Payment Ledger.pdf'));
+    assert.ok(result['walker w'].includes('Walker W Signed Agreement.pdf'));
+    assert.deepEqual(result.__unassigned__, ['Walker A Payment Ledger.pdf', 'Payment Ledger.pdf']);
+    assert.ok(grouped([...files, 'Utsey W Complaint (copy).pdf']).__unassigned__.includes('Utsey W Payment Ledger.pdf'));
 });
 
 test('a mistyped supporting prefix is corrected only by one exact typed Complaint match; manual changes stop automatic reassignment', async () => {

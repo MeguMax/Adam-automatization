@@ -115,7 +115,7 @@ async function main() {
     await once(server, 'listening');
     const port = (server.address() as { port: number }).port;
     const url = `http://127.0.0.1:${port}`;
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({ headless: true, channel: process.env.ADMIN_SMOKE_BROWSER_CHANNEL });
     const context = await browser.newContext();
     await context.route('**/*', route => {
         if (route.request().url().startsWith(url)) return route.continue();
@@ -151,13 +151,27 @@ async function main() {
         await page.locator('tr[data-id="'+email.id+'"]').click();
         await page.locator('#retryBtn').waitFor({state:'visible'});
         await page.waitForFunction(()=>!(document.getElementById('retryBtn') as HTMLButtonElement)?.disabled);
-        await page.locator('#retryBtn').click();
+        const retryButton = await page.locator('#retryBtn').elementHandle();
+        const position = await retryButton!.boundingBox();
+        assert.ok(position);
+        await page.mouse.move(position.x + position.width / 2, position.y + position.height / 2);
+        await page.mouse.down();
+        await page.waitForTimeout(3_250);
+        assert.equal(await retryButton!.evaluate(button => button.isConnected), true, 'polling preserves the pressed button');
+        await page.mouse.up();
         await page.locator('#draftConfirmDialog').waitFor({state:'visible'});
         assert.match(await page.locator('#draftConfirmMessage').innerText(),/saved MiFILE cases stay unchanged/);
         assert.equal(db.getEmailDetail(email.id)!.email.processingStatus,'processed');
         await page.screenshot({path:path.join(screenshots,'email-replay-confirm-desktop.png')});
         await page.locator('#draftConfirmDialog button[value="cancel"]').click();
         assert.equal(db.getEmailDetail(email.id)!.email.processingStatus,'processed','Cancel must not queue a replay');
+        const inactive = db.savePlaintiffMapping({ fullName: 'QA Inactive Example LLC', shortName: 'QAIE', isActive: false });
+        await page.locator('#mappingsTab').click();
+        const mappingRow = page.locator('tr[data-mapping-row="' + inactive.id + '"]');
+        assert.match(await mappingRow.innerText(), /Inactive/);
+        await mappingRow.getByRole('button', { name: 'Activate short name' }).click();
+        await mappingRow.getByRole('button', { name: 'Deactivate mapping' }).waitFor();
+        await page.locator('#queueTab').click();
         await page.setViewportSize({width:390,height:844});
         await page.locator('#retryBtn').click();
         const replayBox=await page.locator('#draftConfirmDialog').boundingBox();
@@ -468,6 +482,8 @@ async function main() {
         const plaintiffAddress = page.locator('[data-party-role="plaintiff"] [data-party-field="address1"]');
         await page.waitForFunction(()=>document.querySelector('[data-party-role="plaintiff"] [data-party-field="address1"]')===document.activeElement);
         const focusedBeforeRefresh = await plaintiffAddress.elementHandle();
+        assert.equal(await focusedBeforeRefresh!.evaluate(element => element.isConnected), true);
+        await page.evaluate(() => (window as any).refreshDraftFilingState(true));
         await page.waitForFunction(element => !element?.isConnected, focusedBeforeRefresh);
         assert.equal(await plaintiffAddress.evaluate(element => element === document.activeElement), true);
         assert.equal(await plaintiffAddress.getAttribute('aria-invalid'), 'true');

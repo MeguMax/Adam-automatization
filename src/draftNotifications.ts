@@ -27,6 +27,9 @@ export interface DraftReadyMail {
     attempts: number;
 }
 
+type IntakeResultMail = Pick<DraftReadyMail, 'to' | 'subject' | 'bodyText' | 'attempts'> & { emailId: string };
+type IntakeResult = { subject: string | null; cases: Array<{ draftId: string; label: string; description: string; ready: boolean }> };
+
 interface ReadySnapshot {
     version: 1;
     executionKey: string;
@@ -53,6 +56,71 @@ function readySnapshot(job:FilingJobView):ReadySnapshot|null {
 
 export class DraftNotificationStore {
     constructor(private readonly sql: DatabaseSync, private readonly now = () => new Date().toISOString()) {}
+
+    enrollIntake(emailId: string, subject: string | null): void {
+        if (/^NEW LT FILING\s*-\s*QA\b/i.test(subject || '')) return;
+        // Do not backfill existing records or change notification modes on a replay.
+        this.sql.prepare(`INSERT INTO intake_result_notifications(email_id,status,next_attempt_at)
+            SELECT ?,'pending',? WHERE NOT EXISTS(SELECT 1 FROM case_drafts WHERE email_id=?)
+            ON CONFLICT(email_id) DO NOTHING`).run(emailId, this.now(), emailId);
+    }
+
+    hasIntake(emailId: string): boolean {
+        return Boolean(this.sql.prepare('SELECT 1 FROM intake_result_notifications WHERE email_id=?').get(emailId));
+    }
+
+    verifiedForNotice(jobId: string): ReadySnapshot | null {
+        const job = this.job(jobId);
+        return job && !this.readinessIssue(job) ? readySnapshot(job) : null;
+    }
+
+    claimIntake(resolve: (emailId: string) => IntakeResult | null, environment = process.env): IntakeResultMail | null {
+        const config = draftNotificationConfig(environment);
+        if (!config.ready) return null;
+        const timestamp = this.now();
+        const rows = this.sql.prepare(`SELECT email_id,attempts FROM intake_result_notifications
+            WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,email_id LIMIT 20`)
+            .all(timestamp) as Array<{email_id:string;attempts:number}>;
+        for (const row of rows) {
+            const result = resolve(row.email_id);
+            if (!result) {
+                this.sql.prepare(`UPDATE intake_result_notifications SET next_attempt_at=? WHERE email_id=? AND status='pending'`)
+                    .run(new Date(Date.parse(timestamp) + 30_000).toISOString(), row.email_id);
+                continue;
+            }
+            const claimed = this.sql.prepare(`UPDATE intake_result_notifications SET status='sending',attempts=attempts+1
+                WHERE email_id=? AND status='pending'`).run(row.email_id);
+            if (!claimed.changes) continue;
+            const ready = result.cases.filter(item => item.ready).length;
+            const headline = result.cases.length ? `${ready} ready, ${result.cases.length - ready} to check` : 'Review required';
+            return {
+                emailId: row.email_id, to: config.recipient, attempts: row.attempts + 1,
+                subject: `MiFILE intake results: ${result.subject || '(no subject)'}`.replace(/[\r\n]+/g, ' ').slice(0, 240),
+                bodyText: [
+                    headline, '',
+                    ...(result.cases.length ? result.cases.flatMap(item => [
+                        `${item.label}: ${item.description}`,
+                        `${config.adminUrl}/?draft=${encodeURIComponent(item.draftId)}`, '',
+                    ]) : ['No case draft could be created. Check the source email in the admin panel.', config.adminUrl, '']),
+                    'Ready means verified in MiFILE History > Unsubmitted. This email is not a payment confirmation or filing receipt.',
+                ].join('\n'),
+            };
+        }
+        return null;
+    }
+
+    finishIntake(mail: IntakeResultMail, result: { sent: true } | { error: unknown }): void {
+        const timestamp = this.now();
+        const error = 'error' in result ? result.error as { statusCode?: number; status?: number } | null : null;
+        const code = Number(error?.statusCode || error?.status || 0);
+        const retry = !('sent' in result) && code === 429 && mail.attempts < 3;
+        const status = 'sent' in result ? 'sent' : retry ? 'pending' : code >= 400 && code < 500 ? 'failed' : 'uncertain';
+        const issue = status === 'sent' ? null : retry ? 'Microsoft throttled sending. A retry is scheduled.' :
+            status === 'failed' ? `Microsoft rejected the notification (HTTP ${code}).` : 'Delivery could not be confirmed. Check Sent items before sending anything again.';
+        this.sql.prepare(`UPDATE intake_result_notifications SET status=?,last_error=?,next_attempt_at=?,sent_at=?
+            WHERE email_id=? AND status='sending'`).run(status, issue,
+            new Date(Date.parse(timestamp) + 60_000 * mail.attempts).toISOString(), status === 'sent' ? timestamp : null, mail.emailId);
+    }
 
     enqueue(job: FilingJobView, packageLabel: string | null, environment: NodeJS.ProcessEnv = process.env): boolean {
         const config = draftNotificationConfig(environment);
@@ -193,6 +261,8 @@ export class DraftNotificationStore {
 
     recover(): number {
         // An interrupted send may already have reached Graph. Never replay it blindly.
+        this.sql.prepare(`UPDATE intake_result_notifications SET status='uncertain',
+            last_error='Email delivery was interrupted; check Sent/recipient before retrying.' WHERE status='sending'`).run();
         return Number(this.sql.prepare(`UPDATE draft_notifications SET status='uncertain',
             last_error='Email delivery was interrupted; check Sent/recipient before retrying.',updated_at=?
             WHERE status='sending'`).run(this.now()).changes);
@@ -241,7 +311,13 @@ export class DraftNotificationStore {
     forDraft(draftId: string) {
         const row=this.sql.prepare('SELECT * FROM draft_notifications WHERE case_draft_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1')
             .get(draftId) as NotificationRow|undefined;
-        if(!row)return null;
+        if(!row) {
+            const batch = this.sql.prepare(`SELECT n.* FROM intake_result_notifications n
+                JOIN case_drafts c ON c.email_id=n.email_id WHERE c.id=?`).get(draftId) as any;
+            if (!batch) return null;
+            return { status: batch.status, attempts: batch.attempts, lastError: batch.last_error,
+                sentAt: batch.sent_at, nextAttemptAt: null, recipient: null, canRetry: false, batch: true };
+        }
         const issue=['pending','failed','uncertain'].includes(row.status) ? this.queuedIssue(row,this.job(row.filing_job_id),false) : null;
         let recipient:string|null=null;
         try{recipient=JSON.parse(row.payload_json).to || null;}catch{/* Show the stored delivery issue instead. */}

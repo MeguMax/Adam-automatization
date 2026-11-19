@@ -2685,6 +2685,15 @@ const migrations: Migration[] = [
             last_error TEXT, sent_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         ); CREATE INDEX idx_draft_notifications_due ON draft_notifications(status,next_attempt_at);`),
     },
+    {
+        version: 36, name: 'intake_result_email_outbox',
+        up: db => db.exec(`CREATE TABLE intake_result_notifications (
+            email_id TEXT PRIMARY KEY REFERENCES email_records(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN ('pending','sending','sent','failed','uncertain')),
+            attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+            last_error TEXT, sent_at TEXT
+        ); CREATE INDEX idx_intake_result_due ON intake_result_notifications(status,next_attempt_at);`),
+    },
 ];
 
 export class WorkflowDatabase {
@@ -2692,6 +2701,57 @@ export class WorkflowDatabase {
     private readonly databasePath: string;
 
     draftNotifications(): DraftNotificationStore { return new DraftNotificationStore(this.db); }
+
+    intakeResultNotification(emailId: string, autoPrepare: boolean) {
+        const detail = this.getEmailDetail(emailId);
+        if (!detail || !['processed', 'partial_failure', 'failed'].includes(detail.email.processingStatus)) return null;
+        const cases = [];
+        for (const sibling of detail.caseDrafts) {
+            const item = this.getDraftDetail(sibling.id);
+            const draft = item?.caseDraft;
+            if (!draft || !item) return null;
+            const root = this.safeJson(draft.normalizedDataJson) || {};
+            const label = draft.editableData.caseTitle || sibling.label;
+            const result = (description: string, ready = false) => ({ draftId: draft.id, label, description, ready });
+            if (draft.status === 'archived' && !item.documents.length) continue;
+            if (['archived', 'rejected'].includes(draft.status)) {
+                cases.push(result('Closed in the admin panel.'));
+                continue;
+            }
+            if (['queued', 'running'].includes(draft.filingStatus)) return null;
+            if (draft.filingStatus === 'prepared') {
+                const job = this.listFilingJobs(draft.id)[0];
+                const ready = job && this.draftNotifications().verifiedForNotice(job.id);
+                cases.push(ready ? result(`Ready in Unsubmitted (${ready.temporaryCaseNumber}).`, true) :
+                    result('Saved package needs verification. Check the draft and MiFILE History before taking action.'));
+                continue;
+            }
+            if (draft.filingStatus === 'succeeded') {
+                cases.push(result('Filing activity already recorded. Check MiFILE History.'));
+                continue;
+            }
+            if (['failed', 'reconciliation_required'].includes(draft.filingStatus)) {
+                cases.push(result('MiFILE preparation needs attention. Check MiFILE History before retrying.'));
+                continue;
+            }
+            const readingPending = ['queued', 'reading', 'retry_scheduled'].includes(draft.complaintReading.status);
+            if (readingPending || item.documents.some(doc => doc.requiredForFiling && (
+                ['retry_queued', 'retrying'].includes(doc.status) ||
+                (doc.status === 'pending' && Boolean(doc.sourceUrl)) ||
+                (doc.status === 'failed' && Boolean(doc.nextRetryAt) && doc.automaticRetryCount < item.retryPolicy.maxAutomaticRetries) ||
+                (doc.recognitionRecovery && (doc.recognitionRecovery.status === 'reading' ||
+                    doc.recognitionRecovery.attempts < DOCUMENT_RECOGNITION_ATTEMPTS))))) return null;
+            const canAutoPrepare = draft.status === 'ready_to_file' && draft.validationStatus === 'passed' &&
+                draft.filingEligible && !draft.validationIssues.length && !root.intake?.manual && !root.manualDocumentEdits &&
+                (draft.complaintExtraction?.extractorVersion ?? 0) >= CURRENT_COMPLAINT_EXTRACTOR_VERSION &&
+                root.supportingPolicyVersion === 2 && !['demand', 'notice_to_quit', 'none'].includes(String(draft.editableData.supportingRequirement)) &&
+                !this.listFilingJobs(draft.id).length;
+            if (canAutoPrepare && autoPrepare) return null;
+            cases.push(result(canAutoPrepare ? 'Automatic MiFILE preparation is unavailable. Open the draft to review next steps.' :
+                'Review required. Open the draft to see the checks that need attention.'));
+        }
+        return { subject: detail.email.subject, cases };
+    }
 
     constructor(dbPath = process.env.WORKFLOW_DB_PATH || DEFAULT_WORKFLOW_DB_PATH) {
         this.databasePath = path.resolve(dbPath);
@@ -6343,8 +6403,12 @@ export class WorkflowDatabase {
             }
             if (input.status === 'prepared') {
                 const completed = this.getFilingJob(input.filingJobId)!;
-                const draftData = this.safeJson(this.getDraftDetail(existing.caseDraftId)?.caseDraft?.normalizedDataJson || null);
-                this.draftNotifications().enqueue(completed, draftData?.intake?.packageLabel || null);
+                const notices = this.draftNotifications();
+                const draftDetail = this.getDraftDetail(existing.caseDraftId);
+                if (!draftDetail || !notices.hasIntake(draftDetail.email.id)) {
+                    const draftData = this.safeJson(draftDetail?.caseDraft?.normalizedDataJson || null);
+                    notices.enqueue(completed, draftData?.intake?.packageLabel || null);
+                }
             }
             this.insertAuditLog('filing_job', input.filingJobId, `filing_job_${input.status}`, {
                 caseDraftId: existing.caseDraftId,
